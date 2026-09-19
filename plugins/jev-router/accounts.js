@@ -13,9 +13,10 @@ const envName = (provider, name) => `KZ_KEY__${provider}__${name}`
 // Env var that DSH itself reads for a provider's active key.
 const ACTIVE_ENV = { deepseek: 'DEEPSEEK_API_KEY' }
 
-export const kindOf = (a) => (SUBSCRIPTION_PROVIDERS.includes(a.provider) ? 'subscription' : 'api')
+/** 'local' agents run a model on this PC (llama.cpp): free, no keys, no quota. */
+export const kindOf = (a) => (SUBSCRIPTION_PROVIDERS.includes(a.provider) ? 'subscription' : a.llm?.provider === 'local' ? 'local' : 'api')
 /** Key provider an api agent draws from: 'deepseek' for DSH's DeepSeek, else its BYOK llm provider. */
-export const keyProviderOf = (a) => (a.provider !== 'spawn' ? null : a.llm?.provider === 'deepseek-official' ? 'deepseek' : a.llm?.provider ?? null)
+export const keyProviderOf = (a) => (a.provider !== 'spawn' || a.llm?.provider === 'local' ? null : a.llm?.provider === 'deepseek-official' ? 'deepseek' : a.llm?.provider ?? null)
 
 // --- .env ---------------------------------------------------------------
 const unquote = (v) => {

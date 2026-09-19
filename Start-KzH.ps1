@@ -39,6 +39,8 @@ $env:npm_config_prefer_offline = 'true'
 Set-Location $Workspace
 # The "No project" workspace (<harness>\no-project) for plain chat; added before DSH opens its storage.
 node (Join-Path $PSScriptRoot 'scripts\ensure-no-project.mjs')
+# Per-run effort and 1.5x speed for Codex (re-applied if the connector was reinstalled).
+node (Join-Path $PSScriptRoot 'scripts\patch-codex-effort.mjs')
 $dshArgs = @('-y', "@deepseek-ai/dsh@$DshVersion", 'web')
 if ($NoOpen) { $dshArgs += '--no-open' }
 & npx @dshArgs

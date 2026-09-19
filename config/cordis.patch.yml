@@ -9,6 +9,11 @@
 #     need permissions already granted in your Claude settings.
 #   codex approve-for-me: workspace-write sandbox, Codex auto-review for
 #     anything that needs approval.
+# Effort (Settings > Jev setup > Effort): jev-router sets CLAUDE_CODE_EFFORT_LEVEL
+#   for claude-code runs; codex effort / 1.5x speed need the one-block patch in
+#   dsh-subagent-codex/lib/index.js (turn/start reads KZ_CODEX_EFFORT /
+#   KZ_CODEX_SERVICE_TIER; original kept as index.js.orig). A reinstall drops it.
+#   Do not set `env: CLAUDE_CODE_EFFORT_LEVEL` here: it would override per-run effort.
 - id: subagent-claude-code
   config:
     permissionMode: acceptEdits
@@ -43,4 +48,66 @@
   disabled: true
 # Developer-only reload channel (unauthenticated /plugins/events).
 - id: client-hmr
+  disabled: true
+
+# Feedback surface (Like/Dislike, the feedback dialog, /feedback). Feedback
+# was stored locally and only uploaded by session-telemetry-otel (off above);
+# nothing else injects these services, so the buttons and command just vanish.
+- id: ui-message-feedback
+  disabled: true
+- id: message-feedback
+  disabled: true
+- id: command-feedback
+  disabled: true
+
+# DeepSeek through DSH's generic pi-ai adapter: route 'deepseek', same
+# DEEPSEEK_API_KEY credential, public https://api.deepseek.com. Unlike the
+# official connector it sends no x-deepseek-harness-user-id/-session-id/
+# -compact headers. Models mirror the official catalog (1M context, efforts
+# off/low/high/max, image input on the Flash and vision models).
+- id: llm-pi-ai
+  config:
+    providers:
+      deepseek:
+        displayName: DeepSeek
+        apiKeyEnv: DEEPSEEK_API_KEY
+        reasoning: high
+        requestImagePixelBudget: 640000
+        requestImageMaxBytes: 1048576
+        models:
+          - id: deepseek-flash
+            name: DeepSeek-V41-Flash
+            contextWindow: 1000000
+            maxTokens: 256000
+            input: [text, image]
+            reasoningEfforts: { off: null, low: low, high: high, max: max }
+          - id: deepseek-v4-flash
+            name: DeepSeek-V4-Flash
+            contextWindow: 1000000
+            maxTokens: 256000
+            input: [text]
+            reasoningEfforts: { off: null, low: low, high: high, max: max }
+          - id: deepseek-v4-pro
+            name: DeepSeek-V4-Pro
+            contextWindow: 1000000
+            maxTokens: 256000
+            input: [text]
+            reasoningEfforts: { off: null, low: low, high: high, max: max }
+          - id: deepseek-v4-flash-vision-exp
+            name: DeepSeek-V4-Flash-Vision-Exp
+            contextWindow: 1000000
+            maxTokens: 256000
+            input: [text, image]
+            reasoningEfforts: { off: null, low: low, high: high, max: max }
+# Fallback default model for new agents (settings.yaml's choice still wins).
+- id: agent-default-model
+  config:
+    provider: deepseek
+    model: deepseek-flash
+
+# Official DeepSeek connector: remove this block to bring it back.
+# (It adds the anonymous-user-id / session-id / compaction headers to every
+# DeepSeek request; also switch jev-router agents.deepseek.llm and auxModel
+# back to provider deepseek-official, see README "Privacy".)
+- id: llm-deepseek
   disabled: true

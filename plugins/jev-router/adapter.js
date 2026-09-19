@@ -19,6 +19,21 @@ const info = (provider, id = MODEL) => ({
   name: 'Jev Auto',
   description: 'Every message goes straight to the Jev router, which picks Claude, Codex, DeepSeek or a tool, then reviews the result.',
   inputModalities: ['text'],
+  reasoning: REASONING,
+})
+
+// Effort in the model menu. Ids are Jev's unified ladder (effort.js maps them per agent).
+const REASONING = Object.freeze({
+  defaultEffort: 'auto',
+  efforts: Object.freeze([
+    { id: 'auto', name: 'Auto', description: 'Jev picks by task (Settings default applies)' },
+    { id: 'low', name: 'Low', description: 'Claude Low · GPT Light · DeepSeek Low' },
+    { id: 'medium', name: 'Medium', description: 'Claude Medium · GPT Medium · DeepSeek High' },
+    { id: 'high', name: 'High', description: 'Claude High · GPT High · DeepSeek High' },
+    { id: 'xhigh', name: 'Extra High', description: 'Claude Extra · GPT Extra High · DeepSeek Max' },
+    { id: 'max', name: 'Max', description: 'Claude Max · GPT Max · DeepSeek Max' },
+    { id: 'ultra', name: 'Ultra', description: 'Claude Ultracode (its top level) · GPT Ultra · DeepSeek Max' },
+  ]),
 })
 
 // Text the person typed. DSH also sends plugin context (skill catalogs, reminders)
@@ -36,7 +51,7 @@ export function line(e) {
     case 'routed': return e.tool ? `Routed to tool ${e.tool}` : `Routed to ${e.routing.primaryAgent} (${e.routing.mode})`
     case 'checks': return `Baseline checks: ${e.checks.map((c) => `${c.name} ${c.passed ? 'pass' : 'FAIL'}`).join(', ')}`
     case 'attempt_start': return `Running ${e.agent} (${e.role})…`
-    case 'attempt_end': return `${e.attempt.agent} finished: ${e.attempt.stopReason} in ${Math.round(e.attempt.durationMs / 1000)}s`
+    case 'attempt_end': return `${e.attempt.agent}${e.attempt.effort ? ` (effort ${e.attempt.effort})` : ''} finished: ${e.attempt.stopReason} in ${Math.round(e.attempt.durationMs / 1000)}s`
     case 'review': return `Review: ${e.assessment.action}. ${e.assessment.why}`
     case 'limit': return `${e.agent} hit its usage limit${e.until ? ` (resets ${new Date(e.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` : ''}: ${{ rotated: 'switched API key, continuing', peer: 'handing the task to another agent', paused: 'no agent left, pausing' }[e.action] ?? e.action}`
     case 'handoff': return `Handoff note saved (${e.source === 'agent' ? 'by the agent' : 'by the harness'}): ${e.path}`
@@ -52,9 +67,17 @@ export function line(e) {
  * @param {Function} p.route the router's route({ task, agent, signal, emit })
  * @param {Function} [p.classify] (message) -> { kind: 'task' | 'question' }
  * @param {{provider: string, model: string}} p.auxModel real model for title and compaction requests
- * @param {(ms: number) => void} [p.onDirectAnswer] a question in a project was answered by the chat model, no agent
+ * @param {(ms: number, model: {provider: string, model: string}) => void} [p.onDirectAnswer] a question in a project was answered by a chat model, no agent
+ * @param {() => Promise<boolean>} [p.isOffline] true when the internet is unreachable
+ * @param {() => Promise<{provider: string, model: string}|null>} [p.localChat] the local chat model, when one is installed
  */
-export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer }) {
+export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isOffline, localChat }) {
+  // Chat models to try in order: online the aux model, then the local one; offline the local one only.
+  const chatModels = async () => {
+    const local = await localChat?.().catch(() => null)
+    const offline = await isOffline?.().catch(() => false)
+    return { offline, models: offline ? (local ? [local] : []) : [auxModel, local].filter(Boolean) }
+  }
   return {
     providerInfo: (p) => ({ id: p, name: 'Jev' }),
     providerRetryPolicy: () => NO_RETRY,
@@ -69,7 +92,10 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer }) {
       // Side requests (session title, compaction) reuse this route; a real model answers them.
       if (options.purpose) {
         const { reasoningEffort: _r, ...rest } = options
-        yield* ctx.llm.stream({ ...rest, provider: auxModel.provider, model: auxModel.model })
+        const m = (await chatModels()).models[0] ?? auxModel
+        // A title has a tiny output budget: no thinking, as the official DeepSeek connector did.
+        const title = options.purpose === 'session-title' && m.provider !== 'local' ? { reasoningEffort: 'off' } : {}
+        yield* ctx.llm.stream({ ...rest, ...title, provider: m.provider, model: m.model })
         return
       }
 
@@ -85,8 +111,8 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer }) {
           yield* textReply('This is the **No project** space, so no agent can work on files here. Pick or add your project folder in the workspace menu next to the message box, then send the task again. Questions are answered here directly.')
           return
         }
-        const answered = yield* answerDirectly(ctx, options, auxModel)
-        if (answered !== true) yield* textReply(`No chat model could answer (${answered}). Check DeepSeek in Settings → Jev setup, or ask inside a project folder so an agent can answer.`)
+        const answered = yield* answerWithAny(ctx, options, await chatModels())
+        if (answered !== true) yield* textReply(`No chat model could answer (${answered}). Check DeepSeek or Local models in Settings → Jev setup, or ask inside a project folder so an agent can answer.`)
         return
       }
 
@@ -95,10 +121,10 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer }) {
       let answerOnly = false
       if ((await classify?.(task).catch(() => null))?.kind === 'question') {
         const started = Date.now()
-        const answered = yield* answerDirectly(ctx, options, auxModel)
-        if (answered === true) { onDirectAnswer?.(Date.now() - started); return }
+        const answered = yield* answerWithAny(ctx, options, await chatModels(), (m) => onDirectAnswer?.(Date.now() - started, m))
+        if (answered === true) return
         // No chat model available: one agent answers, without touching the project, checks or review.
-        process.stdout.write(`[jev] Chat model ${auxModel.provider}/${auxModel.model} could not answer (${answered}); asking an agent\n`)
+        process.stdout.write(`[jev] No chat model could answer (${answered}); asking an agent\n`)
         routeTask = `Answer this question directly and briefly. Do not modify any files.\n\n${task}`
         answerOnly = true
       }
@@ -114,7 +140,7 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer }) {
       let result
       let error
       const emit = (e) => { queue.push(line(e)); wake?.() }
-      route({ task: routeTask, answerOnly, agent, signal: ac.signal, emit })
+      route({ task: routeTask, answerOnly, agent, effort: options.reasoningEffort, signal: ac.signal, emit })
         .then((r) => { result = r }, (e) => { error = e })
         .finally(() => { done = true; wake?.() })
 
@@ -140,11 +166,25 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer }) {
 
 const ABOUT = 'You are answering inside Kz-harness, a desktop app where the Jev router sends coding tasks to Claude Code (the user\'s claude.ai login on this PC), Codex (their ChatGPT login on this PC), DeepSeek (API key) and API-key models, runs the project checks, and reviews results. Logins and keys are managed in Settings → Jev setup → Accounts; usage limits are in the Jev inspector → Usage tab. Answer the user\'s question directly and concisely.'
 
+/** Try each chat model in order until one answers; returns true, or the last failure reason. */
+async function* answerWithAny(ctx, options, { offline, models }, onAnswered) {
+  let why = offline ? 'offline and no local model installed' : 'no chat model configured'
+  for (const m of models) {
+    const r = yield* answerDirectly(ctx, options, m, offline)
+    if (r === true) { onAnswered?.(m); return true }
+    process.stdout.write(`[jev] Chat model ${m.provider}/${m.model} could not answer (${r})\n`)
+    why = r
+  }
+  return why
+}
+
+const PROVIDER_NAME = { deepseek: 'DeepSeek', 'deepseek-official': 'DeepSeek', local: 'Local model' }
+
 /**
  * Stream the answer from the chat model. Returns true, or the failure reason (having yielded nothing)
  * when that model fails before producing text, so the caller can fall back to an agent.
  */
-async function* answerDirectly(ctx, options, auxModel) {
+async function* answerDirectly(ctx, options, auxModel, offline = false) {
   // No tools: a direct answer must not start work (or call the router) on its own.
   const { reasoningEffort: _r, purpose: _p, tools: _t, toolChoice: _tc, ...rest } = options
   const messages = options.messages.map((m, i) => (i === options.messages.length - 1 && m.role === 'user'
@@ -153,7 +193,7 @@ async function* answerDirectly(ctx, options, auxModel) {
   const held = []
   let flowing = false
   let lastIndex = 0
-  const credit = `\n\n_Answered by: ${auxModel.provider === 'deepseek-official' ? 'DeepSeek' : auxModel.provider} (${auxModel.model}), directly: a question, no agents or project work_`
+  const credit = `\n\n_${offline ? 'OFFLINE: local models only. ' : ''}Answered by: ${PROVIDER_NAME[auxModel.provider] ?? auxModel.provider} (${auxModel.model}), directly: a question, no agents or project work_`
   try {
     for await (const chunk of ctx.llm.stream({ ...rest, messages, provider: auxModel.provider, model: auxModel.model })) {
       if (typeof chunk.index === 'number') lastIndex = Math.max(lastIndex, chunk.index)

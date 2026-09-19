@@ -31,6 +31,7 @@ const START_SCRIPT = path.join(HARNESS, 'Start-KzH.ps1')
 const PORT = 3080
 const ICON = path.join(__dirname, 'assets', 'logo.ico')
 const BG = '#151517' // DSH dark base, so nothing flashes white while loading
+const TITLEBAR_H = 36
 
 app.setAppUserModelId('ai.kz.harness')
 if (!app.requestSingleInstanceLock()) app.quit()
@@ -167,6 +168,9 @@ function createMain() {
   main = new BrowserWindow({
     width: 1320, height: 860, minWidth: 900, minHeight: 600,
     title: 'Kz-harness', icon: ICON, backgroundColor: BG, show: false,
+    // Our own title bar (drawn by the pages, 36 px tall); Windows keeps its native min/max/close on the right.
+    titleBarStyle: 'hidden',
+    titleBarOverlay: { color: BG, symbolColor: '#cfd3d6', height: TITLEBAR_H },
     webPreferences: { ...secure, preload: path.join(__dirname, 'preload.js') },
   })
   main.once('ready-to-show', () => main.show())
@@ -276,6 +280,7 @@ ipcMain.handle('harness:browser', (e, op, arg) => {
 })
 
 // ---------- menu + tray ----------
+let appMenu = null
 function buildMenus() {
   const items = [
     { label: 'Show Kz-harness', click: () => { main?.show(); main?.focus() } },
@@ -287,10 +292,13 @@ function buildMenus() {
     { type: 'separator' },
     { label: 'Quit', accelerator: 'CmdOrCtrl+Q', click: () => app.quit() },
   ]
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
+  // The window has no menu bar row any more; the ☰ button in the title bar pops this menu up,
+  // and its accelerators (Ctrl+Shift+L, F12, Ctrl+Q …) keep working.
+  appMenu = Menu.buildFromTemplate([
     { label: 'Kz-harness', submenu: items.slice(1) },
     { label: 'View', submenu: [{ role: 'reload' }, { role: 'toggleDevTools', accelerator: 'F12' }, { role: 'toggleDevTools', accelerator: 'CmdOrCtrl+Shift+I', visible: false }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
-  ]))
+  ])
+  Menu.setApplicationMenu(appMenu)
   tray = new Tray(nativeImage.createFromPath(path.join(__dirname, 'assets', 'logo-32.png')))
   tray.setToolTip('Kz-harness')
   tray.setContextMenu(Menu.buildFromTemplate(items))
@@ -298,6 +306,12 @@ function buildMenus() {
 }
 
 // ---------- renderer API ----------
+// Title-bar ☰ button: pops up the app menu under it (the harness page and the start page both have it).
+ipcMain.handle('harness:menu', (e, at) => {
+  if (!main || (e.sender !== main.webContents && !fromAppPage(e))) return
+  appMenu?.popup({ window: main, x: Math.round(Number(at?.x) || 8), y: Math.round(Number(at?.y) || TITLEBAR_H) })
+})
+ipcMain.handle('harness:titlebar', () => ({ height: TITLEBAR_H, maximized: !!main?.isMaximized() }))
 // Only the app's own start and log pages may read the log or restart the harness, not the harness page.
 ipcMain.handle('harness:state', (e) => (fromAppPage(e) ? { status, logs } : null))
 ipcMain.handle('harness:retry', (e) => { if (fromAppPage(e)) restartDsh() })

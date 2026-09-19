@@ -22,6 +22,8 @@ window.__ModuleLoader__.load({
     const KIND = 'jev-inspector'
     const BROWSER_ID = 'jev-router/browser'
     const BROWSER_KIND = 'kz-browser'
+    const TERMINAL_ID = 'jev-router/terminal'
+    const TERMINAL_KIND = 'kz-terminal'
     // Services captured in apply (ctx.sessions, ctx.sidebarRight, ctx.layout, ctx.uiWorkspace).
     let sessionsApi
     let sidebarRight
@@ -131,6 +133,7 @@ window.__ModuleLoader__.load({
 .jevi .note{background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:6px 10px;margin:6px 0}
 .jevi-modal{position:fixed;inset:0;background:var(--dsw-alias-bg-mask-1);display:flex;align-items:center;justify-content:center;z-index:10000;height:auto;padding:0}
 .jevi-modal .box{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;padding:18px;max-width:380px;width:calc(100% - 32px);box-shadow:0 10px 40px var(--dsw-alias-bg-mask-3)}
+.jevi-modal .box.wide{max-width:640px;max-height:calc(100vh - 48px);overflow:auto}
 .jevi-modal .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
 .jevi kbd{font:var(--dsw-font-xxxs-11);font-family:var(--ds-font-family-code);padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);white-space:nowrap}
 .jevi kbd.none{font-family:inherit;color:var(--dsw-alias-label-caption);border-style:dashed}
@@ -151,7 +154,7 @@ window.__ModuleLoader__.load({
 .jevi .st.stopped{color:var(--dsw-alias-label-caption)}
 @keyframes kzh-spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.jevi .st.running{animation:none}}
-.kzh-bar{display:flex;align-items:center;gap:2px}
+.kzh-bar{display:flex;align-items:center;gap:2px}.kzh-float{position:fixed;top:10px;z-index:30;pointer-events:auto;display:flex;align-items:center;gap:2px;padding:2px;border-radius:10px;background:var(--dsw-alias-bg-base);transition:right var(--ds-transition-duration-slow) var(--ds-ease-in-out)}.kzh-titlebar{position:fixed;top:0;left:0;right:0;height:36px;z-index:40;pointer-events:auto;display:flex;align-items:center;gap:2px;padding-left:8px;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);-webkit-app-region:drag;box-sizing:border-box}.kzh-titlebar button,.kzh-titlebar [role=menu]{-webkit-app-region:no-drag}.kzh-tb-drag{flex:1;align-self:stretch}.kzh-tb-menu{display:inline-flex;align-items:center;gap:8px;background:none;border:0;border-radius:6px;padding:4px 8px;cursor:pointer;font:var(--dsw-font-xxs-strong-12);color:var(--dsw-alias-label-secondary)}.kzh-tb-menu:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.kzh-titlebar .kzh-bar{margin:0}html.kzh-in-app{padding-top:36px;box-sizing:border-box;height:100%}html.kzh-in-app body{height:100%}.kzh-float .kzh-bar{margin:0}
 .kzh-ib{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;transition:background var(--ds-transition-duration-fast) var(--ds-ease-in-out)}
 .kzh-ib:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .kzh-ib[aria-pressed=true],.kzh-ib[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary)}
@@ -262,6 +265,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Everything the header, the menu and the hotkeys can do. `keys` is the default combo ('' = none). */
+    const closedTabs = [] // { kind, params } of sidebar tabs closed with Ctrl+W, newest last
     const ACTIONS = [
       { id: 'terminal', label: 'Terminal', keys: 'Ctrl+`', run: async () => {
         const cwd = currentCwd()
@@ -271,7 +275,7 @@ window.__ModuleLoader__.load({
       { id: 'background', label: 'Background tasks', keys: 'Ctrl+Alt+B', run: () => openPanel(KIND, { view: 'jobs' }) },
       { id: 'browser', label: 'Browser', keys: 'Ctrl+Alt+W', run: () => togglePanel(BROWSER_KIND) },
       { id: 'jev-inspector', label: 'Jev inspector', keys: 'Ctrl+Alt+J', run: () => togglePanel(KIND, { view: 'decisions' }) },
-      { id: 'files', label: 'Files', keys: 'Ctrl+Alt+E', run: () => openPanel('files') },
+      { id: 'files', label: 'Files', keys: 'Ctrl+Alt+E', run: () => togglePanel('files') },
       { id: 'usage', label: 'Usage', keys: 'Ctrl+Alt+U', run: () => openPanel(KIND, { view: 'usage' }) },
       { id: 'left-sidebar', label: 'Toggle left sidebar', keys: 'Ctrl+B', run: () => layout.toggleSidebar() },
       { id: 'focus-mode', label: 'Focus mode', keys: 'Ctrl+Shift+F', run: focusMode },
@@ -282,6 +286,21 @@ window.__ModuleLoader__.load({
         b.click()
       } },
       // No composer focus API; the message box is DSH's one Lexical editor.
+      // Right-sidebar tabs, browser-style. Reopen covers tabs closed with the hotkey (DSH reports no close events).
+      { id: 'close-tab', label: 'Close sidebar tab', keys: 'Ctrl+W', run: () => {
+        let tab
+        try { tab = sidebarRight.isExpanded() ? sidebarRight.active() : null } catch {}
+        if (!tab) return
+        closedTabs.push({ kind: tab.kind, params: tab.navigation?.params })
+        if (closedTabs.length > 20) closedTabs.shift()
+        sidebarRight.close(tab.id)
+      } },
+      { id: 'new-tab', label: 'New sidebar tab', keys: 'Ctrl+Alt+T', run: () => sidebarRight.openTab('guide') },
+      { id: 'reopen-tab', label: 'Reopen closed sidebar tab', keys: 'Ctrl+Shift+T', run: () => {
+        const last = closedTabs.pop()
+        if (!last) throw new Error('No closed tab to reopen')
+        openPanel(last.kind, last.params)
+      } },
       { id: 'focus-input', label: 'Focus message box', keys: '', run: () => document.querySelector('[data-lexical-editor="true"]')?.focus() },
       { id: 'jev-setup', label: 'Jev setup settings', keys: '', run: () => openSettings('Jev setup') },
       { id: 'shortcuts', label: 'Shortcuts settings', keys: '', run: () => openSettings('Shortcuts') },
@@ -602,7 +621,7 @@ window.__ModuleLoader__.load({
     }
 
     // ---------- accounts, usage, limits ----------
-    const AGENT_LABEL = { claude: 'Claude', codex: 'GPT', deepseek: 'DeepSeek', jev: 'Jev', chat: 'Chat model' }
+    const AGENT_LABEL = { claude: 'Claude', codex: 'GPT', deepseek: 'DeepSeek', jev: 'Jev', chat: 'Chat model', 'qwen-local': 'Qwen (local)', 'gemma-local': 'Gemma (local)' }
     const PROVIDER_LABEL = { deepseek: 'DeepSeek', jev: 'Jev' }
     const agentLabel = (id) => AGENT_LABEL[id] ?? id
     const providerLabel = (p) => PROVIDER_LABEL[p] ?? p
@@ -697,7 +716,7 @@ window.__ModuleLoader__.load({
       const st = stateInfo(a)
       const acct = a.account?.email ?? a.account?.label
       const L = a.limits ?? {}
-      const fields = a.kind === 'subscription'
+      const fields = a.kind === 'local' ? [] : a.kind === 'subscription'
         ? [['handoffAtPercent', 'Handoff at %', true], ['stopAtPercent', 'Stop at %', true]]
         : a.id === 'jev' ? [] : [['minBalance', `Min balance${a.balance?.currency ? ` (${a.balance.currency})` : ''}`, false]]
       return h('div', { className: 'card' },
@@ -897,6 +916,41 @@ window.__ModuleLoader__.load({
           : view === 'usage' ? h(UsageView, { usage, error: usageErr, busy: usageBusy, onRefresh: () => loadUsage(true) }) : h(Tasks, { sessionId, runs, jobs, entries }))
     }
 
+    // ---------- settings: Jev setup: effort ----------
+    // Each agent's own names; values are the ids the server maps (effort.js).
+    const EFFORT_LADDERS = {
+      default: [['auto', 'Auto (Jev picks by task)'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra High'], ['max', 'Max'], ['ultra', 'Ultra']],
+      claude: [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra'], ['max', 'Max'], ['ultra', 'Ultracode']],
+      codex: [['low', 'Light'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra High'], ['max', 'Max'], ['ultra', 'Ultra']],
+      deepseek: [['off', 'Off'], ['low', 'Low'], ['high', 'High'], ['max', 'Max']],
+    }
+    function EffortCard() {
+      const [e, setE] = useState(null)
+      const [err, setErr] = useState('')
+      useEffect(() => { api('/jev-router/effort').then(setE, (x) => setErr(x.message)) }, [])
+      const save = async (next) => { setErr(''); try { setE(await api('/jev-router/effort', { method: 'POST', body: JSON.stringify(next) })) } catch (x) { setErr(x.message) } }
+      if (!e) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Effort'), h('div', { className: err ? 'err' : 'muted' }, err || 'Loading…'))
+      const pick = (id, label, value, options, onChange) => [
+        h('dt', { key: `${id}t` }, h('label', { htmlFor: id }, label)),
+        h('dd', { key: `${id}d` }, h('select', { id, value: value ?? '', onChange: (ev) => onChange(ev.target.value) }, ...options.map(([v, n]) => h('option', { key: v, value: v }, n)))),
+      ]
+      const setAgent = (agent, v) => { const perAgent = { ...e.perAgent }; if (v) perAgent[agent] = v; else delete perAgent[agent]; save({ ...e, perAgent }) }
+      const follow = [['', 'Follow the level above']]
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-effort-h' },
+        h('div', { className: 'label', id: 'jevi-effort-h' }, 'Effort'),
+        h('div', { className: 'why' }, 'The Effort choice in the model menu wins over the default; a fixed per-agent effort wins over both. Local models keep their own settings.'),
+        err ? h('div', { className: 'err', role: 'alert' }, err) : null,
+        h('dl', null,
+          ...pick('jevi-ef-d', 'Default level', e.default, EFFORT_LADDERS.default, (v) => save({ ...e, default: v })),
+          ...pick('jevi-ef-c', 'Claude', e.perAgent?.claude, [...follow, ...EFFORT_LADDERS.claude], (v) => setAgent('claude', v)),
+          ...pick('jevi-ef-x', 'GPT (Codex)', e.perAgent?.codex, [...follow, ...EFFORT_LADDERS.codex], (v) => setAgent('codex', v)),
+          ...pick('jevi-ef-s', 'DeepSeek', e.perAgent?.deepseek, [...follow, ...EFFORT_LADDERS.deepseek], (v) => setAgent('deepseek', v)),
+          h('dt', null, 'Codex speed'),
+          h('dd', null, h('label', { className: 'toggle' },
+            h('input', { type: 'checkbox', role: 'switch', checked: e.codexSpeed === 'fast', 'aria-label': 'Codex 1.5x speed', onChange: (ev) => save({ ...e, codexSpeed: ev.target.checked ? 'fast' : 'normal' }) }),
+            e.codexSpeed === 'fast' ? '1.5x (uses more of your plan)' : 'Normal'))))
+    }
+
     // ---------- settings: Jev setup ----------
     function SetupSection() {
       useStyle()
@@ -952,6 +1006,10 @@ window.__ModuleLoader__.load({
 
         h(AccountsCard, { setupAgents: data.agents, usage, busy, act, ask: setConfirm, setNotice }),
 
+        h(LocalModelsCard, { ask: setConfirm }),
+
+        h(EffortCard),
+
         h('div', { className: 'card' },
           h('div', { className: 'label' }, 'Add an API-key agent'),
           data.providers.length === 0
@@ -986,6 +1044,214 @@ window.__ModuleLoader__.load({
         confirm ? h(Confirm, { ...confirm, onCancel: () => setConfirm(null), onConfirm: () => { const c = confirm; setConfirm(null); act(c.run) } }) : null)
     }
 
+    // ---------- local models: /install-llm and /remove-llm pickers, Settings card ----------
+    // A bare /install-llm or /remove-llm opens a picker here (commandUi decoration in apply);
+    // typed ids still run the server command. Installs run on the server and survive closing the dialog.
+    const llmDialog = makeStore({ mode: null })
+    const openLlm = (mode) => llmDialog.set({ mode })
+    const bytes = (b) => (b >= 1024 ** 3 ? `${(b / 1024 ** 3).toFixed(1)} GB` : `${Math.round(b / 1024 ** 2)} MB`)
+    const ACTIVE_JOB = ['queued', 'downloading', 'extracting']
+
+    /** Local engine + module status, polled while shown (faster while something installs). */
+    function useLocal(active) {
+      const [data, setData] = useState(null)
+      const [error, setError] = useState('')
+      const load = useCallback(async () => {
+        try { setData(await api('/jev-router/local')); setError('') } catch (e) { setError(e.message) }
+      }, [])
+      const busy = !!data?.modules?.some((m) => ACTIVE_JOB.includes(m.job?.state) || m.state === 'verifying')
+      useEffect(() => {
+        if (!active) return
+        load()
+        const t = setInterval(() => { if (!document.hidden) load() }, busy ? 1500 : 5000)
+        return () => clearInterval(t)
+      }, [active, busy, load])
+      return { data, error, load }
+    }
+
+    function JobLine({ job }) {
+      if (!job) return null
+      const p = job.total ? Math.min(100, Math.floor((job.received / job.total) * 100)) : 0
+      const text = { queued: 'Queued', downloading: `Downloading ${p}%${job.bytesPerSec ? ` · ${(job.bytesPerSec / 1e6).toFixed(1)} MB/s` : ''}`, extracting: 'Unpacking…', done: 'Installed, SHA256 verified', failed: `Failed: ${job.error}` }[job.state] ?? job.state
+      return h('div', { style: { marginTop: 4 } },
+        h('div', { className: cx('why', job.state === 'failed' && 'err') }, text),
+        ACTIVE_JOB.includes(job.state) ? h('div', { className: 'bar', role: 'progressbar', 'aria-label': 'Install progress', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': p }, h('i', { style: { width: `${p}%` } })) : null)
+    }
+    const Badges = ({ list }) => h('div', { className: 'why' }, list.join(' · '))
+
+    function InstallPicker({ onClose }) {
+      const [cat, setCat] = useState(null)
+      const [error, setError] = useState('')
+      const [picked, setPicked] = useState(null)
+      const [sent, setSent] = useState(false)
+      const { data } = useLocal(true)
+      useEffect(() => {
+        api('/jev-router/local/catalog').then((c) => { setCat(c); setPicked(new Set(c.suggestions.map((s) => s.id))) }, (e) => setError(e.message))
+      }, [])
+      const jobOf = (id) => data?.modules?.find((m) => m.id === id)?.job
+      const installedNow = (x) => x.installed || data?.modules?.find((m) => m.id === x.id)?.state === 'installed'
+      const toggle = (id) => setPicked((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n })
+      const install = async () => {
+        setError('')
+        try { await post('/jev-router/local/install', { ids: [...picked] }); setSent(true) } catch (e) { setError(e.message) }
+      }
+      const engineJobs = cat ? cat.engine.ids.map(jobOf).filter(Boolean) : []
+      return h('div', { className: 'jevi jevi-modal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'jevi-llm-t', onClick: onClose },
+        h('div', { className: 'box wide', onClick: (e) => e.stopPropagation() },
+          h('h3', { id: 'jevi-llm-t' }, 'Install local models'),
+          error ? h('div', { className: 'err', role: 'alert' }, error) : null,
+          !cat ? h('div', { className: 'muted' }, error ? '' : 'Checking this PC…') : h(React.Fragment, null,
+            h('div', { className: 'note' }, h('b', null, 'Your PC: '), cat.pc),
+            h('div', { className: 'card' },
+              h('div', { className: 'label' }, 'Suggested for your PC'),
+              cat.suggestions.length
+                ? h('ul', { className: 'plain' }, ...cat.suggestions.map((s) => h('li', { key: s.id }, h('span', null, s.reason))))
+                : h('div', { className: 'why' }, cat.none)),
+            h('div', { className: 'why', style: { margin: '0 0 8px' } }, `Engine for this PC: ${cat.engine.name}${cat.engine.installed ? ' (installed)' : ` · ${bytes(cat.engine.size)}, installed first`}`),
+            ...engineJobs.map((j, i) => h(JobLine, { key: `e${i}`, job: j })),
+            h('ul', { className: 'plain', 'aria-label': 'Local models' }, ...cat.modules.map((x) => {
+              const inst = installedNow(x)
+              const job = jobOf(x.id)
+              const blocked = x.rating.fit === 'no'
+              const id = `jevi-llm-${x.id}`
+              return h('li', { key: x.id, style: { alignItems: 'flex-start' } },
+                h('label', { htmlFor: id, style: { display: 'flex', gap: 8, minWidth: 0, cursor: inst || blocked ? 'default' : 'pointer' } },
+                  h('input', { id, type: 'checkbox', checked: !inst && !!picked?.has(x.id), disabled: inst || blocked || ACTIVE_JOB.includes(job?.state), onChange: () => toggle(x.id), style: { marginTop: 3 } }),
+                  h('div', { style: { minWidth: 0 } },
+                    h('div', null, h('b', null, x.name), h('span', { className: 'pill' }, bytes(x.size)), inst ? h('span', { className: 'pill ok' }, 'installed') : null, x.suggested && !inst ? h('span', { className: 'pill ok' }, 'suggested') : null),
+                    h('div', { className: cx('why', blocked && 'err') }, blocked ? `Won't fit: ${x.rating.reason}` : x.rating.label),
+                    h(Badges, { list: x.badges }),
+                    h('div', { className: 'why' }, [x.agent ? `Agent: ${x.agent}` : x.for ? `Add-on for ${x.for}` : null, `Source: ${x.repo}`, x.license].filter(Boolean).join(' · ')),
+                    x.notes ? h('div', { className: 'why' }, x.notes) : null,
+                    x.whyNot && !inst ? h('div', { className: 'why' }, x.whyNot) : null,
+                    h(JobLine, { job }))))
+            }))),
+          sent ? h('div', { className: 'note', role: 'status' }, 'Installing. You can close this; progress also shows in Settings → Jev setup → Local models and the log.') : null,
+          h('div', { className: 'actions' },
+            h('button', { className: 'btn', onClick: onClose, autoFocus: true }, 'Close'),
+            h('button', { className: 'btn primary', disabled: !picked?.size || !cat, onClick: install }, `Install${picked?.size ? ` (${picked.size})` : ''}`))))
+    }
+
+    /** Installed modules as removable rows: the engine is one row (one folder). */
+    function removableRows(data) {
+      const mods = data?.modules ?? []
+      const eng = mods.filter((m) => m.kind === 'engine' && m.state === 'installed')
+      return [
+        ...(eng.length ? [{ id: 'engine', ids: eng.map((m) => m.id), name: `llama.cpp engine (${data.engine.variant ?? eng[0].variant})`, files: ['engine/llama (whole folder)'], size: eng.reduce((n, m) => n + m.size, 0) }] : []),
+        ...mods.filter((m) => m.kind !== 'engine' && ['installed', 'corrupt'].includes(m.state)).map((m) => ({ id: m.id, ids: [m.id], name: m.name, files: [m.file], size: m.size })),
+      ]
+    }
+    const removeConfirm = (rows, run) => ({
+      title: rows.length > 1 ? `Remove ${rows.length} local modules?` : `Remove ${rows[0].name}?`,
+      body: `This deletes ${rows.flatMap((r) => r.files).join(', ')} (${bytes(rows.reduce((n, r) => n + r.size, 0))} in total) from this PC. A running local model is stopped first. You can install it again later.`,
+      confirmLabel: rows.length > 1 ? `Remove ${rows.length}` : 'Remove',
+      run,
+    })
+
+    function RemovePicker({ onClose }) {
+      const { data, error: loadErr, load } = useLocal(true)
+      const [picked, setPicked] = useState(() => new Set())
+      const [confirm, setConfirm] = useState(null)
+      const [error, setError] = useState('')
+      const [done, setDone] = useState('')
+      const rows = removableRows(data)
+      const chosen = rows.filter((r) => picked.has(r.id))
+      const toggle = (id) => setPicked((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n })
+      return h('div', { className: 'jevi jevi-modal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'jevi-llmr-t', onClick: onClose },
+        h('div', { className: 'box wide', onClick: (e) => e.stopPropagation() },
+          h('h3', { id: 'jevi-llmr-t' }, 'Remove local models'),
+          error || loadErr ? h('div', { className: 'err', role: 'alert' }, error || loadErr) : null,
+          done ? h('div', { className: 'note', role: 'status' }, done) : null,
+          !data ? h('div', { className: 'muted' }, 'Loading…') : rows.length === 0 ? h('div', { className: 'muted' }, 'Nothing is installed.')
+            : h('ul', { className: 'plain' }, ...rows.map((r) => h('li', { key: r.id },
+              h('label', { className: 'toggle' },
+                h('input', { type: 'checkbox', checked: picked.has(r.id), onChange: () => toggle(r.id) }),
+                h('b', null, r.name)),
+              h('span', { className: 'why' }, `${r.files.join(', ')} · ${bytes(r.size)}`)))),
+          h('div', { className: 'actions' },
+            h('button', { className: 'btn', onClick: onClose, autoFocus: true }, 'Close'),
+            h('button', { className: 'btn danger', disabled: !chosen.length, onClick: () => setConfirm(removeConfirm(chosen, () => post('/jev-router/local/remove', { ids: chosen.flatMap((r) => r.ids) }))) }, `Remove${chosen.length ? ` (${chosen.length})` : ''}`))),
+        confirm ? h(Confirm, {
+          ...confirm,
+          onCancel: () => setConfirm(null),
+          onConfirm: () => {
+            const c = confirm
+            setConfirm(null); setError('')
+            Promise.resolve(c.run()).then(() => { setDone('Removed.'); setPicked(new Set()); load() }, (e) => setError(e.message))
+          },
+        }) : null)
+    }
+
+    function LlmDialog() {
+      useStyle()
+      const { mode } = llmDialog.use()
+      const close = useCallback(() => llmDialog.set({ mode: null }), [])
+      useEffect(() => {
+        if (!mode) return
+        const k = (e) => { if (e.key === 'Escape' && !document.querySelector('#jevi-confirm-t')) close() }
+        window.addEventListener('keydown', k)
+        return () => window.removeEventListener('keydown', k)
+      }, [mode, close])
+      if (mode === 'install') return h(InstallPicker, { onClose: close })
+      if (mode === 'remove') return h(RemovePicker, { onClose: close })
+      return null
+    }
+
+    /** Settings → Jev setup: engine status, chat model, idle stop, GPU layers, installed modules. */
+    function LocalModelsCard({ ask }) {
+      const { data, error, load } = useLocal(true)
+      const [msg, setMsg] = useState('')
+      const [idle, setIdle] = useState('')
+      const [layers, setLayers] = useState('')
+      const [startModel, setStartModel] = useState('')
+      useEffect(() => {
+        if (!data) return
+        setIdle((v) => v || String(data.settings.idleMinutes))
+        setLayers((v) => v || String(data.settings.gpuLayers ?? 'auto'))
+      }, [data])
+      const run = async (fn) => { setMsg(''); try { await fn(); await load() } catch (e) { setMsg(e.message) } }
+      if (!data) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Local models'), h('div', { className: error ? 'err' : 'muted' }, error || 'Loading…'))
+      const e = data.engine
+      const models = data.modules.filter((m) => m.kind === 'model' && m.state === 'installed')
+      const pick = startModel || data.settings.chatModel || models[0]?.id || ''
+      const rows = removableRows(data)
+      const busyJobs = data.modules.filter((m) => ACTIVE_JOB.includes(m.job?.state) || m.state === 'verifying')
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-local-h' },
+        h('div', { className: 'head' },
+          h('div', { className: 'label', id: 'jevi-local-h', style: { margin: 0 } }, 'Local models'),
+          h('div', { style: { display: 'flex', gap: 8 } },
+            h('button', { className: 'btn primary', onClick: () => openLlm('install') }, 'Install…'),
+            h('button', { className: 'btn danger', disabled: !rows.length, onClick: () => openLlm('remove') }, 'Remove…'))),
+        h('p', { className: 'why', style: { margin: '4px 0 8px' } }, 'Free, private models on this PC (llama.cpp, 127.0.0.1 only). Used when you are offline, as a fallback chat model, and as cheap agents Jev may pick. Type /install-llm in any chat to add one.'),
+        h('div', null, h('span', { className: cx('dot', e.running ? 'on' : 'off') }),
+          !e.installed ? 'Engine not installed.' : e.running ? `Running ${e.model}${e.ready ? '' : ' (loading…)'} · 127.0.0.1:${e.port} · context ${e.ctx}${e.gpuLayers ? ` · ${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : ''}${e.vision ? ' · vision' : ''}` : `Stopped (engine: ${e.variant}). Starts by itself when a local model is needed.`),
+        h('div', { className: 'why' }, 'On a 4 GB GPU a model bigger than ~3 GB splits between GPU and CPU and gets several times slower; the rest waits in RAM.'),
+        e.installed && models.length ? h('div', { className: 'limits', style: { marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
+          h('label', { htmlFor: 'jevi-lm-chat' }, 'Chat model ',
+            h('select', { id: 'jevi-lm-chat', value: data.settings.chatModel ?? '', onChange: (ev) => run(() => post('/jev-router/local/settings', { chatModel: ev.target.value })) },
+              ...models.map((m) => h('option', { key: m.id, value: m.id }, m.name)))),
+          h('label', { htmlFor: 'jevi-lm-idle' }, 'Stop after idle (min) ',
+            h('input', { id: 'jevi-lm-idle', type: 'number', min: 1, max: 240, value: idle, style: { width: 64 }, onChange: (ev) => setIdle(ev.target.value), onBlur: () => run(() => post('/jev-router/local/settings', { idleMinutes: Number(idle) })) })),
+          h('label', { htmlFor: 'jevi-lm-ngl' }, 'GPU layers ',
+            h('input', { id: 'jevi-lm-ngl', type: 'text', value: layers, style: { width: 64 }, title: "'auto' fits as many layers as free VRAM allows; a number pins it", onChange: (ev) => setLayers(ev.target.value), onBlur: () => run(() => post('/jev-router/local/settings', { gpuLayers: layers.trim() === 'auto' ? 'auto' : Number(layers) })) })),
+          e.running
+            ? h('button', { className: 'btn', onClick: () => run(() => post('/jev-router/local/stop', {})) }, 'Stop')
+            : h(React.Fragment, null,
+              h('select', { 'aria-label': 'Model to start', value: pick, onChange: (ev) => setStartModel(ev.target.value) }, ...models.map((m) => h('option', { key: m.id, value: m.id }, m.name))),
+              h('button', { className: 'btn', onClick: () => run(() => post('/jev-router/local/start', { model: pick })) }, 'Start'))) : null,
+        msg ? h('div', { className: 'err', role: 'alert' }, msg) : null,
+        busyJobs.length ? h('div', { style: { marginTop: 8 } }, ...busyJobs.map((m) => h('div', { key: m.id }, h('b', null, m.name), m.state === 'verifying' ? h('div', { className: 'why' }, 'Checking SHA256…') : h(JobLine, { job: m.job })))) : null,
+        rows.length ? h('ul', { className: 'plain', style: { marginTop: 8 } }, ...rows.map((r) => {
+          const m = data.modules.find((x) => x.id === r.ids[0])
+          return h('li', { key: r.id },
+            h('div', { style: { minWidth: 0 } },
+              h('div', null, h('b', null, r.name), m?.state === 'corrupt' ? h('span', { className: 'pill bad' }, 'SHA256 mismatch') : h('span', { className: 'pill ok' }, 'installed'), m?.agent ? h('span', { className: 'pill' }, m.agent) : null),
+              h('div', { className: 'why' }, `${r.files.join(', ')} · ${bytes(r.size)}`),
+              m?.badges ? h(Badges, { list: m.badges }) : null),
+            h('button', { className: 'btn danger', 'aria-label': `Remove ${r.name}`, onClick: () => ask(removeConfirm([r], () => post('/jev-router/local/remove', { ids: r.ids }))) }, 'Remove'))
+        })) : h('div', { className: 'muted', style: { marginTop: 8 } }, 'Nothing installed yet. Install… suggests models that fit this PC.'))
+    }
+
     // ---------- icons (16px, currentColor) ----------
     const svg = (...kids) => h('svg', { width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true, focusable: 'false' }, ...kids)
     const P = (d) => h('path', { d })
@@ -1006,6 +1272,30 @@ window.__ModuleLoader__.load({
     const HOME = 'http://localhost:3000'
     const httpUrl = (u) => { try { const x = new URL(u); return ['http:', 'https:'].includes(x.protocol) ? x.href : null } catch { return null } }
     const toUrl = (text) => httpUrl(text.trim()) ?? (/^[\w.-]+(:\d+)?(\/|$)/.test(text.trim()) ? httpUrl(`http://${text.trim()}`) : null)
+
+    // Terminal tab (Start page entry): opens Windows Terminal in this session's project folder. The shell
+    // runs outside the app on purpose: no command ever travels through the harness web server.
+    function TerminalBody({ useTabInfo }) {
+      useStyle()
+      const info = useTabInfo?.()
+      const [msg, setMsg] = useState('')
+      const cwd = currentCwd()
+      const open = async () => {
+        try {
+          if (!cwd) throw new Error('This session has no project folder')
+          await post('/jev-router/open-terminal', { cwd })
+          setMsg('Opened Windows Terminal in this folder.')
+        } catch (e) { setMsg(e.message) }
+      }
+      const opened = useRef(false)
+      useEffect(() => { if (info?.tab?.visible !== false && !opened.current) { opened.current = true; open() } }, [info?.tab?.visible])
+      return h('div', { className: 'jevi' },
+        h('h3', null, 'Terminal'),
+        h('p', { className: 'muted' }, cwd ? cwd : 'Open a session in a project folder to use the terminal.'),
+        h('button', { className: 'btn primary', disabled: !cwd, onClick: open }, 'Open terminal here'),
+        msg ? h('div', { className: 'why', role: 'status', style: { marginTop: 8 } }, msg) : null,
+        h('p', { className: 'why', style: { marginTop: 12 } }, 'The terminal opens as its own window (Windows Terminal, or PowerShell if that is not installed), so it has everything a real terminal has.'))
+    }
 
     function BrowserBody({ useTabInfo, sessionId }) {
       useStyle()
@@ -1147,6 +1437,72 @@ window.__ModuleLoader__.load({
         }) : null)
     }
 
+    // Pages without a session header (the new-session start page) get the same launcher as a floating
+    // bar at the top right of the main area, plus a right-sidebar toggle: DSH only offers "reopen
+    // sidebar" inside a session header, so hiding the sidebar there would otherwise strand it.
+    const rightbarWidth = () => document.querySelector('[data-rightbar-col]')?.getBoundingClientRect().width ?? 0
+    const headerBarShown = () => [...document.querySelectorAll('.kzh-bar')].some((el) => !el.closest('.kzh-float'))
+    function FloatingBar({ useSessions }) {
+      useStyle()
+      useUiTick()
+      const [, bump] = useState(0)
+      useEffect(() => {
+        // Re-check placement when the frame changes (sidebar opened/closed/dragged, session header mounted).
+        const mo = new MutationObserver(() => bump((n) => n + 1))
+        mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'data-rightbar-collapsed'] })
+        return () => mo.disconnect()
+      }, [])
+      if (headerBarShown()) return null
+      let expanded = false
+      try { expanded = !!sidebarRight?.isExpanded() } catch {}
+      return h('div', { className: 'kzh-float', style: { right: Math.round(rightbarWidth()) + 12 } },
+        h(HeaderActions, { sessionId: null, useSessions }),
+        h('button', {
+          type: 'button', className: 'kzh-ib', 'aria-label': expanded ? 'Hide right sidebar' : 'Show right sidebar', title: expanded ? 'Hide right sidebar' : 'Show right sidebar',
+          'aria-pressed': expanded,
+          onClick: () => { try { sidebarRight.toggleExpanded() } catch { openPanel(KIND) } },
+        }, h('svg', { width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, 'aria-hidden': true },
+          h('rect', { x: 1.5, y: 2.5, width: 13, height: 11, rx: 2 }), h('path', { d: 'M10 2.5v11' }))))
+    }
+
+    // Inside the Kz-harness app the window has no native title bar: this strip is it. Logo + ☰ menu on
+    // the left, every launcher button and the right-sidebar toggle on the right (next to Windows'
+    // own min/max/close), on every page, so hiding a sidebar never hides the buttons.
+    const IN_APP = !!window.harness?.titlebar
+    const TITLE_H = 36
+    function TitleBar({ useSessions }) {
+      useStyle()
+      useUiTick()
+      const [, bump] = useState(0)
+      useEffect(() => {
+        const wco = navigator.windowControlsOverlay
+        const f = () => bump((n) => n + 1)
+        wco?.addEventListener?.('geometrychange', f)
+        window.addEventListener('resize', f)
+        return () => { wco?.removeEventListener?.('geometrychange', f); window.removeEventListener('resize', f) }
+      }, [])
+      // Leave room for Windows' caption buttons (the overlay reports where they are).
+      const area = navigator.windowControlsOverlay?.getTitlebarAreaRect?.()
+      const padRight = area && area.width ? Math.max(8, window.innerWidth - (area.x + area.width) + 8) : 146
+      const current = useSessions?.((st) => st.current) ?? null
+      let expanded = false
+      try { expanded = !!sidebarRight?.isExpanded() } catch {}
+      const menuBtn = useRef(null)
+      return h('div', { className: 'kzh-titlebar', style: { paddingRight: padRight } },
+        h('button', {
+          ref: menuBtn, type: 'button', className: 'kzh-tb-menu', 'aria-label': 'Kz-harness menu', title: 'Menu',
+          onClick: () => { const r = menuBtn.current.getBoundingClientRect(); window.harness.menu({ x: r.left, y: r.bottom }) },
+        }, h('img', { src: LOGO, width: 18, height: 18, alt: '' }), h('span', null, 'Kz-harness')),
+        h('div', { className: 'kzh-tb-drag' }),
+        h(HeaderActions, { sessionId: typeof current === 'string' ? current : null, useSessions }),
+        h('button', {
+          type: 'button', className: 'kzh-ib', 'aria-label': expanded ? 'Hide right sidebar' : 'Show right sidebar', title: expanded ? 'Hide right sidebar' : 'Show right sidebar',
+          'aria-pressed': expanded,
+          onClick: () => { try { sidebarRight.toggleExpanded() } catch { openPanel(KIND) } },
+        }, h('svg', { width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, 'aria-hidden': true },
+          h('rect', { x: 1.5, y: 2.5, width: 13, height: 11, rx: 2 }), h('path', { d: 'M10 2.5v11' }))))
+    }
+
     function Toast() {
       const { text, n } = toasts.use()
       const [shown, setShown] = useState(false)
@@ -1275,9 +1631,30 @@ window.__ModuleLoader__.load({
           guide: [{ order: 60, title: () => 'Browser', description: () => 'Local dev servers and docs' }],
         }))
         ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: BROWSER_ID }, BrowserBody))
-        ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({ name: 'conversation.session.header.actions', id: 'kz-launcher', order: 100 }, HeaderActions))
+        ctx.effect(() => ctx.sidebarRightTabs.register({
+          id: TERMINAL_ID,
+          kind: TERMINAL_KIND,
+          priority: 'extension',
+          title: () => 'Terminal',
+          guide: [{ order: 55, title: () => 'Terminal', description: () => "Open a terminal in this session's project folder" }],
+        }))
+        ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TERMINAL_ID }, TerminalBody))
+        if (IN_APP) {
+          document.documentElement.classList.add('kzh-in-app')
+          ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-titlebar' }, TitleBar))
+        } else {
+          ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({ name: 'conversation.session.header.actions', id: 'kz-launcher', order: 100 }, HeaderActions))
+        }
         ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'kz-shortcuts', order: 16, label: () => 'Shortcuts' }, ShortcutsSection))
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-toast' }, Toast))
+        ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-llm' }, LlmDialog))
+        // A bare /install-llm or /remove-llm opens the picker; typed arguments still go to the server command.
+        ctx.inject(['commandUi'], (c) => {
+          for (const [name, mode] of [['install-llm', 'install'], ['remove-llm', 'remove']]) {
+            c.effect(() => c.commandUi.decorate({ name, available: () => true, ui: { kind: 'action', run: () => openLlm(mode) } }))
+          }
+        })
+        if (!IN_APP) ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-float' }, FloatingBar))
         ctx.effect(() => ctx.sidebarRightTabs.register({
           id: TAB_ID,
           kind: KIND,
@@ -1290,6 +1667,26 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('sidebar.brand.mark', () => ctx.slots.register({ name: 'sidebar.brand.mark' }, BrandMark))
         ctx.slots.inject('sidebar.brand.name', () => ctx.slots.register({ name: 'sidebar.brand.name' }, BrandName))
         ctx.slots.inject('conversation.hero.brand.mark', () => ctx.slots.register({ name: 'conversation.hero.brand.mark' }, HeroMark))
+        // Mode menu notes: an English (Kz-harness) language pack that says who each mode affects.
+        // Chosen once automatically when the UI is in plain English; Settings -> General can switch back.
+        ctx.inject(['locale'], (c) => {
+          const KZ = 'en-x-kzh'
+          c.effect(() => c.locale.addLanguage({ id: KZ, label: 'English (Kz-harness)', fallback: 'en' }))
+          c.effect(() => c.locale.register('settings.agentPreset', KZ, {
+            presetStandardName: 'Standard mode',
+            presetStandardDescription: 'Recommended. Full toolbox: file editing, shell, file and web search, skills, planning, subagents. Used by DeepSeek and your API-key agents; Claude Code and Codex always use their own tools. Pick the model (Jev Auto) separately.',
+            presetPtcName: 'PTC mode',
+            presetPtcDescription: 'Experimental. Same tools, but the model writes one TypeScript program to chain them. Only affects DeepSeek and API-key agents; Claude Code and Codex are unchanged.',
+            presetMinimalName: 'Minimal mode',
+            presetMinimalDescription: 'For testing. DeepSeek and API-key agents get only a shell, so they do worse. Claude Code and Codex are unchanged.',
+            presetCordisName: 'Creator mode',
+            presetCordisDescription: 'For plugin authors only: Standard plus letting the model run code inside the engine to build new modes. Not for everyday use.',
+          }))
+          const t = setTimeout(() => {
+            try { if (c.locale.getSnapshot().active === 'en') c.locale.setLocale(KZ) } catch {}
+          }, 1500)
+          c.effect(() => () => clearTimeout(t))
+        })
       },
     }
   },

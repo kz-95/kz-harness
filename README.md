@@ -20,8 +20,9 @@ flowchart TD
     P --> X[Codex<br/>your ChatGPT login]
     P --> D[DeepSeek<br/>API key]
     P --> B[Your API-key models]
+    P --> LM[Local models<br/>free, on this PC]
     P --> T[A tool script<br/>when no LLM is needed]
-    C & X & D & B & T --> V[Project checks<br/>git diff + typecheck / lint / test / build]
+    C & X & D & B & LM & T --> V[Project checks<br/>git diff + typecheck / lint / test / build]
     V --> J{jev-review}
     J -- pass --> OK([Report + answer<br/>'Answered by: …'])
     J -- unsure --> S[Second opinion<br/>from a different agent] --> J
@@ -50,10 +51,12 @@ flowchart LR
       DSH[KzH engine = DSH<br/>127.0.0.1:3080 only]
       PL[jev-router + jev-review plugins<br/>routing, review, usage, accounts]
       CLI[Claude Code / Codex CLIs]
+      LL[llama-server + local models<br/>127.0.0.1 only, on demand]
       PRJ[(Your project folders)]
       APP -- starts & shows --> DSH
       DSH -- loads --> PL
       PL -- starts --> CLI
+      PL -- starts / stops --> LL
       CLI -- read & edit --> PRJ
     end
     PL -- decisions --> JEV[(TypeSafe Jev API)]
@@ -118,7 +121,8 @@ The installer:
 - makes Jev Auto the default model;
 - builds **Kz-harness.exe**;
 - creates **Kz-harness** shortcuts on the Desktop and in the Start menu;
-- lists any keys or CLIs still missing.
+- lists any keys or CLIs still missing;
+- lists the optional local models; it downloads them only with `-LocalModels <ids|all>` (see [Local models & offline](#local-models--offline)).
 
 **4. First start.**
 
@@ -171,6 +175,47 @@ Jev is TypeSafe's System One model. It answers typed questions with calibrated p
   - **stop at** (default 97%): no new tasks go to that account.
   - For API keys, a **minimum balance** plays the same role.
 - **A real limit error always counts.** API keys rotate to your next key; subscriptions hand the task to their peer agent. With no agent left, the run pauses with the note saved.
+- **Local models** have no quota and no key: the Usage tab shows them as *free, local*.
+
+## Local models & offline
+
+KzH can run open models on your own PC with [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`. The jev-router plugin starts it on demand on **127.0.0.1 only**, with a new random API key each start (so other programs on the PC can't use it), and stops it after 10 idle minutes (Settings) and when KzH closes. Nothing is installed by default.
+
+**Install:** type `/install-llm` in any chat. A picker checks this PC (GPU and VRAM, NVIDIA driver, RAM, CPU, free disk), rates every model (*runs fully on GPU*, *splits GPU + CPU* with a speed estimate, *CPU only*, or *won't fit*) and preselects its suggestions: official and stable releases that were tested with this engine first, then what runs at a usable speed, then quality. It installs the matching engine build first (CUDA 12 or 13 by driver version, Vulkan for other GPUs, CPU otherwise). `/remove-llm` opens the same list for removal, behind a confirmation that names every file and its size. Typed forms work too: `/install-llm qwen3-8b`, `/install-llm all`, `/remove-llm qwen3-8b confirm`. The installer can do it as well: `Install-Harness.ps1 -LocalModels qwen3-8b,gemma4-e4b` (or `all`). Every file comes from the model's own organization (or llama.cpp's own GitHub releases), resumes if interrupted, and must match the size and SHA256 in the manifest.
+
+**What is there now** ([`config/local-models.json`](config/local-models.json)):
+
+| Module | Agent | On a 4 GB GPU (RTX 3050 Laptop, 24 GB RAM) |
+|---|---|---|
+| Qwen3 8B, Q4_K_M, `Qwen/Qwen3-8B-GGUF` (4.7 GB) | `qwen-local` | 18 of 37 layers on the GPU, ~8 tokens/s; best local tool calling |
+| Gemma 4 E4B, QAT Q4_0, `google/gemma-4-E4B-it-qat-q4_0-gguf` (4.8 GB) | `gemma-local` | all 43 layers on the GPU, ~47 tokens/s |
+| Gemma 4 E4B vision add-on (0.9 GB, optional) | `gemma-local` reads images | runs on the CPU (not tested yet) |
+
+**What they do:** once a model is installed, its agent appears in Jev setup and switches on. Jev may pick it like any other agent; its description says it is free, private and offline-capable but weaker, so it gets simple edits, explanations and summaries. The installed model also answers direct questions when DeepSeek fails (before an agent is asked), and it shows in the model picker as *Local (llama.cpp)*. Thinking is off and the context is 8,192 tokens (4,096 on PCs with less than 12 GB RAM), so a local agent's run can hit the context limit on big tasks.
+
+**Offline:** KzH checks `api.typesafe.ai` and `api.deepseek.com` (2.5 s timeout, cached 30 s). When neither answers:
+- only local agents can run; Jev is not asked;
+- questions (a question mark or a question word) go to the local chat model; tasks go to `qwen-local`, else `gemma-local`;
+- the review uses the checks only (the git diff and your project's scripts);
+- the report says **OFFLINE: local models only**.
+
+Claude Code, Codex, DeepSeek and API-key models need the internet and are skipped.
+
+**Add another model** by adding an entry to `config/local-models.json` (then `/install-llm` offers it):
+
+| Field | Meaning |
+|---|---|
+| `id`, `name` | Short id (lowercase) and display name |
+| `kind` | `model`, `vision` (a `--mmproj` add-on; `for` names its model) or `engine` (`variant`: `cuda12`, `cuda13`, `vulkan`, `cpu`; `minCuda` for CUDA builds) |
+| `source`, `file`, `size`, `sha256` | Official download URL (`https://huggingface.co/<org>/<repo>/resolve/main/<file>` from the model's **own** organization, or a llama.cpp GitHub release asset), file name, bytes, and SHA256 (Hugging Face: `lfs.oid` from `/api/models/<repo>/tree/main`; GitHub: the asset `digest`) |
+| `license`, `notes` | Shown in the picker |
+| `reliability`, `verified`, `verifiedOn` | `official-stable`, `official-preview` or `community`; `verified: true` only after it ran here with tool calls working. Only `official-stable` + verified modules are suggested |
+| `role`, `rank`, `hfRepo` | `best-quality`, `fast` or `vision-addon`; lower rank = better quality; Hugging Face repo for the download-count tie-breaker |
+| `minVramGB`, `recommendedVramGB`, `minRamGB` | Fit hints: `recommendedVramGB` = VRAM to run fully on the GPU (plus ~0.8 GB for the desktop), `minRamGB` = below this it won't fit |
+| `chatTemplate`, `contextSize`, `maxContext`, `gpuLayers` | Template note (the GGUF's own, with `--jinja`), default and maximum context, `auto` or a number of GPU layers |
+| `agent` | `{ id, description }`: the router agent this model backs; the description is what Jev reads when choosing |
+
+Only add GGUF files published by the model's own organization; if there is none, don't add a random uploader's copy.
 
 ## Updating
 
@@ -194,6 +239,8 @@ KzH itself collects nothing. It turns off DSH's data features in `config/cordis.
 | `plugin-package-inventory-deepseek` | Sent the list of installed plugins with every DeepSeek request |
 | `session-log-deepseek` | Session-log upload with DeepSeek requests (off by default; pinned off) |
 | `client-hmr` | Developer reload channel |
+| `ui-message-feedback`, `message-feedback`, `command-feedback` | 👍/👎 buttons, the feedback dialog and `/feedback` (the feed for the telemetry upload above) |
+| `llm-deepseek` (official DeepSeek connector) | Sent an anonymous installation ID (`x-deepseek-harness-user-id`, from `~/.dsh/.anonymous-user-id`), the session ID and a compaction flag with every DeepSeek request |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | Claude Code telemetry and error reporting in KzH runs |
 
 What stays:
@@ -202,7 +249,19 @@ What stays:
 - The harness page gets no camera, microphone or notifications.
 - Keys and tokens are masked in logs.
 - Your run history and usage logs stay in `~/.dsh/jev-router/` and are never sent anywhere.
-- DeepSeek requests still carry an anonymous installation ID and a session ID (DSH has no switch for these).
+- DeepSeek now runs through DSH's generic pi-ai connector (provider `deepseek`, same `DEEPSEEK_API_KEY`, `https://api.deepseek.com`). A request carries your key, the conversation, and generic headers only: `User-Agent: deepseek-harness/<version>` (DSH has no switch for it) and the OpenAI SDK's `x-stainless-*` platform headers (OS, CPU, Node version). No user or session ID.
+- DeepSeek web search (`web_search`) sends your key, the search query and `User-Agent: deepseek-harness/0.0.1`; nothing else.
+- Online, besides the model calls: the DeepSeek balance check (Usage tab) and the Jev/TypeSafe router calls. Claude Code and Codex talk to their own services under your logins.
+- `~/.dsh/.anonymous-user-id` is no longer read by anything; delete it if you like.
+
+What the switch to the generic connector costs (all minor): images go inline (base64) instead of through DeepSeek's Files API; the DeepSeek-V41-Flash "system prompt update in history" cache trick is gone, so a changed system prompt re-reads the conversation once; old chats started on the official connector need their model re-picked (the picker shows **DeepSeek** models).
+
+### Bringing back the official DeepSeek connector
+
+Only needed for DeepSeek models or features that the generic connector cannot serve (e.g. Files-API images, future image/video models). Re-enabling brings the identity headers back (anonymous user ID, session ID, compaction flag on every DeepSeek request).
+1. In `~/.dsh/profiles/web/cordis.patch.yml` (and `config/cordis.patch.yml`), delete the block under `# Official DeepSeek connector: remove this block to bring it back.`
+2. Point KzH back at it: in the `jev-router` config set `agents` → `deepseek` → `llm.provider: deepseek-official`, and `auxModel.provider: deepseek-official` (or change the defaults in `plugins/jev-router/index.js`).
+3. Optionally remove the `llm-pi-ai` DeepSeek route block too, so the picker does not list DeepSeek twice.
 
 ## Configuration
 
@@ -232,7 +291,7 @@ KzH settings live in `~/.dsh/profiles/web/cordis.patch.yml`; the installer write
 
 - **Tools** get their parameters as `JEV_ARG_<NAME>` and the task text on stdin, never in the command line.
 - **API-key agents** are added in the app (Settings → Models, then Jev setup); other subagent providers are added under `agents`.
-- **`auxModel`** is the chat model for direct answers, session titles and compaction (default `deepseek-official` / `deepseek-flash`).
+- **`auxModel`** is the chat model for direct answers, session titles and compaction (default `deepseek` / `deepseek-flash`).
 
 ## Where things live
 
@@ -243,6 +302,7 @@ KzH settings live in `~/.dsh/profiles/web/cordis.patch.yml`; the installer write
 | Accounts, limits, switches, hotkeys | `~/.dsh/jev-router/` (`accounts.json`, `agents.json`, `hotkeys.json`) |
 | History and usage | `~/.dsh/jev-router/history.jsonl`, `usage.jsonl` |
 | Projects | `C:\HarnessProjects` by default. `C:\Harness\no-project` is the chat-only workspace. |
+| Local models | `C:\Harness\engine\llama` (llama.cpp) and `C:\Harness\models` (GGUF files), both gitignored; the list is `config/local-models.json`. Chat model, idle stop and GPU layers: `~/.dsh/jev-router/local.json`. |
 
 ## Troubleshooting
 
@@ -253,6 +313,8 @@ KzH settings live in `~/.dsh/profiles/web/cordis.patch.yml`; the installer write
 | "all available agents are at their usage limits" | Wait for the reset time shown, raise that account's **stop at** in Usage, or add another API key. |
 | Report says **JEV UNAVAILABLE** | The Jev key is missing or TypeSafe is unreachable; fix it and use **Restart harness**. |
 | Codex can't read files, or "windows sandbox helper … not found" | The helper comes with the Codex app; `Start-KzH.ps1` puts it on PATH. Open the Codex app once if the launcher warns. |
+| Report says **OFFLINE: local models only** | Neither TypeSafe nor DeepSeek answered. Check the connection; with no local model installed, nothing can run offline (`/install-llm` while online). |
+| A local agent is missing or has a red dot | Its model isn't installed or failed its SHA256 check: `/install-llm`. |
 | A header button, sidebar tab or Jev Auto is missing | **Kz-harness → Restart harness**; if it's still missing, re-run the installer. |
 
 ## Project layout
@@ -260,13 +322,14 @@ KzH settings live in `~/.dsh/profiles/web/cordis.patch.yml`; the installer write
 | Path | What |
 |---|---|
 | `app/` | The Electron app. `main.js` starts and stops the engine and holds the security switches, the in-app browser and updates. `preload.js` is a narrow bridge. `ui/` is the start screen and log. `package.mjs` builds `Kz-harness.exe`. |
-| `plugins/jev-router/` | Routing (`router.js`), Jev questions (`jev.js`), the Jev Auto model and direct answers (`adapter.js`), usage and savings (`usage.js`), accounts and keys (`accounts.js`), login checks (`setup.js`), git and checks (`workspace.js`), and the browser half (`client.js`: inspector, setup, shortcuts, header, brand). |
+| `plugins/jev-router/` | Routing (`router.js`), Jev questions (`jev.js`), the Jev Auto model and direct answers (`adapter.js`), usage and savings (`usage.js`), accounts and keys (`accounts.js`), login checks (`setup.js`), git and checks (`workspace.js`), and the browser half (`client.js`: inspector, setup, shortcuts, header, brand, local-model pickers), local models and offline mode (`local.js`). |
 | `plugins/jev-review/` | Review policy (the `jevReview` service). |
 | `config/cordis.patch.yml` | KzH settings and privacy switches, used by the installer |
+| `config/local-models.json` | The local-model manifest: engine builds and models, with official source, size and SHA256 |
 | `scripts/` | `Install-Harness.ps1`, `Update-Harness.ps1`, `ensure-no-project.mjs`, `Set-TypeSafeKey.ps1` |
 | `Start-KzH.ps1` / `.cmd` | Starts the engine: pinned version, privacy settings, Codex helper, "No project" workspace |
 
-Tests: `cd plugins\jev-router` then `npm test`. They cover routing, review policy, tools, limits and handoff, accounts, usage and savings, direct answers, process handling and hotkeys.
+Tests: `cd plugins\jev-router` then `npm test`. They cover routing, review policy, tools, limits and handoff, accounts, usage and savings, direct answers, process handling, hotkeys, and local models / offline mode (no network, no real llama-server).
 
 ## License
 

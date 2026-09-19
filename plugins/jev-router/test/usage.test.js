@@ -70,7 +70,7 @@ test('snapshot: per-key DeepSeek balances, agent ok while any key is usable, OMC
   await usage.logJev({ runId: 'r', account: 'j1', phase: 'route', tokens: { input: 1_000_000, output: 10 } })
   const agents = [
     { id: 'claude', provider: 'claude-code' },
-    { id: 'deepseek', provider: 'spawn', llm: { provider: 'deepseek-official' } },
+    { id: 'deepseek', provider: 'spawn', llm: { provider: 'deepseek' } },
   ]
   const s = await usage.snapshot(agents)
   assert.equal(s.claude.state, 'near')

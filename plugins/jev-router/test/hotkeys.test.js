@@ -26,3 +26,12 @@ test('terminal: only an existing DSH project folder', async () => {
   await assert.rejects(workspaceDir(join(dir, 'gone'), [join(dir, 'gone')]), /does not exist/)
   await assert.rejects(workspaceDir(undefined, [dir]), /cwd/)
 })
+
+test('writes need a JSON content type (cross-site forms are refused)', async () => {
+  const { isJsonRequest } = await import('../index.js')
+  assert.equal(isJsonRequest({ headers: { 'content-type': 'application/json' } }), true)
+  assert.equal(isJsonRequest({ headers: { 'content-type': 'application/json; charset=utf-8' } }), true)
+  assert.equal(isJsonRequest({ headers: { 'content-type': 'text/plain' } }), false)
+  assert.equal(isJsonRequest({ headers: { 'content-type': 'application/x-www-form-urlencoded' } }), false)
+  assert.equal(isJsonRequest({ headers: {} }), false)
+})

@@ -106,6 +106,14 @@ document.getElementById('copy').addEventListener('click', async (ev) => {
 for (const b of document.querySelectorAll('[data-open-logs]')) b.addEventListener('click', () => window.harness.openLogs())
 document.getElementById('retry').addEventListener('click', () => window.harness.retry())
 
+// Main window only: our own title bar with the ☰ menu (the log window keeps the normal frame).
+if (view === 'start') {
+  document.getElementById('titlebar').hidden = false
+  document.body.classList.add('has-titlebar')
+  const b = document.getElementById('tb-menu')
+  b.addEventListener('click', () => { const r = b.getBoundingClientRect(); window.harness.menu({ x: r.left, y: r.bottom }) })
+}
+
 window.harness.state().then(({ status, logs }) => {
   showStatus(status)
   if (view === 'start') { logs.slice(-8).forEach(pushMini); entries = logs.slice() } else { entries = logs.slice(); render() }

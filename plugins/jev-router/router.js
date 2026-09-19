@@ -5,6 +5,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { createReview } from '../jev-review/index.js'
+import { effortFamily, toAgentEffort } from './effort.js'
+import { offlinePick } from './local.js'
 import { assertWorkspace, changedSince, compareChecks, ensureHandoffIgnored, gatherContext, runChecks, snapshot } from './workspace.js'
 
 const pct = (n) => (typeof n === 'number' ? n.toFixed(2) : 'n/a')
@@ -107,10 +109,12 @@ function harnessHandoff({ task, attempts, diff, checks, previous }) {
  * @param {string} p.cwd
  * @param {string} [p.forceAgent]  manual override; skips Jev routing only
  * @param {object} p.config        plugin config (agents, tools, limits, thresholds, checks)
- * @param {object} p.deps          { ready?: {[agentId]: {loggedIn, detail}}, quota?: {[agentId]: {state, until}}, isLimitError?, onLimit?, logAttempt?, jev | null, jevUnavailableReason, execute(agentDef, prompt, signal), runTool?(tool, args, task, signal), review?, emit?, history }
+ * @param {object} p.deps          { offline?: true when the internet is unreachable (local agents only, no Jev), ready?: {[agentId]: {loggedIn, detail}}, quota?: {[agentId]: {state, until}}, isLimitError?, onLimit?, logAttempt?, jev | null, jevUnavailableReason, execute(agentDef, prompt, signal), runTool?(tool, args, task, signal), review?, emit?, history }
  * @param {AbortSignal} p.signal
  */
-export async function runRouted({ task, cwd, forceAgent, answerOnly = false, config, deps, signal = new AbortController().signal }) {
+export async function runRouted({ task, cwd, forceAgent, answerOnly = false, effort, config, deps, signal = new AbortController().signal }) {
+  // Menu choice wins over the Settings default; 'auto' in the menu defers to that default.
+  const level = effort && effort !== 'auto' ? effort : config.effort?.default ?? 'auto'
   const emit = (type, data = {}) => deps.emit?.({ type, at: Date.now(), ...data })
   await assertWorkspace(cwd)
   const runId = randomUUID()
@@ -119,17 +123,20 @@ export async function runRouted({ task, cwd, forceAgent, answerOnly = false, con
   // Only agents that are switched on, signed in (deps.ready from setup.js checks) and not at their limit can be picked.
   const notReady = config.agents.filter((a) => a.enabled && deps.ready?.[a.id] && !deps.ready[a.id].loggedIn)
   const outAtStart = config.agents.filter((a) => a.enabled && !notReady.includes(a) && OUT_STATES.includes(quota[a.id]?.state))
-  const agents = config.agents.filter((a) => a.enabled && !notReady.includes(a) && !outAtStart.includes(a))
+  // Offline: only agents that run on this PC are eligible.
+  const agents = config.agents.filter((a) => a.enabled && !notReady.includes(a) && !outAtStart.includes(a) && (!deps.offline || a.kind === 'local'))
   const out = outAtStart.map((a) => ({ id: a.id, until: quota[a.id].until ?? null })) // grows as agents hit limits
   const outLabel = () => { const e = earliest(out); return e ? ` (earliest reset ${hhmm(e)})` : '' }
   const tools = (config.tools ?? []).filter((t) => t.enabled !== false)
   if (agents.length === 0 && outAtStart.length) throw new Error(`all available agents are at their usage limits${outLabel()}: ${out.map((o) => `${o.id}${o.until ? ` until ${hhmm(o.until)}` : ''}`).join(', ')}`)
+  if (agents.length === 0 && deps.offline) throw new Error('offline, and no local model is ready. Download one in Settings → Jev setup → Local models (needs the internet once)')
   if (agents.length === 0) throw new Error(`no LLM agent is switched on and signed in${notReady.length ? ` (${notReady.map((a) => `${a.id}: ${deps.ready[a.id].detail}`).join('; ')})` : ''}. Open Settings → Plugins → Jev setup`)
   const byId = new Map(agents.map((a) => [a.id, a]))
   const blocked = notReady.find((a) => a.id === forceAgent)
   if (blocked) throw new Error(`${forceAgent} cannot run: ${deps.ready[forceAgent].detail}`)
   const limited = out.find((o) => o.id === forceAgent)
   if (limited) throw new Error(`${forceAgent} is at its usage limit${limited.until ? ` until ${hhmm(limited.until)}` : ''}`)
+  if (forceAgent && deps.offline && !byId.has(forceAgent) && config.agents.some((a) => a.id === forceAgent && a.kind !== 'local')) throw new Error(`${forceAgent} needs the internet; offline, only local agents run (${[...byId.keys()].join(', ')})`)
   if (forceAgent && !byId.has(forceAgent)) throw new Error(`agent "${forceAgent}" is not enabled; enabled: ${[...byId.keys()].join(', ')}`)
   const other = (probabilities, avoid) => pickOther(probabilities, avoid, agents)
   const review = deps.review ?? createReview(deps.jev, config.thresholds, deps.jevUnavailableReason)
@@ -150,6 +157,8 @@ export async function runRouted({ task, cwd, forceAgent, answerOnly = false, con
   const routeStarted = Date.now()
   if (forceAgent) {
     routing = { mode: 'manual', primaryAgent: forceAgent }
+  } else if (deps.offline) {
+    routing = { mode: 'offline', primaryAgent: offlinePick(agents).id, reason: 'no internet: fixed rule, local agents only' }
   } else if (!deps.jev) {
     routing = { mode: 'fallback', primaryAgent: config.fallbackAgent, reason: deps.jevUnavailableReason }
   } else {
@@ -224,12 +233,17 @@ export async function runRouted({ task, cwd, forceAgent, answerOnly = false, con
 
     const started = Date.now()
     emit('attempt_start', { index: attempts.length, agent: next.agent, role: next.role, ...(next.role === 'tool' ? { args: routing.toolArgs } : {}) })
+    const agentDef = byId.get(next.agent)
+    const family = effortFamily(agentDef)
+    const eff = next.role === 'tool' ? null
+      : toAgentEffort(level, agentDef, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[family], model: deps.modelOf?.(agentDef) })
+    const speed = family === 'codex' ? config.effort?.codexSpeed : undefined
     let result
     try {
       const agentSignal = AbortSignal.any([signal, AbortSignal.timeout(config.agentTimeoutMs)])
       result = next.role === 'tool'
         ? await deps.runTool(tool, routing.toolArgs ?? {}, task, agentSignal)
-        : await deps.execute(byId.get(next.agent), prompt, agentSignal)
+        : await deps.execute(agentDef, prompt, agentSignal, { effort: eff, speed })
     } catch (err) {
       if (signal.aborted) throw err
       result = { stopReason: 'error', diagnostic: describeError(err), answerText: '' }
@@ -245,7 +259,8 @@ export async function runRouted({ task, cwd, forceAgent, answerOnly = false, con
       answerText: result.answerText,
       durationMs: Date.now() - started,
       changedFiles: changes.files,
-      ...(next.role === 'tool' ? {} : { model: deps.modelOf?.(byId.get(next.agent)) }),
+      ...(next.role === 'tool' ? {} : { model: deps.modelOf?.(agentDef) }),
+      ...(eff ? { effort: `${eff}${speed === 'fast' ? ' 1.5x' : ''}` } : {}),
       ...(limit.hit ? { limitHit: true } : {}),
     }
     attempts.push(attempt)
@@ -344,6 +359,7 @@ export async function runRouted({ task, cwd, forceAgent, answerOnly = false, con
     context,
     routing,
     continuedFromHandoff: continuing,
+    ...(deps.offline ? { offline: true } : {}),
     availability: { out, near: agents.filter((a) => near(a.id)).map((a) => a.id) },
     limits: limitEvents,
     baseline: (baseline ?? []).map(({ name, passed }) => ({ name, passed })),
@@ -356,14 +372,14 @@ export async function runRouted({ task, cwd, forceAgent, answerOnly = false, con
   await deps.history.append(record).catch((err) => emit('error', { message: `history not saved: ${err.message}` }))
   emit('final', { status, statusReason })
   const last = attempts.findLast((x) => x.answerText)
-  return { ...record, lastAnswer: last?.answerText ?? '', lastAnswerBy: last ? `${last.agent}${last.model ? ` (${last.model})` : ''}, ${last.role}` : '' }
+  return { ...record, lastAnswer: last?.answerText ?? '', lastAnswerBy: last ? `${last.agent}${last.model || last.effort ? ` (${[last.model, last.effort].filter(Boolean).join(', ')})` : ''}, ${last.role}` : '' }
 }
 
 /** "Jev (jev-1.13.0) → deepseek (deepseek-flash) · claude (opus), reviewer": who took part, in order. */
 export function answeredBy(r) {
   const seen = new Map()
   for (const a of r.attempts ?? []) {
-    const key = `${a.agent}|${a.model ?? ''}`
+    const key = `${a.agent}|${[a.model, a.effort].filter(Boolean).join(', ')}`
     const roles = seen.get(key) ?? new Set()
     roles.add(a.role === 'review' ? 'reviewer' : a.role === 'tool' ? 'tool' : 'work')
     seen.set(key, roles)
@@ -381,8 +397,8 @@ export function answeredBy(r) {
 export function formatReport(r) {
   const R = r.routing
   const lines = []
-  const modeLabel = { jev: 'AUTO (Jev decided)', manual: `MANUAL /${R.primaryAgent}`, fallback: 'AUTO, JEV UNAVAILABLE: routing fallback activated' }[R.mode]
-  lines.push(`**Jev router** · ${modeLabel}`)
+  const modeLabel = { jev: 'AUTO (Jev decided)', manual: `MANUAL /${R.primaryAgent}`, fallback: 'AUTO, JEV UNAVAILABLE: routing fallback activated', offline: 'OFFLINE: local models only' }[R.mode]
+  lines.push(`**Jev router** · ${modeLabel}${R.mode !== 'offline' && r.offline ? ' · OFFLINE: local models only' : ''}`)
   if (R.mode === 'fallback') lines.push(`Fallback reason: ${R.reason}. Default agent: ${R.primaryAgent}`)
   lines.push(`- Selected agent: **${R.primaryAgent}**${R.mode === 'jev' ? ` (confidence ${pct(R.agentConfidence)}; ${Object.entries(R.agentProbabilities).map(([k, v]) => `${k} ${pct(v)}`).join(', ')})` : ''}`)
   if (R.mode === 'jev') {

@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld('harness', {
   state: () => ipcRenderer.invoke('harness:state'),
   retry: () => ipcRenderer.invoke('harness:retry'),
   openLogs: () => ipcRenderer.invoke('harness:openLogs'),
+  menu: (at) => ipcRenderer.invoke('harness:menu', at),
+  titlebar: () => ipcRenderer.invoke('harness:titlebar'),
   onLog: (cb) => ipcRenderer.on('harness:log', (_e, entry) => cb(entry)),
   onStatus: (cb) => ipcRenderer.on('harness:status', (_e, s) => cb(s)),
   // In-app browser for the harness page's Browser tab (main.js places a sandboxed view over the given rect).

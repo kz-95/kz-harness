@@ -1,7 +1,9 @@
 # Installs or repairs Kz-harness on this PC. Safe to run again: every step
 # checks first and only does what is missing. Keys are never read or printed.
 #   powershell -ExecutionPolicy Bypass -File C:\Harness\scripts\Install-Harness.ps1
-param([switch]$NoShortcuts)
+# Local models are opt-in (nothing is downloaded by default):
+#   ... Install-Harness.ps1 -LocalModels qwen3-8b,gemma4-e4b    (or: all)
+param([switch]$NoShortcuts, [string[]]$LocalModels)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME '.dsh' }
@@ -92,6 +94,75 @@ if (-not $NoShortcuts) {
     $lnk.Save()
     Ok (Join-Path $dir 'Kz-harness.lnk')
   }
+}
+
+Step 'Local models (optional)'
+# Modules come from config/local-models.json only: official source, exact size and SHA256, nothing else.
+$manifest = (Get-Content (Join-Path $root 'config\local-models.json') -Raw | ConvertFrom-Json).modules
+$engineDir = Join-Path $root 'engine\llama'
+$modelsDir = Join-Path $root 'models'
+function Read-Marker($path) { if (Test-Path $path) { try { return Get-Content $path -Raw | ConvertFrom-Json } catch { } }; return $null }
+function Write-Marker($path, $obj) { New-Item -ItemType Directory -Force (Split-Path $path) | Out-Null; [IO.File]::WriteAllText($path, ($obj | ConvertTo-Json -Compress), $utf8) }
+function Test-Module($m) {
+  if ($m.kind -eq 'engine') { return (Test-Path (Join-Path $engineDir 'llama-server.exe')) -and ((Read-Marker (Join-Path $engineDir ".installed\$($m.id).json")).sha256 -eq $m.sha256) }
+  $file = Join-Path $modelsDir $m.file
+  if (-not (Test-Path $file)) { return $false }
+  $mark = Read-Marker (Join-Path $modelsDir ".verified\$($m.file).json")
+  $item = Get-Item $file
+  $ms = [DateTimeOffset]::new($item.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+  return $mark -and $mark.size -eq $item.Length -and [math]::Floor($mark.mtimeMs) -eq $ms -and $mark.sha256 -eq $m.sha256
+}
+function Get-Verified($m, $dest) {
+  $part = "$dest.part"
+  & curl.exe -fL --retry 5 -C - -o $part $m.source
+  if ($LASTEXITCODE) { throw "download of $($m.file) failed (run again to resume)" }
+  if ((Get-Item $part).Length -ne $m.size) { throw "$($m.file): size differs from the manifest (run again to resume)" }
+  $hash = (Get-FileHash $part -Algorithm SHA256).Hash.ToLower()
+  if ($hash -ne $m.sha256) { Remove-Item $part; throw "$($m.file): SHA256 $hash does not match the manifest; the file was deleted" }
+  Move-Item $part $dest -Force
+}
+function Install-Module($m) {
+  Write-Host "   installing $($m.name) ($([math]::Round($m.size / 1GB, 2)) GB) from $($m.source)"
+  if ($m.kind -eq 'engine') {
+    New-Item -ItemType Directory -Force $engineDir | Out-Null
+    $zip = Join-Path $engineDir $m.file
+    Get-Verified $m $zip
+    Expand-Archive $zip -DestinationPath $engineDir -Force
+    Remove-Item $zip
+    Write-Marker (Join-Path $engineDir ".installed\$($m.id).json") @{ sha256 = $m.sha256 }
+  } else {
+    New-Item -ItemType Directory -Force $modelsDir | Out-Null
+    $dest = Join-Path $modelsDir $m.file
+    Get-Verified $m $dest
+    $item = Get-Item $dest
+    Write-Marker (Join-Path $modelsDir ".verified\$($m.file).json") @{ size = $item.Length; mtimeMs = [DateTimeOffset]::new($item.LastWriteTimeUtc).ToUnixTimeMilliseconds(); sha256 = $m.sha256 }
+  }
+  Ok "$($m.id): SHA256 verified"
+}
+# Engine build for this PC, as the plugin picks it: CUDA when the NVIDIA driver supports it, else Vulkan, else CPU.
+$cuda = 0
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { $cuda = [double]([regex]::Match((nvidia-smi | Out-String), 'CUDA Version:\s*([\d.]+)').Groups[1].Value + '0') }
+$variant = ($manifest | Where-Object { $_.kind -eq 'engine' -and $_.minCuda -and $cuda -ge $_.minCuda } | Sort-Object minCuda -Descending | Select-Object -First 1).variant
+if (-not $variant) { $variant = if (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA|GeForce|AMD|Radeon|Intel' }) { 'vulkan' } else { 'cpu' } }
+$engineMods = @($manifest | Where-Object { $_.kind -eq 'engine' -and $_.variant -eq $variant })
+$models = @($manifest | Where-Object { $_.kind -ne 'engine' })
+foreach ($m in $models) { Write-Host ("   {0,-20} {1,-28} {2,5:N1} GB  {3}" -f $m.id, $m.name, ($m.size / 1GB), $(if (Test-Module $m) { 'installed' } else { '-' })) }
+if (-not $LocalModels) {
+  Write-Host "   Nothing downloaded. Install with -LocalModels <id,id|all>, or type /install-llm in Kz-harness (it suggests what fits this PC)."
+} else {
+  $ids = @($LocalModels | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+  $want = if ($ids -contains 'all') { $models } else { @($ids | ForEach-Object { $id = $_; $m = $models | Where-Object { $_.id -eq $id }; if (-not $m) { throw "unknown local model '$id'; valid: $(($models.id) -join ', '), all" }; $m }) }
+  $todo = @()
+  if (-not (@($manifest | Where-Object kind -eq 'engine' | Group-Object variant | Where-Object { @($_.Group | Where-Object { -not (Test-Module $_) }).Count -eq 0 }).Count)) { $todo += $engineMods }
+  foreach ($m in $want) {
+    if ($m.kind -eq 'vision') { $base = $models | Where-Object { $_.id -eq $m.for }; if (-not (Test-Module $base) -and $todo -notcontains $base) { $todo += $base } }
+    if (-not (Test-Module $m) -and $todo -notcontains $m) { $todo += $m }
+  }
+  $need = ($todo | Measure-Object size -Sum).Sum * 1.1
+  $free = (Get-PSDrive ($root.Substring(0, 1))).Free
+  if ($need -gt $free) { throw "not enough disk space: needs $([math]::Round($need / 1GB, 1)) GB, $([math]::Round($free / 1GB, 1)) GB free" }
+  if (-not $todo.Count) { Ok 'already installed' }
+  foreach ($m in $todo) { Install-Module $m }
 }
 
 Write-Host "`nDone. Start it with the Kz-harness icon, then check Settings -> Jev setup." -ForegroundColor Green

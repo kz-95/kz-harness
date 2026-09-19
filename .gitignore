@@ -17,3 +17,7 @@ app/dist/
 
 # Windows shortcuts
 *.lnk
+
+# Local models: git keeps only config/local-models.json; binaries and GGUF files stay on this PC
+engine/
+models/

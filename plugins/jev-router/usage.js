@@ -27,6 +27,7 @@ export function stateOf({ kind, windows, balance, limits, exhausted, error }) {
     if (over.length) return { state: 'stopped', until: over.map((w) => w.resetsAt).filter(Boolean).sort().at(-1) ?? null }
     return { state: windows.some((w) => w.usedPercent >= limits.handoffAtPercent) ? 'near' : 'ok', until: null }
   }
+  if (kind === 'local') return { state: 'ok', until: null }
   if (balance && limits.minBalance != null && balance.amount < limits.minBalance) return { state: 'stopped', until: null }
   return { state: error && !balance ? 'unknown' : 'ok', until: null }
 }
@@ -217,7 +218,7 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
       const provider = keyProviderOf(a)
       const list = keys[provider] ?? []
       const active = list.find((k) => k.active)
-      Object.assign(base, { account: { label: active?.name ?? a.credentialRef ?? provider ?? a.id }, balance: active?.balance ?? null, error: active?.error ?? null })
+      Object.assign(base, { account: { label: kind === 'local' ? 'free, local' : active?.name ?? a.credentialRef ?? provider ?? a.id }, balance: active?.balance ?? null, error: active?.error ?? null })
       const own = stateOf({ ...base, exhausted: exhaustedOf(a.id) })
       // With keys, the agent is out only when every key is: rotation moves past a spent active key.
       const usable = list.filter((k) => k.state === 'ok' || k.state === 'unknown')

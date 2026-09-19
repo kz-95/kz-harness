@@ -12,19 +12,24 @@ import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import { createJev } from './jev.js'
 import { formatReport, runRouted } from './router.js'
+import { LEVELS, codexServiceTier } from './effort.js'
 import { run } from './workspace.js'
 import { checkAgents } from './setup.js'
 import { JEV_PROVIDER, jevAdapter, line } from './adapter.js'
 import { KEY_NAME, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
 import { createUsage, detectLimit } from './usage.js'
+import { LOCAL_PROVIDER, buildCatalog, createConnectivity, createLocalModels, detectSpecs, installLlmCommand, localAdapter, looksLikeQuestion, readManifest, removeLlmCommand } from './local.js'
 
 export const name = 'jev-router'
 export const inject = ['tools', 'commands', 'subagents', 'credentials']
 
 const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
+const harnessDir = fileURLToPath(new URL('../../', import.meta.url))
+const LOCAL_PERSONA = 'You are a careful software engineer working as a delegated coding agent on a small local model. Keep changes small and focused, complete the task in the given workspace, and report concisely.'
 
 const Agent = Schema.object({
   id: Schema.string().pattern(/^[a-z][a-z0-9_-]*$/).required().description('Short id, also the manual override command name.'),
@@ -71,15 +76,28 @@ export const Config = Schema.object({
       description: 'DeepSeek (native DSH agent): independent analysis, code review, second opinions, reasoning, broad investigation.',
       enabled: true,
       credentialRef: 'DEEPSEEK_API_KEY',
-      llm: { provider: 'deepseek-official', model: 'deepseek-flash' },
+      llm: { provider: 'deepseek', model: 'deepseek-flash' },
       persona: 'You are a careful senior software engineer working as a delegated coding agent. Complete the task in the given workspace and report concisely.',
     },
-  ]),
+  ]).description('Cloud and subscription agents. Local agents (qwen-local, gemma-local, …) come from config/local-models.json once their model is installed.'),
   tools: Schema.array(Tool).default([]).description('Deterministic scripts Jev can run instead of an LLM agent.'),
   auxModel: Schema.object({
-    provider: Schema.string().default('deepseek-official'),
+    provider: Schema.string().default('deepseek'),
     model: Schema.string().default('deepseek-flash'),
   }).description('Real model the Jev Auto model hands session titles and conversation compaction to.'),
+  local: Schema.object({
+    port: Schema.natural().default(8081).description('First 127.0.0.1 port for llama-server; the next ones are tried when it is taken.'),
+    contextSize: Schema.natural().min(2048).description('Context tokens for every local model; unset = the manifest value (8192), 4096 on PCs with under 12 GB RAM.'),
+  }).description('Local models (llama.cpp llama-server under <harness>/engine/llama, GGUF files under <harness>/models).'),
+  effort: Schema.object({
+    default: Schema.union(LEVELS).default('auto').description('Effort when the model menu says Auto.'),
+    perAgent: Schema.object({
+      claude: Schema.union(['low', 'medium', 'high', 'xhigh', 'max']),
+      codex: Schema.union(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']),
+      deepseek: Schema.union(['off', 'low', 'high', 'max']),
+    }).default({}).description('Fixed effort per agent; wins over the menu and the default.'),
+    codexSpeed: Schema.union(['normal', 'fast']).default('normal').description('fast = Codex 1.5x (service tier priority).'),
+  }).default({}),
   fallbackAgent: Schema.string().default('claude').description('Agent used when Jev is unavailable.'),
   credentialRef: Schema.string().default('TYPESAFE_API_KEY').description('Credential name for the TypeSafe API key (env, .credentials.yaml, or .env).'),
   jevModel: Schema.string().default('jev-1.13.0').description('TypeSafe model id, pinned so tuned thresholds keep their meaning.'),
@@ -190,7 +208,9 @@ export function apply(ctx, config) {
     llm: { provider: c.provider, model: c.model },
     persona: 'You are a careful senior software engineer working as a delegated coding agent. Complete the task in the given workspace and report concisely.',
   })
-  const allAgents = (s) => [...config.agents, ...s.custom.map(customAgent)]
+  // Local agents: one per installed model module (config/local-models.json), refreshed when a module changes.
+  let localAgents = []
+  const allAgents = (s) => [...config.agents, ...localAgents, ...s.custom.map(customAgent)]
   const enabledAgents = async () => {
     const s = await readSetup()
     return allAgents(s).map((a) => ({ ...a, kind: kindOf(a), peer: a.peer ?? PEERS[a.id], enabled: a.enabled && !s.disabled.includes(a.id) }))
@@ -216,7 +236,13 @@ export function apply(ctx, config) {
     else if (readyCache && Date.now() - readyCache.at < 5 * 60_000) return readyCache.value
     if (!readyPending) {
       const gen = readyGen
-      readyPending = readSetup().then((s) => checkAgents(allAgents(s), resolveCredential)).then((value) => {
+      readyPending = readSetup().then(async (s) => {
+        const list = allAgents(s)
+        const value = await checkAgents(list.filter((a) => kindOf(a) !== 'local'), resolveCredential)
+        // Local agents: ready when their model file and the engine are present; no login, no quota.
+        for (const a of list.filter((x) => kindOf(x) === 'local')) value[a.id] = await local.readiness(a.llm.model)
+        return value
+      }).then((value) => {
         if (gen === readyGen) readyCache = { at: Date.now(), value }
         return value
       }).finally(() => { if (gen === readyGen) readyPending = null })
@@ -233,6 +259,57 @@ export function apply(ctx, config) {
     codexAccount: () => usage.codexAccount(),
   })
   const usage = createUsage({ dataDir, accounts })
+
+  // Local models (llama-server on 127.0.0.1), installed module by module from config/local-models.json.
+  let modules = []
+  try { modules = readManifest(join(harnessDir, 'config', 'local-models.json')) } catch (err) { process.stdout.write(`[jev] local: manifest not loaded: ${err.message}\n`) }
+  let specsCache = null
+  const specs = () => {
+    if (!specsCache || Date.now() - specsCache.at > 10 * 60_000) specsCache = { at: Date.now(), value: detectSpecs({ dir: join(harnessDir, 'models') }) }
+    return specsCache.value
+  }
+  let llmRuntime = null
+  let refreshing = null
+  let localLoaded = false
+  const refreshLocal = () => (refreshing ??= local.agents(LOCAL_PERSONA).then(async (list) => {
+    // A model installed while KzH runs gets its agent switched on, even if it was switched off before a removal.
+    // The first load at startup keeps the person's on/off choices.
+    const added = localLoaded ? list.filter((a) => !localAgents.some((x) => x.id === a.id)).map((a) => a.id) : []
+    localAgents = list
+    localLoaded = true
+    if (added.length && (await readSetup()).disabled.some((id) => added.includes(id))) {
+      await mutateSetup((s) => ({ ...s, disabled: s.disabled.filter((id) => !added.includes(id)) })).catch(() => {})
+    }
+    readyGen++; readyCache = null
+    try { llmRuntime?.emit?.('llm/adapters-updated') } catch {}
+  }).catch(() => {}).finally(() => { refreshing = null }))
+  const local = createLocalModels({
+    modules,
+    engineDir: join(harnessDir, 'engine', 'llama'),
+    modelsDir: join(harnessDir, 'models'),
+    settingsFile: join(dataDir, 'local.json'),
+    port: config.local.port,
+    contextSize: config.local.contextSize,
+    specs,
+    log: (t) => process.stdout.write(`[jev] ${t}\n`),
+    onChange: () => { refreshLocal() },
+  })
+  ctx.effect(() => () => { local.dispose() })
+  refreshLocal()
+  // Hugging Face download counts: a tie-breaker for suggestions only, cached a day, skipped offline.
+  let hfCache = { at: 0, value: {} }
+  const hfDownloads = async () => {
+    if (Date.now() - hfCache.at < 86_400_000 || !(await connectivity.online())) return hfCache.value
+    hfCache = { at: Date.now(), value: hfCache.value }
+    const repos = [...new Set(modules.map((m) => m.hfRepo).filter(Boolean))]
+    const got = await Promise.all(repos.map((r) => fetch(`https://huggingface.co/api/models/${r}`, { signal: AbortSignal.timeout(3000) }).then((x) => x.json()).then((j) => [r, j.downloads ?? 0], () => null)))
+    hfCache.value = Object.fromEntries(got.filter(Boolean))
+    return hfCache.value
+  }
+  const catalog = async () => buildCatalog(local, await specs(), { downloads: await hfDownloads().catch(() => ({})) })
+  const connectivity = createConnectivity()
+  const isOffline = async () => !(await connectivity.online())
+  const localChat = async () => { const id = await local.chatModel(); return id ? { provider: LOCAL_PROVIDER, model: id } : null }
   accounts.ready().catch((err) => process.stdout.write(`[jev] accounts not loaded: ${err.message}
 `))
 
@@ -284,6 +361,7 @@ export function apply(ctx, config) {
   // Task or question? Questions are answered directly by a chat model instead of running agents in the workspace.
   // Without Jev (no key, error) everything is a task, as before.
   async function classify(message) {
+    if (await isOffline()) return { kind: looksLikeQuestion(message) ? 'question' : 'task', offline: true }
     const jev = await makeJev({ onTrace: () => {}, runId: 'intent', emit: () => {} }).catch(() => null)
     if (!jev) return { kind: 'task' }
     try { return await jev.intent({ message }, AbortSignal.timeout(config.jevTimeoutMs)) } catch { return { kind: 'task' } }
@@ -368,7 +446,7 @@ export function apply(ctx, config) {
   // Subagents inherit the jev_route tool and would re-route their own prompt, nesting forever.
   // Also stops two routes editing the same workspace at once.
   const active = new Set()
-  async function route({ task, agent, forceAgent, answerOnly, signal = new AbortController().signal, emit }) {
+  async function route({ task, agent, forceAgent, answerOnly, effort, signal = new AbortController().signal, emit }) {
     const cwd = agent?.session?.header?.cwd
     if (!cwd) throw new Error('cannot determine the session workspace; open a workspace in DSH first')
     const key = resolve(cwd).toLowerCase()
@@ -385,14 +463,21 @@ export function apply(ctx, config) {
     try {
       const onTrace = (trace) => onEvent({ type: 'jev', at: Date.now(), trace })
       // Review runs on this same client (router's default createReview), so it shares key rotation and the usage log.
-      const jev = await makeJev({ onTrace, runId, emit: onEvent })
+      // Offline: no Jev at all (fixed routing rule, deterministic review), so nothing waits on a dead network.
+      const offline = await isOffline()
+      const jev = offline ? null : await makeJev({ onTrace, runId, emit: onEvent })
       const agents = await enabledAgents()
       await rotateSpentKeys(agents)
       const quota = await quotaFor(agents)
       const byId = new Map(agents.map((a) => [a.id, a]))
       const accountOf = (a) => (kindOf(a) === 'subscription' ? usage.last()?.out?.[a.id]?.account?.email ?? null : accounts.activeKey(keyProviderOf(a)) ?? a.credentialRef ?? null)
 
-      const execute = async (agentDef, prompt, agentSignal) => {
+      const execute = async (agentDef, prompt, agentSignal, { effort: eff, speed } = {}) => {
+        // Claude Code and Codex executors take no per-run options: they read these from process.env
+        // when the run starts (Claude: SDK child env; Codex: patched turn/start, see README).
+        // ponytail: process-wide env, two workspaces starting Claude/Codex in the same instant can swap efforts.
+        if (agentDef.provider === 'claude-code') setEnv('CLAUDE_CODE_EFFORT_LEVEL', eff)
+        if (agentDef.provider === 'codex') { setEnv('KZ_CODEX_EFFORT', eff); setEnv('KZ_CODEX_SERVICE_TIER', codexServiceTier(speed)) }
         const sub = await ctx.subagents.start(agentDef.provider, {
           label: `jev:${agentDef.id}`,
           prompt: [{ type: 'text', text: prompt }],
@@ -402,7 +487,7 @@ export function apply(ctx, config) {
           // In-process children see global tools; hide the router so an agent never re-routes its own task.
           ...(agentDef.provider === 'spawn' && config.registerTool ? { toolFilter: { deny: ['jev_route'] } } : {}),
           // Pin the model: a spawn child otherwise inherits the parent's (Jev) model and routes back into Jev.
-          ...(agentDef.llm?.provider && agentDef.llm?.model ? { agentOptions: { provider: agentDef.llm.provider, model: agentDef.llm.model } } : {}),
+          ...(agentDef.llm?.provider && agentDef.llm?.model ? { agentOptions: { provider: agentDef.llm.provider, model: agentDef.llm.model, ...(eff ? { reasoningEffort: eff } : {}) } } : {}),
         })
         try {
           const r = await sub.result
@@ -417,12 +502,14 @@ export function apply(ctx, config) {
         cwd,
         forceAgent,
         answerOnly,
-        config: { ...config, agents },
+        effort,
+        config: { ...config, agents, effort: await readEffort() },
         signal,
         deps: {
           ready: await readiness(),
           jev,
-          jevUnavailableReason: `${config.credentialRef} not configured`,
+          offline,
+          jevUnavailableReason: offline ? 'offline: no internet, checks only' : `${config.credentialRef} not configured`,
           execute,
           runTool: runTool(cwd, config.agentTimeoutMs),
           modelOf,
@@ -466,6 +553,25 @@ export function apply(ctx, config) {
   })
 
   // Slash commands: /auto lets Jev choose; /<agent-id> forces that agent (post-review still runs).
+  // Local models from the chat. A bare /install-llm or /remove-llm opens the picker in the browser
+  // (client.js decorates these commands); these server handlers serve the typed forms and any client without the picker.
+  ctx.commands.register({
+    name: 'install-llm',
+    description: 'Install a local model (llama.cpp, runs on this PC, works offline). Bare: picker with suggestions for this PC',
+    input: { hint: '[id… | all]' },
+    handler: async ({ rawInput }) => {
+      try { return await installLlmCommand(rawInput, { local, catalog }) } catch (err) { return { kind: 'error', text: `install-llm: ${err.message}` } }
+    },
+  })
+  ctx.commands.register({
+    name: 'remove-llm',
+    description: 'Remove an installed local model or the engine. Bare: picker; typed form asks you to repeat it with "confirm"',
+    input: { hint: '[id…] [confirm]' },
+    handler: async ({ rawInput }) => {
+      try { return await removeLlmCommand(rawInput, { local }) } catch (err) { return { kind: 'error', text: `remove-llm: ${err.message}` } }
+    },
+  })
+
   ctx.commands.register({
     name: 'auto',
     description: 'Jev routes this task to the best agent, verifies, and reviews the result',
@@ -529,12 +635,15 @@ export function apply(ctx, config) {
   // "Jev Auto" in the model picker: every message goes straight to the router, no chat model in front.
   ctx.inject(['llm', 'agents'], (c) => {
     llm = c.llm
-    c.effect(() => () => { llm = null })
+    llmRuntime = c
+    c.effect(() => () => { llm = null; llmRuntime = null })
     c.effect(() => c.llm.registerAdapter([JEV_PROVIDER], jevAdapter({
-      ctx: c, route, classify, auxModel: config.auxModel,
+      ctx: c, route, classify, auxModel: config.auxModel, isOffline, localChat,
       // A question answered without an agent: the "Saved by Jev" estimate counts these.
-      onDirectAnswer: (durationMs) => usage.logAttempt({ agent: 'chat', role: 'direct-answer', durationMs, provider: config.auxModel.provider, model: config.auxModel.model }).catch(() => {}),
+      onDirectAnswer: (durationMs, m) => usage.logAttempt({ agent: 'chat', role: 'direct-answer', durationMs, provider: m.provider, model: m.model }).catch(() => {}),
     })))
+    // Local models in the picker and for local agents: our own adapter, so a request can start llama-server first.
+    c.effect(() => c.llm.registerAdapter([LOCAL_PROVIDER], localAdapter(local, { attachments: () => c.get?.('attachments') })))
   })
 
   // DSH project folders: the only places the Terminal button may open a terminal.
@@ -544,6 +653,9 @@ export function apply(ctx, config) {
     c.effect(() => () => { workspaceRegistry = null })
   })
   const hotkeysFile = join(dataDir, 'hotkeys.json')
+  // Effort settings from Settings -> Jev setup, over the Config defaults.
+  const effortFile = join(dataDir, 'effort.json')
+  const readEffort = async () => { try { return Config.dict.effort({ ...config.effort, ...JSON.parse(await readFile(effortFile, 'utf8').catch(() => '{}')) }) } catch { return config.effort } }
 
   // HTTP routes for the browser half (inspector tab, setup page), behind DSH's own Host/Origin/cookie checks.
   ctx.inject(['webServer', 'connection'], (c) => {
@@ -554,7 +666,7 @@ export function apply(ctx, config) {
         const deny = c.connection.requestRejection(req)
         if (deny) { res.statusCode = deny; return res.end() }
         // Writes need a JSON body type: a cross-site form cannot send one without a CORS preflight.
-        if (req.method !== 'GET' && !String(req.headers['content-type'] ?? '').split(';')[0].trim() === 'application/json') { res.statusCode = 415; return res.end() }
+        if (req.method !== 'GET' && !isJsonRequest(req)) { res.statusCode = 415; return res.end() }
         const url = new URL(String(req.url), 'http://localhost')
         const send = (status, body) => {
           res.statusCode = status
@@ -578,6 +690,16 @@ export function apply(ctx, config) {
             return send(200, { ok: true })
           }
           // Shortcuts page: key bindings and the right sidebar width, one small JSON file.
+          if (req.method === 'GET' && url.pathname === '/jev-router/effort') return send(200, await readEffort())
+          if (req.method === 'POST' && url.pathname === '/jev-router/effort') {
+            if (String(req.headers['content-type'] ?? '').split(';')[0].trim() !== 'application/json') return send(415, { error: 'JSON only' })
+            let clean
+            try { clean = Config.dict.effort(JSON.parse(await readBody(req))) } catch (err) { return send(400, { error: err.message }) }
+            await mkdir(dataDir, { recursive: true })
+            await writeFile(`${effortFile}.tmp`, JSON.stringify(clean, null, 2))
+            await rename(`${effortFile}.tmp`, effortFile)
+            return send(200, clean)
+          }
           if (req.method === 'GET' && url.pathname === '/jev-router/hotkeys') {
             const raw = await readFile(hotkeysFile, 'utf8').catch((err) => { if (err.code === 'ENOENT') return '{}'; throw err })
             return send(200, JSON.parse(raw))
@@ -667,6 +789,24 @@ export function apply(ctx, config) {
             readyGen++; readyCache = null
             return send(200, { ok: true })
           }
+          // Local models: status for the Settings card, the picker's catalog, installs and removals (manifest ids only).
+          if (req.method === 'GET' && url.pathname === '/jev-router/local') {
+            return send(200, { ...(await local.status()), online: connectivity.last()?.online ?? null })
+          }
+          if (req.method === 'GET' && url.pathname === '/jev-router/local/catalog') return send(200, await catalog())
+          if (req.method === 'POST' && url.pathname.startsWith('/jev-router/local/')) {
+            const b = JSON.parse((await readBody(req)) || '{}')
+            const op = url.pathname.slice('/jev-router/local/'.length)
+            const ids = Array.isArray(b.ids) ? b.ids.map(String) : []
+            if (op === 'start') await local.start(String(b.model ?? ''))
+            else if (op === 'stop') await local.stop()
+            else if (op === 'install') return send(200, { ids: await local.install(ids) })
+            // The page asks for confirmation (Confirm modal naming every file and size) before calling this.
+            else if (op === 'remove') { for (const id of ids) await local.remove(id) }
+            else if (op === 'settings') await local.setSettings(b)
+            else return send(404, { error: 'not found' })
+            return send(200, { ok: true })
+          }
           if (req.method === 'POST' && url.pathname === '/jev-router/custom') {
             const b = JSON.parse(await readBody(req))
             if (!/^[a-z][a-z0-9_-]{0,31}$/.test(b.id ?? '')) return send(400, { error: 'name: lowercase letters, digits, - or _, starting with a letter' })
@@ -734,6 +874,9 @@ const sessionIdOf = (agent) => agent?.session?.id ?? agent?.session?.header?.id
 // Model text can quote anything; mask key-shaped strings before they reach the log.
 const redactLine = (t) => t.replace(/(Bearer\s+)\S+/gi, '$1•••').replace(/\b(sk-|tsk_)[\w-]{8,}/g, '$1•••')
 
+// Writes must declare a JSON body: a cross-site form cannot send one without a CORS preflight.
+export const isJsonRequest = (req) => String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase() === 'application/json'
+
 function readBody(req) {
   return new Promise((done, fail) => {
     const chunks = []
@@ -743,3 +886,5 @@ function readBody(req) {
     req.on('error', fail)
   })
 }
+
+function setEnv(name, value) { if (value) process.env[name] = value; else delete process.env[name] }
