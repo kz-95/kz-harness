@@ -11,11 +11,11 @@ const run = (command, timeoutMs = 20_000) => new Promise((resolve) => {
 
 const CHECKS = {
   async 'claude-code'() {
-    const r = await run('claude auth status')
+    const r = await run('claude auth status --json')
     if (!r.ok && /not recognized|not found|ENOENT/i.test(r.out)) return { installed: false, loggedIn: false, detail: 'Claude Code CLI not found. Install: npm i -g @anthropic-ai/claude-code' }
     try {
       const s = JSON.parse(r.out)
-      return { installed: true, loggedIn: !!s.loggedIn, detail: s.loggedIn ? `signed in (${s.authMethod})` : 'not signed in. Run: claude  then /login' }
+      return { installed: true, loggedIn: !!s.loggedIn, detail: s.loggedIn ? `signed in${s.email ? ` as ${s.email}` : ''} (${s.authMethod})` : 'not signed in. Run: claude  then /login' }
     } catch { return { installed: true, loggedIn: false, detail: r.out.slice(0, 200) || 'could not read login status' } }
   },
   async codex() {

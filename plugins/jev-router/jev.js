@@ -103,13 +103,15 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
      * deterministic scripts Jev may pick instead of an agent. Every tool's
      * parameter questions are asked speculatively in the same single call.
      */
-    async route({ task, context, agents, tools = [], history }, signal) {
+    async route({ task, context, agents, tools = [], history, availability, handoff }, signal) {
       const state = { task, workspace: context, recent_outcomes: history }
+      if (availability) state.agent_availability = availability
+      if (handoff) state.handoff = clip(handoff, 3000)
       const questions = {
         agent: choice(
           {
             question: 'Which coding agent should handle `task` first?',
-            focus: 'Match the nature of `task` and the facts in `workspace` to each agent\'s strengths. `recent_outcomes` shows how agents did on earlier tasks here.',
+            focus: 'Match the nature of `task` and the facts in `workspace` to each agent\'s strengths. `recent_outcomes` shows how agents did on earlier tasks here.' + (availability ? ' Prefer agents that are \'ok\' in `agent_availability` over those \'near limit\'.' : ''),
           },
           agentCriteria(agents),
         ),
@@ -120,6 +122,7 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         humanReview: noul('Should a person inspect the result of `task` before it is accepted, even if checks pass?'),
         needsTests: noul('Should deterministic checks (tests, type checker, lint, build) be required to pass before the result of `task` is accepted?'),
       }
+      if (handoff) questions.continueHandoff = noul('Does `task` ask to continue the earlier unfinished work described in `handoff`?')
       if (tools.length) {
         questions.handler = choice(
           {
@@ -156,6 +159,7 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         needsSecondOpinion: answers.secondOpinion.noul,
         needsHumanReview: answers.humanReview.noul,
         needsTests: answers.needsTests.noul,
+        continueHandoff: answers.continueHandoff?.noul,
         handler,
         handlerConfidence: answers.handler?.confidence,
         toolFits: handler === 'agent' ? undefined : answers[`${handler}.fits`]?.noul,
@@ -163,6 +167,20 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         toolArgConfidence: handler === 'agent' ? undefined : Math.min(1, ...params.map((p) => answers[`${handler}.${p}`].confidence)),
         toolArgs: handler === 'agent' ? undefined : Object.fromEntries(params.map((p) => [p, answers[`${handler}.${p}`].choice])),
       }
+    },
+
+    /** Is the latest message work to carry out in the project, or a question to answer directly? One choice, ~0.1 s. */
+    async intent({ message }, signal) {
+      const { answers } = await ask('intent', { message }, {
+        kind: choice(
+          { question: 'What does `message` ask for?', focus: 'Only work that reads or changes the project counts as a task. Questions about tools, accounts, concepts or this app are questions.' },
+          {
+            task: { what: 'Work to carry out in the code project: fix, build, change, refactor, review, test, investigate or explain its code or files', not_for: 'General questions or chat that need no project files' },
+            question: { what: 'A question or conversation to answer directly, such as how something works, why something happened, or advice', not_for: 'Requests to read, change or check files in the project' },
+          },
+        ),
+      }, signal)
+      return { kind: answers.kind.choice, confidence: answers.kind.confidence }
     },
 
     /** Post-execution assessment over summarized, deterministic evidence. */

@@ -1,7 +1,13 @@
 // "Jev Auto" as a model in the DSH picker. Picking it sends every chat message
 // straight to the router: no chat LLM in front deciding whether to call it.
 // Live router progress streams as the reasoning block; the report is the reply.
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 export const JEV_PROVIDER = 'jev'
+// The "No project" workspace (<harness>/no-project): chat only, agents never run there.
+const NO_PROJECT = resolve(fileURLToPath(new URL('../../no-project', import.meta.url))).toLowerCase()
+export const isNoProject = (cwd) => !!cwd && resolve(cwd).toLowerCase() === NO_PROJECT
 const MODEL = 'jev-auto'
 
 // The router run is not idempotent (agents edit files), so never let the runtime retry it.
@@ -32,6 +38,8 @@ export function line(e) {
     case 'attempt_start': return `Running ${e.agent} (${e.role})…`
     case 'attempt_end': return `${e.attempt.agent} finished: ${e.attempt.stopReason} in ${Math.round(e.attempt.durationMs / 1000)}s`
     case 'review': return `Review: ${e.assessment.action}. ${e.assessment.why}`
+    case 'limit': return `${e.agent} hit its usage limit${e.until ? ` (resets ${new Date(e.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` : ''}: ${{ rotated: 'switched API key, continuing', peer: 'handing the task to another agent', paused: 'no agent left, pausing' }[e.action] ?? e.action}`
+    case 'handoff': return `Handoff note saved (${e.source === 'agent' ? 'by the agent' : 'by the harness'}): ${e.path}`
     case 'final': return `Final: ${e.status}`
     case 'error': return `Error: ${e.message}`
     default: return e.type
@@ -42,9 +50,11 @@ export function line(e) {
  * @param {object} p
  * @param {object} p.ctx     cordis context with `llm` and `agents`
  * @param {Function} p.route the router's route({ task, agent, signal, emit })
+ * @param {Function} [p.classify] (message) -> { kind: 'task' | 'question' }
  * @param {{provider: string, model: string}} p.auxModel real model for title and compaction requests
+ * @param {(ms: number) => void} [p.onDirectAnswer] a question in a project was answered by the chat model, no agent
  */
-export function jevAdapter({ ctx, route, auxModel }) {
+export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer }) {
   return {
     providerInfo: (p) => ({ id: p, name: 'Jev' }),
     providerRetryPolicy: () => NO_RETRY,
@@ -65,6 +75,33 @@ export function jevAdapter({ ctx, route, auxModel }) {
 
       const agent = (options.sessionId && ctx.agents.get(options.sessionId)) ?? ctx.agents.currentInitiator?.()
       if (!task) { yield* textReply('Type a task and Jev will route it.'); return }
+      // A bare `/skill` message only loads that skill into the conversation; there is nothing to run yet.
+      const skill = task.match(/^\/([\w:.-]+)$/)
+      if (skill) { yield* textReply(`Skill \`${skill[1]}\` is loaded into this conversation. Tell me what to do with it.`); return }
+
+      // "No project": everything is chat. Project work needs a real folder for the agents.
+      if (isNoProject(agent?.session?.header?.cwd)) {
+        if ((await classify?.(task).catch(() => null))?.kind === 'task') {
+          yield* textReply('This is the **No project** space, so no agent can work on files here. Pick or add your project folder in the workspace menu next to the message box, then send the task again. Questions are answered here directly.')
+          return
+        }
+        const answered = yield* answerDirectly(ctx, options, auxModel)
+        if (answered !== true) yield* textReply(`No chat model could answer (${answered}). Check DeepSeek in Settings → Jev setup, or ask inside a project folder so an agent can answer.`)
+        return
+      }
+
+      // Questions get a direct answer from a chat model; only project work goes to the agents.
+      let routeTask = task
+      let answerOnly = false
+      if ((await classify?.(task).catch(() => null))?.kind === 'question') {
+        const started = Date.now()
+        const answered = yield* answerDirectly(ctx, options, auxModel)
+        if (answered === true) { onDirectAnswer?.(Date.now() - started); return }
+        // No chat model available: one agent answers, without touching the project, checks or review.
+        process.stdout.write(`[jev] Chat model ${auxModel.provider}/${auxModel.model} could not answer (${answered}); asking an agent\n`)
+        routeTask = `Answer this question directly and briefly. Do not modify any files.\n\n${task}`
+        answerOnly = true
+      }
 
       // Router events -> live reasoning lines, report -> reply text. A local
       // controller stops the run on Stop and also when the runtime drops this stream.
@@ -77,7 +114,7 @@ export function jevAdapter({ ctx, route, auxModel }) {
       let result
       let error
       const emit = (e) => { queue.push(line(e)); wake?.() }
-      route({ task, agent, signal: ac.signal, emit })
+      route({ task: routeTask, answerOnly, agent, signal: ac.signal, emit })
         .then((r) => { result = r }, (e) => { error = e })
         .finally(() => { done = true; wake?.() })
 
@@ -99,6 +136,41 @@ export function jevAdapter({ ctx, route, auxModel }) {
       }
     },
   }
+}
+
+const ABOUT = 'You are answering inside Kz-harness, a desktop app where the Jev router sends coding tasks to Claude Code (the user\'s claude.ai login on this PC), Codex (their ChatGPT login on this PC), DeepSeek (API key) and API-key models, runs the project checks, and reviews results. Logins and keys are managed in Settings → Jev setup → Accounts; usage limits are in the Jev inspector → Usage tab. Answer the user\'s question directly and concisely.'
+
+/**
+ * Stream the answer from the chat model. Returns true, or the failure reason (having yielded nothing)
+ * when that model fails before producing text, so the caller can fall back to an agent.
+ */
+async function* answerDirectly(ctx, options, auxModel) {
+  // No tools: a direct answer must not start work (or call the router) on its own.
+  const { reasoningEffort: _r, purpose: _p, tools: _t, toolChoice: _tc, ...rest } = options
+  const messages = options.messages.map((m, i) => (i === options.messages.length - 1 && m.role === 'user'
+    ? { ...m, content: [{ type: 'text', text: ABOUT }, ...m.content] }
+    : m))
+  const held = []
+  let flowing = false
+  let lastIndex = 0
+  const credit = `\n\n_Answered by: ${auxModel.provider === 'deepseek-official' ? 'DeepSeek' : auxModel.provider} (${auxModel.model}), directly: a question, no agents or project work_`
+  try {
+    for await (const chunk of ctx.llm.stream({ ...rest, messages, provider: auxModel.provider, model: auxModel.model })) {
+      if (typeof chunk.index === 'number') lastIndex = Math.max(lastIndex, chunk.index)
+      if (flowing && chunk.type === 'finish' && chunk.reason?.kind === 'stop') {
+        const i = lastIndex + 1
+        yield { type: 'block-start', index: i, blockType: 'text' }
+        yield { type: 'text-delta', index: i, text: credit }
+        yield { type: 'block-end', index: i, block: { type: 'text', text: credit } }
+      }
+      if (flowing) { yield chunk; continue }
+      if (chunk.type === 'finish' && chunk.reason?.kind === 'error') return `${chunk.reason.failure?.code ?? 'error'}: ${chunk.reason.failure?.message ?? ''}`.slice(0, 200)
+      held.push(chunk)
+      if (chunk.type === 'text-delta') { flowing = true; for (const c of held) yield c }
+    }
+  } catch (err) { if (!flowing) return `${err?.code ?? err?.name ?? 'error'}: ${err?.message ?? ''}`.slice(0, 200); throw new Error('chat model stopped mid-answer') }
+  if (!flowing) for (const c of held) yield c
+  return true
 }
 
 async function* textReply(text, index = 0) {

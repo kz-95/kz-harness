@@ -208,3 +208,12 @@ test('a crashed reviewer hands the review to another agent instead of redoing th
   assert.match(r.assessments[1].why, /reviewer .* failed/)
   assert.equal(r.finalStatus, 'accepted')
 })
+
+test('answeredBy names Jev and each agent with its model and role', async () => {
+  const { answeredBy } = await import('../router.js')
+  const r = { routing: { mode: 'jev', model: 'jev-1.13.0' }, attempts: [
+    { agent: 'deepseek', model: 'deepseek-flash', role: 'primary' },
+    { agent: 'claude', model: 'opus', role: 'review' },
+  ] }
+  assert.equal(answeredBy(r), 'Jev (jev-1.13.0) → deepseek (deepseek-flash) · claude (opus), reviewer')
+})

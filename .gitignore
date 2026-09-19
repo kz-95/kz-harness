@@ -8,3 +8,12 @@ node_modules/
 *.bak
 *.bak-*
 *.tmp
+
+# Local chat space for the "No project" workspace
+no-project/
+
+# Built app (npm run package in app/)
+app/dist/
+
+# Windows shortcuts
+*.lnk

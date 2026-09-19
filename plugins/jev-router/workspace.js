@@ -1,8 +1,8 @@
 // Deterministic workspace facts: lightweight routing context, git change
 // detection, and project checks. Nothing here asks a model anything.
 import { execFile, spawn } from 'node:child_process'
-import { readFile, stat } from 'node:fs/promises'
-import { extname, join } from 'node:path'
+import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
+import { dirname, extname, join, resolve } from 'node:path'
 
 /** Kill a child and everything it started. On Windows a shell child's grandchildren (npm, node) survive a plain kill. */
 export function killTree(child) {
@@ -65,10 +65,22 @@ async function statusMap(cwd, signal) {
   const parts = out.split('\0').filter(Boolean)
   for (let i = 0; i < parts.length; i++) {
     const code = parts[i].slice(0, 2)
-    map.set(parts[i].slice(3), code)
+    // The harness's own notes (.kz-harness/) are never an agent's change.
+    if (!parts[i].slice(3).startsWith('.kz-harness/')) map.set(parts[i].slice(3), code)
     if (code[0] === 'R' || code[0] === 'C') i++ // skip rename source
   }
   return map
+}
+
+/** Keep `.kz-harness/` out of git locally via <git dir>/info/exclude. No-op outside git. */
+export async function ensureHandoffIgnored(cwd) {
+  const rel = (await git(cwd, ['rev-parse', '--git-path', 'info/exclude']))?.trim()
+  if (!rel) return
+  const file = resolve(cwd, rel)
+  const text = await readFile(file, 'utf8').catch(() => '')
+  if (text.split(/\r?\n/).some((l) => l.trim() === '.kz-harness/')) return
+  await mkdir(dirname(file), { recursive: true })
+  await appendFile(file, `${text && !text.endsWith('\n') ? '\n' : ''}.kz-harness/\n`)
 }
 
 async function hashes(cwd, paths, signal) {

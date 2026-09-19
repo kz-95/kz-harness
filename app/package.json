@@ -1,14 +1,17 @@
 {
   "name": "kz-harness",
-  "productName": "Kz Harness",
+  "productName": "Kz-harness",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop app for Kz Harness: starts DSH, shows its log, and opens the harness in its own window.",
+  "description": "Desktop app for Kz-harness: starts DSH, shows its log, and opens the harness in its own window.",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "package": "node package.mjs"
   },
   "devDependencies": {
+    "@electron/fuses": "^2.1.3",
+    "@electron/packager": "^20.3.0",
     "electron": "44.4.3"
   }
 }

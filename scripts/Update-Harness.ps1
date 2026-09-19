@@ -1,11 +1,11 @@
-# Updates Kz Harness: pulls new harness code from git, refreshes packages,
+# Updates Kz-harness: pulls new harness code from git, refreshes packages,
 # and reports (or with -BumpDsh applies) a newer DeepSeek Harness version.
-# The app's Harness -> Check for updates runs this and restarts the harness.
+# The app's Kz-harness -> Check for updates runs this and restarts the harness.
 #   powershell -ExecutionPolicy Bypass -File C:\Harness\scripts\Update-Harness.ps1 [-BumpDsh]
 param([switch]$BumpDsh)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$start = Join-Path $root 'Start-DSH.ps1'
+$start = Join-Path $root 'Start-KzH.ps1'
 
 Write-Host '== Harness code'
 # git reports "no upstream" and similar on stderr; that is data here, not a failure.
@@ -22,6 +22,7 @@ else {
     git -C $root pull --ff-only --quiet
     if ($LASTEXITCODE) { throw 'git pull failed (branches diverged?). Resolve it in a terminal.' }
     Write-Host "   pulled $behind commit(s)."
+    if (git -C $root diff --name-only 'HEAD@{1}' HEAD -- app) { Write-Host '   WARN the desktop app changed: close Kz-harness, then run scripts\Install-Harness.ps1 to rebuild Kz-harness.exe.' }
   }
 }
 $ErrorActionPreference = 'Stop'
@@ -43,7 +44,7 @@ elseif (-not $BumpDsh) { Write-Host "   WARN $latest is available (pinned: $pinn
 else {
   (Get-Content $start -Raw).Replace("`$DshVersion = '$pinned'", "`$DshVersion = '$latest'") | Set-Content $start -Encoding utf8 -NoNewline
   npx -y "@deepseek-ai/dsh@$latest" plugin --profile web add -w "@deepseek-ai/dsh-subagent-claude-code@$latest" "@deepseek-ai/dsh-subagent-codex@$latest"
-  if ($LASTEXITCODE) { throw "Installing executors $latest failed; Start-DSH.ps1 now pins $latest, revert it with git if needed." }
-  Write-Host "   switched $pinned -> $latest. If the harness fails to start, run: git -C $root checkout Start-DSH.ps1"
+  if ($LASTEXITCODE) { throw "Installing executors $latest failed; Start-KzH.ps1 now pins $latest, revert it with git if needed." }
+  Write-Host "   switched $pinned -> $latest. If the harness fails to start, run: git -C $root checkout Start-KzH.ps1"
 }
 Write-Host 'Update finished.'

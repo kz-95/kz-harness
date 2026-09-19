@@ -1,4 +1,4 @@
-# Installs or repairs Kz Harness on this PC. Safe to run again: every step
+# Installs or repairs Kz-harness on this PC. Safe to run again: every step
 # checks first and only does what is missing. Keys are never read or printed.
 #   powershell -ExecutionPolicy Bypass -File C:\Harness\scripts\Install-Harness.ps1
 param([switch]$NoShortcuts)
@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME '.dsh' }
 $profileDir = Join-Path $dshHome 'profiles\web'
-$dshVersion = ([regex]::Match((Get-Content (Join-Path $root 'Start-DSH.ps1') -Raw), "\`$DshVersion = '([^']+)'")).Groups[1].Value
+$dshVersion = ([regex]::Match((Get-Content (Join-Path $root 'Start-KzH.ps1') -Raw), "\`$DshVersion = '([^']+)'")).Groups[1].Value
 function Step($text) { Write-Host "`n== $text" -ForegroundColor Cyan }
 function Ok($text) { Write-Host "   ok: $text" -ForegroundColor Green }
 function Warn($text) { Write-Host "   !!  $text" -ForegroundColor Yellow }
@@ -29,6 +29,14 @@ foreach ($dir in 'plugins\jev-router', 'plugins\jev-review', 'app') {
 $electron = Join-Path $root 'app\node_modules\electron\dist\electron.exe'
 if (-not (Test-Path $electron)) { node (Join-Path $root 'app\node_modules\electron\install.js'); if ($LASTEXITCODE) { throw 'Electron download failed' } }
 Ok 'electron'
+# The app as its own Kz-harness.exe (name, icon, version info, locked-down fuses).
+$appExe = Join-Path $root 'app\dist\Kz-harness-win32-x64\Kz-harness.exe'
+if (Get-Process Kz-harness -ErrorAction SilentlyContinue) { Warn 'Kz-harness is running; close it and run this again to rebuild Kz-harness.exe.' }
+else {
+  Push-Location (Join-Path $root 'app')
+  try { npm run package | Out-Null; if ($LASTEXITCODE) { throw 'Building Kz-harness.exe failed' } } finally { Pop-Location }
+  Ok 'Kz-harness.exe built'
+}
 
 Step "DeepSeek Harness $dshVersion and the Claude / Codex executors"
 $pkg = Join-Path $profileDir 'package.json'
@@ -72,17 +80,18 @@ if (-not $NoShortcuts) {
   Step 'Shortcuts'
   $ws = New-Object -ComObject WScript.Shell
   foreach ($dir in [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs')) {
-    $old = Join-Path $dir 'Jev Harness.lnk'
-    if (Test-Path $old) { Remove-Item $old } # the app's earlier name
-    $lnk = $ws.CreateShortcut((Join-Path $dir 'Kz Harness.lnk'))
-    $lnk.TargetPath = $electron
-    $lnk.Arguments = "`"$(Join-Path $root 'app')`""
-    $lnk.WorkingDirectory = Join-Path $root 'app'
+    foreach ($oldName in 'Jev Harness.lnk', 'Kz Harness.lnk') { # the app's earlier names
+      $old = Join-Path $dir $oldName
+      if (Test-Path $old) { Remove-Item $old }
+    }
+    $lnk = $ws.CreateShortcut((Join-Path $dir 'Kz-harness.lnk'))
+    if (Test-Path $appExe) { $lnk.TargetPath = $appExe; $lnk.Arguments = ''; $lnk.WorkingDirectory = Split-Path $appExe }
+    else { $lnk.TargetPath = $electron; $lnk.Arguments = "`"$(Join-Path $root 'app')`""; $lnk.WorkingDirectory = Join-Path $root 'app' }
     $lnk.IconLocation = "$(Join-Path $root 'app\assets\logo.ico'),0"
-    $lnk.Description = 'Kz Harness: Claude, Codex and DeepSeek routed and reviewed by Jev'
+    $lnk.Description = 'Kz-harness: Claude, Codex and DeepSeek routed and reviewed by Jev'
     $lnk.Save()
-    Ok (Join-Path $dir 'Kz Harness.lnk')
+    Ok (Join-Path $dir 'Kz-harness.lnk')
   }
 }
 
-Write-Host "`nDone. Start it with the Kz Harness icon, then check Settings -> Jev setup." -ForegroundColor Green
+Write-Host "`nDone. Start it with the Kz-harness icon, then check Settings -> Jev setup." -ForegroundColor Green

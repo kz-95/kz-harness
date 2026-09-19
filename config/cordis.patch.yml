@@ -30,3 +30,17 @@
 # slots with C:\Harness\Logo.png, so the official DeepSeek brand steps aside.
 - id: ui-brand-official
   disabled: true
+
+# --- Kz-harness privacy: nothing is sent anywhere except the model/API calls you use ---
+# Full-transcript upload to harness-telemetry.deepseeksvc.com when feedback is given.
+- id: session-telemetry-otel
+  disabled: true
+# List of every installed package piggybacked on each DeepSeek API request.
+- id: plugin-package-inventory-deepseek
+  disabled: true
+# Session-log upload with DeepSeek requests (off by default); pinned off.
+- id: session-log-deepseek
+  disabled: true
+# Developer-only reload channel (unauthenticated /plugins/events).
+- id: client-hmr
+  disabled: true

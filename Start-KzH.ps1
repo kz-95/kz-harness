@@ -30,7 +30,15 @@ if ($helper) { $env:PATH = "$($helper.DirectoryName);$env:PATH" }
 else { Write-Warning 'codex-windows-sandbox-setup.exe not found: Codex runs cannot read files. Open the Codex app once, or set [windows] sandbox in ~/.codex/config.toml.' }
 
 if (-not (Test-Path $Workspace)) { New-Item -ItemType Directory -Path $Workspace | Out-Null }
+# Privacy: no DSH telemetry, no Claude Code telemetry/error reporting from harness runs,
+# and no registry check on every start (the version is pinned; Update-Harness.ps1 updates).
+$env:DSH_TELEMETRY_DISABLED = '1'
+$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
+$env:npm_config_prefer_offline = 'true'
+
 Set-Location $Workspace
+# The "No project" workspace (<harness>\no-project) for plain chat; added before DSH opens its storage.
+node (Join-Path $PSScriptRoot 'scripts\ensure-no-project.mjs')
 $dshArgs = @('-y', "@deepseek-ai/dsh@$DshVersion", 'web')
 if ($NoOpen) { $dshArgs += '--no-open' }
 & npx @dshArgs

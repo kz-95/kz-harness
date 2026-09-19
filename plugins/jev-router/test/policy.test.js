@@ -73,3 +73,33 @@ test('route asks a fits Noul per tool and reports weakest argument confidence', 
   assert.equal(used['weather.days'], true)
   assert.equal(used['clock.fits'], false)
 })
+
+test('route adds availability and the continueHandoff Noul only when given', async (t) => {
+  const calls = []
+  t.mock.method(TypeSafeClient.prototype, 'systemOne', async ({ state, questions }) => {
+    calls.push({ state, questions })
+    const answers = Object.fromEntries(Object.entries(questions).map(([k, q]) => [k,
+      q.type === 'noul' ? { type: 'noul', noul: k === 'continueHandoff' ? 0.8 : 0.1 }
+        : q.type === 'score' ? { type: 'score', score: 1, confidence: 0.9 }
+          : { type: 'choice', choice: Object.keys(q.criteria)[0], confidence: 0.9 }]))
+    return { model: 'jev-1.13.0', usage: {}, answers }
+  })
+  const jev = createJev({ apiKey: 'k', model: 'jev-1.13.0' })
+  const agents = [{ id: 'a', description: 'a' }]
+  const r = await jev.route({ task: 'continue', context: {}, agents, availability: { a: 'near limit' }, handoff: 'x'.repeat(5000) }, signal)
+  assert.equal(r.continueHandoff, 0.8)
+  assert.deepEqual(calls[0].state.agent_availability, { a: 'near limit' })
+  assert.ok(calls[0].state.handoff.length < 3100)
+  const plain = await jev.route({ task: 't', context: {}, agents }, signal)
+  assert.equal(plain.continueHandoff, undefined)
+  assert.equal('continueHandoff' in calls[1].questions, false)
+  assert.equal('handoff' in calls[1].state, false)
+})
+
+test('built-in limit matcher ignores completed runs that merely mention rate limits', async () => {
+  const { builtinLimit } = await import('../router.js')
+  assert.equal(builtinLimit({ stopReason: 'error', diagnostic: 'You have hit your usage limit' }).hit, true)
+  assert.equal(builtinLimit({ stopReason: 'error', diagnostic: { category: 'limit' } }).hit, true)
+  assert.equal(builtinLimit({ stopReason: 'completed', answerText: 'added a rate limit to the API' }).hit, false)
+  assert.equal(builtinLimit({ stopReason: 'error', diagnostic: 'exit 1: TypeError' }).hit, false)
+})

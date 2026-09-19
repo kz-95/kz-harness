@@ -18,7 +18,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ---
 
 This license covers only the files in this repository: the plugins, the
-desktop app, the scripts and the documentation. Kz Harness is a reskin and a
+desktop app, the scripts and the documentation. Kz-harness is a reskin and a
 set of plugins on top of other people's software, which it downloads and runs
 under their own licenses and terms:
 
@@ -26,6 +26,5 @@ under their own licenses and terms:
 - Claude Code, Codex CLI, the TypeSafe SDK and Jev, DeepSeek, Electron and
   every npm dependency: their own licenses and terms of service.
 
-Logo.png shows the marks of Anthropic (Claude), OpenAI (ChatGPT/Codex) and
-DeepSeek. Those marks belong to their owners and are not covered by this
-license; replace them if you redistribute the app.
+The Kz-harness logo (Logo.png and the icons made from it) is covered by this
+license like everything else here.
