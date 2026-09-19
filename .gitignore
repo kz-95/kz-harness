@@ -1,0 +1,10 @@
+# Every dotfile and dot-folder is machine-local: .env, .omc, .claude, .vscode, .idea ...
+# Keys live in ~/.dsh/.env, outside this repo, and must never be committed.
+.*
+!.gitignore
+
+node_modules/
+*.log
+*.bak
+*.bak-*
+*.tmp

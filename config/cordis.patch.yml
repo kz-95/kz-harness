@@ -1,0 +1,32 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+#
+# Jev router setup (see C:\Harness\README.md).
+
+# Executors keep native auth (~/.claude, ~/.codex). Permission modes:
+#   claude-code acceptEdits: may edit files in the workspace; other actions
+#     need permissions already granted in your Claude settings.
+#   codex approve-for-me: workspace-write sandbox, Codex auto-review for
+#     anything that needs approval.
+- id: subagent-claude-code
+  config:
+    permissionMode: acceptEdits
+- id: subagent-codex
+  config:
+    permissionMode: approve-for-me
+
+# Router plugin. Agents, limits and thresholds are configurable here; omitted
+# fields use the defaults in the plugin's Config schema.
+# jev-review judges every result (pass / second opinion / retry / human);
+# the router calls it through the `jevReview` service.
+- insert:
+    - id: jev-review
+      name: 'C:/Harness/plugins/jev-review/index.js'
+    - id: jev-router
+      name: 'C:/Harness/plugins/jev-router/index.js'
+
+# Jev Harness brand: the jev-router client fills the sidebar and hero brand
+# slots with C:\Harness\Logo.png, so the official DeepSeek brand steps aside.
+- id: ui-brand-official
+  disabled: true

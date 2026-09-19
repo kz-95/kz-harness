@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kz Harness</title>
+<link rel="stylesheet" href="console.css">
+</head>
+<body>
+  <!-- Start screen: shown while DSH boots, and again if it stops. -->
+  <main id="start" hidden>
+    <div class="glow" aria-hidden="true"></div>
+    <div class="hero">
+      <div class="logo-wrap">
+        <span class="ring" aria-hidden="true"></span>
+        <img class="logo" src="../assets/logo-512.png" alt="Kz Harness logo">
+      </div>
+      <h1>Kz Harness</h1>
+      <p class="tagline">Claude · Codex · DeepSeek, routed and reviewed by Jev</p>
+      <div class="status" role="status" aria-live="polite">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="status-text">Starting the harness…</span>
+      </div>
+      <div class="actions" id="error-actions" hidden>
+        <button class="btn primary" id="retry">Retry</button>
+        <button class="btn" data-open-logs>Show full log</button>
+      </div>
+    </div>
+    <section class="mini-console" aria-label="Latest log lines">
+      <header>
+        <span>Log</span>
+        <button class="link" data-open-logs>Open full log <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>L</kbd></button>
+      </header>
+      <ol id="mini"></ol>
+    </section>
+  </main>
+
+  <!-- Full log window. -->
+  <main id="logs" hidden>
+    <header class="bar">
+      <img src="../assets/logo-32.png" alt="" width="20" height="20">
+      <h1>Harness log</h1>
+      <span class="pill" id="log-status">starting</span>
+      <div class="spacer"></div>
+      <label class="search">
+        <span class="sr-only">Filter log lines</span>
+        <input id="filter" type="search" placeholder="Filter…" autocomplete="off">
+      </label>
+      <div class="seg" role="radiogroup" aria-label="Show">
+        <button role="radio" aria-checked="true" data-level="all">All</button>
+        <button role="radio" aria-checked="false" data-level="warn">Warnings</button>
+        <button role="radio" aria-checked="false" data-level="error">Errors</button>
+      </div>
+      <label class="check"><input id="follow" type="checkbox" checked> Follow</label>
+      <button class="btn" id="copy">Copy</button>
+    </header>
+    <ol id="lines" class="lines" aria-live="off"></ol>
+    <footer class="foot"><span id="count">0 lines</span><span class="muted">The login token is hidden in this log.</span></footer>
+  </main>
+<script src="console.js"></script>
+</body>
+</html>

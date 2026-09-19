@@ -1,0 +1,2 @@
+name: Jev Auto
+description: AUTO routing. Every coding request goes to the Jev router, which picks Claude Code, Codex or DeepSeek, runs checks, and reviews the result.
