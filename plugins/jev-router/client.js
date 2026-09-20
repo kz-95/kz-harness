@@ -24,6 +24,14 @@ window.__ModuleLoader__.load({
     const BROWSER_KIND = 'kz-browser'
     const TERMINAL_ID = 'jev-router/terminal'
     const TERMINAL_KIND = 'kz-terminal'
+    // Subagents, background tasks and usage also stand on their own, so they are
+    // reachable in any session without going through the Jev inspector's tabs.
+    const SUBAGENTS_ID = 'jev-router/subagents'
+    const SUBAGENTS_KIND = 'kz-subagents'
+    const TASKS_ID = 'jev-router/tasks'
+    const TASKS_KIND = 'kz-tasks'
+    const USAGE_ID = 'jev-router/usage'
+    const USAGE_KIND = 'kz-usage'
     // Services captured in apply (ctx.sessions, ctx.sidebarRight, ctx.layout, ctx.uiWorkspace).
     let sessionsApi
     let sidebarRight
@@ -152,8 +160,69 @@ window.__ModuleLoader__.load({
 .jevi .st.done{color:var(--dsw-alias-state-success-primary)}
 .jevi .st.failed{color:var(--dsw-alias-state-error-primary)}
 .jevi .st.stopped{color:var(--dsw-alias-label-caption)}
+.jevi .st.queued{color:var(--dsw-alias-label-tertiary)}
+/* The canonical task states. The ring says "working" for all four in-flight states, and the
+   label text beside it names the state, so a row is never read by colour alone. */
+.jevi .st.routing,.jevi .st.verifying,.jevi .st.reviewing{border:2px solid var(--dsw-alias-bg-layer-3);border-top-color:var(--dsw-alias-state-business-primary);border-radius:50%;animation:kzh-spin .8s linear infinite}
+.jevi .st.completed{color:var(--dsw-alias-state-success-primary)}
+.jevi .st.needs_human,.jevi .st.paused_limit{color:var(--dsw-alias-state-warn-label)}
+.jevi .task .title.struck{text-decoration:line-through;color:var(--dsw-alias-label-tertiary)}
+.jevi .task .unread{display:inline-block;margin-left:6px;padding:0 6px;border-radius:6px;font:var(--dsw-font-xxxs-11);line-height:16px;background:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary-foreground)}
+.jevi .task .reason{margin-top:2px;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.jevi .task .reason.failed{color:var(--dsw-alias-state-error-primary)}
+.jevi .task .reason.needs_human,.jevi .task .reason.paused_limit{color:var(--dsw-alias-state-warn-label)}
+/* The state's name is always spelled out; these tints only help it stand out at a glance. */
+.jevi .pill.state.completed{color:var(--dsw-alias-state-success-primary)}
+.jevi .pill.state.failed{color:var(--dsw-alias-state-error-primary)}
+.jevi .pill.state.stopped{color:var(--dsw-alias-label-caption)}
+.jevi .pill.state.needs_human,.jevi .pill.state.paused_limit{color:var(--dsw-alias-state-warn-label)}
+/* Composer seat. Metrics copied from DSH's own trigger next to it (28px tall,
+   pill radius, 13/20 text) so this lines up with the model button and the ring. */
+.kzh-lim{display:inline-flex;align-items:center;position:relative;flex:none}
+.kzh-lim>button{display:inline-flex;align-items:center;gap:6px;flex:none;height:28px;padding:0 8px;border:none;border-radius:999px;background:0 0;color:var(--dsw-alias-label-secondary);font-size:13px;font-weight:500;line-height:20px;cursor:pointer;outline:none;transition:background var(--ds-transition-duration-fast) var(--ds-ease-in-out)}
+.kzh-lim>button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.kzh-lim .who{max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kzh-lim .tick{flex:none;width:22px;height:4px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);overflow:hidden}
+.kzh-lim .tick i{display:block;height:100%;background:var(--dsw-alias-state-business-primary)}
+.kzh-lim .tick i.warn{background:var(--dsw-alias-state-warning-primary)}
+.kzh-lim .tick i.bad{background:var(--dsw-alias-state-error-primary)}
+.kzh-pop{position:absolute;right:0;bottom:calc(100% + 8px);z-index:10000;width:320px;height:auto;max-width:calc(100vw - 32px);max-height:60vh;overflow-y:auto;overflow-x:hidden;padding:12px;box-sizing:border-box;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:12px;box-shadow:0 8px 28px var(--dsw-alias-bg-mask-3);font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-primary);text-align:left}
+.kzh-pop .err{color:var(--dsw-alias-state-error-primary);margin:0 0 8px}
+.kzh-pop .lead{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);margin:0 0 10px}
+.kzh-pop .grp{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxxs-11);margin:10px 0 4px}
+.kzh-pop .grp:first-of-type{margin-top:0}
+.kzh-pop .row{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+.kzh-pop .row b{font:var(--dsw-font-xs-strong-13)}
+.kzh-pop .row span{color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);white-space:nowrap}
+.kzh-pop .bar{width:100%;box-sizing:border-box;height:4px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);overflow:hidden;margin:3px 0 8px}
+.kzh-pop .bar i{display:block;max-width:100%;height:100%;background:var(--dsw-alias-state-business-primary)}
+.kzh-pop .bar i.warn{background:var(--dsw-alias-state-warning-primary)}
+.kzh-pop .bar i.bad{background:var(--dsw-alias-state-error-primary)}
+.kzh-pop .more{display:block;width:100%;margin-top:8px;padding:10px 0 0;border:none;border-top:1px solid var(--dsw-alias-border-l1);background:none;color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xs-13);text-align:left;cursor:pointer}
+.kzh-pop .more:hover{color:var(--dsw-alias-label-primary)}
+.kzh-q{position:fixed;left:50%;transform:translateX(-50%);bottom:112px;z-index:9999;width:min(560px,calc(100vw - 48px));pointer-events:auto;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;box-shadow:0 10px 40px var(--dsw-alias-bg-mask-3);font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-primary);box-sizing:border-box;overflow:hidden}
+.kzh-q .hd{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.kzh-q .hd b{font:var(--dsw-font-xs-strong-13);flex:1;min-width:0}
+.kzh-q .hd .n{font:var(--dsw-font-xxxs-11);background:var(--dsw-alias-bg-layer-3);border-radius:8px;padding:1px 6px}
+.kzh-q .hd button{border:0;background:none;color:var(--dsw-alias-label-secondary);cursor:pointer;border-radius:8px;padding:4px 8px;font:var(--dsw-font-xs-13)}
+.kzh-q .hd button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.kzh-q ol{list-style:none;margin:0;padding:0;max-height:38vh;overflow-y:auto;overflow-x:hidden}
+.kzh-q li{display:flex;align-items:flex-start;gap:8px;padding:8px 12px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.kzh-q li .no{flex:none;width:18px;text-align:right;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxs-12);line-height:20px}
+.kzh-q li .tx{flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}
+.kzh-q li.now .tx{color:var(--dsw-alias-label-primary)}
+.kzh-q li .tag{flex:none;font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-tertiary)}
+.kzh-q li button{flex:none;border:0;background:none;color:var(--dsw-alias-label-tertiary);cursor:pointer;border-radius:6px;padding:2px 6px;font:var(--dsw-font-xxs-12)}
+.kzh-q li button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.kzh-q li textarea{flex:1;min-width:0;font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:6px 8px;resize:vertical;box-sizing:border-box}
+.kzh-q .add{display:flex;gap:8px;align-items:flex-end;padding:10px 12px}
+.kzh-q .add textarea{flex:1;min-width:0;min-height:38px;max-height:120px;font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px;resize:vertical;box-sizing:border-box}
+.kzh-q .add button{flex:none;border:0;border-radius:8px;padding:8px 12px;background:var(--dsw-alias-button-elevated-fill);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xs-strong-13);cursor:pointer}
+.kzh-q .add button:disabled{opacity:.5;cursor:default}
+.kzh-q .empty{padding:14px 12px;color:var(--dsw-alias-label-tertiary)}
+.kzh-q .err{color:var(--dsw-alias-state-error-primary);padding:0 12px 8px}
 @keyframes kzh-spin{to{transform:rotate(360deg)}}
-@media (prefers-reduced-motion:reduce){.jevi .st.running{animation:none}}
+@media (prefers-reduced-motion:reduce){.jevi .st.running,.jevi .st.routing,.jevi .st.verifying,.jevi .st.reviewing{animation:none}}
 .kzh-bar{display:flex;align-items:center;gap:2px}.kzh-float{position:fixed;top:10px;z-index:30;pointer-events:auto;display:flex;align-items:center;gap:2px;padding:2px;border-radius:10px;background:var(--dsw-alias-bg-base);transition:right var(--ds-transition-duration-slow) var(--ds-ease-in-out)}.kzh-titlebar{position:fixed;top:0;left:0;right:0;height:36px;z-index:40;pointer-events:auto;display:flex;align-items:center;gap:2px;padding-left:8px;background:var(--dsw-alias-bg-base);border-bottom:1px solid var(--dsw-alias-border-l1);-webkit-app-region:drag;box-sizing:border-box}.kzh-titlebar button,.kzh-titlebar [role=menu]{-webkit-app-region:no-drag}.kzh-tb-drag{flex:1;align-self:stretch}.kzh-tb-menu{display:inline-flex;align-items:center;gap:8px;background:none;border:0;border-radius:6px;padding:4px 8px;cursor:pointer;font:var(--dsw-font-xxs-strong-12);color:var(--dsw-alias-label-secondary)}.kzh-tb-menu:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.kzh-titlebar .kzh-bar{margin:0}html.kzh-in-app{padding-top:36px;box-sizing:border-box;height:100%}html.kzh-in-app body{height:100%}.kzh-float .kzh-bar{margin:0}
 .kzh-ib{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;transition:background var(--ds-transition-duration-fast) var(--ds-ease-in-out)}
 .kzh-ib:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
@@ -161,6 +230,7 @@ window.__ModuleLoader__.load({
 .kzh-ib:disabled{opacity:.45;cursor:default}
 .kzh-ib:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
 .kzh-dot{position:absolute;top:4px;right:4px;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 2px var(--dsw-alias-bg-base)}
+.kzh-sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .kzh-menu{position:fixed;z-index:10000;min-width:250px;padding:4px;box-sizing:border-box;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:12px;box-shadow:0 8px 28px var(--dsw-alias-bg-mask-3);font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-primary)}
 .kzh-menu button{display:flex;align-items:center;gap:8px;width:100%;padding:6px 8px;border:0;border-radius:8px;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .kzh-menu button:hover,.kzh-menu button:focus{background:var(--dsw-alias-interactive-bg-hover);outline:none}
@@ -176,6 +246,13 @@ window.__ModuleLoader__.load({
 .kzb .view{flex:1;min-height:0;position:relative}
 .kzb iframe{display:block;border:0;width:100%;height:100%;background:#fff}
 .kzb .note{margin:6px 8px}
+.kzh-agents{display:flex;flex:1 1 0;min-width:0;align-items:center;gap:6px;overflow-x:auto;overscroll-behavior-x:contain;white-space:nowrap;scrollbar-width:none;font:var(--dsw-font-xxxs-11)}
+.kzh-agents::-webkit-scrollbar{display:none}
+.kzh-agents:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px;border-radius:10px}
+.kzh-agents .chip{flex:none;border-radius:999px;padding:0 8px;line-height:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}
+.kzh-agents .chip.wrote{background:var(--dsw-alias-state-business-primary);border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary-foreground)}
+.kzh-agents .arrow{flex:none;color:var(--dsw-alias-label-caption)}
+.kzh-agents .split{flex:none;width:1px;height:14px;background:var(--dsw-alias-border-l2)}
 `
     function useStyle() {
       useEffect(() => {
@@ -218,6 +295,182 @@ window.__ModuleLoader__.load({
     }
     const toasts = makeStore({ text: '', n: 0 })
     const toast = (text) => toasts.set({ text, n: toasts.get().n + 1 })
+
+    // ---------- all transcripts: one bar button opens or shuts every reasoning and tool block ----------
+    // The engine renders a disclosure body only while its row is open, so CSS or an attribute change
+    // cannot open one: the row's own click has to run React's local state. Rows also stream in shut,
+    // so a follow-up pass opens the new ones while the preference is on.
+    const TRANSCRIPT_ROW = '[data-disclosure-row][role="button"]' // reasoning rows and tool-call rows alike
+    // A turn's process group can fold its rows away (they become hidden="until-found") while shut.
+    const TRANSCRIPT_OPENER = 'button[data-turn-process]'
+    // The conversation's own scroller, so rows in other panes (sidebars, settings) are never touched.
+    const transcriptScope = () => document.querySelector('[data-conversation-scroll]')
+
+    /**
+     * The button's open state, label and whether it does anything at all. `total` is every transcript
+     * row in the conversation and `collapsed` how many of them are shut. Pure: numbers in, no DOM.
+     */
+    function transcriptButton(collapsed, total) {
+      const expanded = total > 0 && collapsed === 0
+      return { expanded, disabled: total === 0, label: expanded ? 'Collapse all transcripts' : 'Expand all transcripts' }
+    }
+
+    /**
+     * The rows a pass must click, given `[{ expanded, seen }]` copies of the DOM rows and the
+     * preference. `follow` marks the pass that chases streamed-in rows: it only ever opens, and it
+     * skips every row it has already decided about, so a row the person shut by hand is not fought
+     * over. A click on the button passes no `follow` and overrides that guard. Pure, so it unit-tests.
+     */
+    function transcriptClicks(rows, open, follow = false) {
+      if (follow) return open ? rows.filter((r) => !r.expanded && !r.seen) : []
+      return rows.filter((r) => r.expanded !== open)
+    }
+
+    /** Kept for this application session only: it deliberately resets when the page reloads. */
+    const transcripts = makeStore({ open: false, button: transcriptButton(0, 0) })
+    const transcriptSeen = new WeakSet() // rows and group openers a pass has already decided about
+    let transcriptKey = ''
+    let transcriptFrame = 0
+
+    const transcriptRows = (root) => [...root.querySelectorAll(TRANSCRIPT_ROW)].map((row) => ({
+      row, expanded: row.getAttribute('aria-expanded') === 'true', seen: transcriptSeen.has(row),
+    }))
+
+    /** Recount the conversation's rows; only a changed button state re-renders the bars. */
+    function countTranscripts() {
+      const root = transcriptScope()
+      const rows = root ? transcriptRows(root) : []
+      const st = transcriptButton(rows.filter((r) => !r.expanded).length, rows.length)
+      const key = `${st.label}|${st.expanded}|${st.disabled}`
+      if (key === transcriptKey) return
+      transcriptKey = key
+      transcripts.set({ button: st })
+    }
+
+    /**
+     * Unfold the process groups that hide their rows, so "all" means visible and not merely open.
+     * `newOnly` is the following pass: it takes the groups it has not decided about yet, and the
+     * person folding one back by hand stays folded.
+     */
+    function openGroups(root, newOnly) {
+      const all = [...root.querySelectorAll(TRANSCRIPT_OPENER)]
+      for (const g of all) {
+        if (g.getAttribute('aria-expanded') === 'true' || (newOnly && transcriptSeen.has(g))) continue
+        transcriptSeen.add(g)
+        clickRow(g)
+      }
+      for (const g of all) transcriptSeen.add(g)
+    }
+
+    /** Click a row without taking the keyboard focus out of a half-typed message. */
+    function clickRow(el) {
+      const keep = document.activeElement
+      try { el.click() } catch {}
+      if (keep && keep !== document.body && keep !== document.activeElement && keep.isConnected) {
+        try { keep.focus({ preventScroll: true }) } catch {}
+      }
+    }
+
+    /** Toggle every transcript: the bar button, the "More" menu item and the hotkey all run this. */
+    function toggleTranscripts() {
+      const root = transcriptScope()
+      if (!root) return
+      const open = !transcripts.get().open
+      transcripts.set({ open })
+      if (open) openGroups(root, false)
+      const rows = transcriptRows(root)
+      const hits = transcriptClicks(rows, open)
+      // Marked before the click, so a row whose click fails is not retried frame after frame.
+      for (const r of hits) transcriptSeen.add(r.row)
+      for (const r of hits) clickRow(r.row)
+      for (const r of rows) transcriptSeen.add(r.row)
+      countTranscripts()
+      // Opening reveals bodies that hold more shut rows (a tool's own steps); let a pass take those.
+      scheduleTranscripts()
+    }
+
+    /** One pass: open what the preference wants among the rows nobody has decided about yet. */
+    function passTranscripts() {
+      transcriptFrame = 0
+      const root = transcriptScope()
+      const open = transcripts.get().open
+      if (root) {
+        // Groups first, then the rows: a group opener that is a row too is already open by now.
+        if (open) openGroups(root, true)
+        const rows = transcriptRows(root)
+        const hits = transcriptClicks(rows, open, true)
+        for (const r of hits) transcriptSeen.add(r.row)
+        for (const r of hits) clickRow(r.row)
+        for (const r of rows) transcriptSeen.add(r.row) // decided: later manual changes are left alone
+      }
+      countTranscripts()
+    }
+
+    function scheduleTranscripts() {
+      if (transcriptFrame) return
+      transcriptFrame = requestAnimationFrame(passTranscripts)
+    }
+
+    /**
+     * Watch the conversation, one animation frame at a time. Every row a pass touches is remembered,
+     * so the mutations our own clicks cause cannot start a loop, and a row the person shut by hand is
+     * never re-opened behind their back. A renamed engine just leaves the selectors empty: no throw.
+     */
+    function startTranscripts() {
+      const mo = new MutationObserver(scheduleTranscripts)
+      mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-expanded', 'hidden', 'data-open', 'data-conversation-scroll'] })
+      scheduleTranscripts()
+      return () => { mo.disconnect(); if (transcriptFrame) cancelAnimationFrame(transcriptFrame); transcriptFrame = 0 }
+    }
+
+    /**
+     * Tell the server which background results this browser has actually rendered.
+     *
+     * A finished task stays "unread" until its message is in the conversation, and the engine
+     * has no hook for "a person has now seen this", so the acknowledgement has to come from
+     * here. Rows are matched by the job id the server puts at the front of the notice summary
+     * (`jev-3 · Fix sidebar width · Completed`); each id is acknowledged once, and an id whose
+     * request failed is forgotten so the next pass tries again. A renamed engine simply leaves
+     * the selector empty.
+     */
+    const ackedResults = new Set()
+    /**
+     * The job id a notice summary starts with (`jev-3 · Fix sidebar width · Completed`), or
+     * null when the row is not one of ours. Pure, so the contract with the server is testable.
+     * Our summaries always carry three fields - id, task, status - and requiring all three is
+     * what keeps another plugin's two-field notice from being mistaken for one of ours.
+     */
+    const resultIdOf = (summary) => {
+      const parts = String(summary ?? '').split('·').map((s) => s.trim())
+      if (parts.length < 3) return null
+      return /^[a-z][\w-]{0,40}$/.test(parts[0]) ? parts[0] : null
+    }
+    function acknowledgeResults() {
+      // The engine renders the producer and the summary as TEXT inside marked spans, not as
+      // attribute values: `data-context-source` and `data-context-summary` are boolean
+      // attributes on those spans (dsh-client-ui-chat ContextInjectionRow). So read the text,
+      // and check the producer by its text too - a selector on the attribute value never
+      // matches, which is how an earlier version silently acknowledged nothing.
+      const ids = []
+      for (const span of document.querySelectorAll('[data-context-summary]')) {
+        const row = span.closest('[data-disclosure-row]') ?? span.parentElement
+        if ((row?.querySelector('[data-context-source]')?.textContent ?? '').trim() !== 'jev-router') continue
+        const id = resultIdOf(span.textContent)
+        if (!id || ackedResults.has(id)) continue
+        ackedResults.add(id)
+        ids.push(id)
+      }
+      if (!ids.length) return
+      post('/jev-router/tasks/seen', { jobIds: ids }).catch(() => { for (const id of ids) ackedResults.delete(id) })
+    }
+    function startResultAcks() {
+      let frame = 0
+      const schedule = () => { if (!frame) frame = requestAnimationFrame(() => { frame = 0; acknowledgeResults() }) }
+      const mo = new MutationObserver(schedule)
+      mo.observe(document.body, { childList: true, subtree: true })
+      schedule()
+      return () => { mo.disconnect(); if (frame) cancelAnimationFrame(frame) }
+    }
 
     // ---------- actions and hotkeys ----------
     // Left sidebar state has no read API (ctx.layout only toggles); the frame marks it on its root element.
@@ -272,11 +525,14 @@ window.__ModuleLoader__.load({
         if (!cwd) throw new Error('This session has no project folder')
         await post('/jev-router/open-terminal', { cwd })
       } },
-      { id: 'background', label: 'Background tasks', keys: 'Ctrl+Alt+B', run: () => openPanel(KIND, { view: 'jobs' }) },
+      { id: 'background', label: 'Background tasks', keys: 'Ctrl+Alt+B', run: () => togglePanel(TASKS_KIND) },
+      { id: 'subagents', label: 'Subagents', keys: '', run: () => togglePanel(SUBAGENTS_KIND) },
+      { id: 'export', label: 'Export chat as Markdown', keys: 'Ctrl+Alt+M', run: () => openExport() },
+      { id: 'queue', label: 'Task queue', keys: 'Ctrl+Alt+Q', run: () => openQueue() },
       { id: 'browser', label: 'Browser', keys: 'Ctrl+Alt+W', run: () => togglePanel(BROWSER_KIND) },
       { id: 'jev-inspector', label: 'Jev inspector', keys: 'Ctrl+Alt+J', run: () => togglePanel(KIND, { view: 'decisions' }) },
       { id: 'files', label: 'Files', keys: 'Ctrl+Alt+E', run: () => togglePanel('files') },
-      { id: 'usage', label: 'Usage', keys: 'Ctrl+Alt+U', run: () => openPanel(KIND, { view: 'usage' }) },
+      { id: 'usage', label: 'Usage', keys: 'Ctrl+Alt+U', run: () => togglePanel(USAGE_KIND) },
       { id: 'left-sidebar', label: 'Toggle left sidebar', keys: 'Ctrl+B', run: () => layout.toggleSidebar() },
       { id: 'focus-mode', label: 'Focus mode', keys: 'Ctrl+Shift+F', run: focusMode },
       { id: 'new-session', label: 'New session', keys: 'Ctrl+Alt+N', run: () => {
@@ -304,13 +560,15 @@ window.__ModuleLoader__.load({
       { id: 'focus-input', label: 'Focus message box', keys: '', run: () => document.querySelector('[data-lexical-editor="true"]')?.focus() },
       { id: 'jev-setup', label: 'Jev setup settings', keys: '', run: () => openSettings('Jev setup') },
       { id: 'shortcuts', label: 'Shortcuts settings', keys: '', run: () => openSettings('Shortcuts') },
+      // No default key: it acts on the conversation being read, so it stays opt-in.
+      { id: 'transcripts', label: 'Toggle all transcripts', keys: '', run: () => toggleTranscripts() },
     ]
     const ACT = Object.fromEntries(ACTIONS.map((a) => [a.id, a]))
     const DEFAULTS = Object.fromEntries(ACTIONS.map((a) => [a.id, a.keys]))
-    const DEFAULT_RATIO = 20
+    const DEFAULT_RATIO = 30
     // Shortcuts DSH, its editor and the Kz-harness app already use (read-only; conflict detection checks them).
     const BUILTIN = [
-      ['Ctrl+Enter', 'Send message (DSH message box)'], ['Shift+Enter', 'New line (DSH message box)'],
+      ['Ctrl+Enter', 'Send message (message box)'], ['Shift+Enter', 'New line (message box)'],
       ['Ctrl+A', 'Select all'], ['Ctrl+C', 'Copy'], ['Ctrl+X', 'Cut'], ['Ctrl+V', 'Paste'],
       ['Ctrl+Z', 'Undo'], ['Ctrl+Y', 'Redo'], ['Ctrl+Shift+Z', 'Redo'],
       ['F12', 'Developer tools (Kz-harness app)'], ['Ctrl+Shift+I', 'Developer tools (Kz-harness app)'],
@@ -552,12 +810,150 @@ window.__ModuleLoader__.load({
     }
 
     // ---------- background tasks: Jev runs, DSH jobs and subagents of this session in one list ----------
-    const ST = { running: ['', 'Running'], done: ['✓', 'Done'], failed: ['✕', 'Failed'], stopped: ['■', 'Stopped'] }
+    /**
+     * What every task state is called, word for word the same as adapter.js TASK_LABELS on the
+     * server. The browser cannot import adapter.js (client.js is a classic script), so this is a
+     * deliberate copy; test/tasklist.test.js fails the moment the two drift apart, because the
+     * list and the message that delivers the result must never disagree about a state's name.
+     */
+    const taskLabels = {
+      queued: 'Waiting', routing: 'Choosing executor', running: 'Running', verifying: 'Verifying',
+      reviewing: 'Reviewing', completed: 'Completed', failed: 'Failed', stopped: 'Stopped',
+      needs_human: 'Needs input', paused_limit: 'Paused by limit',
+    }
+    // The four working states spin (the stylesheet draws the ring); every other state carries a
+    // glyph of its own. The label text next to it says the state in words, never colour alone.
+    const taskIcon = { queued: '·', routing: '', running: '', verifying: '', reviewing: '', completed: '✓', failed: '✕', stopped: '■', needs_human: '!', paused_limit: '‖' }
+    /** The five final states; mirrors tasks.js TERMINAL_STATES. Nothing moves a task out of one. */
+    const TERMINAL_TASK = ['completed', 'failed', 'stopped', 'needs_human', 'paused_limit']
+    /** The five states that are still work in progress. */
+    const LIVE_TASK = ['queued', 'routing', 'running', 'verifying', 'reviewing']
+    /**
+     * How many finished results are still waiting to be posted. A task that settled while an
+     * answer was streaming sits here until that answer ends and its message goes out, which is
+     * the spec's "queued for display" - shown outside the active message, never inside it.
+     */
+    const awaitingDelivery = (tasks) => (tasks ?? []).filter((t) => TERMINAL_TASK.includes(t.state) && t.deliveryState !== 'delivered').length
+    /**
+     * How that is said, in one place: the button's accessible name and the screen-reader status
+     * region use the same words, so what is announced and what is shown can never drift apart.
+     */
+    const resultAnnouncement = (n) => (n ? `${n} result${n === 1 ? '' : 's'} waiting to be posted` : '')
+    // One set of codes for the mixed list: the task states above, plus the job service's own
+    // "done" and the run/subagent codes, which are a different vocabulary and stay as they are.
+    const ST = { done: ['✓', 'Done'], ...Object.fromEntries([...LIVE_TASK, ...TERMINAL_TASK].map((s) => [s, [taskIcon[s], taskLabels[s]]])) }
     const elapsed = (from, to) => (from ? ms(to - from) : '')
     const openKid = (sessionId, e) => sessionsApi?.openSubagent?.({ parentSessionId: sessionId, childSessionId: e.id, mode: e.mode, ...(e.label ? { label: e.label } : {}) })
 
-    function taskItems({ sessionId, runs, jobs, entries, now }) {
-      const fromRuns = runs.map((r) => {
+    const ordinal = (n) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] ?? 'th')}`
+    const folderOf = (p) => String(p ?? '').split(/[\\/]/).filter(Boolean).at(-1) ?? ''
+    const clip = (t, n) => (String(t).length > n ? `${String(t).slice(0, n)}…` : String(t))
+
+    /**
+     * One task record as the list row shows it: the name and job id, the state in an icon AND in
+     * words, who is on it, the phase, the waiting line's position, how long it has been going or
+     * how long it took, whether its result is still unread and why it ended the way it did.
+     * Pure and DOM-free (the clock is the only input), so test/tasklist.test.js pins every case.
+     */
+    function taskRowModel(t, now = Date.now()) {
+      const state = t.state
+      const done = TERMINAL_TASK.includes(state)
+      const queued = state === 'queued'
+      const pos = t.position ?? t.queuePosition ?? 0
+      // The phase, shown only when it says something the state label does not.
+      const phase = t.phase && taskLabels[t.phase] !== taskLabels[state] ? taskLabels[t.phase] : null
+      // Elapsed while it runs; the record's own duration once it is finished, so a reopened list
+      // shows how long the work took rather than how long ago it ended.
+      const timing = done
+        ? (t.durationMs != null ? ms(t.durationMs) : elapsed(t.startedAt, t.finishedAt ?? t.startedAt))
+        : elapsed(t.startedAt, now)
+      const meta = [
+        queued ? (pos > 1 ? `${ordinal(pos)} in line` : 'next up') : null,
+        t.agent ?? (queued ? 'Jev picks' : null),
+        t.model, t.effort,
+        phase, folderOf(t.workspace), timing || null,
+      ].filter(Boolean).join(' · ')
+      return {
+        jobId: t.jobId,
+        title: t.taskName || t.taskText || t.task || '',
+        label: taskLabels[state] ?? state,
+        // The spin is drawn by the stylesheet for the working states; this string is the glyph.
+        icon: taskIcon[state] ?? '·',
+        struck: state === 'completed',
+        // Nothing is unread before there is a result, and a result stays unread until the chat has it.
+        unread: done && t.deliveryState !== 'delivered',
+        meta,
+        // A task that did not complete says why in the row itself, not only behind the disclosure.
+        reason: done && state !== 'completed' ? String(t.terminalReason ?? t.progressText ?? '').trim() : '',
+        detail: String(t.progressText ?? t.lastLine ?? '').trim() || '…',
+        canStop: !done,
+        canClear: done,
+      }
+    }
+
+    /** This session's queued, running and finished background tasks, polled while the tab is on screen. */
+    function useTasks(sessionId, visible, every = 1000) {
+      const [tasks, setTasks] = useState(EMPTY)
+      useEffect(() => {
+        if (!visible || !sessionId) return
+        let stop = false
+        let timer
+        const tick = async () => {
+          try { const d = await api('/jev-router/tasks'); if (!stop) setTasks(d.tasks.filter((t) => t.sessionId === sessionId)) } catch {}
+          if (!stop) timer = setTimeout(tick, every)
+        }
+        tick()
+        return () => { stop = true; clearTimeout(timer) }
+      }, [sessionId, visible, every])
+      return tasks
+    }
+
+    /** A finished task's report, fetched only once its row is opened: a report can be long. */
+    function TaskReport({ jobId }) {
+      const [state, setState] = useState({ loading: true, text: '', err: '' })
+      useEffect(() => {
+        let stop = false
+        api(`/jev-router/tasks/report?id=${encodeURIComponent(jobId)}`).then(
+          (d) => { if (!stop) setState({ loading: false, text: d.report ?? '', err: '' }) },
+          (e) => { if (!stop) setState({ loading: false, text: '', err: e.message }) })
+        return () => { stop = true }
+      }, [jobId])
+      if (state.err) return h('div', { className: 'err', role: 'alert' }, state.err)
+      return h('div', { className: 'answer-text' }, state.loading ? 'Loading the report…' : state.text || 'No report.')
+    }
+
+    /** Live work in this session: a background task counts once, not as its job and its run too. */
+    function liveCount({ runs, jobs, entries, tasks }) {
+      const shadowRuns = new Set(tasks.map((t) => t.runId).filter(Boolean))
+      return tasks.filter((t) => LIVE_TASK.includes(t.state)).length
+        + jobs.filter((j) => j.kind !== 'jev' && (j.status === 'running' || j.status === 'stopping')).length
+        + runs.filter((r) => !shadowRuns.has(r.id) && summarize(r).running).length
+        + entries.filter((e) => e.kind === 'child' && e.activity === 'running').length
+    }
+
+    // Live work sorts above the waiting line, which sorts above everything finished.
+    const RANK = { running: 0, routing: 0, verifying: 0, reviewing: 0, queued: 1 }
+    function taskItems({ sessionId, runs, jobs, entries, tasks, open, now }) {
+      // A background task owns both a job and a router run; show the task, not its two shadows.
+      const shadowed = new Set(tasks.map((t) => t.runId).filter(Boolean))
+      const fromTasks = tasks.map((t) => {
+        const queued = t.state === 'queued'
+        const m = taskRowModel(t, now)
+        const key = `t${t.jobId}`
+        return {
+          key, at: t.startedAt ?? t.queuedAt ?? 0, status: t.state, title: m.title, kind: t.jobId,
+          position: t.position ?? 0, icon: m.icon, label: m.label, meta: m.meta,
+          struck: m.struck, unread: m.unread, reason: m.reason,
+          body: open.has(key) && t.reportAvailable
+            ? h(TaskReport, { jobId: t.jobId })
+            : h('div', { className: 'answer-text' }, m.detail),
+          // Only worth offering when something else is genuinely ahead of it.
+          runNext: queued && (t.position ?? 0) > 2 && { workspace: t.workspace, jobId: t.jobId },
+          stop: m.canStop && { what: m.title, run: () => post('/jev-router/tasks/stop', { jobId: t.jobId }) },
+          clear: m.canClear && { what: m.title, run: () => post('/jev-router/tasks/clear', { jobIds: [t.jobId] }) },
+        }
+      })
+      const fromRuns = runs.filter((r) => !shadowed.has(r.id)).map((r) => {
         const s = summarize(r)
         const cur = s.attempts.at(-1)
         const status = r.stopped ? 'stopped' : s.running ? 'running' : s.error || s.final?.status === 'limit_reached' ? 'failed' : 'done'
@@ -568,7 +964,7 @@ window.__ModuleLoader__.load({
           stop: status === 'running' && { what: r.task, run: () => post('/jev-router/runs/stop', { runId: r.id }) },
         }
       })
-      const fromJobs = jobs.map((j) => {
+      const fromJobs = jobs.filter((j) => j.kind !== 'jev').map((j) => {
         const status = j.status === 'running' || j.status === 'stopping' ? 'running' : j.status === 'killed' ? 'stopped' : j.status === 'failed' ? 'failed' : 'done'
         return {
           key: `j${j.id}`, at: j.startedAt ?? 0, status, title: j.label ?? j.kind, kind: j.kind,
@@ -587,44 +983,104 @@ window.__ModuleLoader__.load({
           stop: typeof face?.cancel === 'function' && { what: e.label ?? e.id, run: () => face.cancel() },
         }
       })
-      // Running first, then newest.
-      return [...fromRuns, ...fromJobs, ...fromKids].sort((a, b) => (b.status === 'running') - (a.status === 'running') || b.at - a.at)
+      // Running first, then the waiting line in its own order, then newest.
+      return [...fromTasks, ...fromRuns, ...fromJobs, ...fromKids]
+        .sort((a, b) => (RANK[a.status] ?? 2) - (RANK[b.status] ?? 2)
+          || (a.status === 'queued' ? (a.position ?? 0) - (b.position ?? 0) : b.at - a.at))
     }
 
-    function Tasks({ sessionId, runs, jobs, entries }) {
+    function Tasks({ sessionId, runs, jobs, entries, tasks }) {
       useSubagentCatalog(sessionId)
       const [confirm, setConfirm] = useState(null)
       const [err, setErr] = useState('')
-      const anyRunning = runs.some((r) => summarize(r).running) || jobs.some((j) => j.status === 'running' || j.status === 'stopping')
+      const [open, setOpen] = useState(() => new Set())
+      const anyRunning = runs.some((r) => summarize(r).running)
+        || jobs.some((j) => j.status === 'running' || j.status === 'stopping')
+        || tasks.some((t) => LIVE_TASK.includes(t.state))
       const now = useNow(anyRunning)
-      const items = taskItems({ sessionId, runs, jobs, entries, now })
-      if (!items.length) return h('div', { className: 'empty' }, 'Nothing running or finished in this session yet.')
+      const items = taskItems({ sessionId, runs, jobs, entries, tasks, open, now })
+      const finished = tasks.filter((t) => TERMINAL_TASK.includes(t.state))
+      const act = (fn) => { setErr(''); Promise.resolve(fn()).catch((e) => setErr(e.message)) }
+      const toggle = (key, isOpen) => setOpen((s) => { const n = new Set(s); if (isOpen) n.add(key); else n.delete(key); return n })
+      if (!items.length) return h('div', { className: 'empty' }, 'Nothing queued, running or finished in this session yet.')
       return h('div', null,
         err ? h('div', { className: 'err', role: 'alert' }, err) : null,
+        finished.length ? h('div', { className: 'actions', style: { justifyContent: 'flex-end', marginBottom: 6 } },
+          h('button', {
+            className: 'btn',
+            onClick: () => setConfirm({
+              title: 'Clear finished tasks?',
+              body: `${finished.length} finished task${finished.length === 1 ? '' : 's'} leave this list and the saved task log. Nothing in your project changes, and results already posted into the chat stay there.`,
+              confirmLabel: `Clear ${finished.length}`,
+              run: () => post('/jev-router/tasks/clear', { jobIds: finished.map((t) => t.jobId) }),
+            }),
+          }, `Clear finished (${finished.length})`)) : null,
         h('ul', { className: 'plain', 'aria-label': 'Background tasks' }, ...items.map((it) => h('li', { key: it.key, className: 'task', style: { display: 'block' } },
           h('div', { className: 'top' },
-            h('details', null,
+            h('details', { onToggle: (e) => toggle(it.key, e.currentTarget.open) },
               h('summary', null,
-                h('span', { className: cx('st', it.status), role: 'img', 'aria-label': ST[it.status][1] }, ST[it.status][0]),
+                // The icon is a glyph (or the stylesheet's spinner); it is hidden from a screen
+                // reader because the label right beside it says the same state in words.
+                h('span', { className: cx('st', it.status), 'aria-hidden': true }, it.icon ?? ST[it.status]?.[0] ?? '·'),
                 h('span', { style: { minWidth: 0 } },
-                  h('div', { className: 'title', title: it.title }, it.title),
-                  h('div', { className: 'why' }, h('span', { className: 'pill', style: { marginLeft: 0, marginRight: 6 } }, it.kind), it.meta))),
+                  h('div', { className: cx('title', it.struck && 'struck'), title: it.title }, it.title,
+                    it.unread ? h('span', { className: 'unread', title: 'This result has not been shown in the chat yet' }, 'Unread result') : null),
+                  h('div', { className: 'why' },
+                    h('span', { className: 'pill', style: { marginLeft: 0, marginRight: 6 } }, it.kind),
+                    // The live region is here, on the state, and not on the progress line above:
+                    // a router emits a progress line every few hundred milliseconds, and
+                    // announcing each one buries the changes that matter. Phase and terminal
+                    // transitions are what a screen reader should hear.
+                    h('span', { className: cx('pill', 'state', it.status), style: { marginLeft: 0, marginRight: 6 }, 'aria-live': 'polite', 'aria-atomic': true }, it.label ?? ST[it.status]?.[1] ?? it.status),
+                    it.meta),
+                  // Why a task failed, stopped, needs a person or ran out of limit: in the row, not only
+                  // behind the disclosure, because the reason is the part that needs acting on.
+                  it.reason ? h('div', { className: cx('reason', it.status) }, it.reason) : null)),
               h('div', { style: { marginTop: 6 } }, it.body)),
-            it.stop ? h('button', { className: 'btn danger', 'aria-label': `Stop ${it.title}`, onClick: () => setConfirm(it.stop) }, 'Stop') : null)))),
+            it.runNext ? h('button', {
+              className: 'btn', 'aria-label': `Run ${it.title} next`,
+              onClick: () => act(() => post('/jev-router/tasks/reorder', { workspace: it.runNext.workspace, order: [it.runNext.jobId] })),
+            }, 'Run next') : null,
+            it.clear ? h('button', {
+              className: 'btn', 'aria-label': `Clear ${it.title}`,
+              onClick: () => setConfirm({
+                title: 'Clear this task?',
+                body: `"${clip(it.clear.what, 120)}" leaves this list and the saved task log. Nothing in your project changes.`,
+                confirmLabel: 'Clear task',
+                run: it.clear.run,
+              }),
+            }, 'Clear') : null,
+            it.stop ? h('button', {
+              className: 'btn danger', 'aria-label': `Stop ${it.title}`,
+              onClick: () => setConfirm({
+                title: 'Stop this task?',
+                body: `Stop "${clip(it.stop.what, 120)}"? Work it already did stays in the workspace.`,
+                confirmLabel: 'Stop task',
+                run: it.stop.run,
+              }),
+            }, 'Stop') : null)))),
         confirm ? h(Confirm, {
-          title: 'Stop this task?',
-          body: `Stop "${confirm.what.length > 120 ? `${confirm.what.slice(0, 120)}…` : confirm.what}"? Work it already did stays in the workspace.`,
-          confirmLabel: 'Stop task',
+          title: confirm.title,
+          body: confirm.body,
+          confirmLabel: confirm.confirmLabel,
           onCancel: () => setConfirm(null),
-          onConfirm: () => { const c = confirm; setConfirm(null); setErr(''); Promise.resolve(c.run()).catch((e) => setErr(e.message)) },
+          onConfirm: () => { const c = confirm; setConfirm(null); act(c.run) },
         }) : null)
     }
 
     // ---------- accounts, usage, limits ----------
-    const AGENT_LABEL = { claude: 'Claude', codex: 'GPT', deepseek: 'DeepSeek', jev: 'Jev', chat: 'Chat model', 'qwen-local': 'Qwen (local)', 'gemma-local': 'Gemma (local)' }
-    const PROVIDER_LABEL = { deepseek: 'DeepSeek', jev: 'Jev' }
-    const agentLabel = (id) => AGENT_LABEL[id] ?? id
-    const providerLabel = (p) => PROVIDER_LABEL[p] ?? p
+    // Names come from the server's live catalog, never a table in here: a provider,
+    // model or agent added later names itself. The id shows until they arrive.
+    const names = makeStore({ providers: {}, models: {}, agents: {} })
+    let namesAsked = false
+    const loadNames = () => {
+      if (namesAsked) return
+      namesAsked = true
+      api('/jev-router/names').then((d) => names.set(d), () => { namesAsked = false })
+    }
+    const agentLabel = (id) => names.get().agents[id] ?? id
+    const providerLabel = (p) => names.get().providers[p] ?? p
+    const modelLabel = (provider, model) => (model ? names.get().models[`${provider}/${model}`] ?? model : '')
     const WINDOW = { '5h': '5-hour window', weekly: 'Weekly window' }
     /** "14:05" today, "Mon 14:05" otherwise. */
     const when = (t) => {
@@ -684,23 +1140,72 @@ window.__ModuleLoader__.load({
       }))
     }
 
-    function LimitInput({ agentId, field, label, value, percent }) {
+    function LimitInput({ agentId, field, label, value, percent, onSaved }) {
       const [v, setV] = useState(value ?? '')
       const [dirty, setDirty] = useState(false)
       const [msg, setMsg] = useState('')
-      useEffect(() => { if (!dirty) setV(value ?? '') }, [value, dirty])
+      // What we last wrote. `value` arrives from the usage poll, which can still be carrying
+      // the old number for up to its interval after a save. Without this the field snapped
+      // back to the old figure the moment it saved, which reads as "Enter did nothing".
+      const justSaved = useRef(null)
+      useEffect(() => {
+        if (dirty) return
+        if (justSaved.current !== null && Number(value) !== justSaved.current) return
+        justSaved.current = null
+        setV(value ?? '')
+      }, [value, dirty])
       const save = async () => {
         if (!dirty) return
         const n = Number(v)
         if (v === '' || !Number.isFinite(n) || n < 0 || (percent && n > 100)) { setMsg(percent ? 'Enter 0–100' : 'Enter a number ≥ 0'); return }
         setMsg('Saving…')
-        try { await post('/jev-router/limits', { agentId, [field]: n }); setDirty(false); setMsg('Saved') } catch (e) { setMsg(e.message) }
+        try {
+          await post('/jev-router/limits', { agentId, [field]: n })
+          justSaved.current = n
+          setDirty(false)
+          setMsg('Saved')
+          // Pull the stored value straight back so the card reflects it now, not at the next
+          // poll. Not a forced read: limits live in the local accounts file, not upstream.
+          onSaved?.()
+        } catch (e) { setMsg(e.message) }
       }
       const id = `jevi-lim-${agentId}-${field}`
       return h('label', { htmlFor: id }, label,
         h('input', { id, type: 'number', min: 0, max: percent ? 100 : undefined, step: percent ? 1 : 0.01, value: v,
           onChange: (e) => { setV(e.target.value); setDirty(true); setMsg('') }, onBlur: save, onKeyDown: (e) => { if (e.key === 'Enter') save() } }),
         h('span', { className: cx('saved', msg && msg !== 'Saved' && msg !== 'Saving…' && 'bad'), 'aria-live': 'polite' }, msg))
+    }
+
+    /**
+     * Sign in and out of an agent that owns its own credentials. KzH never handles the
+     * credentials: sign-in opens the CLI's own flow in a terminal, with the person there.
+     * Sign-out clears a stored login, so it is confirmed first and names the account.
+     */
+    function AuthButtons({ a, account, onDone }) {
+      const [busy, setBusy] = useState('')
+      const [msg, setMsg] = useState('')
+      const [confirm, setConfirm] = useState(false)
+      const go = async (action) => {
+        setBusy(action)
+        setMsg('')
+        try {
+          const r = await post('/jev-router/account-auth', { agentId: a.id, action })
+          setMsg(r?.detail ?? 'done')
+          onDone?.()
+        } catch (e) { setMsg(e.message) } finally { setBusy('') }
+      }
+      const signedIn = a.account?.email || a.account?.label || a.state === 'ok'
+      return h('div', { className: 'why', style: { marginTop: 6, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' } },
+        h('button', { className: 'link', disabled: !!busy, onClick: () => go('login') }, busy === 'login' ? 'Opening…' : signedIn ? 'Sign in again' : 'Sign in'),
+        signedIn ? h('button', { className: 'link', disabled: !!busy, onClick: () => setConfirm(true) }, busy === 'logout' ? 'Signing out…' : 'Sign out') : null,
+        msg ? h('span', { 'aria-live': 'polite' }, msg) : null,
+        confirm ? h(Confirm, {
+          title: `Sign out of ${agentLabel(a.id)}?`,
+          body: `This clears the stored login${account ? ` for ${account}` : ''} on this PC. Jev will stop routing work to ${agentLabel(a.id)} until you sign in again. Nothing on the provider's side is changed.`,
+          confirmLabel: 'Sign out',
+          onCancel: () => setConfirm(false),
+          onConfirm: () => { setConfirm(false); go('logout') },
+        }) : null)
     }
 
     function KeyStates({ list }) {
@@ -712,13 +1217,19 @@ window.__ModuleLoader__.load({
       }))
     }
 
-    function UsageCard({ a, keys }) {
+    function UsageCard({ a, keys, links, onSaved }) {
+      // Where to get a key and where to pay, per provider. Opened in the person's own browser.
+      const link = links?.[a.keyProvider] ?? null
       const st = stateInfo(a)
       const acct = a.account?.email ?? a.account?.label
       const L = a.limits ?? {}
-      const fields = a.kind === 'local' ? [] : a.kind === 'subscription'
+      const fields = a.kind === 'local' ? [] : a.id === 'jev' ? [['monthlyBudgetUsd', 'Monthly budget ($)', false]] : a.kind === 'subscription'
         ? [['handoffAtPercent', 'Handoff at %', true], ['stopAtPercent', 'Stop at %', true]]
-        : a.id === 'jev' ? [] : [['minBalance', `Min balance${a.balance?.currency ? ` (${a.balance.currency})` : ''}`, false]]
+        : [
+          // Soft first, then the hard floor: the order they fire in.
+          ['handoffAtBalance', `Hand over below${a.balance?.currency ? ` (${a.balance.currency})` : ''}`, false],
+          ['minBalance', `Stop below${a.balance?.currency ? ` (${a.balance.currency})` : ''}`, false],
+        ]
       return h('div', { className: 'card' },
         h('div', { className: 'head' },
           h('div', { style: { minWidth: 0 } }, h('b', null, agentLabel(a.id)), acct ? h('span', { className: 'why' }, ` · ${acct}`) : null),
@@ -731,10 +1242,37 @@ window.__ModuleLoader__.load({
             h('div', { className: 'bar', role: 'progressbar', 'aria-label': name, 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(used) },
               h('i', { className: used >= (L.stopAtPercent ?? 97) ? 'bad' : used >= (L.handoffAtPercent ?? 85) ? 'warn' : '', style: { width: `${used}%` } })))
         }),
-        money(a.balance) ? h('div', { style: { marginTop: 6 } }, 'Balance ', h('b', null, money(a.balance))) : null,
-        typeof a.spentUsd === 'number' ? h('div', { style: { marginTop: 6 } }, 'Spent this month ', h('b', null, `$${a.spentUsd.toFixed(2)}`)) : null,
+        money(a.balance) ? h('div', { style: { marginTop: 6 } }, 'Balance ', h('b', null, money(a.balance)),
+          typeof a.creditPercent === 'number' ? h('span', { className: 'why' }, ` · ${a.creditPercent}% of ${money(a.creditPeak) ?? 'your top-up'} left`) : null) : null,
+        // Credit left, against the most this key has ever held; a top-up raises the mark.
+        typeof a.creditPercent === 'number' ? h('div', {
+          className: 'bar', role: 'progressbar', 'aria-label': 'Credit left',
+          'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': a.creditPercent, style: { marginTop: 4 },
+        }, h('i', { className: a.creditPercent <= 10 ? 'bad' : a.creditPercent <= 25 ? 'warn' : '', style: { width: `${a.creditPercent}%` } })) : null,
+        // Providers that bill by the clock (DeepSeek): which rate is running right now.
+        a.rateNow ? h('div', { className: 'why', style: { marginTop: 6 } },
+          // Anchored on purpose. An unanchored /off-peak/ matched the dear reading too, because
+          // it explains itself as "twice its off-peak price", so the badge said off-peak while
+          // its own sentence said the opposite. The state is the first word or it is not read.
+          h('span', { className: cx('pill', /^off-peak/.test(a.rateNow) ? 'ok' : 'warn') }, /^off-peak/.test(a.rateNow) ? 'off-peak' : 'peak rate'),
+          ' ', a.rateNow.replace(/^(off-peak|peak) rate\s*/, '')) : null,
+        typeof a.spentUsd === 'number' ? h('div', { style: { marginTop: 6 } },
+          'Spent this month ', h('b', null, `$${a.spentUsd < 0.01 && a.spentUsd > 0 ? a.spentUsd.toFixed(4) : a.spentUsd.toFixed(2)}`),
+          a.limits?.monthlyBudgetUsd ? h('span', { className: 'why' }, ` of $${a.limits.monthlyBudgetUsd}`) : null) : null,
+        // Spend against the budget, not a balance: this provider publishes no balance to read.
+        typeof a.spentUsd === 'number' && a.limits?.monthlyBudgetUsd > 0 ? (() => {
+          const used = Math.max(0, Math.min(100, (a.spentUsd / a.limits.monthlyBudgetUsd) * 100))
+          return h('div', {
+            className: 'bar', role: 'progressbar', 'aria-label': 'Budget used this month',
+            'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(used), style: { marginTop: 4 },
+          }, h('i', { className: used >= 90 ? 'bad' : used >= 70 ? 'warn' : '', style: { width: `${used}%` } }))
+        })() : null,
         keys?.length ? h(KeyStates, { list: keys }) : null,
-        fields.length ? h('div', { className: 'limits' }, ...fields.map(([k, label, percent]) => h(LimitInput, { key: k, agentId: a.id, field: k, label, percent, value: L[k] }))) : null,
+        a.canSignIn ? h(AuthButtons, { a, account: acct, onDone: onSaved }) : null,
+        link && (link.topUp || link.keys) ? h('div', { className: 'why', style: { marginTop: 6, display: 'flex', gap: 10 } },
+          link.topUp ? h('a', { className: 'link', href: link.topUp, target: '_blank', rel: 'noreferrer noopener' }, 'Top up') : null,
+          link.keys ? h('a', { className: 'link', href: link.keys, target: '_blank', rel: 'noreferrer noopener' }, 'Get an API key') : null) : null,
+        fields.length ? h('div', { className: 'limits' }, ...fields.map(([k, label, percent]) => h(LimitInput, { key: k, agentId: a.id, field: k, label, percent, value: L[k], onSaved }))) : null,
         a.error ? h('div', { className: 'err' }, a.error) : a.state === 'unknown' || !a.state ? h('div', { className: 'why', style: { marginTop: 6 } }, 'Usage not known yet.') : null)
     }
 
@@ -748,6 +1286,7 @@ window.__ModuleLoader__.load({
             r.account ? h('div', { className: 'why' }, r.account) : null),
           h('span', { className: 'why', style: { textAlign: 'right' } }, [
             when(r.ts), r.durationMs != null ? ms(r.durationMs) : null,
+            r.model ? modelLabel(r.provider, r.model) : null,
             r.tokens ? `${r.tokens.input ?? 0} in / ${r.tokens.output ?? 0} out tok` : null,
             typeof r.costUsd === 'number' ? `$${r.costUsd.toFixed(4)}` : null,
           ].filter(Boolean).join(' · '))))) : h('div', { className: 'muted' }, 'No agent runs logged yet.'))
@@ -797,7 +1336,7 @@ window.__ModuleLoader__.load({
           h('p', { className: 'why', style: { margin: '6px 0 0' } }, 'Negative numbers mean Jev cost more than the assumed baseline.')))
     }
 
-    function UsageView({ usage, error, busy, onRefresh }) {
+    function UsageView({ usage, error, busy, onRefresh, onSaved }) {
       const agents = usageAgents(usage)
       const keys = usage?.keys ?? {}
       const keysFor = (a) => keys[a.id] ?? keys[a.provider]
@@ -810,7 +1349,7 @@ window.__ModuleLoader__.load({
         error ? h('div', { className: 'err', role: 'alert' }, error) : null,
         usage?.savings ? h(SavingsCard, { savings: usage.savings }) : null,
         usage && !agents.length ? h('div', { className: 'empty' }, 'No usage data yet.') : null,
-        ...agents.map((a) => h(UsageCard, { key: a.id, a, keys: keysFor(a) })),
+        ...agents.map((a) => h(UsageCard, { key: a.id, a, keys: keysFor(a), links: usage?.links, onSaved })),
         ...extra.filter((p) => keys[p]?.length).map((p) => h('div', { className: 'card', key: `k${p}` }, h('div', { className: 'label' }, `${providerLabel(p)} keys`), h(KeyStates, { list: keys[p] }))),
         usage ? h(Recent, { rows: usage.recent ?? [] }) : null)
     }
@@ -893,8 +1432,11 @@ window.__ModuleLoader__.load({
       const runs = useRuns(sessionId, visible)
       const entries = useSessions?.((s) => s.subagentsByParent?.[sessionId]?.entries) ?? EMPTY
       const jobs = useSessions?.((s) => s.jobsBySession?.[sessionId]) ?? EMPTY
+      const tasks = useTasks(sessionId, visible)
       const liveKids = entries.filter((e) => e.kind === 'child' && e.activity === 'running').length
-      const liveJobs = jobs.filter((j) => j.status === 'running' || j.status === 'stopping').length
+      const live = liveCount({ runs, jobs, entries, tasks })
+      names.use()
+      useEffect(() => { if (visible) loadNames() }, [visible])
       const { usage, error: usageErr, busy: usageBusy, load: loadUsage } = useUsage(visible)
       const [agents, setAgents] = useState(null)
       const [chipBusy, setChipBusy] = useState(false)
@@ -911,9 +1453,296 @@ window.__ModuleLoader__.load({
         h('h3', null, 'Jev inspector'),
         h(AgentChips, { agents, usage, busy: chipBusy, onToggle: toggle }),
         chipErr ? h('div', { className: 'err', role: 'alert' }, chipErr) : null,
-        h('div', { className: 'tabs', role: 'tablist' }, tab('decisions', 'Decisions', runs.length), tab('subagents', 'Subagents', liveKids), tab('jobs', 'Background', liveJobs + liveKids + runs.filter((r) => summarize(r).running).length), tab('usage', 'Usage', limited)),
+        h('div', { className: 'tabs', role: 'tablist' }, tab('decisions', 'Decisions', runs.length), tab('subagents', 'Subagents', liveKids), tab('jobs', 'Background', live), tab('usage', 'Usage', limited)),
         view === 'decisions' ? h(Decisions, { runs }) : view === 'subagents' ? h(Subagents, { sessionId, entries })
-          : view === 'usage' ? h(UsageView, { usage, error: usageErr, busy: usageBusy, onRefresh: () => loadUsage(true) }) : h(Tasks, { sessionId, runs, jobs, entries }))
+          : view === 'usage' ? h(UsageView, { usage, error: usageErr, busy: usageBusy, onRefresh: () => loadUsage(true), onSaved: () => loadUsage(false) }) : h(Tasks, { sessionId, runs, jobs, entries, tasks }))
+    }
+
+    // ---------- plan limits beside the composer ----------
+    // DSH's ring next to Send already shows context use. This is the half it has
+    // no view of: how much of each subscription window is gone.
+    //
+    // Under Jev Auto no single number describes "this chat" - the task may go to
+    // any agent - so the reading always names the agent it belongs to, and the
+    // popover lists them all. A bare percentage here would claim more than it knows.
+    const LIMIT_WINDOW = { '5h': '5-hour limit', weekly: 'Weekly · all models' }
+    // Opening the pill re-reads the limits from the providers instead of showing the cached
+    // snapshot, which can be up to the usage TTL old. These numbers decide real spending, so a
+    // stale reading is worse than a slow one. Throttled because toggling the popover open and
+    // shut would otherwise hit every provider each time.
+    const FORCE_EVERY_MS = 15_000
+    /** Every subscription window across the agents, fullest first. */
+    function limitRows(usage) {
+      const rows = []
+      for (const a of usageAgents(usage)) {
+        if (a.kind === 'local' || !a.windows?.length) continue
+        for (const w of a.windows) {
+          if (w.usedPercent == null) continue
+          const used = Math.max(0, Math.min(100, Number(w.usedPercent) || 0))
+          rows.push({
+            key: `${a.id}-${w.name}`,
+            agent: agentLabel(a.id),
+            label: LIMIT_WINDOW[w.name] ?? w.name,
+            used,
+            resetsAt: w.resetsAt,
+            tone: used >= (a.limits?.stopAtPercent ?? 97) ? 'bad' : used >= (a.limits?.handoffAtPercent ?? 85) ? 'warn' : '',
+          })
+        }
+      }
+      return rows.sort((a, b) => b.used - a.used)
+    }
+
+    function LimitsPill() {
+      useStyle()
+      const [open, setOpen] = useState(false)
+      const { usage, error, load } = useUsage(true)
+      const root = useRef(null)
+      const lastForced = useRef(0)
+      useEffect(() => {
+        if (!open) return
+        const away = (e) => { if (e.target instanceof Node && !root.current?.contains(e.target)) setOpen(false) }
+        const esc = (e) => { if (e.key === 'Escape') setOpen(false) }
+        document.addEventListener('pointerdown', away)
+        document.addEventListener('keydown', esc)
+        return () => { document.removeEventListener('pointerdown', away); document.removeEventListener('keydown', esc) }
+      }, [open])
+      const rows = limitRows(usage)
+      // Nothing known yet: stay out of the composer rather than show a placeholder.
+      if (!rows.length) return null
+      const worst = rows[0]
+      const reading = `${Math.round(worst.used)}%`
+      const byAgent = []
+      for (const r of rows) {
+        const g = byAgent.find((x) => x.agent === r.agent) ?? (byAgent.push({ agent: r.agent, windows: [] }), byAgent.at(-1))
+        g.windows.push(r)
+      }
+      return h('span', { className: 'kzh-lim', ref: root },
+        h('button', {
+          type: 'button',
+          'aria-haspopup': 'dialog',
+          'aria-expanded': open,
+          'aria-label': `Plan limits: ${worst.agent} ${worst.label} ${reading} used`,
+          title: `${worst.agent} · ${worst.label}: ${reading} used. Jev may route to any agent; open for all of them.`,
+          onClick: () => {
+            if (!open && Date.now() - lastForced.current > FORCE_EVERY_MS) { lastForced.current = Date.now(); load(true) }
+            setOpen(!open)
+          },
+        },
+        h('span', { className: 'tick' }, h('i', { className: worst.tone, style: { width: `${worst.used}%` } })),
+        h('span', { className: 'who' }, `${worst.agent} ${reading}`)),
+        open ? h('div', { className: 'kzh-pop', role: 'dialog', 'aria-label': 'Plan usage limits' },
+          error ? h('div', { className: 'err', role: 'alert' }, error) : null,
+          h('p', { className: 'lead' }, 'Per agent, not per chat: Jev picks an agent for each task.'),
+          ...byAgent.flatMap((g) => [
+            h('div', { className: 'grp', key: `g${g.agent}` }, g.agent),
+            ...g.windows.flatMap((r) => [
+              h('div', { className: 'row', key: `r${r.key}` }, h('b', null, r.label), h('span', null, `${Math.round(r.used)}%${r.resetsAt ? ` · resets ${when(r.resetsAt)}` : ''}`)),
+              h('div', {
+                className: 'bar', key: `b${r.key}`, role: 'progressbar', 'aria-label': `${g.agent} ${r.label}`,
+                'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(r.used),
+              }, h('i', { className: r.tone, style: { width: `${r.used}%` } })),
+            ]),
+          ]),
+          h('button', { className: 'more', onClick: () => { setOpen(false); runAction('usage') } }, 'See detailed breakdown \u2192')) : null)
+    }
+
+    // ---------- task queue ----------
+    // The engine already queues prompts sent while a turn is running and takes them
+    // in FIFO order, and `updateQueue` edits or drops one that has not started. So
+    // this is a window onto that queue, not a second one: line several tasks up,
+    // the agent works through them, and each drops off the list as it is taken.
+    const queueOpen = makeStore({ open: false })
+    const openQueue = () => queueOpen.set({ open: !queueOpen.get().open })
+
+    /** The live session face for the chat on screen, or null. */
+    const currentFace = () => {
+      const id = sessionsApi?.list?.getSnapshot?.()?.current
+      return id ? sessionsApi?.binding?.(id)?.session ?? null : null
+    }
+    const blockText = (blocks) => (Array.isArray(blocks) ? blocks : [])
+      .filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n').trim()
+
+    /** Re-render on every change to this session's control snapshot. */
+    function useSnapshot(face) {
+      const [, force] = useState(0)
+      useEffect(() => {
+        if (!face?.subscribe) return
+        return face.subscribe(() => force((n) => n + 1))
+      }, [face])
+      try { return face?.getSnapshot?.() ?? null } catch { return null }
+    }
+
+    function TaskQueue() {
+      useStyle()
+      useUiTick()
+      const { open } = queueOpen.use()
+      const face = currentFace()
+      const snap = useSnapshot(face)
+      const [draft, setDraft] = useState('')
+      const [editing, setEditing] = useState(null) // { id, text }
+      const [confirm, setConfirm] = useState(null)
+      const [err, setErr] = useState('')
+      const [busy, setBusy] = useState(false)
+      const items = (snap?.queue ?? []).filter((q) => q.placement !== 'context')
+      // Worth showing unprompted once something is actually waiting.
+      if (!open && !items.length) return null
+      if (!face) return null
+
+      const call = async (fn) => {
+        setErr(''); setBusy(true)
+        try {
+          const r = await fn()
+          // The RPC reports business failures in its result rather than throwing.
+          if (r && r.ok === false) setErr(r.error?.message ?? 'The engine refused that.')
+        } catch (e) { setErr(e?.message ?? String(e)) } finally { setBusy(false) }
+      }
+      const add = () => {
+        const text = draft.trim()
+        if (!text) return
+        setDraft('')
+        call(() => face.prompt([{ type: 'text', text }], 'queue'))
+      }
+      const saveEdit = () => {
+        const text = editing.text.trim()
+        if (!text) return
+        const id = editing.id
+        setEditing(null)
+        call(() => face.updateQueue(id, { kind: 'edit', content: [{ type: 'text', text }] }))
+      }
+
+      return h('div', { className: 'kzh-q', role: 'region', 'aria-label': 'Task queue' },
+        h('div', { className: 'hd' },
+          h('b', null, 'Task queue'),
+          items.length ? h('span', { className: 'n' }, items.length) : null,
+          snap?.running ? h('span', { className: 'tag' }, 'agent busy') : null,
+          h('button', { onClick: () => queueOpen.set({ open: false }), 'aria-label': 'Hide the task queue' }, 'Hide')),
+        err ? h('div', { className: 'err', role: 'alert' }, err) : null,
+        items.length
+          ? h('ol', null, ...items.map((q, i) => {
+            const text = blockText(q.message?.content)
+            const isEditing = editing?.id === q.id
+            return h('li', { key: q.id, className: i === 0 ? 'now' : '' },
+              h('span', { className: 'no' }, `${i + 1}.`),
+              isEditing
+                ? h('textarea', {
+                  value: editing.text, rows: 3, 'aria-label': 'Edit this task',
+                  onChange: (e) => setEditing({ id: q.id, text: e.target.value }),
+                  onKeyDown: (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) saveEdit(); if (e.key === 'Escape') setEditing(null) },
+                })
+                : h('span', { className: 'tx' }, text || '(no text)'),
+              q.placement === 'steering' ? h('span', { className: 'tag' }, 'steering') : null,
+              isEditing
+                ? h('button', { onClick: saveEdit, disabled: busy }, 'Save')
+                : h('button', { onClick: () => setEditing({ id: q.id, text }), disabled: busy, 'aria-label': `Edit task ${i + 1}` }, 'Edit'),
+              isEditing
+                ? h('button', { onClick: () => setEditing(null) }, 'Cancel')
+                : h('button', {
+                  disabled: busy,
+                  'aria-label': `Remove task ${i + 1}`,
+                  onClick: () => setConfirm({ id: q.id, what: text }),
+                }, 'Remove'))
+          }))
+          : h('div', { className: 'empty' }, 'Nothing queued. Add tasks here and the agent takes them one at a time.'),
+        h('div', { className: 'add' },
+          h('textarea', {
+            value: draft, rows: 2, placeholder: 'Add a task to the queue', 'aria-label': 'Add a task to the queue',
+            onChange: (e) => setDraft(e.target.value),
+            onKeyDown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); add() } },
+          }),
+          h('button', { onClick: add, disabled: busy || !draft.trim() }, 'Add')),
+        confirm ? h(Confirm, {
+          title: 'Remove this task?',
+          body: `"${clip(confirm.what || '(no text)', 160)}" is dropped from the queue and never runs. Tasks already finished are unaffected.`,
+          confirmLabel: 'Remove task',
+          onCancel: () => setConfirm(null),
+          onConfirm: () => { const c = confirm; setConfirm(null); call(() => face.updateQueue(c.id, { kind: 'remove' })) },
+        }) : null)
+    }
+
+    // ---------- export the chat as Markdown ----------
+    const exportState = makeStore({ open: false })
+    const openExport = () => {
+      const sessionId = sessionsApi?.list?.getSnapshot?.()?.current
+      if (!sessionId) { toast('Open a chat first'); return }
+      exportState.set({ open: true, sessionId, tools: true, busy: true, error: '', data: null })
+      loadExport(sessionId, true)
+    }
+    async function loadExport(sessionId, tools) {
+      exportState.set({ busy: true, error: '' })
+      try {
+        const d = await api(`/jev-router/export?session=${encodeURIComponent(sessionId)}&tools=${tools ? 1 : 0}`)
+        exportState.set({ busy: false, data: d })
+      } catch (e) { exportState.set({ busy: false, error: e.message, data: null }) }
+    }
+
+    function ExportDialog() {
+      const st = exportState.use()
+      useStyle()
+      useEffect(() => {
+        const k = (e) => { if (e.key === 'Escape') exportState.set({ open: false }) }
+        window.addEventListener('keydown', k)
+        return () => window.removeEventListener('keydown', k)
+      }, [])
+      if (!st.open) return null
+      const close = () => exportState.set({ open: false })
+      const md = st.data?.markdown ?? ''
+      const copy = async () => {
+        try { await navigator.clipboard.writeText(md); toast('Chat copied as Markdown'); close() } catch (e) { exportState.set({ error: `Could not copy: ${e.message}` }) }
+      }
+      const download = () => {
+        const url = URL.createObjectURL(new Blob([md], { type: 'text/markdown;charset=utf-8' }))
+        const a = document.createElement('a')
+        a.href = url
+        a.download = st.data?.filename ?? 'chat.md'
+        a.click()
+        setTimeout(() => URL.revokeObjectURL(url), 10_000)
+        close()
+      }
+      const setTools = (tools) => { exportState.set({ tools }); loadExport(st.sessionId, tools) }
+      return h('div', { className: 'jevi jevi-modal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'jevi-export-t', onClick: close },
+        h('div', { className: 'box wide', onClick: (e) => e.stopPropagation() },
+          h('h3', { id: 'jevi-export-t' }, 'Export this chat'),
+          st.error ? h('div', { className: 'err', role: 'alert' }, st.error) : null,
+          h('label', { className: 'why', style: { display: 'flex', alignItems: 'center', gap: 8, margin: '6px 0 10px' } },
+            h('input', { type: 'checkbox', checked: !!st.tools, onChange: (e) => setTools(e.target.checked) }),
+            'Include tool calls and their output (folded in the Markdown)'),
+          h('div', { className: 'answer-text', style: { maxHeight: 260 } },
+            st.busy ? 'Reading the chat…' : md ? `${md.slice(0, 4000)}${md.length > 4000 ? '\n…' : ''}` : 'Nothing to export.'),
+          h('p', { className: 'why' }, st.data ? `${md.length.toLocaleString()} characters · ${st.data.filename}` : ''),
+          h('div', { className: 'actions' },
+            h('button', { className: 'btn', onClick: close }, 'Cancel'),
+            h('button', { className: 'btn', disabled: !md, onClick: copy }, 'Copy'),
+            h('button', { className: 'btn', disabled: !md, onClick: download }, 'Save .md'))))
+    }
+
+    // ---------- standalone panes: the same views, each in its own sidebar tab ----------
+    // The Jev inspector keeps all of them as tabs; these are for reaching one directly.
+    function SubagentsPane({ useTabInfo, sessionId, useSessions }) {
+      useStyle()
+      const entries = useSessions?.((s) => s.subagentsByParent?.[sessionId]?.entries) ?? EMPTY
+      useTabInfo?.()
+      return h('div', { className: 'jevi' }, h('h3', null, 'Subagents'), h(Subagents, { sessionId, entries }))
+    }
+
+    function TasksPane({ useTabInfo, sessionId, useSessions }) {
+      useStyle()
+      names.use()
+      const visible = useTabInfo?.()?.tab?.visible ?? true
+      useEffect(() => { if (visible) loadNames() }, [visible])
+      const runs = useRuns(sessionId, visible)
+      const entries = useSessions?.((s) => s.subagentsByParent?.[sessionId]?.entries) ?? EMPTY
+      const jobs = useSessions?.((s) => s.jobsBySession?.[sessionId]) ?? EMPTY
+      const tasks = useTasks(sessionId, visible)
+      return h('div', { className: 'jevi' }, h('h3', null, 'Background tasks'), h(Tasks, { sessionId, runs, jobs, entries, tasks }))
+    }
+
+    function UsagePane({ useTabInfo }) {
+      useStyle()
+      names.use()
+      const visible = useTabInfo?.()?.tab?.visible ?? true
+      useEffect(() => { if (visible) loadNames() }, [visible])
+      const { usage, error, busy, load } = useUsage(visible)
+      return h('div', { className: 'jevi' }, h('h3', null, 'Usage'), h(UsageView, { usage, error, busy, onRefresh: () => load(true), onSaved: () => load(false) }))
     }
 
     // ---------- settings: Jev setup: effort ----------
@@ -1257,6 +2086,8 @@ window.__ModuleLoader__.load({
     const P = (d) => h('path', { d })
     const ICON = {
       terminal: () => svg(P('M3 4.5 6.5 8 3 11.5'), P('M8 12h5')),
+      // Reasoning/transcript: a page of lines, half of them showing.
+      reasoning: () => svg(h('rect', { x: 2.5, y: 2.5, width: 11, height: 11, rx: 2 }), P('M5 6h6M5 8.5h6M5 11h3')),
       background: () => svg(P('M5.5 4h8M5.5 8h8M5.5 12h8'), P('M2.5 4h.01M2.5 8h.01M2.5 12h.01')),
       browser: () => svg(h('circle', { cx: 8, cy: 8, r: 6 }), P('M2 8h12'), P('M8 2c1.8 1.8 2.6 3.8 2.6 6S9.8 12.2 8 14c-1.8-1.8-2.6-3.8-2.6-6S6.2 3.8 8 2z')),
       'jev-inspector': () => svg(h('circle', { cx: 7, cy: 7, r: 4.5 }), P('m10.5 10.5 3 3'), P('M5 7h4M7 5v4')),
@@ -1410,21 +2241,42 @@ window.__ModuleLoader__.load({
       const runs = useRuns(sessionId, true, 5000)
       const jobs = useSessions?.((s) => s.jobsBySession?.[sessionId]) ?? EMPTY
       const entries = useSessions?.((s) => s.subagentsByParent?.[sessionId]?.entries) ?? EMPTY
-      const running = runs.filter((r) => summarize(r).running).length
-        + jobs.filter((j) => j.status === 'running' || j.status === 'stopping').length
-        + entries.filter((e) => e.kind === 'child' && e.activity === 'running').length
+      const tasks = useTasks(sessionId, true, 5000)
+      const running = liveCount({ runs, jobs, entries, tasks })
+      // Finished results whose message has not been posted yet: the task settled while an answer
+      // was still streaming, so delivery is waiting for it to end. The spec wants this said
+      // outside the active message, and never by touching it - this is a count, not an insert.
+      const awaiting = awaitingDelivery(tasks)
       const kind = activeKind()
-      const tip = (id) => (bindings[id] ? `${ACT[id].label} (${bindings[id]})` : ACT[id].label)
+      const all = transcripts.use()
+      useEffect(() => { scheduleTranscripts() }, []) // rows may already be on screen when this mounts
+      const tip = (id, label = ACT[id].label) => (bindings[id] ? `${label} (${bindings[id]})` : label)
       const btn = (id, extra = {}) => h('button', {
         key: id, type: 'button', className: 'kzh-ib', title: tip(id), 'aria-label': extra.label ?? ACT[id].label,
         'aria-keyshortcuts': bindings[id] ? ariaKeys(bindings[id]) : undefined, 'aria-pressed': extra.pressed, onClick: () => runAction(id),
       }, ICON[id](), extra.dot ? h('span', { className: 'kzh-dot', 'aria-hidden': true }) : null)
       const item = (id, count) => ({ id, keys: bindings[id], count })
       return h('div', { className: 'kzh-bar' },
+        // The same news the dot gives, for a screen reader: one polite announcement, in a region
+        // that is always present (a live region added together with its text is not announced).
+        // It never takes the focus, so an arriving result cannot interrupt what you are typing.
+        h('span', { className: 'kzh-sr', role: 'status', 'aria-live': 'polite', 'aria-atomic': true }, resultAnnouncement(awaiting)),
         btn('terminal'),
-        btn('background', { dot: running > 0, label: running ? `Background tasks, ${running} running` : 'Background tasks' }),
+        btn('background', {
+          dot: running > 0 || awaiting > 0,
+          pressed: kind === TASKS_KIND,
+          label: [running ? `Background tasks, ${running} running` : 'Background tasks', resultAnnouncement(awaiting)].filter(Boolean).join(', '),
+        }),
         btn('browser', { pressed: kind === BROWSER_KIND }),
         btn('jev-inspector', { pressed: kind === KIND }),
+        // Every reasoning and tool transcript of this conversation at once (see the transcript block
+        // above). Disabled while the conversation has none, and it never takes the keyboard focus.
+        h('button', {
+          type: 'button', className: 'kzh-ib', disabled: all.button.disabled,
+          title: tip('transcripts', all.button.label), 'aria-label': all.button.label, 'aria-expanded': all.button.expanded,
+          'aria-keyshortcuts': bindings.transcripts ? ariaKeys(bindings.transcripts) : undefined,
+          onClick: () => runAction('transcripts'),
+        }, ICON.reasoning()),
         h('button', {
           ref: more, type: 'button', className: 'kzh-ib', 'aria-label': 'More', title: 'More', 'aria-haspopup': 'menu', 'aria-expanded': menu,
           onClick: () => setMenu((m) => !m),
@@ -1432,7 +2284,7 @@ window.__ModuleLoader__.load({
         menu ? h(MoreMenu, {
           anchor: more,
           onClose: (refocus) => { setMenu(false); if (refocus) more.current?.focus() },
-          items: [item('files'), item('background', running), item('browser'), item('terminal'), item('jev-inspector'), item('usage'), '-',
+          items: [item('files'), item('background', running), item('browser'), item('terminal'), item('jev-inspector'), item('transcripts'), item('subagents'), item('usage'), '-', item('queue'), item('export'), '-',
             item('left-sidebar'), item('focus-mode'), item('new-session'), item('focus-input'), '-', item('shortcuts'), item('jev-setup')],
         }) : null)
     }
@@ -1599,6 +2451,70 @@ window.__ModuleLoader__.load({
         }) : null)
     }
 
+    // ---------- agent strip: who produced each answer, in the message's own action row ----------
+    // The chain travels inside the message, as a link reference definition the markdown renderer
+    // drops (router.js writes it). The run log is memory only and keeps 20 runs per session, so
+    // looking the message up there would credit older answers wrongly, or not at all.
+    const STRIP_MARK = /^\[jev-agents\]:\s*kzh-agents-1-([A-Za-z0-9_-]+)\s*$/gm
+    const fromBase64Url = (b) => {
+      const bytes = Uint8Array.from(atob(b.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0))
+      return new TextDecoder().decode(bytes)
+    }
+
+    /** Every chain this message carries, in the order it posted them: one turn can report several finished runs. */
+    function chainsOf(text) {
+      const out = []
+      for (const m of text.matchAll(STRIP_MARK)) {
+        try { out.push(JSON.parse(fromBase64Url(m[1]))) } catch {}
+      }
+      return out
+    }
+
+    /** Text of one finalized assistant message. Newest first: the message being read is usually the last. */
+    function messageText(nodes, messageId) {
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const n = nodes[i]
+        if (n.kind === 'assistant' && n.messageId === messageId) return n.blocks.filter((b) => b.kind === 'text').map((b) => b.text).join('\n')
+      }
+      return ''
+    }
+    const stepLabel = ({ agent, model, roles }) => {
+      const tag = (roles ?? []).filter((r) => r !== 'work').join(', ')
+      return `${agent}${model ? ` (${model})` : ''}${tag ? ` [${tag}]` : ''}`
+    }
+
+    // Chromium does not arrow-scroll this focused overflow row on its own, and a chain
+    // that only a mouse can reach is a chain half the readers cannot read.
+    const scrollChain = (e) => {
+      const by = { ArrowRight: 80, ArrowLeft: -80 }[e.key]
+      if (by === undefined) return
+      e.preventDefault()
+      e.currentTarget.scrollBy({ left: by })
+    }
+
+    /** One scrollable row of chips per finalized message: Jev, then each agent, in run order. */
+    function AgentStrip({ messageId, useChat }) {
+      useStyle()
+      // Selecting the text, not the node, keeps this row out of every unrelated chat change.
+      const text = useChat((s) => messageText(s.legacy.nodes, messageId))
+      const chains = chainsOf(text)
+      if (!chains.length) return null
+      return h('div', { className: 'kzh-agents', role: 'group', tabIndex: 0, 'aria-label': 'Agents that produced this answer', onKeyDown: scrollChain },
+        ...chains.flatMap((steps, c) => [
+          c ? h('span', { key: `s${c}`, className: 'split', 'aria-hidden': true }) : null,
+          ...steps.flatMap((step, i) => [
+            i ? h('span', { key: `a${c}.${i}`, className: 'arrow', 'aria-hidden': true }, '→') : null,
+            // Blue is the one whose words you are reading; every supporting step stays grey.
+            // Colour alone would leave that unsaid for a screen reader, so the label says it too.
+            h('span', {
+              key: `c${c}.${i}`,
+              className: cx('chip', step.answered && 'wrote'),
+              ...(step.answered ? { 'aria-label': `${stepLabel(step)}, wrote this answer` } : {}),
+            }, stepLabel(step)),
+          ]),
+        ]).filter(Boolean))
+    }
+
     // ---------- brand: Kz-harness logo in the sidebar and above the new-session headline ----------
     const LOGO = '/jev-router/logo.png'
     const BrandMark = ({ size = 24 }) => h('img', { src: LOGO, width: size, height: size, alt: '', style: { display: 'block', borderRadius: 6 } })
@@ -1607,12 +2523,20 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['slots', 'sidebarRightTabs', 'sessions', 'sidebarRight', 'layout'],
+      // The task-row decisions are pure, so the DOM-less unit tests read them from here
+      // (test/transcripts.test.js and test/tasklist.test.js): client.js is a classic script and
+      // cannot be imported by node. `taskLabels` is the copy the anti-drift test compares with
+      // adapter.js TASK_LABELS on the server.
+      __test: { transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, resultIdOf, awaitingDelivery, resultAnnouncement },
       apply(ctx) {
         sessionsApi = ctx.sessions
         sidebarRight = ctx.sidebarRight
         layout = ctx.layout
         uiWorkspace = ctx.get('uiWorkspace') // optional: New session falls back to DSH's own button
         loadHotkeys()
+        // Transcript rows stream in shut: a pass follows them while the preference is on (see above).
+        ctx.effect(() => startTranscripts())
+        ctx.effect(() => startResultAcks())
         ctx.effect(() => {
           window.addEventListener('keydown', onHotkey, true)
           const onResize = () => sizeRightbar()
@@ -1639,6 +2563,30 @@ window.__ModuleLoader__.load({
           guide: [{ order: 55, title: () => 'Terminal', description: () => "Open a terminal in this session's project folder" }],
         }))
         ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TERMINAL_ID }, TerminalBody))
+        ctx.effect(() => ctx.sidebarRightTabs.register({
+          id: TASKS_ID,
+          kind: TASKS_KIND,
+          priority: 'extension',
+          title: () => 'Tasks',
+          guide: [{ order: 52, title: () => 'Background tasks', description: () => 'Queued, running and finished work in this session' }],
+        }))
+        ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TASKS_ID }, TasksPane))
+        ctx.effect(() => ctx.sidebarRightTabs.register({
+          id: SUBAGENTS_ID,
+          kind: SUBAGENTS_KIND,
+          priority: 'extension',
+          title: () => 'Subagents',
+          guide: [{ order: 53, title: () => 'Subagents', description: () => 'Child sessions this session started' }],
+        }))
+        ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: SUBAGENTS_ID }, SubagentsPane))
+        ctx.effect(() => ctx.sidebarRightTabs.register({
+          id: USAGE_ID,
+          kind: USAGE_KIND,
+          priority: 'extension',
+          title: () => 'Usage',
+          guide: [{ order: 54, title: () => 'Usage', description: () => 'Limits, balances and what Jev saved' }],
+        }))
+        ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: USAGE_ID }, UsagePane))
         if (IN_APP) {
           document.documentElement.classList.add('kzh-in-app')
           ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-titlebar' }, TitleBar))
@@ -1646,8 +2594,12 @@ window.__ModuleLoader__.load({
           ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({ name: 'conversation.session.header.actions', id: 'kz-launcher', order: 100 }, HeaderActions))
         }
         ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'kz-shortcuts', order: 16, label: () => 'Shortcuts' }, ShortcutsSection))
+        ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({ name: 'conversation.chat.assistant-actions', id: 'jev-agents', order: 100 }, AgentStrip))
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-toast' }, Toast))
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-llm' }, LlmDialog))
+        ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-export' }, ExportDialog))
+        ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-queue' }, TaskQueue))
+        ctx.slots.inject('conversation.input.right', () => ctx.slots.register({ name: 'conversation.input.right', id: 'kz-limits', order: 90, label: () => 'Plan limits' }, LimitsPill))
         // A bare /install-llm or /remove-llm opens the picker; typed arguments still go to the server command.
         ctx.inject(['commandUi'], (c) => {
           for (const [name, mode] of [['install-llm', 'install'], ['remove-llm', 'remove']]) {

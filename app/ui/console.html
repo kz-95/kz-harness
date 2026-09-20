@@ -25,6 +25,8 @@
         <span class="spinner" aria-hidden="true"></span>
         <span id="status-text">Starting the harness…</span>
       </div>
+      <!-- What the launcher is doing, so a 40 second wait is not a blank spinner. -->
+      <ol class="steps" id="steps" aria-label="Startup progress"></ol>
       <div class="actions" id="error-actions" hidden>
         <button class="btn primary" id="retry">Retry</button>
         <button class="btn" data-open-logs>Show full log</button>
@@ -33,6 +35,8 @@
     <section class="mini-console" aria-label="Latest log lines">
       <header>
         <span>Log</span>
+        <span class="grow"></span>
+        <button class="link" id="expand" aria-expanded="false">Show more</button>
         <button class="link" data-open-logs>Open full log <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>L</kbd></button>
       </header>
       <ol id="mini"></ol>

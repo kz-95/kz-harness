@@ -4,7 +4,7 @@
 // its own window (Ctrl+Shift+L, tray, or the Harness menu). Quitting the app
 // stops DSH and everything it started.
 const { app, BrowserWindow, Menu, Tray, WebContentsView, dialog, ipcMain, session, shell, nativeImage } = require('electron')
-const { spawn, execFileSync } = require('node:child_process')
+const { spawn, execFile, execFileSync } = require('node:child_process')
 const net = require('node:net')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
@@ -42,12 +42,38 @@ let tray = null
 let dsh = null
 let quitting = false
 const logs = [] // { t, level, text }
-let status = { phase: 'starting', message: 'Starting the harness…' }
+// Startup is about 40 seconds and most of it is the engine loading its plugin bundle,
+// which we cannot shorten. So say what is happening instead of one unchanging line.
+// Derived from the launcher's own output rather than guessed on a timer.
+const STEPS = [
+  { id: 'update', label: 'Checking for updates' },
+  { id: 'port', label: 'Checking the port is free' },
+  { id: 'prepare', label: 'Preparing the engine' },
+  { id: 'fetch', label: 'Fetching the engine (first run only)' },
+  { id: 'engine', label: 'Starting the engine' },
+  { id: 'ready', label: 'Ready' },
+]
+/** Which step a line of launcher output means, or null when it says nothing about progress. */
+function stepFor(line) {
+  if (/dsh web:/.test(line)) return 'ready'
+  if (/Fetching the engine/i.test(line)) return 'fetch'
+  if (/^patch-|^ensure-no-project|: applied$/.test(line)) return 'prepare'
+  return null
+}
+// Which steps this run actually reached. A repeat run never fetches the engine, and the
+// splash must not tick a step that never ran. Kept here, not in the window, because the
+// window can open after the first steps are already done.
+const seenSteps = new Set(['update'])
+let status = { phase: 'starting', message: 'Starting the harness…', step: 'update', steps: STEPS }
 
 // ---------- log + status fan-out ----------
 // The login token and anything key-shaped never show on screen or get copied around.
 const REDACT = [[/(token=)[\w-]+/g, '$1•••'], [/(Bearer\s+)\S+/gi, '$1•••'], [/\b(sk-|tsk_)[\w-]{8,}/g, '$1•••']]
 const redact = (t) => REDACT.reduce((acc, [re, to]) => acc.replace(re, to), t)
+// The engine prints under its own name ("dsh: failed to load .env: ..."), and a file the
+// branding patch does not reach can still say "DeepSeek Harness". Nobody installed either
+// of those, so the log says KzH. Display only: levelOf and stepFor still read the raw line.
+const unbrand = (t) => t.replace(/^dsh(?=[: ])/, 'KzH').replace(/DeepSeek Harness/g, 'Kz-harness')
 function levelOf(text) {
   // Router steps from the jev-router plugin ("[jev] …").
   if (/^\[jev\] (Routed|Review: accept|Final: accepted)/.test(text)) return 'ok'
@@ -60,13 +86,14 @@ function levelOf(text) {
   return 'info'
 }
 function addLog(text, level) {
-  const entry = { t: Date.now(), level: level ?? levelOf(text), text: redact(text) }
+  const entry = { t: Date.now(), level: level ?? levelOf(text), text: unbrand(redact(text)) }
   logs.push(entry)
   if (logs.length > 5000) logs.shift()
   for (const w of [main, logWin]) w?.webContents.send('harness:log', entry)
 }
 function setStatus(next) {
-  status = next
+  if (next.step) seenSteps.add(next.step)
+  status = { steps: STEPS, done: [...seenSteps], ...next }
   for (const w of [main, logWin]) w?.webContents.send('harness:status', status)
   tray?.setToolTip(`Kz-harness: ${status.message}`)
 }
@@ -78,15 +105,70 @@ const portBusy = () => new Promise((resolve) => {
   s.once('error', () => resolve(false))
 })
 
+/** Run one git command in the harness folder. Never throws: returns the exit code and output. */
+const git = (args, timeout = 20000) => new Promise((resolve) => {
+  execFile('git', ['-C', HARNESS, ...args], { timeout, windowsHide: true }, (err, out, errOut) =>
+    resolve({ code: err ? (err.code ?? 1) : 0, out: String(out).trim(), err: String(errOut).trim() }))
+})
+
+/**
+ * Bring the harness up to date before starting it, but only by a move that cannot leave it
+ * half updated: a fast-forward of a clean tree. git moves the branch ref or it does not, so
+ * there is no in-between state to be interrupted in.
+ *
+ * Anything that would need a second step to be usable is refused, not half done:
+ *  - changed dependencies, which need npm install
+ *  - changes to app\, which need the exe rebuilt
+ * Those print what to run and start the version already on disk. Startup is never blocked by
+ * this: no network, no remote, a dirty tree or a stall all just carry on.
+ */
+let updateChecked = false
+async function safeUpdate() {
+  setStatus({ phase: 'starting', message: 'Checking for updates…', step: 'update' })
+  if (updateChecked) return // Retry after a failed start should not wait on the network again.
+  updateChecked = true
+  const upstream = await git(['rev-parse', '--abbrev-ref', '@{u}'], 5000)
+  if (upstream.code || !upstream.out) { addLog('Updates: no remote is set for this branch; skipped.'); return }
+  // An errored status prints nothing, which must not read as "clean".
+  const dirty = await git(['status', '--porcelain'], 5000)
+  if (dirty.code || dirty.out) { addLog('Updates: you have uncommitted changes here, so nothing was pulled.', 'warn'); return }
+
+  const fetched = await git(['fetch', '--quiet'], 15000)
+  if (fetched.code) { addLog('Updates: could not reach the remote; starting the version you have.', 'warn'); return }
+
+  const behind = await git(['rev-list', '--count', 'HEAD..@{u}'], 5000)
+  const count = Number(behind.out)
+  if (!count) { addLog(`Updates: up to date (${upstream.out}).`); return }
+  // A fast-forward only. Diverged branches need a human.
+  if ((await git(['merge-base', '--is-ancestor', 'HEAD', '@{u}'], 5000)).code) {
+    addLog(`Updates: ${upstream.out} has moved apart from your branch; resolve it in a terminal.`, 'warn')
+    return
+  }
+  const touched = await git(['diff', '--name-only', 'HEAD', '@{u}'], 5000)
+  const files = touched.out.split(/\r?\n/).filter(Boolean)
+  const needsInstall = files.some((f) => /(^|\/)package(-lock)?\.json$/.test(f))
+  const needsRebuild = files.some((f) => f.startsWith('app/'))
+  if (needsInstall || needsRebuild) {
+    const what = [needsInstall && 'new packages', needsRebuild && 'a rebuilt Kz-harness.exe'].filter(Boolean).join(' and ')
+    addLog(`Updates: ${count} new commit(s) need ${what}, which this launcher will not do behind your back. Close Kz-harness and run scripts\\Install-Harness.ps1.`, 'warn')
+    return
+  }
+  const pulled = await git(['pull', '--ff-only', '--quiet'], 20000)
+  if (pulled.code) { addLog(`Updates: the pull failed (${pulled.err || pulled.code}); starting the version you have.`, 'warn'); return }
+  addLog(`Updates: pulled ${count} new commit(s).`, 'ok')
+}
+
 async function startDsh() {
   if (dsh) return
-  setStatus({ phase: 'starting', message: 'Starting the harness…' })
+  await safeUpdate()
+  setStatus({ phase: 'starting', message: 'Checking the port is free…', step: 'port' })
   if (await portBusy()) {
     addLog(`Port ${PORT} is already in use.`, 'error')
     setStatus({ phase: 'error', message: `Another harness is already running on port ${PORT}. Close its black window (or the other Kz-harness), then click Retry.` })
     return
   }
   addLog(`> ${START_SCRIPT} -NoOpen`, 'cmd')
+  setStatus({ phase: 'starting', message: 'Preparing the engine…', step: 'prepare' })
   const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', START_SCRIPT, '-NoOpen'], { cwd: HARNESS, windowsHide: true })
   let buffer = ''
   const onData = (chunk) => {
@@ -98,10 +180,22 @@ async function startDsh() {
       if (!line) continue
       const m = line.match(/dsh web:\s*(http\S+)/)
       addLog(m ? 'KzH ready on this PC only (127.0.0.1)' : line, m ? 'ok' : undefined)
-      if (m) openHarness(m[1])
+      if (m) { openHarness(m[1]); continue }
+      // The launcher's own output is the only honest progress signal we have.
+      const step = stepFor(line)
+      if (step && step !== status.step) {
+        setStatus({ phase: 'starting', message: `${STEPS.find((x) => x.id === step)?.label ?? step}…`, step })
+      }
     }
   }
   dsh = child
+  // The engine prints nothing between starting and serving, which is most of the wait.
+  // Move to that step shortly after spawn so the splash is never silently stuck on "Preparing".
+  setTimeout(() => {
+    if (dsh === child && status.phase === 'starting' && status.step !== 'fetch' && status.step !== 'ready') {
+      setStatus({ phase: 'starting', message: 'Starting the engine, this takes about half a minute…', step: 'engine' })
+    }
+  }, 2500)
   child.stdout.on('data', onData)
   child.stderr.on('data', onData)
   child.on('exit', (code) => {
@@ -155,12 +249,20 @@ function restartDsh() {
 // ---------- windows ----------
 const secure = { contextIsolation: true, nodeIntegration: false, sandbox: true }
 
+/** Bring the window back, rebuilding it if it was closed: the tray must never be a dead end. */
+function showWindow() {
+  if (!main || main.isDestroyed()) { createMain(); return }
+  if (main.isMinimized()) main.restore()
+  main.show()
+  main.focus()
+}
+
 function showStartScreen() {
   main?.loadFile(path.join(__dirname, 'ui', 'console.html'), { hash: 'start' })
 }
 
 function openHarness(url) {
-  setStatus({ phase: 'ready', message: 'Harness running', origin: new URL(url).origin })
+  setStatus({ phase: 'ready', message: 'Harness running', step: 'ready', origin: new URL(url).origin })
   main?.loadURL(url)
 }
 
@@ -173,16 +275,36 @@ function createMain() {
     titleBarOverlay: { color: BG, symbolColor: '#cfd3d6', height: TITLEBAR_H },
     webPreferences: { ...secure, preload: path.join(__dirname, 'preload.js') },
   })
-  main.once('ready-to-show', () => main.show())
+  // Show as soon as the frame exists. The window used to appear only on ready-to-show,
+  // so a page that failed to load left a tray icon and nothing else, with no error.
+  // backgroundColor is already the app's own, so there is no white flash to avoid.
+  const reveal = () => { if (main && !main.isDestroyed() && !main.isVisible()) { main.show(); main.focus() } }
+  main.once('ready-to-show', reveal)
+  reveal()
+  // Whatever the page does, the window is on screen within a second.
+  setTimeout(reveal, 1000)
+  main.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (!isMainFrame) return
+    addLog(`The start screen failed to load (${code} ${desc}) ${url}`, 'error')
+    setStatus({ phase: 'error', message: `The launcher page could not load (${desc || code}). Open the log, then click Retry.` })
+    reveal()
+  })
+  main.webContents.on('render-process-gone', (_e, d) => {
+    addLog(`The window's renderer stopped (${d?.reason ?? 'unknown'}).`, 'error')
+    setStatus({ phase: 'error', message: 'The launcher page stopped. Click Retry.' })
+    reveal()
+  })
   // The harness page sets its own title; keep the app name on the window.
-  // The engine's page calls itself "DeepSeek Harness"; the app is KzH (Kz-harness).
-  main.on('page-title-updated', (e, title) => { e.preventDefault(); const t = (title ?? '').replace(/\s*[—-]?\s*DeepSeek Harness\s*/g, '').trim(); main.setTitle(status.phase === 'ready' && t ? `${t} · Kz-harness` : 'Kz-harness') })
+  // The engine's page title carries the engine's own name; strip it, the app is KzH (Kz-harness).
+  main.on('page-title-updated', (e, title) => { e.preventDefault(); const t = (title ?? '').replace(/\s*[-\u2013\u2014]?\s*(?:DeepSeek Harness|Kz-harness)\s*/g, '').trim(); main.setTitle(status.phase === 'ready' && t ? `${t} · Kz-harness` : 'Kz-harness') })
   lockNavigation(main)
   // The in-app browser view sits over the page; it follows the window and never outlives the harness page.
   main.on('minimize', () => browserView?.setVisible(false))
   main.on('restore', () => browserView?.setVisible(browserWanted))
   main.webContents.on('did-navigate', () => hideBrowser())
-  main.on('closed', () => { main = null; app.quit() })
+  // Closing the window leaves the harness running in the tray; quit from the tray menu
+  // or the app menu. Quitting here made the tray icon a dead end.
+  main.on('closed', () => { main = null })
   showStartScreen()
 }
 
@@ -283,7 +405,7 @@ ipcMain.handle('harness:browser', (e, op, arg) => {
 let appMenu = null
 function buildMenus() {
   const items = [
-    { label: 'Show Kz-harness', click: () => { main?.show(); main?.focus() } },
+    { label: 'Show Kz-harness', click: () => showWindow() },
     { label: 'Show log', accelerator: 'CmdOrCtrl+Shift+L', click: openLogs },
     { type: 'separator' },
     { label: 'Restart harness', click: restartDsh },
@@ -302,7 +424,7 @@ function buildMenus() {
   tray = new Tray(nativeImage.createFromPath(path.join(__dirname, 'assets', 'logo-32.png')))
   tray.setToolTip('Kz-harness')
   tray.setContextMenu(Menu.buildFromTemplate(items))
-  tray.on('click', () => { main?.show(); main?.focus() })
+  tray.on('click', () => showWindow())
 }
 
 // ---------- renderer API ----------
@@ -317,7 +439,8 @@ ipcMain.handle('harness:state', (e) => (fromAppPage(e) ? { status, logs } : null
 ipcMain.handle('harness:retry', (e) => { if (fromAppPage(e)) restartDsh() })
 ipcMain.handle('harness:openLogs', (e) => { if (fromAppPage(e)) openLogs() })
 
-app.on('second-instance', () => { if (main) { if (main.isMinimized()) main.restore(); main.focus() } })
+// Double-clicking the exe again brings the window back rather than doing nothing.
+app.on('second-instance', () => showWindow())
 app.on('web-contents-created', (_e, wc) => wc.on('will-attach-webview', (ev) => ev.preventDefault()))
 app.whenReady().then(() => {
   // The harness page gets no camera, microphone, location or notifications; only clipboard writes.
@@ -329,4 +452,4 @@ app.whenReady().then(() => {
   startDsh()
 })
 app.on('before-quit', () => { quitting = true; stopDsh(); browserView?.webContents.close(); browserView = null })
-app.on('window-all-closed', () => app.quit())
+// Not quitting on window-all-closed: the tray keeps the harness alive until you quit it.

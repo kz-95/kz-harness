@@ -41,7 +41,7 @@ const routeResult = (over = {}) => ({
   taskType: 'debugging', taskTypeConfidence: 0.9, complexity: 0.2, risk: 0.2,
   needsSecondOpinion: 0.1, needsHumanReview: 0.1, needsTests: 0.9, ...over,
 })
-const accept = { verdict: 'accept', addressed: 0.9, complete: 0.9, unrelatedChanges: 0.1, regressionRisk: 0.1, needsPerson: 0.05, nextAgent: 'claude', nextAgentProbabilities: {} }
+const accept = { verdict: 'accept', addressed: 0.9, complete: 0.9, unrelatedChanges: 0.1, regressionRisk: 0.1, needsPerson: 0.05, reviewAgent: 'claude', reviewAgentProbabilities: {}, retryAgent: 'claude', retryAgentProbabilities: {} }
 const limitHit = { stopReason: 'error', diagnostic: 'Claude usage limit reached', answerText: '' }
 const fix = (dir) => { writeFileSync(join(dir, 'state.txt'), 'fixed'); return { stopReason: 'completed', answerText: 'fixed it' } }
 const until = new Date(Date.now() + 3_600_000).toISOString()

@@ -31,6 +31,20 @@
     - id: jev-router
       name: 'C:/Harness/plugins/jev-router/index.js'
 
+# Cost policy. Past this share of its WEEKLY window a subscription stops taking
+# execution work and is kept for reviewing, where its remaining percent buys the
+# most. Work prefers another subscription still under its own gate; only when every
+# subscription is past one does the metered API take over.
+# Set per plan: Claude Pro 80 / Max 90, Codex Plus 80 / Pro 90. Not auto-detected:
+# the live usage endpoint reports no plan name, and the cached credential lags an
+# upgrade, so guessing would gate a Max account at 80 and spend money needlessly.
+- id: jev-router
+  config:
+    policy:
+      gateAtPercent:
+        default: 80
+        claude: 90
+
 # Jev Harness brand: the jev-router client fills the sidebar and hero brand
 # slots with C:\Harness\Logo.png, so the official DeepSeek brand steps aside.
 - id: ui-brand-official
@@ -45,6 +59,10 @@
   disabled: true
 # Session-log upload with DeepSeek requests (off by default); pinned off.
 - id: session-log-deepseek
+  disabled: true
+# Bundled "dsh-badge" skill: tells the model to add a "powered by dsh" badge to
+# pull requests and documents. Commits and PRs here carry no tool attribution.
+- id: skill-badge
   disabled: true
 # Developer-only reload channel (unauthenticated /plugins/events).
 - id: client-hmr

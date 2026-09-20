@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { autoLevel, codexServiceTier, toAgentEffort } from '../effort.js'
+import { autoLevel, codexServiceTier, isLocalLevel, localAgentFor, toAgentEffort } from '../effort.js'
 import { jevAdapter } from '../adapter.js'
 import { answeredBy, runRouted } from '../router.js'
 
@@ -23,8 +23,25 @@ test('mapping table', () => {
     high: ['high', 'high', 'high', null, null],
     xhigh: ['xhigh', 'xhigh', 'max', null, null],
     max: ['max', 'xhigh', 'max', null, null],
-    ultra: ['max', 'xhigh', 'max', null, null],
+    // Claude's top level is spelled 'ultracode'; Codex gets the whole ladder for an
+    // unknown/unnamed model but clamps a *known* older one (see the ceiling tests).
+    ultra: ['ultracode', 'xhigh', 'max', null, null],
   })
+})
+
+test('claude ultra sends ultracode, its real top level, not max', () => {
+  assert.equal(toAgentEffort('ultra', claude), 'ultracode')
+  // The rungs below ultra are untouched, and 'max' is still max.
+  assert.deepEqual(['low', 'medium', 'high', 'xhigh', 'max'].map((l) => toAgentEffort(l, claude)), ['low', 'medium', 'high', 'xhigh', 'max'])
+  // A per-agent override to ultra sends ultracode too.
+  assert.equal(toAgentEffort('low', claude, { override: 'ultra' }), 'ultracode')
+})
+
+test('deepseek takes max at the top, and local levels stay null', () => {
+  assert.equal(toAgentEffort('ultra', ds), 'max')
+  assert.equal(toAgentEffort('max', ds), 'max')
+  assert.equal(toAgentEffort('ultra', local), null)
+  assert.equal(toAgentEffort('ultra', other), null)
 })
 
 test('auto follows complexity/risk and never picks ultra', () => {
@@ -37,11 +54,34 @@ test('auto follows complexity/risk and never picks ultra', () => {
 })
 
 test('codex clamps to the model top effort; speed maps to the priority tier', () => {
+  // gpt-5.5 tops out at xhigh today; nothing here may silently raise or lower that.
   assert.equal(toAgentEffort('ultra', codex, { model: 'gpt-5.5' }), 'xhigh')
-  assert.equal(toAgentEffort('ultra', codex, { model: 'gpt-5.6-luna' }), 'max')
-  assert.equal(toAgentEffort('ultra', codex, { model: 'gpt-5.6-sol' }), 'ultra')
+  assert.equal(toAgentEffort('max', codex, { model: 'gpt-5.5' }), 'xhigh')
+  assert.equal(toAgentEffort('high', codex, { model: 'gpt-5.5' }), 'high')
   assert.equal(codexServiceTier('fast'), 'priority')
   assert.equal(codexServiceTier('normal'), null)
+})
+
+test('every gpt-5.6 variant takes ultra, and a model we have never seen is not capped', () => {
+  for (const model of ['gpt-5.6', 'gpt-5.6-luna', 'gpt-5.6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'GPT-5.6-Luna']) {
+    assert.equal(toAgentEffort('ultra', codex, { model }), 'ultra', model)
+  }
+  // Unknown/newer is the benefit of the doubt, not a quiet clamp.
+  for (const model of ['gpt-6', 'gpt-5.7-orion', 'some-future-model']) {
+    assert.equal(toAgentEffort('ultra', codex, { model }), 'ultra', model)
+  }
+  // Older/unknown families still get every rung below their ceiling.
+  assert.equal(toAgentEffort('low', codex, { model: 'gpt-5.6-luna' }), 'low')
+})
+
+test('a declared model capability list beats the built-in ceilings', () => {
+  const declared = { id: 'codex', provider: 'codex', models: [{ id: 'gpt-5.5', reasoning: { efforts: [{ id: 'low' }, { id: 'ultra' }] } }] }
+  assert.equal(toAgentEffort('ultra', declared, { model: 'gpt-5.5' }), 'ultra', 'the connector declares this build takes ultra')
+  // A declaration that tops out lower still clamps.
+  const legacy = { id: 'codex', provider: 'codex', models: [{ id: 'gpt-5.6-sol', reasoning: { efforts: [{ id: 'low' }, { id: 'high' }] } }] }
+  assert.equal(toAgentEffort('ultra', legacy, { model: 'gpt-5.6-sol' }), 'high')
+  // No declaration for the running model: the pattern rules decide.
+  assert.equal(toAgentEffort('ultra', declared, { model: 'gpt-5.6-luna' }), 'ultra')
 })
 
 test('per-agent override wins over level', () => {
@@ -54,7 +94,7 @@ test('adapter declares efforts and forwards the chosen one', async () => {
   const a = jevAdapter({ ctx: { agents: { get: () => ({}) } }, route: async ({ effort }) => { got = effort; return 'r' }, auxModel: { provider: 'x', model: 'y' } })
   const m = await a.resolveModel('jev', 'jev-auto')
   assert.equal(m.reasoning.defaultEffort, 'auto')
-  assert.deepEqual(m.reasoning.efforts.map((e) => e.id), ['auto', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+  assert.deepEqual(m.reasoning.efforts.map((e) => e.id), ['auto', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'local-low', 'local-high'])
   for await (const _ of a.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: 'fix it' }] }], reasoningEffort: 'xhigh', sessionId: 's' })) { /* drain */ }
   assert.equal(got, 'xhigh')
 })
@@ -78,4 +118,39 @@ test('router: menu beats default, per-agent beats menu; effort shows in Answered
   const r = await run('high', { ...config, effort: { ...config.effort, perAgent: { claude: 'max' } } })
   assert.deepEqual(seen, ['low', 'low', 'high', 'max'])
   assert.match(answeredBy(r), /claude \(opus, max\)/)
+})
+
+test('local-low and local-high name a model by size, not by id', () => {
+  // Real numbers from config/local-models.json: the fast model is the BIGGER file,
+  // so role has to decide this, not size.
+  const agents = [
+    { id: 'claude', provider: 'claude-code', enabled: true },
+    { id: 'gemma-local', kind: 'local', enabled: true, role: 'fast', size: 5_154_941_280 },
+    { id: 'qwen-local', kind: 'local', enabled: true, role: 'best-quality', size: 5_027_783_488 },
+  ]
+  assert.equal(localAgentFor('local-low', agents), 'gemma-local', 'the fast model, though it is the larger file')
+  assert.equal(localAgentFor('local-high', agents), 'qwen-local', 'the best-quality model, though it is the smaller file')
+  // A newly installed model sorts itself in with no code change.
+  // A model with no role sits between fast and best-quality, ranked by size against its peers.
+  const withUnroled = [...agents, { id: 'mid-local', kind: 'local', enabled: true, size: 3_000_000_000 }]
+  assert.equal(localAgentFor('local-low', withUnroled), 'gemma-local', 'an explicit fast role still wins')
+  assert.equal(localAgentFor('local-high', withUnroled), 'qwen-local', 'an explicit best-quality role still wins')
+  // With no roles at all it falls back to size, which is better than nothing.
+  const unroled = [{ id: 'a-local', kind: 'local', enabled: true, size: 1 }, { id: 'b-local', kind: 'local', enabled: true, size: 9 }]
+  assert.equal(localAgentFor('local-low', unroled), 'a-local')
+  assert.equal(localAgentFor('local-high', unroled), 'b-local')
+})
+
+test('local levels need a local model, and are not efforts', () => {
+  assert.equal(localAgentFor('local-low', []), null, 'no local model installed')
+  assert.equal(localAgentFor('local-low', [{ id: 'gemma-local', kind: 'local', enabled: false, size: 1 }]), null, 'a disabled agent is not picked')
+  assert.equal(localAgentFor('high', [{ id: 'gemma-local', kind: 'local', enabled: true, size: 1 }]), null, 'an ordinary level names no model')
+  assert.equal(isLocalLevel('local-low'), true)
+  assert.equal(isLocalLevel('high'), false)
+  assert.equal(isLocalLevel(undefined), false)
+  // A cloud agent asked for a local level keeps its own default rather than a bad value.
+  for (const a of [{ provider: 'claude-code' }, { provider: 'codex' }, { llm: { provider: 'deepseek' } }]) {
+    assert.equal(toAgentEffort('local-low', a), null)
+    assert.equal(toAgentEffort('local-high', a), null)
+  }
 })

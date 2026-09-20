@@ -1,4 +1,5 @@
-// Accounts: API keys per provider (values only in ~/.dsh/.env), per-agent
+// Accounts: API keys per provider. A key's value lives in exactly one place,
+// ~/.dsh/.env; everything else refers to it by variable name. Per-agent
 // limits, exhaustion marks, and the subscription tools' own login/logout.
 // Metadata lives in accounts.json; no function here ever returns a key value
 // except resolveKey, which is server-internal.
@@ -8,7 +9,16 @@ import { join } from 'node:path'
 
 export const KEY_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/
 export const SUBSCRIPTION_PROVIDERS = ['claude-code', 'codex']
-export const DEFAULT_LIMITS = { subscription: { handoffAtPercent: 85, stopAtPercent: 97 }, api: { minBalance: 0.5 }, jev: {} }
+// An api key gets the same two tiers a subscription has: a soft one that hands the
+// work over while there is still credit to finish cleanly, and a hard floor that
+// refuses to start. In the key's own currency, so a CNY balance means CNY figures.
+export const DEFAULT_LIMITS = {
+  subscription: { handoffAtPercent: 85, stopAtPercent: 97 },
+  api: { minBalance: 5, handoffAtBalance: 10 },
+  // TypeSafe exposes no balance endpoint (its SDK has only /v1/models and /v1/systemone),
+  // so Jev is measured by what this harness has spent, against a budget you set.
+  jev: { monthlyBudgetUsd: 5 },
+}
 const envName = (provider, name) => `KZ_KEY__${provider}__${name}`
 // Env var that DSH itself reads for a provider's active key.
 const ACTIVE_ENV = { deepseek: 'DEEPSEEK_API_KEY' }
@@ -82,7 +92,7 @@ const LOGOUT = { claude: 'claude auth logout', codex: 'codex logout' }
  * @param {object} p
  * @param {string} p.dataDir
  * @param {string} p.envFile              ~/.dsh/.env
- * @param {object} [p.credentials]        DSH credentials service (resolve/describe/set)
+ * @param {object} [p.credentials]        DSH credentials service (resolve/describe/unset); values are never written to it
  * @param {string} [p.jevCredentialRef]   Jev key used when no jev key is registered
  * @param {Function} [p.codexAccount]     async () => {email, planType} | null
  * @param {Function} [p.run]              shell runner, injectable for tests
@@ -94,7 +104,8 @@ export function createAccounts({ dataDir, envFile, credentials, jevCredentialRef
     let raw
     try { raw = await readFile(file, 'utf8') } catch (err) { if (err.code === 'ENOENT') return { keys: {}, limits: {}, exhausted: {} }; throw err }
     const s = JSON.parse(raw) // damaged file must throw, not read as empty and be overwritten
-    return { keys: s.keys ?? {}, limits: s.limits ?? {}, exhausted: s.exhausted ?? {} }
+    // peakBalance must be read back or every mutate() erases the high-water marks.
+    return { keys: s.keys ?? {}, limits: s.limits ?? {}, exhausted: s.exhausted ?? {}, peakBalance: s.peakBalance ?? {} }
   }
   let queue = Promise.resolve()
   let cache = null
@@ -140,13 +151,12 @@ export function createAccounts({ dataDir, envFile, credentials, jevCredentialRef
     const value = await keyValue(provider, name)
     if (!value) throw new Error(`key ${provider}/${name} has no value in .env`)
     await writeEnvFile(envFile, { [ref]: value })
-    // DSH resolves the DeepSeek key per request from its credential store
-    // (process env > .credentials.yaml, hot-reloaded > .env read once at launch).
-    // Writing the store switches the key live; only an inherited env var needs a restart.
-    const d = await credentials?.describe?.(ref).catch(() => undefined)
-    if (d?.source === 'env' || !credentials?.set) return { restartRequired: true }
-    await credentials.set(ref, value)
-    return { restartRequired: false }
+    // One home for a secret: ~/.dsh/.env. The engine resolves a key per request in
+    // the order process env > .credentials.yaml > .env, so a copy left in the store
+    // would shadow the file we just wrote. Clear it instead of writing a second copy.
+    // The cost is that .env is read once at launch, so switching keys needs a restart.
+    await credentials?.unset?.(ref).catch(() => {})
+    return { restartRequired: true }
   }
 
   const accounts = {
@@ -208,12 +218,31 @@ export function createAccounts({ dataDir, envFile, credentials, jevCredentialRef
     activeKey: (provider) => accounts.cached().keys[provider]?.find((k) => k.active)?.name ?? null,
     /** Server-internal only: never send the result to a client or a log. */
     resolveKey: keyValue,
+    /**
+     * Remember the most credit a key has ever held, so a balance can be shown as a
+     * share of it. A top-up raises the mark, which is what makes it self-maintaining;
+     * a different currency replaces it rather than being compared against.
+     * @returns the mark now in force, or null when there is nothing to compare.
+     */
+    async notePeakBalance(provider, name, balance) {
+      if (!balance || !(Number(balance.amount) >= 0)) return null
+      await ready()
+      const key = `${provider}:${name}`
+      const seen = accounts.cached().peakBalance?.[key]
+      const same = seen && seen.currency === balance.currency
+      if (same && seen.amount >= balance.amount) return seen
+      const mark = { amount: Number(balance.amount), currency: balance.currency, at: new Date().toISOString() }
+      await mutate((st) => { (st.peakBalance ??= {})[key] = mark })
+      return mark
+    },
     async setLimits(agentId, limits) {
       const clean = {}
       for (const f of ['handoffAtPercent', 'stopAtPercent']) if (limits[f] !== undefined) {
         const n = Number(limits[f]); if (!(n >= 0 && n <= 100)) throw new Error(`${f} must be 0-100`); clean[f] = n
       }
-      if (limits.minBalance !== undefined) { const n = Number(limits.minBalance); if (!(n >= 0)) throw new Error('minBalance must be ≥ 0'); clean.minBalance = n }
+      for (const f of ['minBalance', 'handoffAtBalance', 'monthlyBudgetUsd']) if (limits[f] !== undefined) {
+        const n = Number(limits[f]); if (!(n >= 0)) throw new Error(`${f} must be ≥ 0`); clean[f] = n
+      }
       await ready()
       return mutate((s) => { s.limits[agentId] = { ...s.limits[agentId], ...clean } })
     },

@@ -1,5 +1,5 @@
 # Updates Kz-harness: pulls new harness code from git, refreshes packages,
-# and reports (or with -BumpDsh applies) a newer DeepSeek Harness version.
+# and reports (or with -BumpDsh applies) a newer engine (DSH) version.
 # The app's Kz-harness -> Check for updates runs this and restarts the harness.
 #   powershell -ExecutionPolicy Bypass -File C:\Harness\scripts\Update-Harness.ps1 [-BumpDsh]
 param([switch]$BumpDsh)
@@ -34,7 +34,40 @@ foreach ($dir in 'plugins\jev-router', 'plugins\jev-review', 'app') {
   Write-Host "   ok: $dir"
 }
 
-Write-Host '== DeepSeek Harness'
+Write-Host '== Config'
+# Install-Harness.ps1 writes the patch file once and skips it ever after, so a
+# later template change (a new gate percent, a newly disabled skill) never reaches
+# the running harness and nobody is told. Report the drift, do not merge it: the
+# live file is the user's to hand-edit and a merge would overwrite those edits
+# silently. Telling beats doing here, because only the user knows which is which.
+$homeName = ([regex]::Match((Get-Content $start -Raw), "DSH_HOME = Join-Path \`$HOME '([^']+)'")).Groups[1].Value
+$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } elseif ($homeName) { Join-Path $HOME $homeName } else { Join-Path $HOME '.dsh' }
+$live = Join-Path $dshHome 'profiles\web\cordis.patch.yml'
+$template = Join-Path $root 'config\cordis.patch.yml'
+# Settings lines only: comment and blank-line drift changes nothing at runtime.
+# Line-level, not YAML-aware (PowerShell 5.1 ships no YAML parser), so a shared
+# line such as `config:` can join the list when the counts differ. It over-reports
+# rather than under-reports, which is the safe direction for a warning.
+function Get-Settings($path) { (Get-Content $path) | ForEach-Object { ($_ -replace '#.*', '').TrimEnd() } | Where-Object { $_ } }
+if (-not (Test-Path $live)) { Write-Host "   WARN no live config at $live; run scripts\Install-Harness.ps1." }
+else {
+  # The template says C:/Harness; the live copy says wherever this checkout lives.
+  $want = Get-Settings $template | ForEach-Object { $_.Replace('C:/Harness', ($root -replace '\\', '/')) }
+  $drift = Compare-Object $want (Get-Settings $live)
+  $gaps = @($drift | Where-Object SideIndicator -eq '<=' | ForEach-Object InputObject)
+  $localOnly = @($drift | Where-Object SideIndicator -eq '=>' | ForEach-Object InputObject)
+  # Back in template order, so the warning reads as the YAML you would paste.
+  $missing = @($want | Where-Object { $gaps -contains $_ } | Select-Object -Unique)
+  if ($missing) {
+    Write-Host "   WARN $($missing.Count) setting(s) from config\cordis.patch.yml are missing in $live"
+    $missing | ForEach-Object { Write-Host "        $_" }
+    Write-Host '   Nothing was merged. Copy the lines you want by hand, so your own edits stay yours.'
+  }
+  if ($localOnly) { Write-Host "   note: $($localOnly.Count) setting line(s) live only in your copy; left alone." }
+  if (-not $missing -and -not $localOnly) { Write-Host '   live config matches the template.' }
+}
+
+Write-Host '== Engine'
 $pinned = ([regex]::Match((Get-Content $start -Raw), "\`$DshVersion = '([^']+)'")).Groups[1].Value
 $tag = if ($pinned -match '-') { 'next' } else { 'latest' }
 $latest = (npm view "@deepseek-ai/dsh@$tag" version 2>$null)

@@ -9,7 +9,7 @@ import { createAccounts, parseEnv, parseUse, setEnvLines } from '../accounts.js'
 
 const creds = (values = {}, source = 'file') => {
   const calls = []
-  return { calls, resolve: async (r) => (values[r] ? { value: values[r], source } : undefined), describe: async () => ({ source }), set: async (r, v) => { calls.push([r, v]) } }
+  return { calls, resolve: async (r) => (values[r] ? { value: values[r], source } : undefined), describe: async () => ({ source }), set: async (r, v) => { calls.push(['set', r, v]) }, unset: async (r) => { calls.push(['unset', r]) } }
 }
 function setup(values, source) {
   const dir = mkdtempSync(join(tmpdir(), 'kz-acc-'))
@@ -38,7 +38,7 @@ test('first run registers the keys DSH uses as "default"; values stay out of acc
   assert.equal(await acc.resolveKey('jev', 'default'), 'ts-1')
 })
 
-test('activation rewrites DEEPSEEK_API_KEY and the live credential store; rotation cycles and skips spent keys', async () => {
+test('activation rewrites .env only and clears the store copy; rotation cycles and skips spent keys', async () => {
   const { envFile, credentials, acc } = setup({ DEEPSEEK_API_KEY: 'sk-old' })
   await acc.addKey('deepseek', 'second', 'sk-two')
   await acc.addKey('deepseek', 'third', 'sk-three')
@@ -48,8 +48,11 @@ test('activation rewrites DEEPSEEK_API_KEY and the live credential store; rotati
   await acc.markExhausted('deepseek:second', { until: new Date(Date.now() + 60_000).toISOString(), reason: '402' })
   assert.equal(acc.nextKey('deepseek'), 'third')
   const r = await acc.activate('deepseek', 'third')
-  assert.equal(r.restartRequired, false)
-  assert.deepEqual(credentials.calls.at(-1), ['DEEPSEEK_API_KEY', 'sk-three'])
+  // .env is read once at launch, so a switch needs a restart; that is the price of one home for the secret.
+  assert.equal(r.restartRequired, true)
+  // The store is cleared, never written: a copy there would shadow the .env we just wrote.
+  assert.deepEqual(credentials.calls.at(-1), ['unset', 'DEEPSEEK_API_KEY'])
+  assert.equal(credentials.calls.some((c) => c[0] === 'set'), false, 'a key value is never handed to the credential store')
   assert.equal(parseEnv(readFileSync(envFile, 'utf8')).get('DEEPSEEK_API_KEY'), 'sk-three')
   assert.equal(acc.nextKey('deepseek'), 'default') // wraps, skipping the exhausted one
   assert.ok(!existsSync(`${envFile}.tmp`))
@@ -58,10 +61,19 @@ test('activation rewrites DEEPSEEK_API_KEY and the live credential store; rotati
   assert.equal(parseEnv(readFileSync(envFile, 'utf8')).has('KZ_KEY__deepseek__third'), false)
 })
 
-test('an inherited env var shadows the store: activation says restart', async () => {
+test('activation says restart whatever the store says, and a store without unset is tolerated', async () => {
   const { acc } = setup({ DEEPSEEK_API_KEY: 'sk-old' }, 'env')
   await acc.addKey('deepseek', 'b', 'sk-b')
   assert.equal((await acc.activate('deepseek', 'b')).restartRequired, true)
+
+  // No credentials service at all: .env is still written and nothing throws.
+  const dir = mkdtempSync(join(tmpdir(), 'kz-acc-'))
+  const envFile = join(dir, '.env')
+  writeFileSync(envFile, 'DEEPSEEK_API_KEY=sk-old\n')
+  const bare = createAccounts({ dataDir: dir, envFile })
+  await bare.addKey('deepseek', 'b', 'sk-b')
+  assert.equal((await bare.activate('deepseek', 'b')).restartRequired, true)
+  assert.equal(parseEnv(readFileSync(envFile, 'utf8')).get('DEEPSEEK_API_KEY'), 'sk-b')
 })
 
 test('bad names and values are refused', async () => {

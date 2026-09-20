@@ -3,7 +3,7 @@
   "productName": "Kz-harness",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop app for Kz-harness: starts DSH, shows its log, and opens the harness in its own window.",
+  "description": "Desktop app for Kz-harness: starts the engine, shows its log, and opens the harness in its own window.",
   "main": "main.js",
   "scripts": {
     "start": "electron .",

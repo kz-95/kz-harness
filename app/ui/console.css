@@ -56,7 +56,7 @@ body.is-error .ring { display: none; }
 .actions { display: flex; gap: 8px; margin-top: 14px; }
 
 .mini-console { position: relative; width: min(720px, 100%); background: var(--layer-1); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-.mini-console header { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; border-bottom: 1px solid var(--border-soft); color: var(--caption); font-size: 12px; font-weight: 600; }
+.mini-console header { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 8px 14px; border-bottom: 1px solid var(--border-soft); color: var(--caption); font-size: 12px; font-weight: 600; }
 #mini { list-style: none; margin: 0; padding: 8px 0; height: 168px; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; font: 12px/19px var(--mono); }
 
 /* ---------- log lines (both views) ---------- */
@@ -105,3 +105,22 @@ body.is-error .ring { display: none; }
 .tb-menu { display: inline-flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 6px; padding: 4px 8px; color: var(--label-2); font: 600 12px/1 var(--font); cursor: pointer; }
 .tb-menu:hover { background: var(--hover); color: var(--label); }
 body.has-titlebar #start { padding-top: 48px; }
+
+/* Startup checklist. Done steps dim, the current one pulses, later ones stay faint. */
+.steps { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 6px; text-align: left; }
+.steps li { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted, #8a8f94); }
+.steps li .dot { flex: none; width: 14px; text-align: center; }
+.steps li.done { color: var(--muted, #8a8f94); }
+.steps li.done .dot { color: #4ea96a; }
+.steps li.now { color: var(--fg, #e8e8e8); }
+.steps li.now .dot { animation: kzh-pulse 1.2s ease-in-out infinite; }
+.steps li.todo { opacity: .55; }
+.steps li.skipped { opacity: .55; }
+@keyframes kzh-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .steps li.now .dot { animation: none; } }
+
+.mini-console header .grow { flex: 1; }
+/* Expanded: a real scrollback. Must be written with #mini, not `.expanded ol`, or the id
+   selector on the collapsed height outranks it and the box never grows. Lines run top-down
+   because a flex column with justify-content:flex-end clips its own overflow in Chromium. */
+.mini-console.expanded #mini { height: 46vh; justify-content: flex-start; overflow: auto; }

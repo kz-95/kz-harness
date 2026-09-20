@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createAccounts } from '../accounts.js'
-import { codexRpc, createUsage, detectLimit, stateOf } from '../usage.js'
+import { codexRpc, createUsage, creditPercent, detectLimit, longWindowPercent, stateOf } from '../usage.js'
 
 const sub = { handoffAtPercent: 85, stopAtPercent: 97 }
 const soon = () => new Date(Date.now() + 60_000).toISOString()
@@ -86,4 +86,35 @@ test('snapshot: per-key DeepSeek balances, agent ok while any key is usable, OMC
   const line = (await usage.recent(1))[0]
   assert.equal(line.agent, 'jev')
   assert.ok(!JSON.stringify(await usage.recent()).includes('sk-'))
+})
+
+test('creditPercent: a balance as a share of the most that key ever held', () => {
+  const cny = (n) => ({ amount: n, currency: 'CNY' })
+  assert.equal(creditPercent(cny(363.82), cny(400)), 91)
+  assert.equal(creditPercent(cny(400), cny(400)), 100, 'a fresh top-up reads full')
+  assert.equal(creditPercent(cny(0), cny(400)), 0)
+  // A balance above the mark is clamped; notePeakBalance raises the mark on the next read.
+  assert.equal(creditPercent(cny(500), cny(400)), 100)
+  // Nothing to compare against, or comparing across currencies, says nothing at all.
+  assert.equal(creditPercent(cny(10), null), null)
+  assert.equal(creditPercent(null, cny(400)), null)
+  assert.equal(creditPercent(cny(10), { amount: 400, currency: 'USD' }), null, 'never compare CNY against USD')
+  assert.equal(creditPercent(cny(10), cny(0)), null, 'a zero mark is no mark')
+})
+
+test('longWindowPercent: the rationed window, found by duration not by label', () => {
+  const w = (name, minutes, usedPercent) => ({ name, minutes, usedPercent })
+  assert.equal(longWindowPercent([w('5h', 300, 19), w('weekly', 10080, 3)]), 3)
+  // A relabelled window must not switch the gate off: duration decides.
+  assert.equal(longWindowPercent([w('5h', 300, 19), w('secondary', 10080, 97)]), 97)
+  // Sub-day windows are not the resource the policy rations.
+  assert.equal(longWindowPercent([w('5h', 300, 99)]), null)
+  assert.equal(longWindowPercent([w('primary', 60, 99)]), null)
+  // Unknown is null, never 0: 0 would read as "plenty left" and is the expensive mistake.
+  assert.equal(longWindowPercent([]), null)
+  assert.equal(longWindowPercent(undefined), null)
+  assert.equal(longWindowPercent([{ name: 'weekly', minutes: 10080 }]), null, 'no percent means unknown')
+  assert.equal(longWindowPercent([w('weekly', 10080, 0)]), 0, 'a real zero is still zero')
+  // Two long windows: the longer one wins.
+  assert.equal(longWindowPercent([w('daily', 1440, 50), w('weekly', 10080, 10)]), 10)
 })

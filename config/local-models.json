@@ -111,7 +111,7 @@
       "minRamGB": 12,
       "notes": "Q4_K_M. Needs ~5.7 GB of GPU memory to run fully on the GPU; with less it splits between GPU and CPU. Best local tool calling here. Qwen3.5-9B has no official GGUF yet.",
       "chatTemplate": "embedded (--jinja); thinking off (--reasoning off)",
-      "contextSize": 8192,
+      "contextSize": 16384,
       "maxContext": 40960,
       "gpuLayers": "auto",
       "agent": {
@@ -139,7 +139,7 @@
       "minRamGB": 8,
       "notes": "Google's QAT Q4_0 (no official Q4_K_M). 4.5B effective parameters; the file is large because of per-layer embeddings, which stay in RAM. Needs ~3 GB of GPU memory to run fully on the GPU.",
       "chatTemplate": "embedded (--jinja); thinking off (--reasoning off)",
-      "contextSize": 8192,
+      "contextSize": 16384,
       "maxContext": 131072,
       "gpuLayers": "auto",
       "agent": {

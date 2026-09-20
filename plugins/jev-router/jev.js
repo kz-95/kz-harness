@@ -2,6 +2,8 @@
 // Jev only answers typed questions; all policy (thresholds, limits, overrides)
 // lives in router.js so raw judgments stay reusable and inspectable.
 import { TypeSafeClient, choice, noul, score } from '@typesafe-ai/sdk'
+import { CAPABILITIES } from './capabilities.js'
+import { redactSecrets } from './export.js'
 
 export const TASK_TYPES = {
   architecture: 'Designing structure, data flow, or a strategy across components before or instead of writing code',
@@ -53,9 +55,20 @@ export const VERDICTS = {
   },
 }
 
+/**
+ * Mask key-shaped strings on anything that goes to Jev, with the same scrubber the
+ * Markdown export uses. A key pasted into the chat was already masked in the log and
+ * in the export; sending it verbatim to a third party was the one path that missed.
+ * Secrets only, on purpose: the routing judgment is made of the task text, the diff
+ * and the check output, so stripping code, paths or branch names would quietly make
+ * every routing decision worse.
+ */
+const scrub = (text) => (typeof text === 'string' ? redactSecrets(text) : text)
+
 function clip(text, max) {
-  if (typeof text !== 'string') return text
-  return text.length <= max ? text : `${text.slice(0, max)}\n...[truncated ${text.length - max} chars]`
+  const s = scrub(text)
+  if (typeof s !== 'string') return s
+  return s.length <= max ? s : `${s.slice(0, max)}\n...[truncated ${s.length - max} chars]`
 }
 
 function agentCriteria(agents) {
@@ -71,6 +84,10 @@ function traceOf(phase, questions, res, ms, used) {
     phase,
     ms,
     model: res.model,
+    // The call's own id from `x-typesafe-request-id`. The quick reference's house rule is to log
+    // it with the model, because it is the only handle TypeSafe support can act on when a
+    // judgment looks wrong.
+    requestId: res.requestId,
     usage: res.usage,
     questions: Object.entries(questions).map(([name, q]) => {
       const a = res.answers[name]
@@ -92,8 +109,13 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
   const client = new TypeSafeClient({ apiKey, ...(model ? { defaultModel: model } : {}) })
   const ask = async (phase, state, questions, signal, used = () => true) => {
     const t0 = Date.now()
-    const res = await client.systemOne({ state, questions }, { timeout: timeoutMs, signal })
-    onTrace?.(traceOf(phase, questions, res, Date.now() - t0, used))
+    const call = client.systemOne({ state, questions }, { timeout: timeoutMs, signal })
+    // `.withResponse()` is how the SDK hands back the request id; without it the id never
+    // reaches the log. Falls back cleanly if a future SDK drops the method.
+    const { data: res, requestId } = typeof call?.withResponse === 'function'
+      ? await call.withResponse()
+      : { data: await call, requestId: undefined }
+    onTrace?.(traceOf(phase, questions, requestId ? { ...res, requestId } : res, Date.now() - t0, used))
     return res
   }
 
@@ -103,15 +125,18 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
      * deterministic scripts Jev may pick instead of an agent. Every tool's
      * parameter questions are asked speculatively in the same single call.
      */
-    async route({ task, context, agents, tools = [], history, availability, handoff }, signal) {
-      const state = { task, workspace: context, recent_outcomes: history }
+    async route({ task, context, agents, tools = [], history, availability, trackRecord, handoff, capabilities }, signal) {
+      const state = { task: scrub(task), workspace: context, recent_outcomes: history }
       if (availability) state.agent_availability = availability
+      if (trackRecord) state.agent_track_record = trackRecord
       if (handoff) state.handoff = clip(handoff, 3000)
       const questions = {
         agent: choice(
           {
             question: 'Which coding agent should handle `task` first?',
-            focus: 'Match the nature of `task` and the facts in `workspace` to each agent\'s strengths. `recent_outcomes` shows how agents did on earlier tasks here.' + (availability ? ' Prefer agents that are \'ok\' in `agent_availability` over those \'near limit\'.' : ''),
+            focus: 'Match the nature of `task` and the facts in `workspace` to each agent\'s strengths. `recent_outcomes` shows how agents did on earlier tasks here.'
+              + (trackRecord ? ' Prefer the cheapest agent likely to succeed, judged by `agent_track_record` (accepted rate for this kind of task here, then overall): free-local agents for simple or read-only work, api agents for routine work, subscription agents for hard, risky or cross-cutting work or where cheaper agents keep failing. Avoid agents with repeated limit hits. Where `price_now` says an agent is on its standard (not off-peak) rate, prefer an equally capable agent that is not, unless the task needs that one.' : '')
+              + (availability ? ' Prefer agents that are \'ok\' in `agent_availability` over those \'near limit\'.' : ''),
           },
           agentCriteria(agents),
         ),
@@ -123,6 +148,25 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         needsTests: noul('Should deterministic checks (tests, type checker, lint, build) be required to pass before the result of `task` is accepted?'),
       }
       if (handoff) questions.continueHandoff = noul('Does `task` ask to continue the earlier unfinished work described in `handoff`?')
+      // What kind of outcome this needs. Batched with everything else, so it costs only its own
+      // tokens and no extra round trip. The options are the capabilities some pickable executor
+      // really has: a category nothing on this machine can carry out is never offered, and
+      // `human_required` is always available because a person always is.
+      if (capabilities?.length) {
+        questions.capability = choice(
+          {
+            question: 'What kind of outcome does `task` need?',
+            focus: 'Choose what finishing the task actually requires. Explaining while changing code is still `project_change`; reading the project without changing it is `project_read`.',
+          },
+          {
+            ...Object.fromEntries(capabilities.map((c) => [c, { what: CAPABILITIES[c] }])),
+            human_required: { what: CAPABILITIES.human_required },
+            // Choice is relative, so something always wins (quick reference rule 6): without an
+            // escape hatch a request that fits nothing is forced into the nearest wrong category.
+            other: { what: 'Nothing in this list fits: the request needs something these executors are not described as doing' },
+          },
+        )
+      }
       if (tools.length) {
         questions.handler = choice(
           {
@@ -152,6 +196,10 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         primaryAgent: answers.agent.choice,
         agentConfidence: answers.agent.confidence,
         agentProbabilities: answers.agent.probabilities,
+        // What the request needs. Undefined when no registry was wired, so nothing downstream
+        // has to guess whether the answer is meaningful.
+        capability: answers.capability?.choice,
+        capabilityConfidence: answers.capability?.confidence,
         taskType: answers.taskType.choice,
         taskTypeConfidence: answers.taskType.confidence,
         complexity: unit(answers.complexity, COMPLEXITY_LEVELS),
@@ -169,9 +217,16 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
       }
     },
 
-    /** Is the latest message work to carry out in the project, or a question to answer directly? One choice, ~0.1 s. */
+    /**
+     * Is the latest message work to carry out in the project, or a question to answer directly?
+     * And how much does answering it well depend on real reasoning?
+     *
+     * Both ride the one call (~0.1 s), so the second question costs no extra round trip. It
+     * decides which model answers: everyday talk goes to the local model first (free, private,
+     * instant), and Jev is the one that decides when it is worth waking a bigger model.
+     */
     async intent({ message }, signal) {
-      const { answers } = await ask('intent', { message }, {
+      const { answers } = await ask('intent', { message: scrub(message) }, {
         kind: choice(
           { question: 'What does `message` ask for?', focus: 'Only work that reads or changes the project counts as a task. Questions about tools, accounts, concepts or this app are questions.' },
           {
@@ -179,24 +234,46 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
             question: { what: 'A question or conversation to answer directly, such as how something works, why something happened, or advice', not_for: 'Requests to read, change or check files in the project' },
           },
         ),
+        depth: choice(
+          { question: 'How much does answering `message` well depend on careful reasoning or wide, current knowledge?', focus: 'Judge the question itself, not who is asking it or how it is worded.' },
+          {
+            everyday: { what: 'Greetings, small talk, thanks, a short how-to or factual answer, or something a small local model handles well', not_for: 'Anything whose answer needs several steps of reasoning, wide or current knowledge, or the details of this project' },
+            deep: { what: 'Needs careful step-by-step reasoning, wide or up-to-date knowledge, or knowledge of this project: worth the strongest available model', not_for: 'Greetings, thanks, small talk, and one-line factual or how-to answers' },
+          },
+        ),
+        // One message may do both: answer it and ask for work. Asked independently so a message
+        // that is mostly a question can still queue the change it mentions - the old single
+        // question-versus-task choice could not express that at all.
+        alsoWork: noul('Even if `message` is a question to answer directly, does it also ask for work to be carried out in the project?'),
       }, signal)
-      return { kind: answers.kind.choice, confidence: answers.kind.confidence }
+      return {
+        kind: answers.kind.choice,
+        confidence: answers.kind.confidence,
+        // Undefined when Jev did not answer that one: the caller then keeps the cheap default.
+        depth: answers.depth?.choice,
+        depthConfidence: answers.depth?.confidence,
+        alsoWork: answers.alsoWork?.noul,
+      }
     },
 
     /** Post-execution assessment over summarized, deterministic evidence. */
     async assess({ task, routing, attempts, checks, diff, agents }, signal) {
       const state = {
-        task,
+        task: scrub(task),
         routing: { task_type: routing.taskType, risk: routing.risk, complexity: routing.complexity },
-        attempts: attempts.map((a) => ({
+        // Only the newest attempt is sent in full. Earlier ones shrink to what the review
+        // actually uses them for: who tried, how it ended, and whether anything moved. Round 3
+        // used to resend rounds 1 and 2 at full length, paying for the same words every round.
+        attempts: attempts.map((a, i) => ({
           agent: a.agent,
           role: a.role,
           status: a.stopReason,
-          diagnostic: a.diagnostic,
-          answer: clip(a.answerText, 2500),
+          diagnostic: scrub(a.diagnostic),
+          ...(i === attempts.length - 1 ? { answer: clip(a.answerText, 2500) } : {}),
           changed_files: a.changedFiles,
         })),
-        verification: checks,
+        // Check output is test and build stdout, which prints whatever the run had in env.
+        verification: checks.map((c) => ({ ...c, output: scrub(c.output) })),
         diff: { stat: diff.stat, excerpt: clip(diff.patch, 6000) },
       }
       // One snap judgment per question: atomic Nouls (yes = the thing named) decide
@@ -214,10 +291,21 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         unrelatedChanges: noul('Does `diff` change anything `task` did not ask for?'),
         regressionRisk: noul('Does `diff` carry meaningful risk of breaking behavior that `task` did not ask to change?'),
         needsPerson: noul('Does the latest entry in `attempts` ask a question, report being blocked, or need a decision only a person can make?'),
-        nextAgent: choice(
+        // Asked separately because they are different jobs. A careful critic and a strong
+        // fixer are rarely the same agent, and one answer spent on both meant whichever the
+        // run happened to need got the other one's pick. Both ride this same call, so the
+        // split costs no extra round trip.
+        reviewAgent: choice(
           {
-            question: 'If another agent works on `task` next, to review or to fix the latest attempt, which agent is best?',
-            focus: 'An independent perspective usually helps most. Prefer an agent other than the one that just failed or produced the work, unless it is clearly the best fit.',
+            question: 'If another agent REVIEWS the latest attempt without changing it, which agent should judge it?',
+            focus: 'Judging rewards care and independence over speed or cost, and costs few tokens. Prefer an agent other than the one that produced the work, unless it is clearly the best judge.',
+          },
+          agentCriteria(agents),
+        ),
+        retryAgent: choice(
+          {
+            question: 'If another agent has to FIX the latest attempt, which agent should do the work?',
+            focus: 'Fixing is bulk work: weigh track record on this kind of task and cost. Prefer an agent other than the one that just failed, unless it is clearly the best fit.',
           },
           agentCriteria(agents),
         ),
@@ -231,8 +319,10 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         unrelatedChanges: answers.unrelatedChanges.noul,
         regressionRisk: answers.regressionRisk.noul,
         needsPerson: answers.needsPerson.noul,
-        nextAgent: answers.nextAgent.choice,
-        nextAgentProbabilities: answers.nextAgent.probabilities,
+        reviewAgent: answers.reviewAgent.choice,
+        reviewAgentProbabilities: answers.reviewAgent.probabilities,
+        retryAgent: answers.retryAgent.choice,
+        retryAgentProbabilities: answers.retryAgent.probabilities,
       }
     },
   }

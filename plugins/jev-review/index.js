@@ -49,7 +49,9 @@ export function createReview(jev, thresholds, unavailableReason = 'Jev not confi
     } else a = { mode: 'fallback', reason: unavailableReason }
     if (a.mode === 'fallback') {
       a.verdict = last.stopReason !== 'completed' || blockAccept ? 'retry' : 'accept'
-      a.nextAgent = pickOther({}, last.agent)
+      // No Jev answer to split, so both jobs fall back to the same peer pick.
+      a.reviewAgent = pickOther({}, last.agent)
+      a.retryAgent = a.reviewAgent
     }
 
     // Jev-mode policy: atomic Nouls, three bands, risk-scaled bar.

@@ -15,13 +15,17 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import { createJev } from './jev.js'
-import { formatReport, runRouted } from './router.js'
+import { formatReport, pricingNow, runRouted } from './router.js'
 import { LEVELS, codexServiceTier } from './effort.js'
 import { run } from './workspace.js'
-import { checkAgents } from './setup.js'
-import { JEV_PROVIDER, jevAdapter, line } from './adapter.js'
+import { authAction, canAuth, checkAgents } from './setup.js'
+import { JEV_PROVIDER, jevAdapter, line, nameOfAgent, queuedLine } from './adapter.js'
+import { executorsFrom } from './capabilities.js'
+import { createDelivery } from './delivery.js'
+import { TERMINAL_STATES, createLanes, createTasks, laneKey, validJobId } from './tasks.js'
+import { SESSION_ID, exportSession, redactSecrets } from './export.js'
 import { KEY_NAME, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
-import { createUsage, detectLimit } from './usage.js'
+import { createUsage, detectLimit, longWindowPercent } from './usage.js'
 import { LOCAL_PROVIDER, buildCatalog, createConnectivity, createLocalModels, detectSpecs, installLlmCommand, localAdapter, looksLikeQuestion, readManifest, removeLlmCommand } from './local.js'
 
 export const name = 'jev-router'
@@ -33,7 +37,8 @@ const LOCAL_PERSONA = 'You are a careful software engineer working as a delegate
 
 const Agent = Schema.object({
   id: Schema.string().pattern(/^[a-z][a-z0-9_-]*$/).required().description('Short id, also the manual override command name.'),
-  provider: Schema.string().required().description('DSH subagent provider name, e.g. claude-code, codex, spawn.'),
+  provider: Schema.string().required().description('Subagent provider name, e.g. claude-code, codex, spawn.'),
+  name: Schema.string().description('Shown in the model menu, the inspector and reports. Defaults to the id, title-cased.'),
   description: Schema.string().required().description('Strengths shown to Jev when choosing. A prior, not a rule.'),
   enabled: Schema.boolean().default(true),
   persona: Schema.string().description('Optional persona for providers that accept one (spawn).'),
@@ -60,20 +65,23 @@ export const Config = Schema.object({
   agents: Schema.array(Agent).default([
     {
       id: 'claude',
+      name: 'Claude Code',
       provider: 'claude-code',
       description: 'Claude Code: architecture, planning, large-context understanding, complex cross-file reasoning, ambiguous requirements.',
       enabled: true,
     },
     {
       id: 'codex',
+      name: 'Codex (GPT)',
       provider: 'codex',
       description: 'OpenAI Codex: implementation, debugging, repository modification, targeted fixes, writing and running tests.',
       enabled: true,
     },
     {
       id: 'deepseek',
+      name: 'DeepSeek agent',
       provider: 'spawn',
-      description: 'DeepSeek (native DSH agent): independent analysis, code review, second opinions, reasoning, broad investigation.',
+      description: 'DeepSeek (native harness agent): independent analysis, code review, second opinions, reasoning, broad investigation.',
       enabled: true,
       credentialRef: 'DEEPSEEK_API_KEY',
       llm: { provider: 'deepseek', model: 'deepseek-flash' },
@@ -98,6 +106,53 @@ export const Config = Schema.object({
     }).default({}).description('Fixed effort per agent; wins over the menu and the default.'),
     codexSpeed: Schema.union(['normal', 'fast']).default('normal').description('fast = Codex 1.5x (service tier priority).'),
   }).default({}),
+  pricing: Schema.object({
+    peak: Schema.dict(Schema.object({
+      windowsUtc: Schema.array(Schema.object({
+        fromUtc: Schema.string().pattern(/^\d{1,2}:\d{2}$/).required().description('Window start, UTC "HH:MM".'),
+        toUtc: Schema.string().pattern(/^\d{1,2}:\d{2}$/).required().description('Window end, UTC "HH:MM"; an end at or before the start wraps past midnight.'),
+      })).default([]).description('The hours the dearer rate applies. Everything outside them is off-peak.'),
+      daysUtc: Schema.array(Schema.number().min(0).max(6)).default([1, 2, 3, 4, 5]).description('UTC days peak applies, 0 = Sunday. The default is Monday to Friday.'),
+      note: Schema.string().description('Shown to Jev, e.g. what the difference costs.'),
+    })).default({
+      // DeepSeek charges double during Beijing business hours only: Mon-Fri 09:00-12:00 and
+      // 14:00-18:00 CST, which is 01:00-04:00 and 06:00-10:00 UTC. Everything else, every
+      // evening and the whole weekend, is already the cheap rate. Confirmed from DeepSeek's
+      // 2026-09-10 pricing notice; check https://api-docs.deepseek.com/quick_start/pricing
+      // and edit here if they move it.
+      deepseek: {
+        windowsUtc: [{ fromUtc: '01:00', toUtc: '04:00' }, { fromUtc: '06:00', toUtc: '10:00' }],
+        daysUtc: [1, 2, 3, 4, 5],
+        note: 'DeepSeek peak is exactly twice off-peak on every line: output 8 vs 4 CNY per million tokens',
+      },
+    }).description('Agent id -> the hours its provider charges its DEARER rate. Jev prefers an agent on its cheap rate when the choice is otherwise even.'),
+  }).default({}).description('Time-of-day pricing, for the providers that have it.'),
+  links: Schema.dict(Schema.object({
+    keys: Schema.string().description('Where this provider issues API keys.'),
+    topUp: Schema.string().description('Where this provider takes payment.'),
+  })).default({
+    // console.typesafe.ai/keys and /billing both resolve (307 to login), so both are real.
+    // DeepSeek serves 403 to anything unauthenticated, so /top_up could not be checked:
+    // api_keys is known good, and the rest is editable here if it ever moves.
+    deepseek: { keys: 'https://platform.deepseek.com/api_keys', topUp: 'https://platform.deepseek.com/top_up' },
+    jev: { keys: 'https://console.typesafe.ai/keys', topUp: 'https://console.typesafe.ai/billing' },
+  }).description('Per key-provider links shown on the Usage cards: where to get a key, where to top up.'),
+  policy: Schema.object({
+    gateAtPercent: Schema.dict(Schema.number().min(0).max(100)).default({
+      // Past this share of its WEEKLY window a subscription stops doing bulk work and is
+      // kept for reviewing, where its remaining percent buys the most. Set per plan:
+      // Claude Pro 80 / Max 90; Codex Plus 80 / Pro 90. The plan cannot be detected
+      // reliably (the live endpoint reports none, and the cached credential lags an
+      // upgrade), so this is yours to set rather than something guessed for you.
+      default: 80,
+    }).description('Agent id -> weekly percent at which it stops taking execution work. "default" applies to the rest.'),
+    minRoutingConfidence: Schema.number().min(0).max(1).default(0.5)
+      .description('Below this confidence Jev is treated as undecided, and a metered pick is swapped for a subscription agent it rated about the same.'),
+    tieMargin: Schema.number().min(0).max(1).default(0.1)
+      .description('How close another agent must be to the top pick to count as tied, for the swap above.'),
+    stallAfter: Schema.number().min(1).max(10).default(2)
+      .description('Work attempts in a row that change no files before the run stops and asks a person, instead of retrying again.'),
+  }).default({}).description('Cost policy: how far a subscription is spent on bulk work before the API takes over.'),
   fallbackAgent: Schema.string().default('claude').description('Agent used when Jev is unavailable.'),
   credentialRef: Schema.string().default('TYPESAFE_API_KEY').description('Credential name for the TypeSafe API key (env, .credentials.yaml, or .env).'),
   jevModel: Schema.string().default('jev-1.13.0').description('TypeSafe model id, pinned so tuned thresholds keep their meaning.'),
@@ -168,14 +223,20 @@ export function apply(ctx, config) {
   if (unpinned.length) throw new Error(`jev-router: spawn agents need llm: { provider, model }: ${unpinned.map((a) => a.id).join(', ')}`)
   if (config.auxModel.provider === JEV_PROVIDER) throw new Error('jev-router: auxModel must be a real model, not Jev')
   const dataDir = dirname(config.historyFile)
+  // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
+  const allRecords = async () => {
+    const raw = await readFile(config.historyFile, 'utf8').catch(() => '')
+    return raw.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  }
   const history = {
     async recent(cwd, n) {
-      const raw = await readFile(config.historyFile, 'utf8').catch(() => '')
-      // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
-      return raw.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l) } catch { return null } })
-        .filter((r) => r && r.workspace === cwd).slice(-n)
+      return (await allRecords()).filter((r) => r.workspace === cwd).slice(-n)
         .map((r) => ({ task_type: r.routing?.taskType, first_agent: r.routing?.primaryAgent, attempts: r.attempts?.length, outcome: r.finalStatus }))
     },
+    // Full rows for trackRecord: what each agent costs, how it has done here, and whether it is
+    // on its cheap rate right now. Without this the router silently skips all of that and Jev
+    // picks with no cost or history prior at all.
+    records: allRecords,
     async append(record) {
       await mkdir(dataDir, { recursive: true })
       await appendFile(config.historyFile, `${JSON.stringify(record)}\n`)
@@ -320,7 +381,11 @@ export function apply(ctx, config) {
       usage.snapshot(agents).catch(() => null),
       new Promise((r) => setTimeout(r, 4000, null)),
     ]) ?? usage.last()?.out ?? {}
-    return Object.fromEntries(Object.entries(snap).map(([id, q]) => [id, { state: q.state, until: q.until, summary: summaryOf(q) }]))
+    // weeklyPercent is what the subscription-first policy rations; it was computed
+    // upstream and thrown away here, which is why that policy was unimplementable.
+    return Object.fromEntries(Object.entries(snap).map(([id, q]) => [id, {
+      state: q.state, until: q.until, kind: q.kind, weeklyPercent: longWindowPercent(q.windows), summary: summaryOf(q),
+    }]))
   }
 
   // A Jev client on the active jev key; on 429/402 it moves to the next jev key and retries the call once.
@@ -336,7 +401,8 @@ export function apply(ctx, config) {
       timeoutMs: config.jevTimeoutMs,
       onTrace: (t) => {
         onTrace(t)
-        usage.logJev({ runId, account: name, phase: t.phase, ms: t.ms, tokens: { input: t.usage?.input_tokens ?? 0, output: t.usage?.output_tokens ?? 0 } }).catch(() => {})
+        // model and request id together: the two things a TypeSafe support query needs.
+        usage.logJev({ runId, account: name, phase: t.phase, ms: t.ms, model: t.model, requestId: t.requestId, tokens: { input: t.usage?.input_tokens ?? 0, output: t.usage?.output_tokens ?? 0 } }).catch(() => {})
       },
     })
     let client = build()
@@ -359,9 +425,11 @@ export function apply(ctx, config) {
   }
 
   // Task or question? Questions are answered directly by a chat model instead of running agents in the workspace.
+  // `mode` is the picked Jev row; 'offline' keeps this on the local heuristic.
   // Without Jev (no key, error) everything is a task, as before.
-  async function classify(message) {
-    if (await isOffline()) return { kind: looksLikeQuestion(message) ? 'question' : 'task', offline: true }
+  async function classify(message, mode) {
+    // Offline mode is a choice, not a network state: it must not call out even with the internet up.
+    if (mode === 'offline' || await isOffline()) return { kind: looksLikeQuestion(message) ? 'question' : 'task', offline: true }
     const jev = await makeJev({ onTrace: () => {}, runId: 'intent', emit: () => {} }).catch(() => null)
     if (!jev) return { kind: 'task' }
     try { return await jev.intent({ message }, AbortSignal.timeout(config.jevTimeoutMs)) } catch { return { kind: 'task' } }
@@ -446,14 +514,20 @@ export function apply(ctx, config) {
   // Subagents inherit the jev_route tool and would re-route their own prompt, nesting forever.
   // Also stops two routes editing the same workspace at once.
   const active = new Set()
-  async function route({ task, agent, forceAgent, answerOnly, effort, signal = new AbortController().signal, emit }) {
+  async function route({ task, agent, forceAgent, answerOnly, effort, mode = 'auto', laneHeld = false, modalities, signal = new AbortController().signal, emit, onEntry }) {
     const cwd = agent?.session?.header?.cwd
-    if (!cwd) throw new Error('cannot determine the session workspace; open a workspace in DSH first')
+    if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
     const key = resolve(cwd).toLowerCase()
+    // A nested agent calling jev_route would deadlock on the lane its own parent holds,
+    // so that case still refuses outright rather than waiting.
     if (active.has(key)) throw new Error('already routing a task in this workspace; wait for it to finish (a nested agent must do its task directly, not call jev_route)')
+    // One queue per workspace for every caller. Background tasks and slash commands
+    // used to hold two independent mutexes, which let both run in one working tree.
+    const release = laneHeld ? () => {} : await lanes.acquire(key, `route-${randomUUID()}`, signal)
     active.add(key)
     const sessionId = sessionIdOf(agent) ?? cwd
     const entry = logRun(sessionId, task)
+    onEntry?.(entry)
     const stop = new AbortController()
     stoppers.set(entry.id, stop)
     signal = AbortSignal.any([signal, stop.signal])
@@ -464,7 +538,9 @@ export function apply(ctx, config) {
       const onTrace = (trace) => onEvent({ type: 'jev', at: Date.now(), trace })
       // Review runs on this same client (router's default createReview), so it shares key rotation and the usage log.
       // Offline: no Jev at all (fixed routing rule, deterministic review), so nothing waits on a dead network.
-      const offline = await isOffline()
+      // 'local' keeps Jev routing but only over local models; 'offline' also drops Jev.
+      const localOnly = mode === 'local' || mode === 'offline'
+      const offline = mode === 'offline' || await isOffline()
       const jev = offline ? null : await makeJev({ onTrace, runId, emit: onEvent })
       const agents = await enabledAgents()
       await rotateSpentKeys(agents)
@@ -497,9 +573,14 @@ export function apply(ctx, config) {
         }
       }
 
+      // Which agents can be handed an image. A fact about their own tool loop, not a guess.
+      const seesImages = new Set()
+      for (const a of agents) if (await agentSeesImages(a.id).catch(() => false)) seesImages.add(a.id)
+
       const result = await runRouted({
         task,
         cwd,
+        sessionId,
         forceAgent,
         answerOnly,
         effort,
@@ -509,7 +590,17 @@ export function apply(ctx, config) {
           ready: await readiness(),
           jev,
           offline,
-          jevUnavailableReason: offline ? 'offline: no internet, checks only' : `${config.credentialRef} not configured`,
+          localOnly,
+          jevUnavailableReason: offline ? (mode === 'offline' ? 'offline mode: local models and checks only' : 'offline: no internet, checks only') : `${config.credentialRef} not configured`,
+          // Capability routing: what each executor on this machine really is, so code can drop
+          // the ones that cannot do this request before Jev is asked (and check its pick after).
+          executors: executorsFrom({
+            agents,
+            tools: config.tools ?? [],
+            chat: [config.auxModel, await localChat().catch(() => null)].filter(Boolean),
+            seesImages: (id) => seesImages.has(id),
+          }),
+          inputModalities: modalities ?? ['text'],
           execute,
           runTool: runTool(cwd, config.agentTimeoutMs),
           modelOf,
@@ -518,6 +609,15 @@ export function apply(ctx, config) {
           quota,
           isLimitError: detectLimit,
           onLimit: (agentId, info) => onLimit(byId.get(agentId), info),
+          // Only metered keys need re-reading; a subscription's window is rationed by the gate,
+          // and a local model costs nothing.
+          checkBalance: async (agentId) => {
+            const a = byId.get(agentId)
+            if (!a || kindOf(a) !== 'api') return null
+            const snap = await usage.snapshot([a], { force: true }).catch(() => null)
+            const q = snap?.[agentId]
+            return q ? { state: q.state, balance: q.balance ?? null, until: q.until ?? null } : null
+          },
           logAttempt: (entry) => {
             // This run's id (shared with its Jev call lines) and normalized token counts win over the router's.
             const { tokens: u, runId: _routerRunId, answerText: _a, ...rest } = entry
@@ -536,8 +636,73 @@ export function apply(ctx, config) {
       throw err
     } finally {
       active.delete(key)
+      release()
       stoppers.delete(entry.id)
     }
+  }
+
+  // --- Background tasks -------------------------------------------------
+  // A routed task runs as a DSH background job so the chat stays free, and one
+  // at a time per workspace (a lane) so two agents never edit the same folder.
+  // The result is posted into the chat on the session's next turn.
+  const lanes = createLanes()
+
+  // The delivery path lives in its own module so it can be tested (test/delivery.test.js): it is
+  // the path a person's result travels, and inside this closure it had no test at all. It needs
+  // the task registry, which is built just below with a callback that calls it, so the reference
+  // is filled in immediately afterwards.
+  let delivery = null
+  const tasks = createTasks({
+    file: join(dataDir, 'tasks.jsonl'),
+    lanes,
+    // Optional service: without the tool-jobs plugin there is no job controller,
+    // enqueue() returns null and the adapter runs the task blocking, as before.
+    // ctx.jobs THROWS when 'jobs' is not in this plugin's inject list, rather than
+    // returning undefined, so ask for it the way an optional service must be asked.
+    // Absent (no tool-jobs plugin) means enqueue() returns null and tasks run blocking.
+    jobs: () => { try { return ctx.get?.('jobs') ?? null } catch { return null } },
+    // The result goes to its conversation the moment the task settles, and keeps trying if
+    // that first attempt does not land.
+    onSettled: (result, owner) => { delivery.deliverWithRetry(result, owner).catch(() => {}) },
+    log: (m) => process.stdout.write(`[jev] ${m}
+`),
+    run: (t, { signal, emit, onEntry }) => {
+      // Read before the first emit: `t.agent` becomes the agent the router picked.
+      const forceAgent = t.agent ?? undefined
+      // Only say "waiting" when something is actually ahead of it.
+      if (lanes.busy(laneKey(t.workspace))) emit({ type: 'queued' })
+      return lanes.acquire(laneKey(t.workspace), t.jobId, signal).then(async (release) => {
+        try {
+          return await route({ task: t.task, agent: t.owner, forceAgent, effort: t.effort ?? undefined, mode: t.mode ?? 'auto', laneHeld: true, modalities: t.modalities ?? ['text'], signal, emit, onEntry })
+        } finally { release() }
+      })
+    },
+  })
+  // Filled in now that the registry exists; onSettled above only dereferences it once a task
+  // actually settles, which cannot happen before this line has run.
+  delivery = createDelivery({ tasks, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
+
+  const orchestrator = {
+    /** Unread finished results for this session, in the order they finished. */
+    results: (sessionId) => tasks.results(sessionId),
+    /** How much is still in flight here, so a notice turn can say something true. */
+    live: (sessionId) => tasks.list().filter((t) => t.sessionId === sessionId && !TERMINAL_STATES.includes(t.state)).length,
+    /** The result is being rendered now; still unread until delivered(). */
+    delivering: (jobId) => tasks.delivering(jobId),
+    /** The result's message was accepted: stop offering it. */
+    delivered: (jobId) => tasks.delivered(jobId),
+    /** Queue one chat task; returns the chat line, or null when background jobs are unavailable. */
+    enqueue({ agent, task, effort, forceAgent, mode, sessionId }) {
+      const cwd = agent?.session?.header?.cwd
+      if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
+      // sessionId comes from the caller that will also read the results back.
+      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode })
+      if (!t) return null
+      // Counted, not read from the lane: the job joins the lane a tick after enqueue returns.
+      const key = laneKey(cwd)
+      const ahead = tasks.list().filter((x) => x.jobId !== t.jobId && laneKey(x.workspace) === key && !TERMINAL_STATES.includes(x.state)).length
+      return queuedLine({ jobId: t.jobId, agent: t.agent, position: ahead ? ahead + 1 : 0, workspace: cwd })
+    },
   }
 
   ctx.commands.register({
@@ -632,13 +797,80 @@ export function apply(ctx, config) {
 
   const knownProviders = async () => ['deepseek', 'jev', ...(await modelProviders()).map((p) => p.id)]
 
+  // What a model really takes, asked of the catalog it is registered with: the same
+  // declaration the engine's own gate reads, so the picker and the gate cannot disagree.
+  async function canSeeImages(m) {
+    if (!m?.provider || !m?.model) return false
+    const info = await llm?.resolveModel?.(m.provider, m.model).catch(() => null)
+    return info?.inputModalities?.includes('image') === true
+  }
+  // Claude Code and Codex own their tool loop, so they open an image file we name. Every other
+  // agent is an in-process model, which reads an image only when that model itself accepts one.
+  const OWNS_IMAGE_READING = new Set(['claude-code', 'codex'])
+  const agentSeesImages = async (agentId) => {
+    const a = (await enabledAgents().catch(() => [])).find((x) => x.id === agentId)
+    if (!a) return false
+    return OWNS_IMAGE_READING.has(a.provider) || await canSeeImages(a.llm)
+  }
+  /**
+   * Attached image bytes, for an agent that cannot be handed content blocks: written where the
+   * agent's own tools can open them, so the path can travel in the prompt. Under the workspace's
+   * .kz-harness folder - already git-excluded locally, and already never counted as a change an
+   * agent made - so a sandboxed agent reads it as an ordinary project file.
+   */
+  async function handOffImages(refs, { cwd } = {}) {
+    const store = ctx.get?.('attachments')
+    if (!store || !cwd || !refs?.length) return []
+    const dir = join(cwd, '.kz-harness', 'attachments')
+    await mkdir(dir, { recursive: true })
+    const out = []
+    for (const ref of refs) {
+      const img = await store.readImageRequest(ref, { maxPixels: 4_000_000, maxBytes: 8_000_000 }, AbortSignal.timeout(20_000))
+      const ext = String(img.mediaType).split('/')[1]?.replace('jpeg', 'jpg') ?? 'png'
+      const name = String(ref.attachmentId ?? randomUUID()).replace(/[^\w.-]/g, '')
+      const file = join(dir, `${name || randomUUID()}.${ext}`)
+      await writeFile(file, img.data)
+      out.push(file)
+    }
+    return out
+  }
+
+  // Display names for the browser half: providers and models from the live catalog,
+  // agents from their own config entry. No table of names in the client, so a new
+  // provider, model or agent names itself everywhere it is shown.
+  async function displayNames() {
+    const providers = { jev: 'Jev' }
+    const models = {}
+    for (const p of await modelProviders()) {
+      providers[p.id] = p.name
+      for (const m of p.models) models[`${p.id}/${m.id}`] = m.name
+    }
+    const agents = { jev: 'Jev', chat: 'Chat model' }
+    for (const a of await enabledAgents().catch(() => [])) agents[a.id] = nameOfAgent(a)
+    return { providers, models, agents }
+  }
+
   // "Jev Auto" in the model picker: every message goes straight to the router, no chat model in front.
   ctx.inject(['llm', 'agents'], (c) => {
     llm = c.llm
     llmRuntime = c
     c.effect(() => () => { llm = null; llmRuntime = null })
     c.effect(() => c.llm.registerAdapter([JEV_PROVIDER], jevAdapter({
-      ctx: c, route, classify, auxModel: config.auxModel, isOffline, localChat,
+      ctx: c, route, classify, auxModel: config.auxModel, isOffline, localChat, orchestrator, agents: enabledAgents,
+      canSeeImages, agentSeesImages, handOffImages,
+      // Direct answers route through the same registry as background work: a chat model is
+      // offered for what it can actually do, and its provider/model ride along so the answer
+      // can be streamed from it.
+      answerExecutors: async () => {
+        const local = await localChat().catch(() => null)
+        const chat = [config.auxModel, local].filter(Boolean)
+        const sees = new Set()
+        for (const m of chat) if (await canSeeImages(m).catch(() => false)) sees.add(m.model)
+        return executorsFrom({ chat, seesImages: (id) => sees.has(id) }).map((e) => {
+          const [provider, ...model] = e.id.replace(/^chat:/, '').split('/')
+          return { ...e, provider, model: model.join('/') }
+        })
+      },
       // A question answered without an agent: the "Saved by Jev" estimate counts these.
       onDirectAnswer: (durationMs, m) => usage.logAttempt({ agent: 'chat', role: 'direct-answer', durationMs, provider: m.provider, model: m.model }).catch(() => {}),
     })))
@@ -684,10 +916,48 @@ export function apply(ctx, config) {
           if (req.method === 'POST' && url.pathname === '/jev-router/runs/stop') {
             const { runId } = JSON.parse(await readBody(req))
             const stop = stoppers.get(runId)
-            if (!stop) return send(404, { error: 'no active run with that id' })
+            // A background task aborts through its own controller, so it settles as stopped, not failed.
+            const task = tasks.stopRun(runId)
+            if (!stop && !task) return send(404, { error: 'no active run with that id' })
             for (const runs of logs.values()) for (const r of runs) if (r.id === runId) r.stopped = true
-            stop.abort(new Error('stopped by the user'))
+            stop?.abort(new Error('stopped by the user'))
             return send(200, { ok: true })
+          }
+          // Export one chat as Markdown, read from DSH's own stored session log.
+          if (req.method === 'GET' && url.pathname === '/jev-router/export') {
+            const session = url.searchParams.get('session') ?? ''
+            if (!SESSION_ID.test(session)) return send(400, { error: 'session: a session id' })
+            try {
+              return send(200, await exportSession(join(dshHome, 'sessions'), session, { tools: url.searchParams.get('tools') !== '0' }))
+            } catch (err) { return send(err.status ?? 500, { error: err.message }) }
+          }
+          if (req.method === 'GET' && url.pathname === '/jev-router/names') return send(200, await displayNames())
+          // Background tasks: the task list column (queued / running / finished).
+          if (req.method === 'GET' && url.pathname === '/jev-router/tasks') {
+            await tasks.ready
+            const ws = url.searchParams.get('workspace')
+            const all = tasks.list()
+            return send(200, { tasks: ws ? all.filter((t) => laneKey(t.workspace) === laneKey(ws)) : all })
+          }
+          if (req.method === 'GET' && url.pathname === '/jev-router/tasks/report') {
+            await tasks.ready // a task restored from tasks.jsonl has a report before the list is asked for
+            const report = tasks.report(url.searchParams.get('id') ?? '')
+            return report === null ? send(404, { error: 'no report for that task' }) : send(200, { report })
+          }
+          if (req.method === 'POST' && url.pathname.startsWith('/jev-router/tasks/')) {
+            const body = JSON.parse(await readBody(req))
+            try {
+              if (url.pathname === '/jev-router/tasks/stop') return send(200, { result: tasks.stop(validJobId(body.jobId)) })
+              if (url.pathname === '/jev-router/tasks/reorder') { tasks.reorder(body.workspace, body.order ?? []); return send(200, { ok: true }) }
+              if (url.pathname === '/jev-router/tasks/clear') return send(200, { cleared: tasks.clear(body.jobIds ?? []) })
+              // The browser reporting that it has actually rendered these result messages. This
+              // is the only thing that marks a result read, which is what "unread" means.
+              if (url.pathname === '/jev-router/tasks/seen') {
+                await tasks.ready
+                const seen = (body.jobIds ?? []).map((id) => { try { return validJobId(id) } catch { return null } }).filter(Boolean)
+                return send(200, { acknowledged: seen.filter((id) => tasks.delivered(id)) })
+              }
+            } catch (err) { return send(err.status ?? 400, { error: err.message }) }
           }
           // Shortcuts page: key bindings and the right sidebar width, one small JSON file.
           if (req.method === 'GET' && url.pathname === '/jev-router/effort') return send(200, await readEffort())
@@ -710,6 +980,25 @@ export function apply(ctx, config) {
             await writeFile(`${hotkeysFile}.tmp`, JSON.stringify(clean, null, 2))
             await rename(`${hotkeysFile}.tmp`, hotkeysFile)
             return send(200, clean)
+          }
+          // Sign in / out of an agent by running its own CLI. The client sends an agent id and
+          // "login" or "logout", never a command: the command is chosen here, by provider.
+          if (req.method === 'POST' && url.pathname === '/jev-router/account-auth') {
+            const { agentId, action } = JSON.parse(await readBody(req))
+            const agent = (await enabledAgents()).find((a) => a.id === agentId)
+            if (!agent || !canAuth(agent.provider)) return send(400, { error: 'that agent has no sign-in of its own' })
+            if (action !== 'login' && action !== 'logout') return send(400, { error: 'action must be login or logout' })
+            // A visible terminal, because the CLI asks questions and opens a browser.
+            const terminal = (argv) => {
+              const shell = () => spawn('powershell.exe', ['-NoExit', '-Command', argv.join(' ')], { detached: true, stdio: 'ignore' }).on('error', () => {}).unref()
+              spawn('wt.exe', [...argv], { detached: true, stdio: 'ignore' }).on('error', shell).unref()
+            }
+            try {
+              const r = await authAction(agent.provider, action, terminal)
+              // The cached readiness is now stale either way.
+              await readiness(true).catch(() => {})
+              return send(200, r)
+            } catch (err) { return send(400, { error: err.message }) }
           }
           // Opens the user's own terminal in a DSH project folder; the client sends only the folder, never a command.
           if (req.method === 'POST' && url.pathname === '/jev-router/open-terminal') {
@@ -755,8 +1044,11 @@ export function apply(ctx, config) {
               const st = await stat(join(w, '.kz-harness', 'handoff.md')).catch(() => null)
               return st && { workspace: w, updatedAt: st.mtime.toISOString() }
             }))).filter(Boolean)
+            // What each agent costs at this hour, for the agents whose provider bills by the clock.
+            const rates = pricingNow(config.pricing?.peak)
             return send(200, {
-              agents: Object.entries(snap).map(([id, q]) => ({ id, ...q })),
+              agents: Object.entries(snap).map(([id, q]) => ({ id, ...q, rateNow: rates[id] ?? null })),
+              links: config.links ?? {},
               keys: usage.last().keys,
               recent: lines.slice(-50),
               handoffs,
@@ -856,7 +1148,7 @@ export async function workspaceDir(cwd, projectPaths) {
   if (typeof cwd !== 'string' || !cwd) throw new Error('cwd: the session folder')
   const dir = resolve(cwd)
   const same = (p) => resolve(p).toLowerCase() === dir.toLowerCase()
-  if (!projectPaths.some(same)) throw new Error('that folder is not a DSH project')
+  if (!projectPaths.some(same)) throw new Error('that folder is not a harness project')
   if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new Error('that folder does not exist')
   return dir
 }
@@ -872,7 +1164,8 @@ function summaryOf(q) {
 const sessionIdOf = (agent) => agent?.session?.id ?? agent?.session?.header?.id
 
 // Model text can quote anything; mask key-shaped strings before they reach the log.
-const redactLine = (t) => t.replace(/(Bearer\s+)\S+/gi, '$1•••').replace(/\b(sk-|tsk_)[\w-]{8,}/g, '$1•••')
+// One redaction rule for the log and the export, so a provider added to one covers both.
+const redactLine = redactSecrets
 
 // Writes must declare a JSON body: a cross-site form cannot send one without a CORS preflight.
 export const isJsonRequest = (req) => String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase() === 'application/json'

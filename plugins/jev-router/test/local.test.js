@@ -21,8 +21,9 @@ const config = {
   agents: [
     { id: 'claude', provider: 'claude-code', description: 'a', enabled: true, kind: 'subscription' },
     { id: 'deepseek', provider: 'spawn', description: 'b', enabled: true, kind: 'api', llm: { provider: 'deepseek', model: 'deepseek-flash' } },
-    { id: 'qwen-local', provider: 'spawn', description: 'c', enabled: true, kind: 'local', llm: { provider: 'local', model: 'qwen3-8b' } },
-    { id: 'gemma-local', provider: 'spawn', description: 'd', enabled: true, kind: 'local', llm: { provider: 'local', model: 'gemma4-e4b' } },
+    // `role` as the manifest declares it: offline routing ranks by it, so the fixture carries it.
+    { id: 'qwen-local', provider: 'spawn', description: 'c', enabled: true, kind: 'local', role: 'best-quality', llm: { provider: 'local', model: 'qwen3-8b' } },
+    { id: 'gemma-local', provider: 'spawn', description: 'd', enabled: true, kind: 'local', role: 'fast', llm: { provider: 'local', model: 'gemma4-e4b' } },
   ],
   fallbackAgent: 'claude',
   agentTimeoutMs: 60_000,
@@ -83,6 +84,9 @@ test('offlinePick and question heuristic', () => {
   assert.equal(offlinePick(config.agents).id, 'qwen-local')
   assert.equal(offlinePick(config.agents.filter((a) => a.id !== 'qwen-local')).id, 'gemma-local')
   assert.equal(offlinePick(config.agents.filter((a) => a.kind !== 'local')), null)
+  // A model no fixed list knows: its role alone puts it ahead of the faster one.
+  const newer = { id: 'new-local', provider: 'spawn', description: 'e', enabled: true, kind: 'local', role: 'best-quality' }
+  assert.equal(offlinePick([...config.agents.filter((a) => a.id === 'gemma-local'), newer]).id, 'new-local')
   assert.ok(looksLikeQuestion('how does login work'))
   assert.ok(looksLikeQuestion('the tests fail?'))
   assert.ok(!looksLikeQuestion('fix the failing test in users.ts'))
@@ -194,8 +198,8 @@ test('fit rating: full GPU, GPU+CPU split with a speed estimate, CPU only, and h
   assert.match(rateModule(big, { ...PC, diskFreeBytes: 2 * 1024 ** 3 }, 'cuda12').reason, /free disk/)
   assert.equal(rateModule(big, { ...PC, diskFreeBytes: 2 * 1024 ** 3 }, 'cuda12', { installed: true }).fit, 'split')
   assert.match(rateModule(big, { ...PC, ramGB: 8 }, 'cuda12').reason, /12 GB RAM/)
-  assert.deepEqual(defaultsFor(big, { ...PC, ramGB: 8 }, 'cpu'), { ctx: 4096, gpuLayers: 0 })
-  assert.deepEqual(defaultsFor(big, PC, 'cuda12'), { ctx: 8192, gpuLayers: 'auto' })
+  assert.deepEqual(defaultsFor(big, { ...PC, ramGB: 8 }, 'cpu'), { ctx: 12288, gpuLayers: 0 })
+  assert.deepEqual(defaultsFor(big, PC, 'cuda12'), { ctx: 12288, gpuLayers: 'auto' })
 })
 
 test('suggestions: reliable (official-stable + verified) first, then fit, then quality; others say why', () => {
@@ -382,22 +386,40 @@ const runAdapter = async (a) => {
   return chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
 }
 
-test('direct answer: DeepSeek fails -> local chat model answers before any agent', async () => {
+test('direct answer: the local chat model answers first, and the cloud is never asked', async () => {
   const asked = []
-  const ctx = { agents: { get: () => ({}) }, llm: { async *stream(o) { asked.push(o.provider); yield* (o.provider === 'local' ? say('local says hi') : [{ type: 'finish', reason: { kind: 'error', failure: { code: 'QUOTA' } } }]) } } }
+  const ctx = { agents: { get: () => ({}) }, llm: { async *stream(o) { asked.push(o.provider); yield* (o.provider === 'local' ? say('local says hi') : say('deepseek says hi')) } } }
   let routed = false
   const a = jevAdapter({ ctx, route: async () => { routed = true; return '' }, classify: async () => ({ kind: 'question' }), auxModel: { provider: 'deepseek', model: 'deepseek-flash' }, isOffline: async () => false, localChat: async () => ({ provider: 'local', model: 'qwen3-8b' }) })
   const text = await runAdapter(a)
-  assert.deepEqual(asked, ['deepseek', 'local'])
-  assert.match(text, /^local says hi[\s\S]*Answered by: Local model \(qwen3-8b\)/)
+  assert.deepEqual(asked, ['local'], 'everyday conversation stays on this PC')
+  assert.match(text, /^local says hi[\s\S]*Answered by: local\/qwen3-8b/)
   assert.equal(routed, false)
+})
+
+test('direct answer: a local model that cannot answer hands the question to the cloud, and says so', async () => {
+  const asked = []
+  const ctx = { agents: { get: () => ({}) }, llm: { async *stream(o) { asked.push(o.provider); yield* (o.provider === 'local' ? [{ type: 'finish', reason: { kind: 'error', failure: { code: 'LOCAL_ENGINE' } } }] : say('cloud says hi')) } } }
+  const a = jevAdapter({ ctx, route: async () => '', classify: async () => ({ kind: 'question' }), auxModel: { provider: 'deepseek', model: 'deepseek-flash' }, isOffline: async () => false, localChat: async () => ({ provider: 'local', model: 'qwen3-8b' }) })
+  const text = await runAdapter(a)
+  assert.deepEqual(asked, ['local', 'deepseek'])
+  assert.match(text, /the local model could not answer this, so Answered by: deepseek/)
+})
+
+test('direct answer: Jev saying the question is deep puts the cloud model first', async () => {
+  const asked = []
+  const ctx = { agents: { get: () => ({}) }, llm: { async *stream(o) { asked.push(o.provider); yield* say(`${o.provider} says hi`) } } }
+  const a = jevAdapter({ ctx, route: async () => '', classify: async () => ({ kind: 'question', confidence: 0.9, depth: 'deep' }), auxModel: { provider: 'deepseek', model: 'deepseek-flash' }, isOffline: async () => false, localChat: async () => ({ provider: 'local', model: 'qwen3-8b' }) })
+  const text = await runAdapter(a)
+  assert.deepEqual(asked, ['deepseek'])
+  assert.match(text, /Jev judged this worth the stronger model, so Answered by: deepseek/)
 })
 
 test('direct answer offline: only the local chat model is asked, and the credit says OFFLINE', async () => {
   const asked = []
   const ctx = { agents: { get: () => ({}) }, llm: { async *stream(o) { asked.push(o.provider); yield* say('ok') } } }
   const a = jevAdapter({ ctx, route: async () => '', classify: async () => ({ kind: 'question' }), auxModel: { provider: 'deepseek', model: 'deepseek-flash' }, isOffline: async () => true, localChat: async () => ({ provider: 'local', model: 'gemma4-e4b' }) })
-  assert.match(await runAdapter(a), /OFFLINE: local models only\. Answered by: Local model \(gemma4-e4b\)/)
+  assert.match(await runAdapter(a), /OFFLINE: local models only\. Answered by: local\/gemma4-e4b/)
   assert.deepEqual(asked, ['local'])
 })
 
@@ -408,7 +430,7 @@ test('session title goes to the chat model with thinking off; the answer credit 
   for await (const _ of a.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }], purpose: 'session-title', reasoningEffort: 'high', signal })) { /* drain */ }
   assert.equal(seen[0].provider, 'deepseek')
   assert.equal(seen[0].reasoningEffort, 'off')
-  assert.match(await runAdapter(a), /Answered by: DeepSeek \(deepseek-flash\)/)
+  assert.match(await runAdapter(a), /Answered by: deepseek\/deepseek-flash/)
 })
 
 test('engine install: verified zip is unpacked with the OS tar, marker written, zip removed', { skip: process.platform !== 'win32' }, async () => {

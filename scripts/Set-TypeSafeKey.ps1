@@ -6,4 +6,4 @@ $plain = [Net.NetworkCredential]::new('', $secure).Password
 if ([string]::IsNullOrWhiteSpace($plain)) { Write-Error 'No key entered; nothing changed.'; exit 1 }
 [Environment]::SetEnvironmentVariable('TYPESAFE_API_KEY', $plain.Trim(), 'User')
 Remove-Variable plain, secure
-Write-Host 'TYPESAFE_API_KEY saved for your user. Close and reopen terminals, then restart DSH.'
+Write-Host 'TYPESAFE_API_KEY saved for your user. Close and reopen terminals, then restart Kz-harness.'

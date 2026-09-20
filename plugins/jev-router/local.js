@@ -10,6 +10,7 @@ import { mkdir, open, readFile, rename, rm, stat, statfs, unlink, writeFile } fr
 import { createServer } from 'node:net'
 import { cpus, freemem, totalmem } from 'node:os'
 import { dirname, join } from 'node:path'
+import { localAgentFor } from './effort.js'
 
 export const LOCAL_PROVIDER = 'local'
 
@@ -148,10 +149,14 @@ const QUESTION = /^(what|why|how|when|where|who|which|whose|is|are|was|were|does
 /** Offline stand-in for Jev's task-or-question call. */
 export const looksLikeQuestion = (text) => /\?\s*$/.test(text.trim()) || QUESTION.test(text.trim())
 
-/** Offline routing rule: the preferred local agent that can run, else any local agent. */
-export function offlinePick(agents, prefer = ['qwen-local', 'gemma-local']) {
-  const local = agents.filter((a) => a.kind === 'local')
-  return prefer.map((id) => local.find((a) => a.id === id)).find(Boolean) ?? local[0] ?? null
+/**
+ * Offline routing rule: the strongest local agent that can run, by the manifest's `role`.
+ * Ranked by `local-high` itself, so the effort ladder and offline mode cannot disagree
+ * about which installed model is the best one.
+ */
+export function offlinePick(agents) {
+  const id = localAgentFor('local-high', agents)
+  return agents.find((a) => a.id === id) ?? null
 }
 
 // ---------- OpenAI-compatible wire <-> DSH stream chunks ----------
@@ -372,8 +377,10 @@ export function rateModule(m, specs, variant, { installed = false } = {}) {
 }
 
 /** Default context and GPU layers for a model on this PC (manifest values unless the PC is small). */
+// DSH's system prompt plus tool list alone is ~8.6k tokens, so a local model needs well over 8k of context.
+export const MIN_CTX = 12288
 export const defaultsFor = (m, specs, variant) => ({
-  ctx: specs && specs.ramGB < 12 ? Math.min(4096, m.contextSize ?? 8192) : m.contextSize ?? 8192,
+  ctx: specs && specs.ramGB < 12 ? MIN_CTX : Math.max(MIN_CTX, m.contextSize ?? 16384),
   gpuLayers: variant === 'cpu' ? 0 : m.gpuLayers ?? 'auto',
 })
 
@@ -472,7 +479,8 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   let installing = Promise.resolve()
   const jobs = new Map() // module id -> { state: queued | downloading | extracting | done | failed, received, total, bytesPerSec, error }
 
-  const DEFAULTS = { chatModel: null, idleMinutes: 10, gpuLayers: null }
+  const DEFAULTS = { chatModel: null, idleMinutes: 10, gpuLayers: null, keepWarm: false, loadAtStart: null }
+  const loadMs = new Map() // model id -> last load time, for the "~8 s" estimate
   const readSettings = async () => ({ ...DEFAULTS, ...JSON.parse(await readFile(settingsFile, 'utf8').catch(() => '{}')) })
   async function setSettings(patch) {
     const s = { ...(await readSettings()) }
@@ -483,6 +491,14 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     if (patch.gpuLayers !== undefined) {
       if (!(patch.gpuLayers === null || patch.gpuLayers === 'auto' || (Number.isInteger(patch.gpuLayers) && patch.gpuLayers >= 0 && patch.gpuLayers <= 999))) throw new Error("GPU layers: 'auto' or 0-999")
       s.gpuLayers = patch.gpuLayers
+    }
+    if (patch.keepWarm !== undefined) {
+      if (typeof patch.keepWarm !== 'boolean') throw new Error('keepWarm: true or false')
+      s.keepWarm = patch.keepWarm
+    }
+    if (patch.loadAtStart !== undefined) {
+      if (patch.loadAtStart !== null && !(await installed()).some((m) => m.id === patch.loadAtStart)) throw new Error(`${patch.loadAtStart} is not installed`)
+      s.loadAtStart = patch.loadAtStart
     }
     if (patch.chatModel !== undefined) {
       if (!(await installed()).some((m) => m.id === patch.chatModel)) throw new Error(`${patch.chatModel} is not installed`)
@@ -541,7 +557,10 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   /** Router agents for installed models (manifest `agent`); none until the model is installed. */
   async function agents(persona) {
     return (await installed()).filter((m) => m.agent).map((m) => ({
-      id: m.agent.id, provider: 'spawn', description: m.agent.description, enabled: true, llm: { provider: LOCAL_PROVIDER, model: m.id }, persona,
+      id: m.agent.id, name: m.agent.name ?? (m.name ? `${m.name} (local)` : undefined), provider: 'spawn', description: m.agent.description, enabled: true,
+      // `role` ('fast' | 'balanced' | 'best-quality') ranks the local models for the
+      // local-low / local-high effort levels; size only breaks a tie.
+      role: m.role, size: m.size, llm: { provider: LOCAL_PROVIDER, model: m.id }, persona,
     }))
   }
 
@@ -616,7 +635,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       while (Date.now() < deadline) {
         if (child.exitCode !== null || engine !== e) throw new Error(`llama-server exited: ${e.tail.slice(-3).join(' | ')}`)
         const ok = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false)
-        if (ok) { log(`local: engine ready: ${m.id}, ${e.gpuLayers ? `${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : 'GPU layers unknown'}`); return }
+        if (ok) { e.loaded = true; loadMs.set(m.id, Date.now() - e.startedAt); log(`local: engine ready: ${m.id}, ${e.gpuLayers ? `${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : 'GPU layers unknown'}`); return }
         await Promise.race([sleep(500), exited])
       }
       throw new Error('llama-server did not become ready within 5 minutes')
@@ -628,8 +647,8 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   const scheduleIdle = async () => {
     clearTimeout(idleTimer)
     if (busy > 0 || !engine) return
-    const { idleMinutes } = await readSettings()
-    if (busy > 0) return
+    const { idleMinutes, keepWarm } = await readSettings()
+    if (busy > 0 || keepWarm) return
     idleTimer = setTimeout(() => { if (busy === 0) stop() }, idleMinutes * 60_000)
     idleTimer.unref?.()
   }
@@ -788,14 +807,51 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   }
 
   return {
-    readiness, installed, agents, chatModel, stream, acquire, status, install, plan, remove, setSettings, settled, engineVariant, visionFor,
+    readiness, installed, agents, chatModel, stream, acquire, status, install, plan, remove, setSettings, settled, engineVariant, visionFor, readSettings,
+    /** True when `modelId` is loaded and answering (no cold start). */
+    isLoaded: (modelId) => !!engine?.loaded && engine.modelId === modelId,
+    /** Expected load time: the last one measured this session, else ~8 s. */
+    loadEstimateMs: (modelId) => loadMs.get(modelId) ?? 8000,
     start: async (id) => { const c = await acquire(id); c.release() },
     stop: async () => { if (busy > 0) throw new Error('a local model is answering right now'); await stop() },
     dispose: async () => { process.off('exit', onExit); await stop() },
-    contextOf: (id) => { const m = mod(id); return m ? Math.min(contextSize ?? m.contextSize ?? 8192, m.maxContext ?? Infinity) : contextSize ?? 8192 },
+    contextOf: (id) => { const m = mod(id); return m ? Math.min(contextSize ?? Math.max(MIN_CTX, m.contextSize ?? 16384), m.maxContext ?? Infinity) : contextSize ?? 16384 },
     modelOf: mod,
     modules,
   }
+}
+
+/**
+ * A local model is not loaded yet: say so, and after `delayMs` offer to switch to `alt`
+ * (a cloud agent) instead of waiting. The question is withdrawn once loading finishes.
+ * @returns {Promise<'ready'|'switch'>}
+ */
+export async function coldStart({ name, estimateMs = 8000, load, say, ask, alt, delayMs = 1500 }) {
+  say(`Loading ${name} (local, ~${Math.max(1, Math.round(estimateMs / 1000))} s)…`)
+  let loaded = false
+  const loading = Promise.resolve().then(load).then(() => { loaded = true })
+  loading.catch(() => {})
+  if (!ask || !alt) { await loading; return 'ready' }
+  const early = await Promise.race([loading.then(() => true), new Promise((r) => setTimeout(r, delayMs, false))])
+  if (early || loaded) return 'ready'
+  const withdraw = new AbortController()
+  loading.then(() => withdraw.abort(new Error('loaded')), () => {})
+  const keep = 'Keep waiting'
+  const other = `Switch to ${alt}`
+  let answer
+  try {
+    answer = await ask({
+      signal: withdraw.signal,
+      questions: [{ id: 'cold-start', header: 'Local model', question: `${name} is still loading. Keep waiting or run this step on ${alt}?`, options: [{ label: keep, description: `Wait for ${name} (free, on this PC)` }, { label: other, description: `Run on ${alt} now` }] }],
+    })
+  } catch {
+    // Withdrawn because loading finished, or no answerer: wait for the model.
+    await loading
+    return 'ready'
+  }
+  if (answer?.answers?.[0]?.selected?.includes(other)) { say(`Switching to ${alt} while ${name} loads`); return 'switch' }
+  await loading
+  return 'ready'
 }
 
 /** DSH model provider `local`: every installed model, served through the engine above. */
@@ -849,7 +905,7 @@ export async function buildCatalog(local, specs, { downloads = {} } = {}) {
   }
 }
 
-const listLine = (x) => `- \`${x.id}\` ${x.name} · ${size(x.size)} · ${x.rating.fit === 'no' ? `won't fit: ${x.rating.reason}` : x.rating.label}${x.agent ? ` · agent ${x.agent}` : x.for ? ` · add-on for ${x.for}` : ''} · ${x.installed ? '✓ installed' : '—'}`
+const listLine = (x) => `- \`${x.id}\` ${x.name} · ${size(x.size)} · ${x.rating.fit === 'no' ? `won't fit: ${x.rating.reason}` : x.rating.label}${x.agent ? ` · agent ${x.agent}` : x.for ? ` · add-on for ${x.for}` : ''} · ${x.installed ? '✓ installed' : 'not installed'}`
 
 /** `/install-llm [ids…|all]`: bare lists and suggests; with ids starts the verified install in the background. */
 export async function installLlmCommand(raw, { local, catalog }) {

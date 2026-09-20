@@ -42,3 +42,38 @@ export async function checkAgents(agents, resolveCredential) {
   }))
   return out
 }
+
+// Sign in and out by running each CLI's own command. KzH never touches the credentials
+// itself: the agents own their tokens, and the sign-in happens in their flow with the
+// person at the keyboard. Fixed strings, chosen here by provider, so nothing a browser
+// sends can become part of a command.
+const AUTH = {
+  'claude-code': { login: ['claude', 'auth', 'login'], logout: 'claude auth logout', interactive: true },
+  codex: { login: ['codex', 'login'], logout: 'codex logout', interactive: true },
+}
+
+/** Which agents can be signed in and out from the UI. */
+export const canAuth = (provider) => !!AUTH[provider]
+
+/**
+ * Run a sign-in or sign-out for one provider.
+ * Sign-out is a plain command and reports its result. Sign-in needs a person, so it opens a
+ * terminal running the CLI's own login rather than pretending to do it headlessly.
+ * @param {string} provider
+ * @param {'login'|'logout'} action
+ */
+export async function authAction(provider, action, spawnTerminal) {
+  const spec = AUTH[provider]
+  if (!spec) throw new Error(`${provider} has no sign-in of its own`)
+  if (action === 'logout') {
+    const r = await run(spec.logout)
+    // Some CLIs exit non-zero when there was no session to end; that is the wanted state.
+    if (!r.ok && !/not logged in|no (stored )?credentials|not signed in/i.test(r.out)) {
+      throw new Error(r.out.slice(0, 200) || `${spec.logout} failed`)
+    }
+    return { ok: true, detail: 'signed out' }
+  }
+  if (action !== 'login') throw new Error(`unknown action "${action}"`)
+  spawnTerminal(spec.login)
+  return { ok: true, detail: 'a terminal is open: finish signing in there, then press Refresh' }
+}

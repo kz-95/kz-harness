@@ -7,10 +7,24 @@ import { appendFile, mkdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_LIMITS, keyProviderOf, kindOf } from './accounts.js'
+import { canAuth } from './setup.js'
 
 const TTL = 3 * 60_000
 const BACKOFF = 5 * 60_000
 export const JEV_USD_PER_INPUT_TOKEN = 0.042 / 1e6
+
+/**
+ * A prepaid balance as a share of the most that key has ever held. A subscription
+ * has a window to divide by; a balance does not, so the high-water mark stands in
+ * for one and a top-up resets it to full by raising the mark.
+ * @returns 0-100, or null when there is nothing to compare against.
+ */
+export function creditPercent(balance, peak) {
+  if (!balance || !peak || peak.currency !== balance.currency) return null
+  const top = Number(peak.amount)
+  if (!(top > 0)) return null
+  return Math.max(0, Math.min(100, Math.round((Number(balance.amount) / top) * 100)))
+}
 
 const iso = (t) => (t == null ? null : new Date(typeof t === 'number' && t < 1e12 ? t * 1000 : t).toISOString())
 const future = (t) => t && Date.parse(t) > Date.now()
@@ -29,7 +43,22 @@ export function stateOf({ kind, windows, balance, limits, exhausted, error }) {
   }
   if (kind === 'local') return { state: 'ok', until: null }
   if (balance && limits.minBalance != null && balance.amount < limits.minBalance) return { state: 'stopped', until: null }
+  // Soft tier, mirroring handoffAtPercent: still usable, but Jev prefers others and the
+  // agent is told to work in small steps and keep the handoff current.
+  if (balance && limits.handoffAtBalance != null && balance.amount < limits.handoffAtBalance) return { state: 'near', until: null }
   return { state: error && !balance ? 'unknown' : 'ok', until: null }
+}
+
+/**
+ * The longest window's percentage: the "weekly" one for both providers today, found by
+ * duration rather than by name so a relabelled window cannot silently disable the gate.
+ * Sub-day windows are ignored; a 5-hour window is not the resource the policy rations.
+ * @returns 0-100, or null when no long window is known (never 0, which would read as "empty").
+ */
+export function longWindowPercent(windows) {
+  const long = (windows ?? []).filter((w) => typeof w.usedPercent === 'number' && (w.minutes ?? 0) >= 1440)
+  if (!long.length) return null
+  return long.reduce((a, b) => ((a.minutes ?? 0) >= (b.minutes ?? 0) ? a : b)).usedPercent
 }
 
 // Exhaustion signals, per executor. Only failures count: a finished answer may talk about rate limits.
@@ -125,7 +154,7 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     const omc = await readFile(join(home, '.claude', 'plugins', 'oh-my-claudecode', '.usage-cache-anthropic.json'), 'utf8').then(JSON.parse).catch(() => null)
     if (omc?.data && !omc.error && Date.now() - omc.timestamp < TTL) {
       const d = omc.data
-      return { windows: [{ name: '5h', usedPercent: d.fiveHourPercent, resetsAt: iso(d.fiveHourResetsAt) }, { name: 'weekly', usedPercent: d.weeklyPercent, resetsAt: iso(d.weeklyResetsAt) }] }
+      return { windows: [{ name: '5h', minutes: 300, usedPercent: d.fiveHourPercent, resetsAt: iso(d.fiveHourResetsAt) }, { name: 'weekly', minutes: 10080, usedPercent: d.weeklyPercent, resetsAt: iso(d.weeklyResetsAt) }] }
     }
     const cred = await readFile(join(home, '.claude', '.credentials.json'), 'utf8').then(JSON.parse).catch(() => null)
     const o = cred?.claudeAiOauth
@@ -138,14 +167,16 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     })
     if (!r.ok) throw new Error(`Claude usage HTTP ${r.status}`)
     const j = await r.json()
-    return { windows: [['5h', j.five_hour], ['weekly', j.seven_day]].filter(([, w]) => w).map(([name, w]) => ({ name, usedPercent: w.utilization, resetsAt: iso(w.resets_at) })) }
+    return { windows: [['5h', j.five_hour, 300], ['weekly', j.seven_day, 10080]].filter(([, w]) => w).map(([name, w, minutes]) => ({ name, minutes, usedPercent: w.utilization, resetsAt: iso(w.resets_at) })) }
   })
 
   const codex = cached(async () => {
     const r = await codexRpc([['account/rateLimits/read'], ['account/read', {}]], { spawn })
     const rl = r['account/rateLimits/read']?.rateLimits
     if (!rl) throw new Error(r['account/rateLimits/read']?.error ?? 'no rate limits from codex')
-    const win = (w, fallback) => w && { name: w.windowDurationMins === 300 ? '5h' : w.windowDurationMins === 10080 ? 'weekly' : fallback, usedPercent: w.usedPercent, resetsAt: iso(w.resetsAt) }
+    // Carry the duration too: the gate finds the longest window by minutes rather than by
+    // label, so a renamed window cannot silently switch the policy off.
+    const win = (w, fallback) => w && { name: w.windowDurationMins === 300 ? '5h' : w.windowDurationMins === 10080 ? 'weekly' : fallback, minutes: w.windowDurationMins ?? null, usedPercent: w.usedPercent, resetsAt: iso(w.resetsAt) }
     const acct = r['account/read']?.account
     return { windows: [win(rl.primary, 'primary'), win(rl.secondary, 'secondary')].filter(Boolean), email: acct?.email ?? null, plan: acct?.planType ?? rl.planType ?? null, limitReached: rl.rateLimitReachedType ?? null }
   })
@@ -186,7 +217,14 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
       out[provider] = await Promise.all(list.map(async (k) => {
         const row = { name: k.name, active: !!k.active }
         const q = provider === 'deepseek' ? await deepseekBalance(k.name)(force) : null
-        if (q) { row.balance = q.balance ?? null; if (q.error) row.error = q.error }
+        if (q) {
+          row.balance = q.balance ?? null
+          if (q.error) row.error = q.error
+          // How much of this key's credit is left, against the most it has ever held.
+          const peak = await accounts.notePeakBalance(provider, k.name, row.balance).catch(() => null)
+          row.creditPercent = creditPercent(row.balance, peak)
+          row.creditPeak = peak
+        }
         if (provider === 'jev') row.spentUsd = spent[k.name] ?? 0
         const s = stateOf({ kind: 'api', balance: row.balance, limits: { minBalance: minBalance[provider] }, exhausted: exhaustedOf(`${provider}:${k.name}`), error: q?.error })
         return { ...row, state: s.state, until: s.until }
@@ -208,7 +246,7 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     for (const a of agents) {
       const kind = kindOf(a)
       const limits = limitsOf(a.id, kind)
-      const base = { kind, provider: a.provider, limits, windows: [], balance: null, spentUsd: null, error: null, checkedAt }
+      const base = { kind, provider: a.provider, keyProvider: keyProviderOf(a), canSignIn: canAuth(a.provider), limits, windows: [], balance: null, creditPercent: null, spentUsd: null, error: null, checkedAt }
       if (kind === 'subscription') {
         const q = a.provider === 'claude-code' ? cq : a.provider === 'codex' ? xq : null
         Object.assign(base, { windows: q?.windows ?? [], error: q?.error ?? null, account: { label: a.provider === 'codex' ? 'ChatGPT' : 'Claude', email: a.provider === 'codex' ? q?.email ?? null : claudeEmail } })
@@ -218,7 +256,7 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
       const provider = keyProviderOf(a)
       const list = keys[provider] ?? []
       const active = list.find((k) => k.active)
-      Object.assign(base, { account: { label: kind === 'local' ? 'free, local' : active?.name ?? a.credentialRef ?? provider ?? a.id }, balance: active?.balance ?? null, error: active?.error ?? null })
+      Object.assign(base, { account: { label: kind === 'local' ? 'free, local' : active?.name ?? a.credentialRef ?? provider ?? a.id }, balance: active?.balance ?? null, creditPercent: active?.creditPercent ?? null, creditPeak: active?.creditPeak ?? null, error: active?.error ?? null })
       const own = stateOf({ ...base, exhausted: exhaustedOf(a.id) })
       // With keys, the agent is out only when every key is: rotation moves past a spent active key.
       const usable = list.filter((k) => k.state === 'ok' || k.state === 'unknown')
@@ -228,7 +266,7 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     }
     const jevKeys = keys.jev ?? []
     const jevActive = jevKeys.find((k) => k.active)
-    out.jev = { kind: 'api', provider: 'jev', account: { label: jevActive?.name ?? 'default' }, windows: [], balance: null, spentUsd: jevKeys.reduce((s, k) => s + (k.spentUsd ?? 0), 0), limits: limitsOf('jev', 'jev'), state: jevKeys.length && jevKeys.every((k) => k.state === 'exhausted') ? 'exhausted' : 'ok', until: null, error: null, checkedAt }
+    out.jev = { kind: 'api', provider: 'jev', keyProvider: 'jev', account: { label: jevActive?.name ?? 'default' }, windows: [], balance: null, spentUsd: jevKeys.reduce((s, k) => s + (k.spentUsd ?? 0), 0), limits: limitsOf('jev', 'jev'), state: jevKeys.length && jevKeys.every((k) => k.state === 'exhausted') ? 'exhausted' : 'ok', until: null, error: null, checkedAt }
     last = { out, keys }
     return out
   }
@@ -342,5 +380,78 @@ export function computeSavings(usage, runs, { baseline = DEFAULT_BASELINE, agent
       agentMedianSamples: done.length,
       agentMedianFallbackMs,
     },
+  }
+}
+
+// A rate over a handful of runs is noise: trackRecord already withholds an agent's accepted
+// rate below 3 attempts. A calibration curve is a stronger claim than one rate, so the bar is
+// higher here, and a bucket under it reports its count with no rate at all.
+export const MIN_CALIBRATION_SAMPLES = 10
+
+const workAttempts = (r) => (r.attempts ?? []).filter((a) => a.role === 'primary' || a.role === 'retry')
+/**
+ * A usage limit stops a run for lack of allowance, and a continued run did not start from this
+ * route, so neither says anything about the pick. Dropped, not counted as failures.
+ */
+const scorable = (r) => !r.continuedFromHandoff && r.finalStatus !== 'paused_limit' && !(r.attempts ?? []).some((a) => a.limitHit)
+/** The agent Jev picked did the work that was accepted, and the run never fell through to a peer. */
+const pickWorked = (r) => String(r.finalStatus).startsWith('accepted') && workAttempts(r).at(-1)?.agent === r.routing?.primaryAgent
+const r2 = (x) => Math.round(x * 100) / 100
+
+/**
+ * Calibration: when Jev said it was X% sure of the agent, how often was it right? Buckets runs by
+ * routing.agentConfidence decile and reports count, mean confidence and observed success rate per
+ * bucket, with the sample size beside every number.
+ *
+ * Right is `pickWorked` above, not raw finalStatus: a run whose peer rescued it is a wrong pick
+ * even though the work was accepted. Everything else scorable counts as wrong, and that includes
+ * needs_human, which reflects the reviewer's bar as much as the router's pick, so this measures
+ * "the pick carried the run on its own" and nothing finer. Read `scored` before any rate: below
+ * `minSamples` the rate is null on purpose, because a curve drawn from 3 runs is worse than none.
+ *
+ * Pure and read-only: rows in, plain object out. No fetch, no write, no Jev call.
+ * @param {object[]} runs history.jsonl records
+ */
+export function calibration(runs, { minSamples = MIN_CALIBRATION_SAMPLES } = {}) {
+  const raw = Array.from({ length: 10 }, () => ({ n: 0, successes: 0, sum: 0 }))
+  let noConfidence = 0
+  let unscorable = 0
+  for (const r of runs ?? []) {
+    const c = r.routing?.agentConfidence
+    if (!(Number.isFinite(c) && c >= 0 && c <= 1)) { noConfidence++; continue }
+    if (!scorable(r)) { unscorable++; continue }
+    // Confidence 1 belongs in the top decile, not an eleventh bucket of its own.
+    const b = raw[Math.min(9, Math.floor(c * 10))]
+    b.n++
+    b.sum += c
+    if (pickWorked(r)) b.successes++
+  }
+  const rateOf = (n, successes) => (n >= minSamples ? r2(successes / n) : null)
+  const buckets = raw.map((b, i) => ({
+    range: `${i / 10}-${(i + 1) / 10}`,
+    n: b.n,
+    successes: b.successes,
+    meanConfidence: b.n ? r2(b.sum / b.n) : null,
+    successRate: rateOf(b.n, b.successes),
+  }))
+  const scored = raw.reduce((s, b) => s + b.n, 0)
+  const successes = raw.reduce((s, b) => s + b.successes, 0)
+  const enough = buckets.filter((b) => b.successRate !== null).length
+  return {
+    label: 'the agent Jev picked did the accepted work, no peer fallback, no limit, no handoff',
+    minSamples,
+    runs: (runs ?? []).length,
+    scored,
+    skipped: { noConfidence, unscorable },
+    overall: {
+      n: scored,
+      successes,
+      meanConfidence: scored ? r2(raw.reduce((s, b) => s + b.sum, 0) / scored) : null,
+      successRate: rateOf(scored, successes),
+    },
+    buckets,
+    note: enough
+      ? `${enough} of 10 deciles have at least ${minSamples} scored runs; the rest report counts only`
+      : `not enough data: no decile has ${minSamples} scored runs (${scored} scored in total), counts only`,
   }
 }

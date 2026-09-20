@@ -21,7 +21,7 @@ test('terminal: only an existing DSH project folder', async () => {
   const file = join(dir, 'f.txt')
   writeFileSync(file, '')
   assert.equal(await workspaceDir(dir.toUpperCase(), [dir]), join(dir.toUpperCase()))
-  await assert.rejects(workspaceDir(dir, []), /not a DSH project/)
+  await assert.rejects(workspaceDir(dir, []), /not a harness project/)
   await assert.rejects(workspaceDir(file, [file]), /does not exist/)
   await assert.rejects(workspaceDir(join(dir, 'gone'), [join(dir, 'gone')]), /does not exist/)
   await assert.rejects(workspaceDir(undefined, [dir]), /cwd/)

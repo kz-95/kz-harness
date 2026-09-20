@@ -1,15 +1,81 @@
 // One effort ladder for Jev Auto, mapped to what each agent accepts.
-// Claude Code (CLAUDE_CODE_EFFORT_LEVEL): low medium high xhigh max.
+// Claude Code (CLAUDE_CODE_EFFORT_LEVEL): low medium high xhigh max ultracode.
 // Codex app-server turn effort: low medium high xhigh max ultra (clamped per model).
 // DeepSeek via pi-ai (agentOptions.reasoningEffort): off low high max.
 // Local llama.cpp and other API models: null (their own defaults).
-export const LEVELS = ['auto', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+export const LEVELS = ['auto', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'local-low', 'local-high']
 
-const CLAUDE = { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'max' }
+// Two of those levels are not efforts at all: they say "run this on the small local
+// model" or "on the big one". They pick the agent, and local models take no effort
+// value, so every mapping below leaves them null.
+export const LOCAL_LEVELS = { 'local-low': 'small', 'local-high': 'large' }
+export const isLocalLevel = (level) => Object.hasOwn(LOCAL_LEVELS, level ?? '')
+
+// What a local model is for, from the manifest's own `role`. File size says almost
+// nothing about speed here: Gemma 4 E4B is the larger file yet runs ~47 tok/s to
+// Qwen3 8B's ~8, because only ~4B of its parameters are active. A model with no
+// role sits in the middle and is separated by size.
+const ROLE_RANK = { fast: 0, balanced: 1, 'best-quality': 2 }
+const rankOf = (a) => ROLE_RANK[a.role] ?? 1
+
+/**
+ * The local agent a local-* level means: the quickest installed model for
+ * `local-low`, the strongest for `local-high`. Ranked by the manifest's `role`,
+ * so installing another model sorts itself in without touching this code.
+ * @param {string} level
+ * @param {Array<{id: string, kind?: string, role?: string, size?: number}>} agents enabled agents
+ * @returns the agent id, or null when no local model is installed
+ */
+export function localAgentFor(level, agents = []) {
+  const want = LOCAL_LEVELS[level]
+  if (!want) return null
+  const local = agents.filter((a) => a.kind === 'local' && a.enabled !== false)
+  if (!local.length) return null
+  // Quickest first; a tie falls back to the smaller file, which is the better guess.
+  const sorted = [...local].sort((a, b) => rankOf(a) - rankOf(b) || (a.size ?? Infinity) - (b.size ?? Infinity))
+  return (want === 'small' ? sorted[0] : sorted[sorted.length - 1]).id
+}
+
+// Claude Code's own ladder: its top rung is spelled 'ultracode', which is what the
+// Ultra label in adapter.js has always advertised.
+const CLAUDE = { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max', ultra: 'ultracode' }
 const DEEPSEEK = { off: 'off', low: 'low', medium: 'high', high: 'high', xhigh: 'max', max: 'max', ultra: 'max' }
+// Codex app-server effort ladder, weakest to strongest.
 const CODEX_ORDER = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
-// Highest effort per Codex model (live model/list, codex-cli 0.145.0); unknown models get all six.
-const CODEX_TOP = { 'gpt-5.5': 'xhigh', 'gpt-5.6-luna': 'max' }
+
+// Which Codex model families top out below the full ladder, first match wins. This is a
+// fallback, not the whole truth: a declared capability list beats it, and a model that
+// matches nothing is assumed to take all six rungs, so a model newer than this list is
+// never silently capped. Adding a family is one line here. Source: Codex model/list,
+// codex-cli 0.145.0 — every gpt-5.6 variant (astra, sol, terra, luna, …) takes ultra.
+const CODEX_CEILINGS = [
+  { pattern: /^gpt-5\.5(?:$|[-.])/, top: 'xhigh' },
+  { pattern: /^gpt-5\.6(?:$|[-.])/, top: 'ultra' },
+]
+const fullLadder = CODEX_ORDER[CODEX_ORDER.length - 1]
+
+/**
+ * The strongest effort a model says it supports, from the agent's own model list:
+ * `{ models: [{ id, reasoning: { efforts: [{ id }] } }] }`, the same shape adapter.js
+ * publishes. Live declaration wins over CODEX_CEILINGS, so a connector that reports
+ * capabilities needs no change here. Null when nothing is declared for this model.
+ */
+function declaredTop(agentDef, model) {
+  const declared = agentDef?.models?.find((m) => m.id === model)?.reasoning?.efforts
+  if (!Array.isArray(declared) || !declared.length) return null
+  const rungs = declared.map((e) => CODEX_ORDER.indexOf(e?.id)).filter((i) => i >= 0)
+  return rungs.length ? CODEX_ORDER[Math.max(...rungs)] : null
+}
+
+/** Highest Codex effort for a model id: its own declaration, else the family rule. */
+function codexTop(agentDef, model) {
+  const declared = declaredTop(agentDef, model)
+  if (declared) return declared
+  // No model name at all tells us nothing, so keep the old conservative xhigh.
+  if (!model) return 'xhigh'
+  const id = String(model).toLowerCase()
+  return CODEX_CEILINGS.find((r) => r.pattern.test(id))?.top ?? fullLadder
+}
 
 /** 'claude' | 'codex' | 'deepseek' | null: whose effort vocabulary an agent speaks. */
 export function effortFamily(agentDef) {
@@ -36,12 +102,14 @@ export function autoLevel({ complexity, risk } = {}) {
 export function toAgentEffort(level, agentDef, { complexity, risk, override, model } = {}) {
   const family = effortFamily(agentDef)
   if (!family) return null
+  // A local-* level names a model, not an effort: the agent keeps its own default.
+  if (isLocalLevel(override || level)) return null
   const l = override || (!level || level === 'auto' ? autoLevel({ complexity, risk }) : level)
   if (family === 'claude') return CLAUDE[l] ?? null
   if (family === 'deepseek') return DEEPSEEK[l] ?? null
   const i = CODEX_ORDER.indexOf(l)
   if (i < 0) return null
-  const top = CODEX_ORDER.indexOf(CODEX_TOP[model] ?? (model ? 'ultra' : 'xhigh'))
+  const top = CODEX_ORDER.indexOf(codexTop(agentDef, model))
   return CODEX_ORDER[Math.min(i, top)]
 }
 

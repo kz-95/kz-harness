@@ -6,7 +6,12 @@
 param([switch]$NoShortcuts, [string[]]$LocalModels)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME '.dsh' }
+# The data folder is whatever Start-KzH.ps1 sets, read from that file so there is
+# one source of truth; the engine's own default (~/.dsh) applies only if it is gone.
+$startPs1 = Get-Content (Join-Path $root 'Start-KzH.ps1') -Raw
+$homeName = ([regex]::Match($startPs1, "DSH_HOME = Join-Path \`$HOME '([^']+)'")).Groups[1].Value
+if (-not $homeName) { $homeName = '.dsh'; Write-Host "   !!  Start-KzH.ps1 sets no DSH_HOME; falling back to ~/.dsh" -ForegroundColor Yellow }
+$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME $homeName }
 $profileDir = Join-Path $dshHome 'profiles\web'
 $dshVersion = ([regex]::Match((Get-Content (Join-Path $root 'Start-KzH.ps1') -Raw), "\`$DshVersion = '([^']+)'")).Groups[1].Value
 function Step($text) { Write-Host "`n== $text" -ForegroundColor Cyan }
@@ -18,7 +23,7 @@ $utf8 = New-Object System.Text.UTF8Encoding $false
 Step 'Tools'
 foreach ($cmd in 'node', 'npm', 'git') { if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { throw "$cmd is not installed. Install Node.js 24 (https://nodejs.org) and Git (https://git-scm.com), then run this again." } }
 $node = [version]((node --version).TrimStart('v'))
-if ($node -lt [version]'22.19.0') { throw "Node $node is too old; DSH needs 22.19 or newer." }
+if ($node -lt [version]'22.19.0') { throw "Node $node is too old; the engine needs 22.19 or newer." }
 Ok "node $node, git, npm"
 foreach ($cli in 'claude', 'codex') { if (Get-Command $cli -ErrorAction SilentlyContinue) { Ok "$cli CLI found" } else { Warn "$cli CLI not found. That agent stays unavailable until installed (see README)." } }
 
@@ -40,7 +45,7 @@ else {
   Ok 'Kz-harness.exe built'
 }
 
-Step "DeepSeek Harness $dshVersion and the Claude / Codex executors"
+Step "Engine $dshVersion and the Claude / Codex executors"
 $pkg = Join-Path $profileDir 'package.json'
 $have = (Test-Path $pkg) -and ((Get-Content $pkg -Raw) -match [regex]::Escape("`"@deepseek-ai/dsh-subagent-codex`": `"$dshVersion`""))
 if ($have) { Ok 'already installed' }
