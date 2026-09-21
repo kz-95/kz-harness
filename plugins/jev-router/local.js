@@ -10,7 +10,7 @@ import { mkdir, open, readFile, rename, rm, stat, statfs, unlink, writeFile } fr
 import { createServer } from 'node:net'
 import { cpus, freemem, totalmem } from 'node:os'
 import { dirname, join } from 'node:path'
-import { localAgentFor } from './effort.js'
+import { localAgentFor, quickestLocal } from './effort.js'
 
 export const LOCAL_PROVIDER = 'local'
 
@@ -125,17 +125,30 @@ export async function downloadVerified({ url, dest, size, sha256, fetch = global
 
 /**
  * Online when any probe answers at all (any HTTP status); offline when every one
- * fails or times out. Cached for `ttlMs`; one probe in flight.
+ * fails or times out. The endpoints are tried one at a time and the first answer
+ * ends the check, so once connectivity is known the later ones are never
+ * contacted. The budget is split evenly across them, so a slow first endpoint
+ * cannot starve the rest and the whole check still fits in `timeoutMs`. Cached
+ * for `ttlMs`; one probe in flight. The default list is the Jev endpoint alone:
+ * DeepSeek is deliberately not probed, because a connectivity check must not
+ * contact a provider this run has not chosen. With one endpoint the whole
+ * `timeoutMs` budget goes to it, so the worst case is unchanged.
  */
-export function createConnectivity({ fetch = globalThis.fetch, urls = ['https://api.typesafe.ai', 'https://api.deepseek.com'], timeoutMs = 2500, ttlMs = 30_000, now = Date.now } = {}) {
+export function createConnectivity({ fetch = globalThis.fetch, urls = ['https://api.typesafe.ai'], timeoutMs = 2500, ttlMs = 30_000, now = Date.now } = {}) {
   let cache = null
   let pending = null
-  const probe = (url) => fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(timeoutMs) }).then(() => true, () => false)
+  const each = Math.max(1, Math.floor(timeoutMs / urls.length))
+  const reached = async () => {
+    for (const url of urls) {
+      if (await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(each) }).then(() => true, () => false)) return true
+    }
+    return false
+  }
   return {
     async online(force = false) {
       if (!force && cache && now() - cache.at < ttlMs) return cache.online
-      pending ??= Promise.all(urls.map(probe)).then((r) => {
-        cache = { at: now(), online: r.some(Boolean) }
+      pending ??= reached().then((online) => {
+        cache = { at: now(), online }
         return cache.online
       }).finally(() => { pending = null })
       return pending
@@ -572,12 +585,19 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     return { installed: true, loggedIn: true, detail: `free, local: ${m.file}` }
   }
 
-  /** The model answering direct questions: the chosen one if installed, else the first installed in manifest order. */
+  /**
+   * The model answering direct questions: the one chosen in Settings if installed, else the
+   * quickest installed one. Manifest order used to decide the fallback, which sent every simple
+   * question to whichever model the manifest happened to list first - Qwen here, ~8 tokens/s -
+   * instead of to the `fast` role that exists for exactly this job (Gemma 4 E4B, ~47 tokens/s).
+   * A direct answer is a short one, so speed is what a local chat model is for; the stored
+   * choice still wins over both.
+   */
   async function chatModel() {
     if (!(await engineInstalled())) return null
     const have = await installed()
     const { chatModel: want } = await readSettings()
-    return (have.find((m) => m.id === want) ?? have[0])?.id ?? null
+    return have.find((m) => m.id === want)?.id ?? quickestLocal(have)?.id ?? null
   }
 
   async function runDefaults(m) {

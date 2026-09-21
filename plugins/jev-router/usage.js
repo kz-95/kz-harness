@@ -261,7 +261,9 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
       // With keys, the agent is out only when every key is: rotation moves past a spent active key.
       const usable = list.filter((k) => k.state === 'ok' || k.state === 'unknown')
       out[a.id] = own.state === 'exhausted' || !list.length ? { ...base, ...own }
-        : usable.length ? { ...base, state: usable.some((k) => k.state === 'ok') ? 'ok' : 'unknown', until: null }
+        // The active key's own state carries the soft tier: keys are scored against minBalance
+        // only, so without this "hand over below" never fires for an api agent.
+        : usable.length ? { ...base, state: usable.some((k) => k.state === 'ok') ? (own.state === 'near' ? 'near' : 'ok') : 'unknown', until: null }
         : { ...base, state: list.every((k) => k.state === 'exhausted') ? 'exhausted' : 'stopped', until: list.map((k) => k.until).filter(Boolean).sort()[0] ?? null }
     }
     const jevKeys = keys.jev ?? []

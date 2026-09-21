@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path'
 import { createReview } from '../jev-review/index.js'
 import { eligible, rank } from './capabilities.js'
 import { effortFamily, toAgentEffort } from './effort.js'
+import { tagIsAnswerOnly } from './feedback.js'
 import { offlinePick } from './local.js'
 import { assertWorkspace, changedSince, compareChecks, ensureHandoffIgnored, gatherContext, runChecks, snapshot } from './workspace.js'
 
@@ -49,6 +50,14 @@ const STALL_AFTER = 2
 // Attempts needed before an accepted rate is reported at all. Below this the number is noise,
 // and the routing prompt weighs accepted rate first, so noise wins picks.
 const MIN_RATE_SAMPLES = 3
+
+// Feedback priors: how many recent Like/Dislike verdicts the routing prior weighs, and the
+// most a run of them may move an agent's probability. A verdict is explicit, so it counts more
+// than one quiet run, but a click is still one data point: the bias is ramped over three
+// verdicts and capped, so one cannot swing a pick and ten cannot make an agent unoverridable.
+const FEEDBACK_WINDOW = 20
+const FEEDBACK_WEIGHT = 0.15
+const FEEDBACK_RAMP = 3
 
 const TIER = { local: 'free-local', api: 'api', subscription: 'subscription' }
 const tierOf = (a) => TIER[a.kind] ?? (a.provider === 'claude-code' || a.provider === 'codex' ? 'subscription' : a.llm?.provider === 'local' ? 'free-local' : 'api')
@@ -148,6 +157,80 @@ export function trackRecord(records, cwd, agents, { availability = {}, pricing =
     }
     return [a.id, { cost_tier: tierOf(a), ...(pricing[a.id] ? { price_now: pricing[a.id] } : {}), availability: availability[a.id] ?? 'ok', here_by_task_type: byType, overall: stats(all, a.id) ?? 'no runs yet' }]
   }))
+}
+
+/**
+ * The routing prior from recent feedback.jsonl rows: per agent, the Like/Dislike counts, the
+ * reasons the person gave, and a bounded bias for Jev's probabilities. It extends the same
+ * deps.history path trackRecord uses, one file over, so there is one priors mechanism, not two.
+ *
+ * Which agent a verdict is about comes from `provider` (and `model`): the engine's message id
+ * is never known on this side, so `messageId` is only the client's key and this file's upsert
+ * key. A row that resolves to no enabled agent is dropped rather than guessed at. The newest
+ * verdict, when it names a `suggestedAgent`, is returned separately: an explicit correction,
+ * not a vote, and it is cleared by any later verdict.
+ *
+ * The tag splits the signal in two. A routing tag (wrong agent, misread my question, wrong
+ * scope, good pick) is a statement about the pick, and counts as a vote like an untagged row
+ * always has. An answer-only tag (not enough detail, too slow, good answer) is a statement
+ * about the answer: its text and tag still ride `reasons` into the routing prompt as context,
+ * but it never reaches `likes` / `dislikes`, so the bias it feeds is untouched, and it cannot
+ * raise a `suggestion` either, because that would promote an agent through the answer door.
+ */
+export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } = {}) {
+  const recent = (records ?? []).slice(-n)
+  const modelOfAgent = (a) => a.llm?.model ?? modelOf?.(a) ?? ''
+  const agentOf = (r) => {
+    if (!r?.provider) return undefined
+    // An agent id first (the client sends the chain chip's agent), then a real provider id,
+    // optionally narrowed by the model the chip shows.
+    const byId = agents.find((a) => a.id === r.provider)
+    if (byId) return byId.id
+    return agents.find((a) => (a.llm?.provider ?? a.provider) === r.provider && (!r.model || modelOfAgent(a) === r.model))?.id
+  }
+  const tally = new Map()
+  const bump = (id, fn) => {
+    if (!id || !agents.some((a) => a.id === id)) return
+    const t = tally.get(id) ?? { likes: 0, dislikes: 0, suggested: 0, reasons: [] }
+    fn(t)
+    tally.set(id, t)
+  }
+  // The person's words with the chosen tag in front of them: this is what rides the agent's
+  // track record into the routing prompt. An answer-only row gets no further than this.
+  const note = (r) => {
+    const tag = typeof r.tag === 'string' ? r.tag.trim() : ''
+    if (!tag) return r.reason ?? ''
+    return r.reason ? `${tag}: ${r.reason}` : tag
+  }
+  for (const r of recent) {
+    if (r?.verdict !== 'like' && r?.verdict !== 'dislike') continue
+    // The split, in one line: only a routing-affecting row is allowed to vote.
+    const counts = !tagIsAnswerOnly(r.tag)
+    bump(agentOf(r), (t) => {
+      if (counts) {
+        if (r.verdict === 'dislike') t.dislikes++
+        else t.likes++
+      }
+      const text = note(r)
+      if (text) t.reasons.push(text)
+    })
+    // A suggestion is a promotion, so an answer-only tag may not make one.
+    if (counts) bump(r.suggestedAgent, (t) => { t.suggested++ })
+  }
+  const out = new Map()
+  for (const [id, t] of tally) {
+    const votes = t.likes + t.dislikes
+    out.set(id, {
+      likes: t.likes,
+      dislikes: t.dislikes,
+      suggested: t.suggested,
+      reasons: t.reasons.slice(-3),
+      bias: votes ? r2(FEEDBACK_WEIGHT * (t.likes - t.dislikes) / Math.max(FEEDBACK_RAMP, votes)) : 0,
+    })
+  }
+  const latest = recent.at(-1)
+  const suggestible = latest?.verdict === 'dislike' && latest.suggestedAgent && !tagIsAnswerOnly(latest.tag)
+  return { agents: out, suggestion: suggestible ? latest.suggestedAgent : undefined }
 }
 
 function basePrompt(task, cwd, { near, handoff } = {}) {
@@ -339,6 +422,17 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // Agents billed by time of day (DeepSeek): Jev sees which are on their cheap rate right now.
   const pricing = pricingNow(config.pricing?.peak)
   const agentRecord = deps.history.records ? trackRecord(await deps.history.records().catch(() => []), cwd, agents, { availability, pricing }) : undefined
+  // Feedback priors: the person's Like/Dislike on earlier answers, read through the same
+  // deps.history path history.jsonl uses. The reasons ride each agent's track record into the
+  // routing prompt, and the bounded bias is applied to Jev's own probabilities once it answers.
+  // No feedback, an unreadable file, or a verdict naming no agent leaves all of this empty.
+  const feedbackRows = deps.history.feedback ? await deps.history.feedback(sessionId).catch(() => []) : []
+  const priors = feedbackPrior(feedbackRows, agents, { modelOf: deps.modelOf })
+  if (agentRecord) {
+    for (const [id, f] of priors.agents) {
+      if (agentRecord[id]) agentRecord[id] = { ...agentRecord[id], feedback: { likes: f.likes, dislikes: f.dislikes, suggested: f.suggested, recent_reasons: f.reasons } }
+    }
+  }
 
   // 1. Routing
   let routing
@@ -437,6 +531,43 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     if (swap && swap !== routing.primaryAgent && !gated(swap)) {
       emit('gate', { agent: routing.primaryAgent, to: swap, percent: quota[routing.primaryAgent]?.weeklyPercent ?? null, at: gateAt(routing.primaryAgent) })
       routing = { ...routing, primaryAgent: swap, gatedFrom: routing.primaryAgent }
+    }
+  }
+
+  // The feedback prior, applied. The bounded bias from recent Likes and Dislikes moves an
+  // agent's probability, and the top pick is re-read from the adjusted numbers, so a demoted
+  // agent loses a close call while a confident pick survives. The person's newest correction (a
+  // suggestedAgent) is stronger and switches the pick outright, but only to an agent this run
+  // could really have used: enabled, in the capability pool, and not past its weekly gate.
+  // Manual overrides and non-Jev routes never reach here, so those are untouched.
+  // Only vote rows are in `priors.agents` with a non-zero bias: an answer-only tag contributed no
+  // vote (see feedbackPrior), so nothing here can move a pick because of one. Its words already
+  // reached the routing prompt through the track record above, which is all it is meant to do.
+  if (!forceAgent && routing.mode === 'jev' && priors.agents.size) {
+    const probs = { ...(routing.agentProbabilities ?? {}) }
+    const moved = []
+    for (const [id, f] of priors.agents) {
+      if (!f.bias || !pickPool.some((a) => a.id === id && !gated(a.id))) continue
+      const before = probs[id] ?? 0
+      probs[id] = Math.max(0, Math.min(1, before + f.bias))
+      moved.push({ agent: id, from: before, to: probs[id], likes: f.likes, dislikes: f.dislikes })
+    }
+    const pick = routing.primaryAgent
+    // Only an agent this run could really have used may take the work, so a stale or
+    // unavailable suggestion still cannot route past capability or the weekly gate.
+    const usable = (id) => !!id && byId.has(id) && !gated(id) && pickPool.some((a) => a.id === id) && (!executors.length || capableSet.has(id))
+    let primary = pick
+    if (priors.suggestion && priors.suggestion !== pick && usable(priors.suggestion)) {
+      primary = priors.suggestion
+      moved.push({ agent: primary, suggested: true })
+    } else if (moved.length) {
+      const top = Object.entries(probs).sort((a, b) => b[1] - a[1])[0]?.[0]
+      if (top && top !== primary && usable(top)) { primary = top; moved.push({ agent: top, promoted: true }) }
+    }
+    if (primary !== pick) routing = { ...routing, primaryAgent: primary, feedbackFrom: pick }
+    if (moved.length) {
+      routing = { ...routing, agentProbabilities: probs, feedback: moved }
+      emit('feedback', { from: routing.feedbackFrom ?? null, to: routing.primaryAgent, moved })
     }
   }
 
@@ -571,7 +702,10 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
         if (fresh?.state && fresh.state !== was) {
           quota[next.agent] = { ...(quota[next.agent] ?? {}), ...fresh }
           emit('balance', { agent: next.agent, from: was ?? null, state: fresh.state, balance: fresh.balance ?? null })
-          if (OUT_STATES.includes(fresh.state)) limit = { hit: true, until: fresh.until ?? null, spent: true }
+          // The attempt is already pushed, and it is the same object: mark it here or the run
+          // treats this as a quota stop while the record says a plain failure, which would
+          // depress the agent's track record, mis-score the routing pick and hide the pill.
+          if (OUT_STATES.includes(fresh.state)) { limit = { hit: true, until: fresh.until ?? null, spent: true }; attempt.limitHit = true }
         }
       }
 
@@ -643,7 +777,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       emit('attempt_end', { index: attempts.length - 1, attempt: { ...attempt, answerText: (attempt.answerText ?? '').slice(0, 4000) } })
       const cmp = compareChecks(baseline ?? [], lastChecks)
       const totalDiff = await changedSince(cwd, startSnap, signal)
-      const touchedCode = (totalDiff.files?.length ?? 0) > 0
+      const touchedCode = totalDiff.files === null || totalDiff.files.length > 0
       const blockAccept = result.stopReason !== 'completed' || cmp.regressed.length > 0 || (requireChecks && touchedCode && cmp.failing.length > 0)
 
       // Review plugin: Jev verdict plus deterministic overrides.
@@ -662,7 +796,9 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
         // will not be different. Stop and ask a person rather than spend again on the same
         // nothing. Uses changedFiles, which every attempt already records.
         const work = attempts.filter((a) => a.role === 'primary' || a.role === 'retry').slice(-(config.policy?.stallAfter ?? STALL_AFTER))
-        if (work.length >= (config.policy?.stallAfter ?? STALL_AFTER) && work.every((a) => !a.changedFiles?.length)) {
+        // changedFiles is null when we could not measure (not a git repo, git status failed):
+        // unknown is not zero, and stopping a run that was working costs more than one more attempt.
+        if (work.length >= (config.policy?.stallAfter ?? STALL_AFTER) && work.every((a) => a.changedFiles?.length === 0)) {
           emit('stalled', { attempts: work.length, agents: work.map((a) => a.agent) })
           status = 'needs_human'
           statusReason = `${work.length} work attempts in a row changed no files; stopping instead of retrying again`
@@ -773,6 +909,7 @@ export function formatReport(r) {
   if (r.routing?.capabilityFrom) lines.push(`- ${r.routing.capabilityFrom} cannot do this (${r.routing.capability ?? 'capability unclear'}): ${r.routing.primaryAgent} took the work`)
   if (r.gated?.length) lines.push(`- Past the weekly gate, kept for review only: ${r.gated.join(', ')}`)
   if (r.routing?.gatedFrom) lines.push(`- Work moved off ${r.routing.gatedFrom} (past its weekly gate) to ${r.routing.primaryAgent}`)
+  if (r.routing?.feedbackFrom) lines.push(`- Feedback moved the pick off ${r.routing.feedbackFrom} to ${r.routing.primaryAgent}`)
   if (r.continuedFromHandoff) lines.push(`- Continuing from handoff (${HANDOFF})`)
   const av = r.availability
   if (av?.out.length || av?.near.length) {

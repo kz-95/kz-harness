@@ -12,8 +12,12 @@ const { pathToFileURL } = require('node:url')
 // No remote control: a debug port or inspector would let any program on this PC drive the app.
 // Developers opt in with KZH_DEBUG=1. (DevTools on F12 stays: that needs someone at the keyboard.)
 const DEBUG = process.env.KZH_DEBUG === '1'
+// ELECTRON_RUN_AS_NODE counts only in development. The packaged exe has the RunAsNode fuse off
+// (package.mjs), so the variable cannot turn it into Node there, and editors such as VS Code
+// export it for every child process, which made the packaged app refuse to start from a terminal.
+const runAsNode = !!process.env.ELECTRON_RUN_AS_NODE && !app.isPackaged
 const debugSwitch = process.argv.some((a) => /^--(inspect|remote-debugging-(port|pipe)|js-flags)/.test(a)) ||
-  /--inspect/.test(process.env.NODE_OPTIONS ?? '') || !!process.env.ELECTRON_RUN_AS_NODE
+  /--inspect/.test(process.env.NODE_OPTIONS ?? '') || runAsNode
 if (debugSwitch && !DEBUG) {
   dialog.showErrorBox('Kz-harness', 'Kz-harness was started with a debugging switch, which would let other programs control it. Start it from the Kz-harness icon instead.')
   app.exit(1)
@@ -105,6 +109,76 @@ const portBusy = () => new Promise((resolve) => {
   s.once('error', () => resolve(false))
 })
 
+// ---------- who holds the port ----------
+// Stopping another program is the most dangerous thing this app can do, so the test is narrow:
+// the holder counts as ours only when its own command line is the pinned engine invocation AND
+// no live Kz-harness.exe sits above it. Never by port number alone.
+/** Run one command and return its stdout, or null on any failure. */
+const runCmd = (file, args, timeout = 10000) => new Promise((resolve) => {
+  execFile(file, args, { timeout, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, out) => resolve(err ? null : String(out)))
+})
+
+/**
+ * Whether a command line is the engine Start-KzH.ps1 launches: node, the pinned @deepseek-ai/dsh
+ * package, and `web` as its own argument. To look like this by accident a stranger would have to
+ * run node on that exact package path with a bare `web` argument, and the live Kz-harness check
+ * below still has to pass before anything is stopped.
+ */
+const isEngineCommand = (cmd) => {
+  const line = String(cmd ?? '')
+  return /\bnode(\.exe)?\b/i.test(line) && /@deepseek-ai[\\/]dsh\b/i.test(line) && /(?:^|\s)web(?:\s|$)/i.test(line)
+}
+
+/** The PID listening on PORT, or null. netstat is on every Windows and needs no PowerShell module. */
+async function portOwnerPid() {
+  const out = await runCmd('netstat', ['-ano'])
+  if (!out) return null
+  for (const line of out.split(/\r?\n/)) {
+    const f = line.trim().split(/\s+/)
+    if (f.length < 5 || f[0].toUpperCase() !== 'TCP' || f[3].toUpperCase() !== 'LISTENING') continue
+    if (!f[1].endsWith(`:${PORT}`)) continue
+    const pid = Number(f[4])
+    if (Number.isInteger(pid) && pid > 0) return pid
+  }
+  return null
+}
+
+/** One live process row from CIM, or null when the process has already gone. */
+async function processRow(pid) {
+  const script = `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction SilentlyContinue; if ($p) { $p | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress }`
+  const out = await runCmd('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script])
+  if (!out || !out.trim()) return null
+  try {
+    const r = JSON.parse(out)
+    return { pid: Number(r.ProcessId), parent: Number(r.ParentProcessId), name: String(r.Name ?? ''), cmd: String(r.CommandLine ?? '') }
+  } catch { return null }
+}
+
+/**
+ * Classify whoever holds PORT. `orphan` is our engine with no live Kz-harness.exe above it, safe
+ * to stop; `running` is our engine still under a live Kz-harness.exe, which is the other harness
+ * this app already tells you to close, so it is left alone; `foreign` is anything else, left alone.
+ */
+async function inspectPortHolder() {
+  const pid = await portOwnerPid()
+  if (!pid) return null
+  const chain = []
+  let cur = pid
+  for (let i = 0; i < 8 && cur > 0; i++) {
+    const row = await processRow(cur)
+    if (!row) break
+    chain.push(row)
+    if (row.parent === cur) break
+    cur = row.parent
+  }
+  const top = chain[0]
+  if (!top) return null
+  if (!isEngineCommand(top.cmd)) return { pid, kind: 'foreign', name: top.name }
+  // Only a live process reaches this chain, so an ancestor named Kz-harness.exe is still open.
+  const underApp = chain.some((r) => /^kz-harness(\.exe)?$/i.test(r.name))
+  return { pid, kind: underApp ? 'running' : 'orphan', name: top.name }
+}
+
 /** Run one git command in the harness folder. Never throws: returns the exit code and output. */
 const git = (args, timeout = 20000) => new Promise((resolve) => {
   execFile('git', ['-C', HARNESS, ...args], { timeout, windowsHide: true }, (err, out, errOut) =>
@@ -164,7 +238,19 @@ async function startDsh() {
   setStatus({ phase: 'starting', message: 'Checking the port is free…', step: 'port' })
   if (await portBusy()) {
     addLog(`Port ${PORT} is already in use.`, 'error')
-    setStatus({ phase: 'error', message: `Another harness is already running on port ${PORT}. Close its black window (or the other Kz-harness), then click Retry.` })
+    const holder = await inspectPortHolder()
+    if (holder?.kind === 'orphan') {
+      addLog(`The engine on port ${PORT} (PID ${holder.pid}) has no running Kz-harness app above it, so it is orphaned. "Use it here" stops it and starts this app's engine.`, 'warn')
+      addLog('Adopting that engine is not possible: its access token is generated per process and never written to disk, so this app cannot authenticate to it. It has to be stopped and started here.', 'info')
+      setStatus({ phase: 'error', holder: 'orphan', message: `A Kz-harness engine is still running on port ${PORT}, left behind by an app that is no longer open. Click "Use it here" to stop it and start here.` })
+    } else if (holder?.kind === 'running') {
+      addLog(`Port ${PORT} is held by a Kz-harness engine (PID ${holder.pid}) that still belongs to a running Kz-harness.`, 'warn')
+      setStatus({ phase: 'error', holder: 'running', message: `Another harness is already running on port ${PORT}. Close its black window (or the other Kz-harness), then click Retry.` })
+    } else {
+      const who = holder ? `${holder.name || 'a process'} (PID ${holder.pid})` : 'an unrelated program'
+      addLog(`Port ${PORT} is held by ${who}, which is not this harness. Nothing was stopped.`, 'warn')
+      setStatus({ phase: 'error', holder: 'foreign', message: `Another program is already using port ${PORT}. It is not this harness (${who}), so nothing was stopped. Close it, then click Retry.` })
+    }
     return
   }
   addLog(`> ${START_SCRIPT} -NoOpen`, 'cmd')
@@ -244,6 +330,43 @@ function restartDsh() {
   addLog('Restarting…', 'cmd')
   showStartScreen()
   setTimeout(startDsh, 800)
+}
+
+/**
+ * "Use it here": stop the orphaned engine that holds PORT, then start this app's own engine.
+ * The holder is inspected again here, not trusted from the error state, so a port that changed
+ * hands between the splash and the click is never killed. A foreign holder is never stopped.
+ */
+let reclaiming = false
+async function useHere() {
+  if (reclaiming) return { ok: false, reason: 'busy' }
+  if (status.phase !== 'error') return { ok: false, reason: 'not-error' }
+  reclaiming = true
+  try {
+    const holder = await inspectPortHolder()
+    if (holder?.kind !== 'orphan') {
+      addLog(`Use it here: port ${PORT} is not held by an orphaned engine any more; nothing was stopped.`, 'warn')
+      setStatus({ phase: 'error', holder: holder?.kind ?? 'foreign', message: holder?.kind === 'running'
+        ? `Another harness is already running on port ${PORT}. Close its black window (or the other Kz-harness), then click Retry.`
+        : `Port ${PORT} is no longer held by an orphaned engine. Open the log, then click Retry.` })
+      return { ok: false, reason: holder?.kind ?? 'gone' }
+    }
+    addLog(`Use it here: stopping the orphaned engine (PID ${holder.pid}) and everything it started.`, 'cmd')
+    try { execFileSync('taskkill', ['/pid', String(holder.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }) } catch (err) { addLog(`Use it here: taskkill reported ${err.message ?? err}; checking the port anyway.`, 'warn') }
+    // A dead process can leave the socket in LISTEN for a moment, so wait before giving up.
+    let busy = await portBusy()
+    for (let i = 0; busy && i < 20; i++) { await new Promise((r) => setTimeout(r, 250)); busy = await portBusy() }
+    if (busy) {
+      addLog(`Use it here: port ${PORT} is still busy after stopping PID ${holder.pid}; not starting a second engine.`, 'error')
+      setStatus({ phase: 'error', holder: 'foreign', message: `Port ${PORT} is still busy after stopping the orphaned engine. Something else took the port; open the log, then click Retry.` })
+      return { ok: false, reason: 'still-busy' }
+    }
+    addLog(`Use it here: port ${PORT} is free; starting this app's engine.`, 'ok')
+    startDsh()
+    return { ok: true }
+  } finally {
+    reclaiming = false
+  }
 }
 
 // ---------- windows ----------
@@ -437,6 +560,7 @@ ipcMain.handle('harness:titlebar', () => ({ height: TITLEBAR_H, maximized: !!mai
 // Only the app's own start and log pages may read the log or restart the harness, not the harness page.
 ipcMain.handle('harness:state', (e) => (fromAppPage(e) ? { status, logs } : null))
 ipcMain.handle('harness:retry', (e) => { if (fromAppPage(e)) restartDsh() })
+ipcMain.handle('harness:useHere', (e) => (fromAppPage(e) ? useHere() : null))
 ipcMain.handle('harness:openLogs', (e) => { if (fromAppPage(e)) openLogs() })
 
 // Double-clicking the exe again brings the window back rather than doing nothing.

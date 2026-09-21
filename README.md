@@ -73,6 +73,7 @@ Only the model and API calls you choose go online. KzH switches off DSH's data c
 - **Header like Claude desktop:** buttons for **Terminal**, **Background tasks**, **Browser** and **Jev inspector**, plus a **⋮** menu (Files, Usage, focus mode, settings). Every action has a hotkey you can change in **Settings → Shortcuts**.
 - **Right sidebar** (opens at 20% width; change it in Settings → Shortcuts):
   - **Jev inspector:** timings, the pick and its reasons, every step with that agent's own answer, and every question Jev was asked with its probabilities.
+  - **Overview:** the whole session as one time-ordered ledger: your messages and the assistant's, tool calls, context and compaction, then the routed runs, background tasks and subagents. Filter chips by kind, and every row expands to the inspector's own detail (see [The work board, history and feedback](#the-work-board-history-and-feedback)).
   - **Background tasks:** Jev runs, background jobs and subagents, each with a live timer, output and **Stop**.
   - **Usage:** each account's 5-hour and weekly limits, DeepSeek balance and Jev spend; editable per-account limits; recent runs; and **Saved by Jev (estimate)**, covering money, time and tokens compared with a chat model making the same decisions.
   - **Browser:** a real browser pane, sandboxed in its own session.
@@ -83,6 +84,10 @@ Only the model and API calls you choose go online. KzH switches off DSH's data c
 - **Tools without an LLM:** Jev runs one of your scripts when it fully covers the task.
 
 ## Install (new PC)
+
+KzH runs on **any Windows 10/11 PC**, not just the one it was built on: nothing in the repo hardcodes a machine, a user folder or a drive. It is Windows only, though, and deliberately so. The launcher is a packaged Electron app for `win32-x64`, the installer and starter are PowerShell, and the shortcuts are Desktop and Start menu entries. There is no macOS or Linux build, and none is planned here.
+
+Two things never travel with the repo, by design: your keys (they live in `~/.kzh/.env`, outside the repo) and the local model binaries (`models/` and `engine/` are ignored; only `config/local-models.json` is committed, and the installer downloads from it). A fresh clone therefore needs step 2 and, if you want local models, the `-LocalModels` flag in step 3.
 
 **You need:** Windows 10/11, [Node.js](https://nodejs.org) 22.19+ (24 recommended), [Git](https://git-scm.com), and at least one of:
 
@@ -126,7 +131,7 @@ The installer:
 
 **4. First start.**
 
-1. Double-click **Kz-harness**. The start screen shows the log; the app opens after 10–20 s.
+1. Double-click **Kz-harness**. The start screen shows the log; the app opens after 10-20 s.
 2. **Settings → Jev setup:** every agent you use should show a green dot. A red dot tells you what to run; do it, then click **Recheck logins**.
 3. Pick a workspace (a project folder) or **No project**, and type.
 
@@ -152,17 +157,19 @@ Start it from the icon. Double-clicking a `.ps1` file opens Notepad on purpose; 
 
 Jev is told what each agent costs at the hour it is choosing, and prefers an agent on its cheap rate when the choice is otherwise even. It is a preference, not a rule: a task that needs a particular agent still goes there.
 
-DeepSeek bills by the UTC clock, cheap inside a daily window and several times that outside it. The window is config, not code - `pricing.offPeak` in the plugin's Config, keyed by agent id:
+DeepSeek bills by the UTC clock, twice the price inside its weekday business hours and at its cheap rate the rest of the time, so every evening and the whole weekend is already cheap. The dear hours are config, not code - `pricing.peak` in the plugin's Config, keyed by agent id:
 
 ```yaml
 - id: jev-router
   config:
     pricing:
-      offPeak:
-        deepseek: { fromUtc: '16:30', toUtc: '00:30', note: 'DeepSeek off-peak discount' }
+      peak:
+        deepseek:
+          windowsUtc: [{ fromUtc: '01:00', toUtc: '04:00' }, { fromUtc: '06:00', toUtc: '10:00' }]
+          daysUtc: [1, 2, 3, 4, 5]
 ```
 
-An end at or before the start wraps past midnight. Check the window against [DeepSeek's pricing page](https://api-docs.deepseek.com/quick_start/pricing) and edit it there if they move it; add an entry for any other agent whose provider charges by time of day. Subscription agents (Claude Code, Codex) are flat-rate, so they have no entry.
+The windows are the **dearer** hours; anything outside them is off-peak. An end at or before the start wraps past midnight, and `daysUtc` is the UTC day, 0 = Sunday, defaulting to Monday to Friday. Check the hours against [DeepSeek's pricing page](https://api-docs.deepseek.com/quick_start/pricing) and edit them there if they move; add an entry for any other agent whose provider charges by time of day. Subscription agents (Claude Code, Codex) are flat-rate, so they have no entry.
 
 ## Subscription first
 
@@ -237,7 +244,7 @@ A task you type in a project does **not** hold the chat. Jev queues it, answers 
 
 and you carry on: ask a question, start a task in another project, read the inspector.
 
-When the task finishes, its result is posted into that chat **as its own message**, headed with the task name, its id, the agent, the model and the status - never merged into, and never in front of, whatever the assistant is saying. If an answer is streaming when the task lands, delivery waits for that answer to finish, so nothing interrupts it. A result counts as **unread** until your browser reports that it actually rendered the row, so the badge means "you have not seen this yet"; if the message could not be posted it stays on offer and is retried, and an appended result is never posted twice. Each result is a collapsed `Context injection · jev-router` row, which is the engine's own notice row rather than a bespoke card.
+When the task finishes, its result is posted into that chat **as its own message**, headed with the task name, its id, the agent, the model and the status - never merged into, and never in front of, whatever the assistant is saying. If an answer is streaming when the task lands, delivery waits for that answer to finish, so nothing interrupts it. A result counts as **unread** until your browser reports that it actually rendered the row, so the badge means "you have not seen this yet"; if the message could not be posted it stays on offer and is retried, and an appended result is never posted twice. Each result is a collapsed `Context injection · jev-router` row, which is the engine's own notice row rather than a bespoke card. That is deliberate: the slot the card needed is keyed, not chained, so taking it replaced the row for every other producer too and flattened five structured bodies. Open the row for the raw text, or the **Overview** tab in the right sidebar to read the same report rendered as Markdown, on a surface KzH owns outright.
 
 - **One at a time per project folder.** Two agents never edit the same folder at once; a second task for the same folder waits its turn. Different folders run in parallel.
 - **Every state is on the record**: waiting, choosing executor, running, verifying, reviewing, and then completed, failed, stopped, needs input or paused by limit. A completed row gets a check mark and a struck-through title; failed, stopped, needs-input and paused rows keep their own icon, a text label (never colour alone) and the reason.
@@ -249,11 +256,25 @@ When the task finishes, its result is posted into that chat **as its own message
 - Questions, `/auto`, `/claude` and the other forced-agent commands still answer in line, as before - only routed project work is queued.
 - Task records are kept in `~/.kzh/jev-router/tasks.jsonl` (the last 100). If the engine has no job service, tasks run in the chat exactly as they did before.
 
+## The work board, history and feedback
+
+These are plugin features (`plugins/jev-router/client.js`), loaded by the engine: a harness restart picks them up, not a rebuilt exe.
+
+- **The work board** is a sticky card at the top of the conversation, per session: this session's background tasks as a checklist. The header reads `N/M completed` and names each non-completed terminal state that occurred (`1 failed`, `2 stopped`, and so on), because only `completed` counts as done. Each row shows its state in words plus the agent, model, effort and elapsed time, and a live row ticks once a second. **Stop all** stops every live task after a confirmation naming them and what is kept; the control is hidden while nothing is live. A session with no tasks renders nothing at all. Every row reuses the Tasks panel's own row model, so the words in the board, the panel and the delivered result cannot drift apart.
+- **Composer history:** ArrowUp recalls your previous input, ArrowDown walks forward, and the draft you were typing is restored once you walk past the newest entry. The entries are this session's own user messages (the newest 50), and the arrows work only while the composer is on screen and the caret is on the draft's first or last line.
+- **Left sidebar file tree:** a toggle beside the Workspaces search icon opens a VS Code style tree of the open session's project folder. One directory level loads at a time as you expand it (capped at 400 rows); a directory opens and closes, and clicking a file opens it in the right sidebar the same way the shipped Files tab does. The honest limit: it roots at the **open session's** folder, because the engine exposes no independent selected workspace, so it follows the session, not a separately highlighted workspace row.
+- **Answer feedback:** every answer carries **Like** and **Dislike**. A verdict can take an optional tag and an optional one-line **Why?**; a dislike also gets a **should have been** picker naming another enabled agent.
+  - The routing tags (`wrong agent`, `misread my question`, `wrong scope`, `good pick`) are statements about the pick and may move Jev's probabilities within a bounded bias (weight 0.15, ramped over the first three votes, reading the newest 20). An untagged verdict votes too.
+  - The answer-only tags (`not enough detail`, `too slow`, `good answer`) never move a pick; their text and tag still ride the routing prompt as context.
+  - A written reason always reaches the routing prompt, with its tag in front when one was picked.
+  - A `should have been` suggestion is stronger and can switch the pick outright, but only to an agent this run could really have used: enabled, capable and not past its weekly gate. Clearing a verdict appends a tombstone row, so an earlier verdict is never lost by a clear.
+  - Verdicts are stored locally, one append-only row each, in `<DSH_HOME>/jev-router/feedback.jsonl` (`~/.kzh/jev-router/feedback.jsonl`). The bias is small and ramped, so a handful of clicks will not change picks: no accuracy improvement is measurable until real verdicts accumulate.
+
 ## How Jev decides
 
 Jev is TypeSafe's System One model. It answers typed questions with calibrated probabilities and never writes code. KzH follows the [Jev docs](https://docs.typesafe.ai/introduction): each call batches all its questions, each question is one judgment, and **code** makes the decision.
 
-- **Before running** (one call): which agent, the task type, complexity and risk, whether a second opinion, a person or passing tests are needed, whether any tool fits exactly (and its arguments), whether the task continues an earlier handoff, **what kind of outcome the request needs** (below), and **whether a question also asks for work** (below). Only small facts are sent (the task, file-type counts, script and dependency names, changed file names, recent outcomes); source files never are.
+- **Before running** (one call): which agent, the task type, complexity and risk, whether a second opinion, a person or passing tests are needed, whether any tool fits exactly (and its arguments), whether the task continues an earlier handoff, **what kind of outcome the request needs** (below), and **whether a question also asks for work** (below). Only small facts are sent (the task, file-type counts, script and dependency names, changed file names, recent outcomes, and the folder's handoff note when it has one, which quotes the previous task's answer and so can carry code from it); whole source files never are.
 - **After each run** (one call over the diff, the checks and the answer): addressed, complete, unrelated changes, regression risk, needs a person, and which agent should go next.
 
 ### One message can do both
@@ -328,9 +349,9 @@ KzH can run open models on your own PC with [llama.cpp](https://github.com/ggml-
 | Gemma 4 E4B, QAT Q4_0, `google/gemma-4-E4B-it-qat-q4_0-gguf` (4.8 GB) | `gemma-local` | all 43 layers on the GPU, ~47 tokens/s |
 | Gemma 4 E4B vision add-on (0.9 GB, optional) | `gemma-local` reads images | runs on the CPU (not tested yet) |
 
-**What they do:** once a model is installed, its agent appears in Jev setup and switches on. Jev may pick it like any other agent; its description says it is free, private and offline-capable but weaker, so it gets simple edits, explanations and summaries. The installed model also answers direct questions when DeepSeek fails (before an agent is asked), and it shows in the model picker as *Local (llama.cpp)*. Thinking is off and the context is 8,192 tokens (4,096 on PCs with less than 12 GB RAM), so a local agent's run can hit the context limit on big tasks.
+**What they do:** once a model is installed, its agent appears in Jev setup and switches on. Jev may pick it like any other agent; its description says it is free, private and offline-capable but weaker, so it gets simple edits, explanations and summaries. The installed model also answers direct questions when DeepSeek fails (before an agent is asked), and it shows in the model picker as *Local (llama.cpp)*. Thinking is off and the context is 16,384 tokens (12,288 on PCs with less than 12 GB RAM), so a local agent's run can hit the context limit on big tasks.
 
-**Offline:** KzH checks `api.typesafe.ai` and `api.deepseek.com` (2.5 s timeout, cached 30 s). When neither answers:
+**Offline:** KzH checks `api.typesafe.ai` (2.5 s timeout, cached 30 s). When it does not answer:
 - only local agents can run; Jev is not asked;
 - questions (a question mark or a question word) go to the local chat model; tasks go to `qwen-local`, else `gemma-local`;
 - the review uses the checks only (the git diff and your project's scripts);
@@ -397,7 +418,7 @@ Claude Code and Codex do not use keys at all: they sign in with your own account
 
 ## Privacy
 
-KzH has no telemetry of its own: there is no KzH endpoint and nothing here phones home. That is not the same as "little leaves this machine". The work itself goes out: your prompts and code go to whichever model you pick, and **every message you type also goes to TypeSafe**, so the router can classify it, along with the task text and a slice of your real `git diff` when a run is reviewed. What that means in full is under [What goes to TypeSafe](#what-goes-to-typesafe) below.
+KzH has no telemetry of its own: there is no KzH endpoint and nothing here phones home. That is not the same as "little leaves this machine". The work itself goes out: your prompts and code go to whichever model you pick, and **every message you type also goes to TypeSafe**, so the router can classify it, along with the task text, a slice of your real `git diff` when a run is reviewed, and the folder's handoff note (`.kz-harness/handoff.md`) on every routing call once one exists, which quotes the previous task's answer verbatim and so routinely carries code from an earlier, unrelated task. What that means in full is the list below.
 
 What was switched off is genuinely off, not just asked to be off: the DSH data features below were audited in the running app, and no hidden telemetry was found anywhere else. They are turned off in `config/cordis.patch.yml` and `Start-KzH.ps1`:
 
@@ -407,7 +428,7 @@ What was switched off is genuinely off, not just asked to be off: the DSH data f
 | `plugin-package-inventory-deepseek` | Sent the list of installed plugins with every DeepSeek request |
 | `session-log-deepseek` | Session-log upload with DeepSeek requests (off by default; pinned off) |
 | `client-hmr` | Developer reload channel |
-| `ui-message-feedback`, `message-feedback`, `command-feedback` | 👍/👎 buttons, the feedback dialog and `/feedback` (the feed for the telemetry upload above) |
+| `ui-message-feedback`, `message-feedback`, `command-feedback` | The engine's own 👍/👎 buttons, the feedback dialog and `/feedback` (the feed for the telemetry upload above). KzH's own Like/Dislike is a separate plugin control, stored locally (see [The work board, history and feedback](#the-work-board-history-and-feedback)) |
 | `llm-deepseek` (official DeepSeek connector) | Sent an anonymous installation ID (`x-deepseek-harness-user-id`, from `~/.kzh/.anonymous-user-id`), the session ID and a compaction flag with every DeepSeek request |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | Claude Code telemetry and error reporting in KzH runs |
 | `skill-badge` | Bundled `dsh-badge` skill that told the model to add a "powered by dsh" badge to pull requests and documents |
@@ -417,12 +438,12 @@ What stays:
 - The app refuses debug ports and inspectors unless started with `KZH_DEBUG=1`. The exe's Electron "fuses" block Node mode, `NODE_OPTIONS` and `--inspect`.
 - The harness page gets no camera, microphone or notifications.
 - Keys and tokens are masked in logs, in the Markdown export, and in everything sent to Jev.
-- Your run history and usage logs are files on this PC (`~/.kzh/jev-router/`) and are never uploaded. Summaries drawn from them do go to TypeSafe with every routing call: per past run the task type, the agent picked, how many attempts and how it ended (`recent_outcomes`), and per agent its attempt count, accepted rate here, average seconds, limit hits and cost tier (`agent_track_record`). No task text and no file contents from old runs.
+- Your run history and usage logs are files on this PC (`~/.kzh/jev-router/`) and are never uploaded. Summaries drawn from them do go to TypeSafe with every routing call: per past run the task type, the agent picked, how many attempts and how it ended (`recent_outcomes`), and per agent its attempt count, accepted rate here, average seconds, limit hits and cost tier (`agent_track_record`). No task text and no file contents from old runs. Answer feedback lives only on this PC too, in `~/.kzh/jev-router/feedback.jsonl`: your verdict, its optional tag and the reason you typed. Its derived summary does ride the routing call: per agent the Like/Dislike counts and up to three recent reasons, so a reason you type can leave with the next routing call. The one earlier-task text that does leave is the handoff note above: it lives in the project (`.kz-harness/handoff.md`), not in these logs, and the first 3000 characters of it ride with every routing call in that folder.
 - DeepSeek now runs through DSH's generic pi-ai connector (provider `deepseek`, same `DEEPSEEK_API_KEY`, `https://api.deepseek.com`). A request carries your key, the conversation, and generic headers only: `User-Agent: deepseek-harness/<version>` (DSH has no switch for it) and the OpenAI SDK's `x-stainless-*` platform headers (OS, CPU, Node version). No user or session ID.
 - DeepSeek web search (`web_search`) sends your key, the search query and `User-Agent: deepseek-harness/0.0.1`; nothing else.
 - Online, besides the model calls:
-  - the Jev/TypeSafe router calls, described below;
-  - a connectivity probe to `api.typesafe.ai` and `api.deepseek.com`, to tell "offline" from "no key": a HEAD request with no key and no content (2.5 s timeout, cached 30 s);
+  - the Jev/TypeSafe router calls, described above;
+  - a connectivity probe to `api.typesafe.ai` (never DeepSeek), to tell "offline" from "no key": a HEAD request with no key and no content (2.5 s timeout, cached 30 s);
   - the DeepSeek balance check (Usage tab), which sends your DeepSeek key;
   - the Claude usage check, which reads your Claude OAuth token from `~/.claude/.credentials.json` and sends it to `api.anthropic.com/api/oauth/usage` (skipped while the oh-my-claudecode statusline cache is fresh);
   - `huggingface.co` catalog lookups for the local-model list, plus the model and engine downloads themselves;
@@ -436,7 +457,7 @@ What the switch to the generic connector costs (all minor): images go inline (ba
 
 Only needed for DeepSeek models or features that the generic connector cannot serve (e.g. Files-API images, future image/video models). Re-enabling brings the identity headers back (anonymous user ID, session ID, compaction flag on every DeepSeek request).
 1. In `~/.kzh/profiles/web/cordis.patch.yml` (and `config/cordis.patch.yml`), delete the block under `# Official DeepSeek connector: remove this block to bring it back.`
-2. Point KzH back at it: in the `jev-router` config set `agents` → `deepseek` → `llm.provider: deepseek-official`, and `auxModel.provider: deepseek-official` (or change the defaults in `plugins/jev-router/index.js`).
+2. Point KzH back at it: in the `jev-router` config set `agents` → `deepseek` → `llm.provider: deepseek-official`, and set both `auxModel.provider: deepseek-official` and `auxModel.model`, or change the defaults in `plugins/jev-router/index.js`.
 3. Optionally remove the `llm-pi-ai` DeepSeek route block too, so the picker does not list DeepSeek twice.
 
 ## Configuration
@@ -467,7 +488,7 @@ KzH settings live in `~/.kzh/profiles/web/cordis.patch.yml`; the installer write
 
 - **Tools** get their parameters as `JEV_ARG_<NAME>` and the task text on stdin, never in the command line.
 - **API-key agents** are added in the app (Settings → Models, then Jev setup); other subagent providers are added under `agents`.
-- **`auxModel`** is the chat model for direct answers, session titles and compaction (default `deepseek` / `deepseek-flash`).
+- **`auxModel`** is the chat model for direct answers, session titles and compaction. Unset, it follows this machine: the installed local chat model first, else the first enabled agent that pins a provider and model. Set both to pin one, and titles, compaction and direct answers then run on that model rather than DeepSeek.
 
 ## Where things live
 
@@ -480,6 +501,7 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 | Accounts, limits, switches, hotkeys | `~/.kzh/jev-router/` (`accounts.json`, `agents.json`, `hotkeys.json`) |
 | History and usage | `~/.kzh/jev-router/history.jsonl`, `usage.jsonl` |
 | Background tasks | `~/.kzh/jev-router/tasks.jsonl` (the last 100 finished tasks and their reports) |
+| Answer feedback | `~/.kzh/jev-router/feedback.jsonl` (your Like/Dislike verdicts, their tags and reasons) |
 | Chats (what the export reads) | `~/.kzh/sessions/<workspace>/<session>/session.v3.jsonl.zstd`, written by the engine |
 | Projects | `C:\HarnessProjects` by default. `C:\Harness\no-project` is the chat-only workspace. |
 | Local models | `C:\Harness\engine\llama` (llama.cpp) and `C:\Harness\models` (GGUF files), both gitignored; the list is `config/local-models.json`. Chat model, idle stop and GPU layers: `~/.kzh/jev-router/local.json`. |
@@ -489,6 +511,7 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 | You see | Do this |
 |---|---|
 | Start screen: another harness is already running | A `Start-KzH.cmd` console or a second Kz-harness is open. Close it, then click **Retry**. |
+| Start screen: a Kz-harness engine is still running on port 3080, left behind by an app that is no longer open | Click **Use it here**: it stops that orphaned engine and everything it started, then starts this app's own. It re-checks the holder at the click, and it refuses to stop a process that is not this harness, or a harness still under another running Kz-harness; close that one and click **Retry**. This button is app source (`app/main.js`, `app/ui/console.js`), so it reaches **Kz-harness.exe** only after a rebuild (run the installer). |
 | Jev setup shows a red dot | Do what the line under it says, then **Recheck logins**. |
 | "all available agents are at their usage limits" | Wait for the reset time shown, raise that account's **stop at** in Usage, or add another API key. |
 | Report says **JEV UNAVAILABLE** | The Jev key is missing or TypeSafe is unreachable; fix it and use **Restart harness**. |
@@ -508,8 +531,33 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 | `config/local-models.json` | The local-model manifest: engine builds and models, with official source, size and SHA256 |
 | `scripts/` | `Install-Harness.ps1`, `Update-Harness.ps1`, `ensure-no-project.mjs`, `Set-TypeSafeKey.ps1`, `patch-codex-effort.mjs`, `patch-dsh-branding.mjs` |
 | `Start-KzH.ps1` / `.cmd` | Starts the engine: pinned version, privacy settings, Codex helper, branding patch, "No project" workspace |
+| `docs/` | [`docs/README.md`](docs/README.md) is the index: what each document covers and when to reach for it. [`docs/handoff.md`](docs/handoff.md) is the living handoff, and the place to start when picking the work up cold. |
+| `progress/progress.html` | Per-item record of what is verified, built, partial or open. It tracks the tree, so the percentage goes down when a defect is found. |
 
-Tests: `cd plugins\jev-router` then `npm test`. They cover routing, review policy, tools, limits and handoff, accounts, usage and savings, direct answers, process handling, hotkeys, background tasks and their queue, the subscription-first gate, time-of-day pricing, the Markdown export, and local models / offline mode (no network, no real llama-server).
+Tests: `cd plugins\jev-router` then `npm test`. They cover routing, review policy, tools, limits and handoff, accounts, usage and savings, direct answers, process handling, hotkeys, background tasks and their queue, the subscription-first gate, time-of-day pricing, the Markdown export, the work board's row model, composer history, the file tree, answer feedback, the Overview ledger, and local models / offline mode (no network, no real llama-server). Some are tripwires rather than behaviour tests: they fail if an animation-frame scheduler comes back into `client.js` (it never fires in this renderer) or if the keyed `context` chat node is registered again.
+
+## UI checks without Playwright
+
+The app draws its window on the GPU, so a Windows screen grab (GDI) comes back blank even while the UI is right there on screen. To see or check the real UI, drive the running app over its DevTools protocol instead. `scripts/kzh-ui-test.mjs` does that with Node's built-in `fetch` and `WebSocket`, so there is nothing to install.
+
+Start the app with a debug port (it refuses one otherwise):
+
+```powershell
+$env:KZH_DEBUG='1'; Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+& "C:\Harness\app\dist\Kz-harness-win32-x64\Kz-harness.exe" --remote-debugging-port=9222
+```
+
+Then, from the repo root:
+
+```powershell
+node scripts/kzh-ui-test.mjs list                       # pages on the debug port
+node scripts/kzh-ui-test.mjs shot shot.png              # screenshot of the real rendered page
+node scripts/kzh-ui-test.mjs eval "document.title"      # run an expression in the page
+node scripts/kzh-ui-test.mjs keys "Ctrl+B"              # a real key down and key up
+node scripts/kzh-ui-test.mjs wait "#app" --timeout 5000 # non-zero exit if it never appears
+```
+
+`--wait <selector>` waits for the selector before any action, and a wait that times out exits 3, so a UI check can be a script rather than a guess. `keys` sends the events through `Input.dispatchKeyEvent` with the real `code`, `key` and modifiers, because handlers that read `event.code` ignore a synthetic `KeyboardEvent`. `--help` lists the modes and exit codes; the port defaults to 9222 and can be set with `--port` or `KZH_CDP_PORT`.
 
 ## License
 

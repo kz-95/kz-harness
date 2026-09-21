@@ -4,6 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { waitFor } from './wait-for.js'
 
 // client.js is a classic browser script - window.__ModuleLoader__.load({ id, factory }) - not an ES
 // module, so node cannot import it. Run the real file body as a function of `window` (which is the
@@ -18,7 +19,7 @@ function loadPlugin() {
   return registration.factory((id) => { if (id === 'react') return React; throw new Error(`unexpected require: ${id}`) })
 }
 
-const { transcriptButton, transcriptClicks, actions } = loadPlugin().__test
+const { transcriptButton, transcriptClicks, actions, startTranscripts, startResultAcks } = loadPlugin().__test
 
 test('transcripts: the label says what the next click does, and nothing to do means disabled', () => {
   // An empty conversation has no transcript rows: nothing to expand, so the button is disabled.
@@ -57,4 +58,47 @@ test('transcripts: one rebindable action with no default key', () => {
   assert.equal(typeof mine[0].label, 'string')
   // ACT and DEFAULTS are keyed by id, so an id may only appear once.
   assert.equal(new Set(actions.map((a) => a.id)).size, actions.length)
+})
+
+// Both follow-up passes are coalesced on a timer, never on an animation frame: a hidden or minimised
+// window runs no frames at all, so a frame-gated pass would silently never land while the app sits in
+// the background. The stub below is a frame scheduler that never calls back; the pass must still run.
+// The toggle hints have their own version of this test for the shared helper; these two prove the
+// transcripts pass and the result acknowledger are actually wired to it.
+function stub(name, value) {
+  const saved = globalThis[name]
+  globalThis[name] = value
+  return () => { if (saved === undefined) delete globalThis[name]; else globalThis[name] = saved }
+}
+
+const noFrames = () => [stub('requestAnimationFrame', () => 0), stub('cancelAnimationFrame', () => {})]
+const noObserver = () => stub('MutationObserver', class { observe() {} disconnect() {} })
+
+test('transcripts: the follow-up pass lands on a timer while no frame is ever delivered', async () => {
+  const scans = []
+  const root = { querySelectorAll: (sel) => { scans.push(sel); return [] } }
+  const restores = [...noFrames(), noObserver(), stub('document', { body: {}, querySelector: () => root, querySelectorAll: () => [], activeElement: null })]
+  try {
+    const stop = startTranscripts()
+    assert.equal(scans.length, 0, 'nothing runs synchronously')
+    await waitFor('the transcripts pass ran', () => scans.length, (n) => n > 0)
+    assert.ok(scans.length > 0, 'the pass ran with no frame available')
+    stop()
+  } finally {
+    for (const restore of restores.reverse()) restore()
+  }
+})
+
+test('result acks: the acknowledge pass lands on a timer while no frame is ever delivered', async () => {
+  const scans = []
+  const restores = [...noFrames(), noObserver(), stub('document', { body: {}, querySelectorAll: (sel) => { scans.push(sel); return [] } })]
+  try {
+    const stop = startResultAcks()
+    assert.equal(scans.length, 0, 'nothing runs synchronously')
+    await waitFor('the result-acknowledge pass ran', () => scans.length, (n) => n > 0)
+    assert.ok(scans.length > 0, 'the pass ran with no frame available')
+    stop()
+  } finally {
+    for (const restore of restores.reverse()) restore()
+  }
 })

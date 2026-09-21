@@ -60,7 +60,7 @@ expand?.addEventListener('click', async () => {
     // Backfill what happened before the page was ready, rather than only what arrives next.
     const state = await window.harness?.state?.().catch(() => null)
     if (state?.logs?.length) {
-      mini.replaceChildren(...state.logs.slice(-miniCap).map(lineEl))
+      mini.replaceChildren(...state.logs.slice(-miniCap).map((e) => lineEl(e)))
       mini.lastChild?.scrollIntoView({ block: 'end' })
     }
   } else trimMini()
@@ -99,6 +99,12 @@ function showStatus(s) {
   document.body.classList.toggle('is-error', s.phase === 'error')
   document.getElementById('status-text').textContent = s.message
   document.getElementById('error-actions').hidden = s.phase !== 'error'
+  // "Use it here" only makes sense while an orphaned engine holds the port and the launcher
+  // has confirmed nothing else owns it. Foreign holders and other live harnesses hide it.
+  const useHere = document.getElementById('use-here')
+  useHere.hidden = !(s.phase === 'error' && s.holder === 'orphan')
+  useHere.disabled = false
+  useHere.textContent = 'Use it here'
   const pill = document.getElementById('log-status')
   pill.textContent = { starting: 'starting', ready: 'running', error: 'stopped' }[s.phase] ?? s.phase
   pill.className = `pill ${s.phase}`
@@ -157,6 +163,14 @@ document.getElementById('copy').addEventListener('click', async (ev) => {
 // ---------- wiring ----------
 for (const b of document.querySelectorAll('[data-open-logs]')) b.addEventListener('click', () => window.harness.openLogs())
 document.getElementById('retry').addEventListener('click', () => window.harness.retry())
+// The launcher re-inspects the holder before stopping anything, so a port that changed hands
+// between the error state and this click is never killed from here.
+document.getElementById('use-here').addEventListener('click', async (ev) => {
+  ev.target.disabled = true
+  ev.target.textContent = 'Stopping the orphaned engine…'
+  const r = await window.harness.useHere().catch(() => null)
+  if (!r?.ok) ev.target.textContent = 'Use it here'
+})
 
 // Main window only: our own title bar with the ☰ menu (the log window keeps the normal frame).
 if (view === 'start') {

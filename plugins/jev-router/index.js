@@ -22,6 +22,8 @@ import { authAction, canAuth, checkAgents } from './setup.js'
 import { JEV_PROVIDER, jevAdapter, line, nameOfAgent, queuedLine } from './adapter.js'
 import { executorsFrom } from './capabilities.js'
 import { createDelivery } from './delivery.js'
+import { createFormatter } from './format.js'
+import { createFeedback, validFeedback } from './feedback.js'
 import { TERMINAL_STATES, createLanes, createTasks, laneKey, validJobId } from './tasks.js'
 import { SESSION_ID, exportSession, redactSecrets } from './export.js'
 import { KEY_NAME, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
@@ -34,6 +36,9 @@ export const inject = ['tools', 'commands', 'subagents', 'credentials']
 const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
 const harnessDir = fileURLToPath(new URL('../../', import.meta.url))
 const LOCAL_PERSONA = 'You are a careful software engineer working as a delegated coding agent on a small local model. Keep changes small and focused, complete the task in the given workspace, and report concisely.'
+// How many runs one /jev-router/history response carries, newest last. The cap is a response
+// size, not a storage rule: history.jsonl keeps every run.
+const HISTORY_RESPONSE_CAP = 200
 
 const Agent = Schema.object({
   id: Schema.string().pattern(/^[a-z][a-z0-9_-]*$/).required().description('Short id, also the manual override command name.'),
@@ -90,13 +95,18 @@ export const Config = Schema.object({
   ]).description('Cloud and subscription agents. Local agents (qwen-local, gemma-local, …) come from config/local-models.json once their model is installed.'),
   tools: Schema.array(Tool).default([]).description('Deterministic scripts Jev can run instead of an LLM agent.'),
   auxModel: Schema.object({
-    provider: Schema.string().default('deepseek'),
-    model: Schema.string().default('deepseek-flash'),
-  }).description('Real model the Jev Auto model hands session titles and conversation compaction to.'),
+    provider: Schema.string().default(''),
+    model: Schema.string().default(''),
+  }).default({}).description('Real model the Jev Auto model hands session titles, conversation compaction and direct answers to. Unset, these follow this machine: the installed local chat model when there is one, then the first enabled agent that pins llm.provider and llm.model. Set both to pin one.'),
   local: Schema.object({
     port: Schema.natural().default(8081).description('First 127.0.0.1 port for llama-server; the next ones are tried when it is taken.'),
-    contextSize: Schema.natural().min(2048).description('Context tokens for every local model; unset = the manifest value (8192), 4096 on PCs with under 12 GB RAM.'),
+    contextSize: Schema.natural().min(2048).description('Context tokens for every local model; unset = the model\'s manifest value (16,384), 12,288 on PCs with under 12 GB RAM.'),
   }).description('Local models (llama.cpp llama-server under <harness>/engine/llama, GGUF files under <harness>/models).'),
+  format: Schema.object({
+    enabled: Schema.boolean().default(true).description('Rewrite a finished background result into readable prose with the installed local chat model before it is posted. Off, the report is posted exactly as the agent wrote it.'),
+    timeoutMs: Schema.natural().min(1000).default(60_000).description('Wall clock for one rewrite call; on timeout the report is posted as written.'),
+    reserveTokens: Schema.natural().default(2048).description('Context kept back for the prompt and the answer when sizing the report body against the model window.'),
+  }).default({}).description('Message transfer: the result body is rewritten by the small local model when one is installed. Only the report body changes; the structured head (task, id, agent, status) is never touched.'),
   effort: Schema.object({
     default: Schema.union(LEVELS).default('auto').description('Effort when the model menu says Auto.'),
     perAgent: Schema.object({
@@ -223,6 +233,8 @@ export function apply(ctx, config) {
   if (unpinned.length) throw new Error(`jev-router: spawn agents need llm: { provider, model }: ${unpinned.map((a) => a.id).join(', ')}`)
   if (config.auxModel.provider === JEV_PROVIDER) throw new Error('jev-router: auxModel must be a real model, not Jev')
   const dataDir = dirname(config.historyFile)
+  // Like/Dislike on a finished answer, next to history.jsonl, read back by the router below.
+  const feedback = createFeedback({ file: join(dataDir, 'feedback.jsonl') })
   // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
   const allRecords = async () => {
     const raw = await readFile(config.historyFile, 'utf8').catch(() => '')
@@ -237,6 +249,9 @@ export function apply(ctx, config) {
     // on its cheap rate right now. Without this the router silently skips all of that and Jev
     // picks with no cost or history prior at all.
     records: allRecords,
+    // The same priors path as history.jsonl, one file over: the router reads it to demote an
+    // agent whose picks were disliked and promote one whose picks were liked.
+    feedback: (sessionId) => feedback.list(sessionId),
     async append(record) {
       await mkdir(dataDir, { recursive: true })
       await appendFile(config.historyFile, `${JSON.stringify(record)}\n`)
@@ -284,6 +299,8 @@ export function apply(ctx, config) {
     await rename(tmp, setupFile)
     readyGen++
     readyCache = null
+    // Which agents are on can change the aux fallback; refresh it now.
+    resolveAux()
   }
 
   // Login status per agent, cached so routing does not shell out on every message.
@@ -353,7 +370,7 @@ export function apply(ctx, config) {
     contextSize: config.local.contextSize,
     specs,
     log: (t) => process.stdout.write(`[jev] ${t}\n`),
-    onChange: () => { refreshLocal() },
+    onChange: () => { refreshLocal(); resolveAux() },
   })
   ctx.effect(() => () => { local.dispose() })
   refreshLocal()
@@ -371,6 +388,37 @@ export function apply(ctx, config) {
   const connectivity = createConnectivity()
   const isOffline = async () => !(await connectivity.online())
   const localChat = async () => { const id = await local.chatModel(); return id ? { provider: LOCAL_PROVIDER, model: id } : null }
+  // Titles, compaction and direct answers need one real chat model, and none is assumed:
+  // a hidden DeepSeek default sent that housekeeping to api.deepseek.com for everyone. An
+  // unpinned auxModel follows this machine instead, local chat model first, then the first
+  // enabled agent that pins a provider and model. The object is live; the adapter holds this
+  // reference and reads it per call, so a model installed later is picked up without a
+  // restart. An empty pair means neither was found: the request fails and its caller falls
+  // through, never to a DeepSeek call nobody asked for.
+  let auxResolved = { provider: '', model: '' }
+  const auxPinned = () => (config.auxModel.provider && config.auxModel.model ? { provider: config.auxModel.provider, model: config.auxModel.model } : null)
+  const resolveAux = async () => {
+    const pinned = auxPinned()
+    if (pinned) { auxResolved = pinned; return }
+    const local = await localChat().catch(() => null)
+    if (local) { auxResolved = local; return }
+    const first = (await enabledAgents().catch(() => [])).find((a) => a.enabled && a.llm?.provider && a.llm?.model)
+    auxResolved = first ? { provider: first.llm.provider, model: first.llm.model } : { provider: '', model: '' }
+  }
+  const auxModel = {
+    get provider() { return auxResolved.provider },
+    get model() { return auxResolved.model },
+  }
+  // The chat models a direct answer may use: the aux model when one resolved, then the
+  // installed local chat model. Only complete pairs are offered, because the capability
+  // registry refuses an executor with an empty name.
+  const chatPair = async () => {
+    const local = await localChat().catch(() => null)
+    const aux = auxResolved.provider && auxResolved.model ? { provider: auxResolved.provider, model: auxResolved.model } : null
+    const same = !!aux && !!local && aux.provider === local.provider && aux.model === local.model
+    return [aux, same ? null : local].filter(Boolean)
+  }
+  resolveAux()
   accounts.ready().catch((err) => process.stdout.write(`[jev] accounts not loaded: ${err.message}
 `))
 
@@ -597,7 +645,7 @@ export function apply(ctx, config) {
           executors: executorsFrom({
             agents,
             tools: config.tools ?? [],
-            chat: [config.auxModel, await localChat().catch(() => null)].filter(Boolean),
+            chat: await chatPair(),
             seesImages: (id) => seesImages.has(id),
           }),
           inputModalities: modalities ?? ['text'],
@@ -652,6 +700,9 @@ export function apply(ctx, config) {
   // the task registry, which is built just below with a callback that calls it, so the reference
   // is filled in immediately afterwards.
   let delivery = null
+  // The finished result body is rewritten by this before it is posted. Filled in by the llm block
+  // below, once the local chat model can be asked; until then (and with no local model) it no-ops.
+  let formatter = null
   const tasks = createTasks({
     file: join(dataDir, 'tasks.jsonl'),
     lanes,
@@ -680,7 +731,12 @@ export function apply(ctx, config) {
   })
   // Filled in now that the registry exists; onSettled above only dereferences it once a task
   // actually settles, which cannot happen before this line has run.
-  delivery = createDelivery({ tasks, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
+  delivery = createDelivery({
+    tasks,
+    log: (m) => process.stdout.write(`[jev] ${m}\n`),
+    // Lazy: the formatter is built by the llm block below and is null until then.
+    format: (r, text) => (formatter ? formatter(r, text) : text),
+  })
 
   const orchestrator = {
     /** Unread finished results for this session, in the order they finished. */
@@ -692,11 +748,13 @@ export function apply(ctx, config) {
     /** The result's message was accepted: stop offering it. */
     delivered: (jobId) => tasks.delivered(jobId),
     /** Queue one chat task; returns the chat line, or null when background jobs are unavailable. */
-    enqueue({ agent, task, effort, forceAgent, mode, sessionId }) {
+    // `modalities` rides along: dropped here the task record falls back to text, the capability
+    // filter stops requiring image support, and an attached picture reaches an agent that is blind to it.
+    enqueue({ agent, task, effort, forceAgent, mode, sessionId, modalities }) {
       const cwd = agent?.session?.header?.cwd
       if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
       // sessionId comes from the caller that will also read the results back.
-      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode })
+      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode, modalities })
       if (!t) return null
       // Counted, not read from the lane: the job joins the lane a tick after enqueue returns.
       const key = laneKey(cwd)
@@ -854,16 +912,26 @@ export function apply(ctx, config) {
   ctx.inject(['llm', 'agents'], (c) => {
     llm = c.llm
     llmRuntime = c
-    c.effect(() => () => { llm = null; llmRuntime = null })
+    // Message transfer: the local chat model rewrites a finished result body into prose. Built
+    // here because `c.llm` is what it streams through; it is asked only when a result settles.
+    formatter = createFormatter({
+      stream: (opts) => c.llm.stream(opts),
+      chatModel: () => local.chatModel(),
+      contextOf: (id) => local.contextOf(id),
+      enabled: config.format?.enabled ?? true,
+      timeoutMs: config.format?.timeoutMs ?? 60_000,
+      reserveTokens: config.format?.reserveTokens ?? 2048,
+      log: (m) => process.stdout.write(`[jev] ${m}\n`),
+    })
+    c.effect(() => () => { llm = null; llmRuntime = null; formatter = null })
     c.effect(() => c.llm.registerAdapter([JEV_PROVIDER], jevAdapter({
-      ctx: c, route, classify, auxModel: config.auxModel, isOffline, localChat, orchestrator, agents: enabledAgents,
+      ctx: c, route, classify, auxModel, isOffline, localChat, orchestrator, agents: enabledAgents,
       canSeeImages, agentSeesImages, handOffImages,
       // Direct answers route through the same registry as background work: a chat model is
       // offered for what it can actually do, and its provider/model ride along so the answer
       // can be streamed from it.
       answerExecutors: async () => {
-        const local = await localChat().catch(() => null)
-        const chat = [config.auxModel, local].filter(Boolean)
+        const chat = await chatPair()
         const sees = new Set()
         for (const m of chat) if (await canSeeImages(m).catch(() => false)) sees.add(m.model)
         return executorsFrom({ chat, seesImages: (id) => sees.has(id) }).map((e) => {
@@ -913,6 +981,17 @@ export function apply(ctx, config) {
             return res.end(await readFile(new URL('./assets/logo.png', import.meta.url)))
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/log') return send(200, logs.get(url.searchParams.get('session')) ?? [])
+          // The durable record, not the in-memory tail above: every run this session ever wrote to
+          // history.jsonl, newest last, returned as stored. A truncated final line (a crash mid
+          // append) is skipped by allRecords the same way tasks.jsonl reading skips one, so a bad
+          // last line cannot hide the runs before it.
+          if (req.method === 'GET' && url.pathname === '/jev-router/history') {
+            const session = url.searchParams.get('session')
+            if (!SESSION_ID.test(session ?? '')) return send(400, { error: 'session: a session id' })
+            const all = (await allRecords()).filter((r) => r.sessionId === session)
+            const records = all.slice(-HISTORY_RESPONSE_CAP)
+            return send(200, { session, total: all.length, returned: records.length, truncated: all.length > records.length, records })
+          }
           if (req.method === 'POST' && url.pathname === '/jev-router/runs/stop') {
             const { runId } = JSON.parse(await readBody(req))
             const stop = stoppers.get(runId)
@@ -980,6 +1059,23 @@ export function apply(ctx, config) {
             await writeFile(`${hotkeysFile}.tmp`, JSON.stringify(clean, null, 2))
             await rename(`${hotkeysFile}.tmp`, hotkeysFile)
             return send(200, clean)
+          }
+          // Like/Dislike on a finished answer, with the person's reason and an optional tag
+          // saying what the verdict was about. The client posts one verdict per answer message;
+          // a later verdict for the same message replaces the earlier one on read, tag included.
+          // A verdict of `clear` appends the tombstone instead, and the GET stops reporting that
+          // message, so a cleared verdict survives a reload. An unknown tag is rejected here with
+          // a 400 by validFeedback, before it is stored. The GET is for the inspector and for a
+          // page that reloads.
+          if (req.method === 'POST' && url.pathname === '/jev-router/feedback') {
+            let record
+            try { record = validFeedback(JSON.parse(await readBody(req))) } catch (err) { return send(400, { error: err.message }) }
+            return send(200, { ok: true, record: await feedback.append(record) })
+          }
+          if (req.method === 'GET' && url.pathname === '/jev-router/feedback') {
+            const session = url.searchParams.get('session')
+            if (session !== null && !SESSION_ID.test(session)) return send(400, { error: 'session: a session id' })
+            return send(200, { feedback: await feedback.list(session ?? undefined) })
           }
           // Sign in / out of an agent by running its own CLI. The client sends an agent id and
           // "login" or "logout", never a command: the command is chosen here, by provider.

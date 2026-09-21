@@ -22,7 +22,7 @@ const JEV_MODELS = {
   'jev-local': {
     mode: 'local',
     name: 'Jev Auto · Local',
-    description: 'Jev routes, but only over the local models on this PC. No code leaves the machine; Jev still sees the task text and file names.',
+    description: 'Jev routes, but only over the local models on this PC. Your code is only edited here; Jev still sees the task text, file names and a slice of the diff when it reviews. It also sends the handoff note from a previous task (up to 3000 characters, quoting an earlier agent\'s answer) on the routing call.',
   },
   'jev-offline': {
     mode: 'offline',
@@ -31,6 +31,10 @@ const JEV_MODELS = {
   },
 }
 const modeOf = (model) => JEV_MODELS[String(model ?? '')]?.mode ?? 'auto'
+// A model pair is usable only when it names both a provider and a model. A failed aux
+// resolution still returns a truthy object with empty strings, so without this test that
+// object beats the local fallback in the `??` chains and the model-list filter below.
+const usableModel = (m) => typeof m?.provider === 'string' && m.provider !== '' && typeof m.model === 'string' && m.model !== ''
 // One entry per enabled agent, next to Jev Auto: picking it sends every message
 // to that agent, skipping the routing question. `/claude …` still works per message.
 // How sure Jev must be that a message is a question before the agents are skipped. A wrong
@@ -97,8 +101,10 @@ const REASONING = Object.freeze({
     { id: 'ultra', name: 'Ultra', description: 'Claude Ultracode (its top level) · GPT Ultra · DeepSeek Max' },
     // These two pick a model rather than an effort: the smallest installed local
     // model for a quick answer, the largest when it is worth the wait.
-    { id: 'local-low', name: 'Local · quick', description: 'The smallest local model on this PC. Free, private, fastest.' },
-    { id: 'local-high', name: 'Local · best', description: 'The largest local model on this PC. Free, private, slower.' },
+    // "Free" is the token bill, not a privacy claim: these pick the executor only, so in Jev Auto
+    // the routing and review calls still go out. Saying "private" here read as more than that.
+    { id: 'local-low', name: 'Local · quick', description: 'The smallest local model on this PC. Free to run, fastest.' },
+    { id: 'local-high', name: 'Local · best', description: 'The largest local model on this PC. Free to run, slower.' },
   ]),
 })
 
@@ -171,6 +177,7 @@ export function line(e) {
     case 'review': return `Review: ${e.assessment.action}. ${e.assessment.why}`
     case 'balance': return `${e.agent} credit ${e.balance ? `${e.balance.amount} ${e.balance.currency ?? ''}`.trim() : 'changed'}: ${{ near: 'low, working in small steps and keeping the handoff current', stopped: 'below the floor, handing the task over', exhausted: 'spent, handing the task over' }[e.state] ?? e.state}`
     case 'gate': return `${e.agent} is ${e.percent == null ? 'past' : `${Math.round(e.percent)}% into`} its weekly window (gate ${e.at}%): ${e.to} takes the work, ${e.agent} stays for review`
+    case 'feedback': return `Feedback moved the pick${e.from ? ` off ${e.from}` : ''} to ${e.to}`
     case 'limit': return `${e.agent} hit its usage limit${e.until ? ` (resets ${new Date(e.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` : ''}: ${{ rotated: 'switched API key, continuing', peer: 'handing the task to another agent', paused: 'no agent left, pausing' }[e.action] ?? e.action}`
     case 'handoff': return `Handoff note saved (${e.source === 'agent' ? 'by the agent' : 'by the harness'}): ${e.path}`
     case 'final': return `Final: ${e.status}`
@@ -252,7 +259,7 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
     }
     const list = offline
       ? (local ? [local] : [])
-      : (deep && local ? [auxModel, local] : [local, auxModel]).filter(Boolean)
+      : (deep && local ? [auxModel, local] : [local, auxModel]).filter(usableModel)
     if (!images) return { offline, models: list }
     return { offline, models: await keepReaders(list) }
   }
@@ -314,13 +321,17 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       const forceAgent = pickedAgent ?? localForced ?? undefined
 
       // Side requests (session title, compaction) reuse this route; a real model answers them.
-      // Not the local one while there is a connection: naming a chat is one short line of
-      // housekeeping, and it is not worth starting the local engine for it.
+      // The resolved aux model while it is usable, the local one otherwise: naming a chat is one
+      // short line of housekeeping, and an empty aux pair would fail the request outright.
       if (options.purpose) {
         const { reasoningEffort: _r, ...rest } = options
-        const offline = await isOffline?.().catch(() => false)
         const local = await localChat?.().catch(() => null)
-        const m = (offline ? local : auxModel) ?? local ?? auxModel
+        // The local model is the only thing the probe could switch to, and with none installed
+        // offline and online pick the same model, so the probe would decide nothing and is
+        // skipped: a session title must not be what sends the HEAD out on its own.
+        const offline = local ? await isOffline?.().catch(() => false) : false
+        const aux = usableModel(auxModel) ? auxModel : null
+        const m = (offline ? local : aux) ?? local ?? auxModel
         // A title has a tiny output budget: no thinking, as the official DeepSeek connector did.
         const title = options.purpose === 'session-title' && m.provider !== 'local' ? { reasoningEffort: 'off' } : {}
         yield* ctx.llm.stream({ ...rest, ...title, provider: m.provider, model: m.model })
@@ -543,7 +554,7 @@ async function* answerDirectly(ctx, options, auxModel, offline = false, note = '
   let flowing = false
   let lastIndex = 0
   // The name the picker shows, plus the id a bug report needs.
-  const credit = `\n\n_${offline ? 'OFFLINE: local models only. ' : ''}${note}Answered by: ${label}${label === pair ? '' : ` (\`${pair}\`)`}, directly: a question, no agents or project work_`
+  const credit = `\n\n> ${offline ? 'OFFLINE: local models only. ' : ''}${note}Answered by: ${label}${label === pair ? '' : ` (\`${pair}\`)`}, directly: a question, no agents or project work`
   try {
     for await (const chunk of ctx.llm.stream({ ...rest, messages, provider: auxModel.provider, model: auxModel.model })) {
       if (typeof chunk.index === 'number') { lastIndex = Math.max(lastIndex, chunk.index); if (pos) pos.last = Math.max(pos.last, lastIndex) }

@@ -88,6 +88,20 @@ test('snapshot: per-key DeepSeek balances, agent ok while any key is usable, OMC
   assert.ok(!JSON.stringify(await usage.recent()).includes('sk-'))
 })
 
+test('snapshot: an api agent reads near when its key is below the hand-over figure, not only at the floor', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kz-near-'))
+  const envFile = join(dir, '.env')
+  writeFileSync(envFile, 'KZ_KEY__deepseek__a=sk-a\n')
+  writeFileSync(join(dir, 'accounts.json'), JSON.stringify({ keys: { deepseek: [{ name: 'a', active: true }] } }))
+  const accounts = createAccounts({ dataDir: dir, envFile, run: async () => ({ ok: true, out: '{}' }) })
+  // Default api limits: floor 5, hand over below 10. 7 is above the floor and inside the soft tier.
+  const fetch = async () => ({ ok: true, json: async () => ({ is_available: true, balance_infos: [{ currency: 'USD', total_balance: '7.00' }] }) })
+  const usage = createUsage({ dataDir: dir, accounts, fetch, home: dir })
+  const s = await usage.snapshot([{ id: 'deepseek', provider: 'spawn', llm: { provider: 'deepseek' } }])
+  assert.equal(s.deepseek.state, 'near', 'the soft tier survives the per-key rollup')
+  assert.equal(usage.last().keys.deepseek[0].state, 'ok', 'the key is scored against the floor alone')
+})
+
 test('creditPercent: a balance as a share of the most that key ever held', () => {
   const cny = (n) => ({ amount: n, currency: 'CNY' })
   assert.equal(creditPercent(cny(363.82), cny(400)), 91)

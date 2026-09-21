@@ -156,6 +156,24 @@ test('local agents: kind local, no key provider; they exist only once their mode
   await local.dispose()
 })
 
+test('chat model default: the quickest installed model, not the first in the manifest', async () => {
+  const { engineDir, modelsDir, local } = localIn(tmp())
+  writeFileSync(join(engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'), '')
+  mkdirSync(join(engineDir, '.installed'))
+  writeFileSync(join(engineDir, '.installed', 'eng.json'), JSON.stringify({ sha256: sha('e') }))
+  writeFileSync(join(modelsDir, 'big.gguf'), 'big')
+  writeFileSync(join(modelsDir, 'small.gguf'), 'small')
+  await local.installed() // schedules the background hash of the hand-placed files
+  await local.settled()
+  // `big` is first in the manifest and best-quality; `small` declares the fast role.
+  assert.deepEqual((await local.installed()).map((m) => m.id), ['big', 'small'], 'manifest order')
+  assert.equal(await local.chatModel(), 'small', 'a direct answer goes to the fast role, whatever the manifest order')
+  // An explicit choice in Settings -> Jev setup -> Local models still wins over the default.
+  await local.setSettings({ chatModel: 'big' })
+  assert.equal(await local.chatModel(), 'big')
+  await local.dispose()
+})
+
 // ---------- this PC ----------
 const PC = {
   gpus: [{ name: 'NVIDIA GeForce RTX 3050 Laptop GPU', vendor: 'nvidia', vramGB: 4 }, { name: 'Intel(R) UHD Graphics', vendor: 'intel', vramGB: 0 }],
@@ -268,21 +286,25 @@ test('usage: a local agent is ok, free, and has no limits to edit', async () => 
 })
 
 // ---------- connectivity ----------
-test('connectivity: online if any probe answers, offline if all fail, cached for the ttl', async () => {
+test('connectivity: online if the probe answers, offline if it fails, cached for the ttl, DeepSeek never contacted', async () => {
+  const urls = []
   let calls = 0
   let t = 0
   let up = false
-  const fetch = async (url) => { calls++; if (up && url.includes('deepseek')) return { status: 404 }; throw new Error('ENOTFOUND') }
+  const fetch = async (url) => { calls++; urls.push(url); if (up) return { status: 404 }; throw new Error('ENOTFOUND') }
   const c = createConnectivity({ fetch, now: () => t, ttlMs: 30_000 })
   assert.equal(await c.online(), false)
-  assert.equal(calls, 2)
+  assert.equal(calls, 1, 'one probe')
+  assert.equal(urls[0], 'https://api.typesafe.ai', 'the Jev endpoint is the only probe')
   up = true
   t = 10_000
   assert.equal(await c.online(), false, 'cached within 30 s')
-  assert.equal(calls, 2)
+  assert.equal(calls, 1)
   t = 31_000
-  assert.equal(await c.online(), true, 'one answering probe (any status) means online')
-  assert.equal(calls, 4)
+  assert.equal(await c.online(), true, 'an answering probe (any status) means online')
+  assert.equal(calls, 2)
+  assert.deepEqual(urls, ['https://api.typesafe.ai', 'https://api.typesafe.ai'], 'the second check probes the same single endpoint')
+  assert.ok(!urls.some((u) => u.includes('deepseek')), 'DeepSeek is never probed, so no DeepSeek request can leave the machine')
 })
 
 // ---------- llama-server args ----------

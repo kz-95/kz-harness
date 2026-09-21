@@ -262,6 +262,39 @@ test('a catalog lookup that throws does not break the answer', async () => {
   assert.match(text, /Answered by: deepseek\/deepseek-flash/)
 })
 
+// ---------- an unresolved aux pair is empty strings, not a model ----------
+const EMPTY_AUX = { provider: '', model: '' }
+
+test('a side request with an empty aux pair falls back to the local model, never an empty provider', async () => {
+  const seen = []
+  const ctx = { agents: { get: () => ({}) }, llm: { async *stream(o) { seen.push(o); yield* OK_TEXT } } }
+  const a = jevAdapter({
+    ctx, route: async () => '', auxModel: EMPTY_AUX,
+    localChat: async () => ({ provider: 'local', model: 'qwen3-8b' }),
+    isOffline: async () => false,
+  })
+  for (const purpose of ['session-title', 'compaction']) {
+    for await (const _ of a.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }], purpose, signal: new AbortController().signal })) { /* drain */ }
+  }
+  assert.deepEqual(seen.map((o) => `${o.provider}/${o.model}`), ['local/qwen3-8b', 'local/qwen3-8b'], 'the empty pair never beats the local one')
+  assert.ok(seen.every((o) => o.provider !== '' && o.model !== ''), 'no request carries an empty provider and model')
+})
+
+test('an empty aux pair is never offered as a chat model: the question falls back to an agent', async () => {
+  const asked = []
+  let routedTask
+  const ctx = { agents: { get: () => ({}) }, llm: { async *stream(o) { asked.push(`${o.provider}/${o.model}`); yield* OK_TEXT } } }
+  const a = jevAdapter({
+    ctx, route: async ({ task }) => { routedTask = task; return 'agent answer' },
+    classify: async () => ({ kind: 'question' }),
+    auxModel: EMPTY_AUX,
+    localChat: async () => null,
+  })
+  assert.equal(await run(a, 'what is this?'), 'agent answer')
+  assert.deepEqual(asked, [], 'the empty pair is filtered out, so no provider is ever asked with blank names')
+  assert.match(routedTask, /Do not modify any files[\s\S]*what is this\?/)
+})
+
 test('offline mode classifies locally: the classifier is told the mode, never the network', async () => {
   const seen = []
   const a = jevAdapter({

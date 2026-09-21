@@ -112,7 +112,7 @@ export function createMutex() {
 }
 
 const JOB_ID = /^[a-z][\w-]{0,40}$/
-/** Body list of job ids: 1–100 short ids. Throws otherwise. */
+/** Body list of job ids: 1-100 short ids. Throws otherwise. */
 export function validJobIds(ids) {
   if (!Array.isArray(ids) || !ids.length || ids.length > 100 || !ids.every((x) => typeof x === 'string' && JOB_ID.test(x))) throw new Error('jobIds: array of 1-100 job ids')
   return ids
@@ -131,6 +131,9 @@ const SAVED = [
 /** A record from disk (possibly written by an older version) with every field present. */
 const hydrate = (raw) => ({
   ...raw,
+  // An older build recorded a settled task as "done"; this build calls that state "completed".
+  // Any other value is copied through untouched: not recognising it says nothing about what happened.
+  state: raw.state === 'done' ? 'completed' : raw.state,
   taskName: raw.taskName ?? raw.task ?? '',
   taskText: raw.taskText ?? raw.task ?? '',
   capability: raw.capability ?? null,
@@ -167,7 +170,15 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
     writing = writing.then(async () => {
       await mkdir(dirname(file), { recursive: true })
       await writeFile(`${file}.tmp`, rows.length ? `${rows.join('\n')}\n` : '')
-      await rename(`${file}.tmp`, file)
+      // A reader that has the destination open makes rename fail on Windows with EPERM/EBUSY.
+      // That failure used to drop the whole write, leaving a stale record on disk that a restart
+      // would read as the truth. Retry the rename a few times instead of losing it.
+      for (let attempt = 0; ; attempt++) {
+        try { await rename(`${file}.tmp`, file); break } catch (err) {
+          if (attempt >= 6 || !['EPERM', 'EACCES', 'EBUSY'].includes(err.code)) throw err
+          await new Promise((r) => setTimeout(r, 5 * (attempt + 1)))
+        }
+      }
     }).catch((err) => log(`tasks not saved: ${err.message}`))
     return writing
   }
@@ -182,9 +193,12 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
   }
 
   const ready = readFile(file, 'utf8').then((raw) => {
-    for (const l of raw.split('\n').filter(Boolean).slice(-max)) {
+    for (const l of raw.split('\n').filter(Boolean)) {
       try { const t = hydrate(JSON.parse(l)); tasks.push(t); restored.push(t) } catch {}
     }
+    // trim() is the one rule for dropping rows. Cutting the oldest lines blindly would take
+    // finished reports that were never posted, and the next persist() writes that loss back.
+    trim()
   }, () => {}).then(reconcile)
 
   /**
@@ -192,11 +206,14 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
    * not survive a restart, so that work can never finish. Leaving it "running" would show
    * a task that is silently dead, so it becomes stopped, keeps its last progress line, and
    * stays unread so the person is told what happened to it.
+   *
+   * A state this build does not know is left alone: not recognising a value says nothing
+   * about what happened, and rewriting it would replace a settled outcome with a false one.
    */
   function reconcile() {
     let touched = false
     for (const t of restored) {
-      if (FINISHED.includes(t.state)) {
+      if (!TASK_STATES.includes(t.state) || FINISHED.includes(t.state)) {
         // A result caught mid-delivery by the restart: no append is in flight any more, and
         // nothing says whether the message made it. Offering it again risks the report showing
         // twice; dropping it risks losing it for good, and the spec settles that in favour of
@@ -471,7 +488,8 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
       if (!t) throw Object.assign(new Error('no task with that id'), { status: 404 })
       if (FINISHED.includes(t.state)) return 'already-finished'
       try { getJobs()?.kill(jobId, t.owner, 'stopped by the user') } catch {}
-      t.ac.abort(new Error('stopped by the user'))
+      // A record restored from disk has no live controller: there is nothing running to abort.
+      t.ac?.abort(new Error('stopped by the user'))
       return 'requested'
     },
     /** Stop the task whose inspector run id is `runId` (the inspector's Stop button). */

@@ -41,8 +41,8 @@ const baseConfig = (extra = {}) => ({
  * rather than the review plugin's thresholds.
  * `touch` writes a file per attempt, which is how an attempt comes to have changedFiles.
  */
-async function run({ route, action = 'accept', policy, touch = false }) {
-  const dir = repo()
+async function run({ route, action = 'accept', policy, touch = false, git = true }) {
+  const dir = git ? repo() : mkdtempSync(join(tmpdir(), 'kz-guards-nogit-'))
   const seen = []
   const deps = {
     jev: {
@@ -81,6 +81,13 @@ test('two work attempts that change no files stop the run instead of retrying ag
 test('attempts that do change files keep retrying: the guard is about nothing happening, not about failing', async () => {
   const { seen } = await run({ route: jevPick('claude', 0.9, { claude: 0.9 }), action: 'retry', touch: true })
   assert.ok(seen.length > 2, `kept going while work was landing, ran ${seen.length}`)
+})
+
+test('where changes cannot be measured the guard holds off: unknown is not "changed nothing"', async () => {
+  // No git, so changedSince reports null for every attempt even though each one writes a file.
+  const { r, seen } = await run({ route: jevPick('claude', 0.9, { claude: 0.9 }), action: 'retry', touch: true, git: false })
+  assert.ok(seen.length > 2, `kept going where changes are unknown, ran ${seen.length}`)
+  assert.notEqual(r.finalStatus, 'needs_human')
 })
 
 test('the stall threshold is configurable', async () => {

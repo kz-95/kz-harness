@@ -260,7 +260,7 @@ test('a key that falls below its floor mid-run hands the task over', async () =>
   const dir = repo()
   const seen = []
   const events = []
-  await runRouted({
+  const r = await runRouted({
     task: 'a long job',
     cwd: dir,
     config: baseConfig({ limits: { maxAttempts: 4, maxReviews: 1, maxRounds: 5 } }),
@@ -285,6 +285,9 @@ test('a key that falls below its floor mid-run hands the task over', async () =>
   // rather than the run stopping dead or carrying on spending.
   assert.ok(events.some((e) => e.type === 'limit' || e.type === 'handoff'), 'it handed over')
   assert.ok(seen.slice(1).every((id) => id !== 'deepseek'), 'the spent key is not used again')
+  // The record has to agree with the run. Without the mark, the track record, the calibration
+  // score, the next report and the client's pill all read an out-of-credit stop as a failure.
+  assert.equal(r.attempts[0].limitHit, true, 'the attempt that ran out of credit says so in history')
 })
 
 test('a re-check that fails never stops the run', async () => {

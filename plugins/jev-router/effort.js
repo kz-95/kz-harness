@@ -19,6 +19,16 @@ const ROLE_RANK = { fast: 0, balanced: 1, 'best-quality': 2 }
 const rankOf = (a) => ROLE_RANK[a.role] ?? 1
 
 /**
+ * Quickest first, by the manifest's `role` and then by file size (a tie falls back to the
+ * smaller file, which is the better guess). One rule in one place: the effort ladder, offline
+ * mode and the local chat model must never disagree about which installed model is the fast one.
+ */
+export const byQuickness = (a, b) => rankOf(a) - rankOf(b) || (a.size ?? Infinity) - (b.size ?? Infinity)
+
+/** The quickest of these local models (a manifest entry or an agent), or null for none. */
+export const quickestLocal = (models = []) => [...models].sort(byQuickness)[0] ?? null
+
+/**
  * The local agent a local-* level means: the quickest installed model for
  * `local-low`, the strongest for `local-high`. Ranked by the manifest's `role`,
  * so installing another model sorts itself in without touching this code.
@@ -31,8 +41,7 @@ export function localAgentFor(level, agents = []) {
   if (!want) return null
   const local = agents.filter((a) => a.kind === 'local' && a.enabled !== false)
   if (!local.length) return null
-  // Quickest first; a tie falls back to the smaller file, which is the better guess.
-  const sorted = [...local].sort((a, b) => rankOf(a) - rankOf(b) || (a.size ?? Infinity) - (b.size ?? Infinity))
+  const sorted = [...local].sort(byQuickness)
   return (want === 'small' ? sorted[0] : sorted[sorted.length - 1]).id
 }
 
@@ -47,7 +56,7 @@ const CODEX_ORDER = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 // fallback, not the whole truth: a declared capability list beats it, and a model that
 // matches nothing is assumed to take all six rungs, so a model newer than this list is
 // never silently capped. Adding a family is one line here. Source: Codex model/list,
-// codex-cli 0.145.0 — every gpt-5.6 variant (astra, sol, terra, luna, …) takes ultra.
+// codex-cli 0.145.0: every gpt-5.6 variant (astra, sol, terra, luna, …) takes ultra.
 const CODEX_CEILINGS = [
   { pattern: /^gpt-5\.5(?:$|[-.])/, top: 'xhigh' },
   { pattern: /^gpt-5\.6(?:$|[-.])/, top: 'ultra' },

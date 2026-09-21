@@ -2,10 +2,11 @@
 // a finished task posts back into its chat.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TERMINAL_STATES, createLanes, createTasks, laneKey, validJobIds } from '../tasks.js'
+import { waitFor } from './wait-for.js'
 
 const tick = () => new Promise((r) => setImmediate(r))
 
@@ -172,11 +173,13 @@ test('acceptance: five tasks in one workspace, every state, then a restart', asy
   const persisted = () => {
     try { return readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) } catch { return [] }
   }
-  for (let i = 0; i < 200; i++) {
-    const rows = persisted()
-    if (rows.length === 5 && rows.every((r) => TERMINAL_STATES.includes(r.state) && r.deliveryState === 'delivered')) break
-    await new Promise((r) => setTimeout(r, 10))
-  }
+  await waitFor(
+    'the five settled rows reached disk, the delivered ones marked delivered',
+    persisted,
+    (rows) => rows.length === 5
+      && rows.every((r) => TERMINAL_STATES.includes(r.state))
+      && rows.filter((r) => r.sessionId === 's1').every((r) => r.deliveryState === 'delivered'),
+  )
   const after = createTasks({ file, lanes: createLanes(), jobs: () => fakeJobs(), run: async () => 'never' })
   await after.ready
   const rows = Object.fromEntries(after.list().map((t) => [t.task, t]))
@@ -250,8 +253,8 @@ test('a result caught mid-delivery by a restart is offered again, not lost', asy
   for (let i = 0; i < 5; i++) await tick()
   first.tasks.delivering(t.jobId)          // the append was about to happen...
   const onDisk = () => { try { return readFileSync(file, 'utf8') } catch { return '' } }
-  for (let i = 0; i < 200 && !onDisk().includes('"delivering"'); i++) await new Promise((r) => setTimeout(r, 10))
-  assert.match(onDisk(), /"delivering"/, 'the claim reached disk before the crash')
+  const claimed = await waitFor('the claim reached disk before the crash', onDisk, (text) => text.includes('"delivering"'))
+  assert.match(claimed, /"delivering"/, 'the claim reached disk before the crash')
   // ...and the process died there. Nothing is in flight any more.
   const second = harness({ file, run: async () => 'never' })
   await second.tasks.ready
@@ -348,7 +351,9 @@ test('an interrupted task is reconciled to stopped on restart, with its progress
   const t = first.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'long one' })
   for (let i = 0; i < 3; i++) await tick()
   assert.equal(first.tasks.get(t.jobId).state, 'routing', 'onEntry is what starts the clock')
-  await new Promise((r) => setTimeout(r, 60))
+  const diskState = () => readFileSync(file, 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.parse(l)).find((r) => r.jobId === t.jobId)?.state ?? 'no row on disk'
+  await waitFor('the running task reached disk as routing', diskState, (state) => state === 'routing')
 
   // The app restarts: a fresh registry over the same file, with no live job for that id.
   const second = harness({ file, run: async () => 'never runs' })
@@ -489,8 +494,8 @@ test('a failing task reports the error, is saved, and clears on request', async 
   const [failed] = tasks.results('s1')
   assert.equal(failed.state, 'failed')
   assert.match(failed.terminalReason, /agent exploded/, 'the failure reason is on the record')
-  await new Promise((r) => setTimeout(r, 50))
-  assert.match(readFileSync(file, 'utf8'), /agent exploded/, 'finished tasks are on disk')
+  const disk = await waitFor('finished tasks are on disk', () => readFileSync(file, 'utf8'), (text) => text.includes('agent exploded'))
+  assert.match(disk, /agent exploded/, 'finished tasks are on disk')
   assert.deepEqual(tasks.clear([t.jobId]), [t.jobId])
   assert.equal(tasks.get(t.jobId), null)
   assert.deepEqual(tasks.clear([t.jobId]), [], 'clearing an unknown id is a no-op')
@@ -634,4 +639,59 @@ test('acknowledging one result does not mark another read', async () => {
   assert.deepEqual(tasks.results('s1').map((r) => r.task), ['b'], 'only the acknowledged one is read')
   assert.equal(tasks.get(b.jobId).deliveryState, 'pending', 'the other is untouched')
   assert.equal(tasks.get(a.jobId).deliveryState, 'delivered')
+})
+test('a state this build does not know is left alone by reconcile', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  // A record written by some other build. Not recognising its state is no evidence that the
+  // task was interrupted, and rewriting it buries a settled outcome under a false notice.
+  const row = { jobId: 'jev-1', sessionId: 's1', workspace: 'C:/work', taskName: 'a thing', taskText: 'a thing', state: 'archived', terminalReason: null, deliveryState: 'pending', seq: 4, report: 'the report' }
+  writeFileSync(file, `${JSON.stringify(row)}\n`)
+  const { tasks } = harness({ file })
+  await tasks.ready
+  const back = tasks.get('jev-1')
+  assert.equal(back.state, 'archived', 'an unknown state is not turned into stopped')
+  assert.equal(back.terminalReason, null, 'and no interruption is invented for it')
+  assert.equal(back.seq, 4, 'the record is not rewritten at all')
+})
+
+test('a load over the cap keeps a finished report that was never posted', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  // Three rows for a cap of two. The oldest is finished and still unposted, so it is the one
+  // a blind cut of the oldest lines would take, and the next persist() writes that loss back.
+  const row = (jobId, deliveryState) => JSON.stringify({ jobId, sessionId: 's1', workspace: 'C:/work', taskName: jobId, taskText: jobId, state: 'completed', finishedAt: 1, deliveryState, report: `${jobId} report`, seq: 2 })
+  writeFileSync(file, `${['jev-1', 'jev-2', 'jev-3'].map((id, i) => row(id, i ? 'delivered' : 'pending')).join('\n')}\n`)
+  const lanes = createLanes()
+  const jobs = fakeJobs()
+  const tasks = createTasks({ file, lanes, jobs: () => jobs, run: async () => 'never', max: 2 })
+  await tasks.ready
+  assert.ok(tasks.get('jev-1'), 'the unposted report survives a load over the cap')
+  assert.equal(tasks.report('jev-1'), 'jev-1 report')
+  assert.equal(tasks.results('s1').length, 1, 'and it is still offered to the person')
+  assert.equal(tasks.list().length, 2, 'a delivered row made the room instead')
+})
+
+test('background enqueue: every field the adapter passes reaches tasks.enqueue', () => {
+  // The background path crosses two files with nothing checking the join: adapter.js hands
+  // orchestrator.enqueue (index.js) a field set and index.js forwards it to tasks.enqueue below.
+  // Dropping one there is silent - `modalities` falls back to text, the capability filter stops
+  // demanding image support, and an attached screenshot reaches an agent that cannot see it, which
+  // then answers from the words around it. The orchestrator is built inside apply(), so calling it
+  // needs the whole plugin runtime; the three source lines are read instead.
+  const src = (f) => readFileSync(new URL(`../${f}`, import.meta.url), 'utf8')
+  // Top-level keys of an object literal, shorthand or not. Values holding a comma (an array, a
+  // ternary) split into fragments that are not identifiers, so the filter drops them.
+  const keysOf = (lit) => lit.split(',').map((p) => p.split(':')[0].trim()).filter((k) => /^[A-Za-z_$][\w$]*$/.test(k))
+  const callSites = src('adapter.js').match(/orchestrator\.enqueue\(\{([^}]*)\}/g) ?? []
+  assert.equal(callSites.length, 2, 'both background call sites are still in adapter.js')
+  const passed = new Set(callSites.flatMap((c) => keysOf(c.slice(c.indexOf('{') + 1))))
+  assert.ok(passed.has('modalities'), 'the adapter still declares what the task carries')
+  const index = src('index.js')
+  const taken = keysOf(index.match(/\n\s*enqueue\(\{([^}]*)\}\)/)[1])
+  // Names, not keys: the adapter's `agent` is forwarded as `owner: agent`, so what matters is
+  // that the field is used on the way through, whatever it is called on the other side.
+  const forwarded = index.match(/tasks\.enqueue\(\{([^}]*)\}\)/)[1].match(/[A-Za-z_$][\w$]*/g)
+  for (const f of passed) {
+    assert.ok(taken.includes(f), `orchestrator.enqueue does not accept ${f}`)
+    assert.ok(forwarded.includes(f), `${f} never reaches the task record`)
+  }
 })

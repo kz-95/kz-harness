@@ -481,3 +481,129 @@ test('with Jev down and nothing able to do the job, it says so', async () => {
     /nothing here can do this request/,
   )
 })
+
+// ---------- Like/Dislike feedback as a routing signal ----------
+// The rows are fixtures; the join is provider -> agent, because the engine's message id never
+// reaches the server and `messageId` only dedupes a changed verdict on read.
+const FB_CONFIG = { ...config, agents: [
+  { id: 'claude', provider: 'claude-code', description: 'a', enabled: true },
+  { id: 'codex', provider: 'codex', description: 'b', enabled: true },
+] }
+const fbRow = (over = {}) => ({ ts: '2026-09-21T00:00:00.000Z', sessionId: 's', messageId: 'm1', verdict: 'dislike', reason: '', provider: 'codex', ...over })
+const fbHistory = (rows) => ({ rows: [], recent: async () => [], records: async () => [], feedback: async () => rows, append: async () => {} })
+const closeRoute = (over = {}) => routeResult({ primaryAgent: 'codex', agentConfidence: 0.8, agentProbabilities: { codex: 0.55, claude: 0.45 }, ...over })
+
+test('routing: a disliked agent is demoted when the picks are close', async () => {
+  const dir = repo()
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const rows = [1, 2, 3].map((i) => fbRow({ messageId: `m${i}` }))
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: fbHistory(rows) } })
+  assert.equal(r.attempts[0].agent, 'claude', 'three dislikes cost codex the close call')
+  assert.equal(r.routing.feedbackFrom, 'codex')
+  assert.ok(r.routing.feedback.some((m) => m.agent === 'codex' && m.dislikes === 3), 'the demotion is recorded in the run')
+})
+
+test('routing: a single verdict does not swing a close call', async () => {
+  const dir = repo()
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: fbHistory([fbRow()]) } })
+  assert.equal(r.attempts[0].agent, 'codex', 'one click is a nudge, not a ruling')
+  assert.equal(r.routing.feedbackFrom, undefined)
+})
+
+test('routing: a liked agent is promoted when the picks are close', async () => {
+  const dir = repo()
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const rows = [1, 2, 3].map((i) => fbRow({ messageId: `m${i}`, verdict: 'like', provider: 'claude' }))
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: fbHistory(rows) } })
+  assert.equal(r.attempts[0].agent, 'claude', 'three likes raised claude over a close codex pick')
+  assert.equal(r.routing.feedbackFrom, 'codex')
+})
+
+test('routing: suggestedAgent is the strongest signal and wins the pick', async () => {
+  const dir = repo()
+  const jev = { route: async () => routeResult({ primaryAgent: 'codex', agentConfidence: 0.9, agentProbabilities: { codex: 0.8, claude: 0.2 } }), assess: async () => verdict('accept') }
+  const rows = [fbRow({ reason: 'should have been claude', suggestedAgent: 'claude' })]
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: fbHistory(rows) } })
+  assert.equal(r.attempts[0].agent, 'claude')
+  assert.equal(r.routing.feedbackFrom, 'codex')
+  assert.match(formatReport(r), /Feedback moved the pick off codex to claude/)
+})
+
+test('routing: the written reason rides the track record into the routing prompt', async () => {
+  const dir = repo()
+  let seen
+  const jev = { route: async (args) => { seen = args.trackRecord; return closeRoute() }, assess: async () => verdict('accept') }
+  const rows = [fbRow({ reason: 'the parser is architecture, Claude should have had it' })]
+  await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: fbHistory(rows) } })
+  assert.equal(seen.codex.feedback.dislikes, 1)
+  assert.deepEqual(seen.codex.feedback.recent_reasons, ['the parser is architecture, Claude should have had it'])
+})
+
+test('routing: no feedback, or no feedback reader at all, leaves the pick exactly as Jev made it', async () => {
+  const dir = repo()
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const empty = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: fbHistory([]) } })
+  assert.equal(empty.attempts[0].agent, 'codex')
+  assert.equal(empty.routing.feedbackFrom, undefined)
+  const noReader = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: history() } })
+  assert.equal(noReader.attempts[0].agent, 'codex')
+})
+
+test('feedbackPrior: attributes by provider, drops unknown agents, and keeps only the newest suggestion', async () => {
+  const { feedbackPrior } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }]
+  const p = feedbackPrior([
+    { verdict: 'dislike', reason: 'a', provider: 'codex' },
+    { verdict: 'like', provider: 'ghost' },
+    { verdict: 'dislike', reason: 'b', provider: 'codex', suggestedAgent: 'claude' },
+  ], agents)
+  assert.equal(p.agents.get('codex').dislikes, 2, 'both dislikes land on codex')
+  assert.equal(p.agents.get('codex').likes, 0)
+  assert.deepEqual(p.agents.get('codex').reasons, ['a', 'b'])
+  assert.equal(p.agents.has('ghost'), false, 'a verdict naming no known agent is dropped, not guessed')
+  assert.equal(p.agents.get('claude').suggested, 1)
+  assert.equal(p.suggestion, 'claude')
+})
+
+test('feedbackPrior: an answer-only tag is context, never a vote', async () => {
+  const { feedbackPrior } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }]
+  // A routing tag counts, exactly as an untagged row always has.
+  const routing = feedbackPrior([{ verdict: 'dislike', provider: 'codex', tag: 'wrong agent', reason: 'a' }], agents)
+  assert.equal(routing.agents.get('codex').dislikes, 1)
+  assert.ok(routing.agents.get('codex').bias < 0, 'a routing dislike moves the bias')
+  // An answer-only tag does not, in either direction, while its words still reach the prompt.
+  const answer = feedbackPrior([{ verdict: 'dislike', provider: 'codex', tag: 'not enough detail', reason: 'a' }], agents)
+  assert.equal(answer.agents.get('codex').likes, 0)
+  assert.equal(answer.agents.get('codex').dislikes, 0, 'the vote is not counted')
+  assert.equal(answer.agents.get('codex').bias, 0, 'so the bias cannot move')
+  assert.deepEqual(answer.agents.get('codex').reasons, ['not enough detail: a'], 'words and tag still ride the track record')
+  const liked = feedbackPrior([{ verdict: 'like', provider: 'codex', tag: 'good answer' }], agents)
+  assert.equal(liked.agents.get('codex').likes, 0, 'an answer-only like cannot promote either')
+  assert.equal(liked.agents.get('codex').bias, 0)
+  // A suggestion is a promotion, so an answer-only row may not carry one either.
+  assert.equal(feedbackPrior([{ verdict: 'dislike', provider: 'codex', tag: 'too slow', suggestedAgent: 'claude' }], agents).suggestion, undefined)
+  // Untagged is unchanged: it still counts and can still suggest.
+  assert.equal(feedbackPrior([{ verdict: 'dislike', provider: 'codex', suggestedAgent: 'claude' }], agents).suggestion, 'claude')
+})
+
+test('routing: an answer-only dislike cannot move the pick, a routing dislike does', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  // The same three dislikes that demote codex when they are about the pick (see the test above).
+  const dir1 = repo()
+  const answerOnly = [1, 2, 3].map((i) => fbRow({ messageId: `m${i}`, tag: 'not enough detail' }))
+  const kept = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: fbHistory(answerOnly) } })
+  assert.equal(kept.attempts[0].agent, 'codex', 'three answer-only dislikes leave the pick alone')
+  assert.equal(kept.routing.feedbackFrom, undefined)
+  const dir2 = repo()
+  const routing = [1, 2, 3].map((i) => fbRow({ messageId: `m${i}`, tag: 'wrong agent' }))
+  const moved = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: fbHistory(routing) } })
+  assert.equal(moved.attempts[0].agent, 'claude', 'the same three dislikes about the pick do demote codex')
+  assert.equal(moved.routing.feedbackFrom, 'codex')
+  // An answer-only dislike that names another agent cannot promote it either.
+  const dir3 = repo()
+  const suggest = [fbRow({ messageId: 'm1', tag: 'not enough detail', suggestedAgent: 'claude' })]
+  const r3 = await runRouted({ task: 'fix', cwd: dir3, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir3), history: fbHistory(suggest) } })
+  assert.equal(r3.attempts[0].agent, 'codex', 'the suggestion is ignored behind an answer-only tag')
+})

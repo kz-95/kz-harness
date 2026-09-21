@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { autoLevel, codexServiceTier, isLocalLevel, localAgentFor, toAgentEffort } from '../effort.js'
+import { autoLevel, codexServiceTier, isLocalLevel, localAgentFor, quickestLocal, toAgentEffort } from '../effort.js'
 import { jevAdapter } from '../adapter.js'
 import { answeredBy, runRouted } from '../router.js'
 
@@ -139,6 +139,11 @@ test('local-low and local-high name a model by size, not by id', () => {
   const unroled = [{ id: 'a-local', kind: 'local', enabled: true, size: 1 }, { id: 'b-local', kind: 'local', enabled: true, size: 9 }]
   assert.equal(localAgentFor('local-low', unroled), 'a-local')
   assert.equal(localAgentFor('local-high', unroled), 'b-local')
+  // The local chat model defaults through the same rule, so no caller can pick a different
+  // "quickest" model: manifest entries arrive in manifest order, not in speed order.
+  assert.equal(quickestLocal([{ id: 'qwen3-8b', role: 'best-quality', size: 5_027_783_488 }, { id: 'gemma4-e4b', role: 'fast', size: 5_154_941_280 }]).id, 'gemma4-e4b')
+  assert.equal(quickestLocal(unroled).id, 'a-local')
+  assert.equal(quickestLocal([]), null)
 })
 
 test('local levels need a local model, and are not efforts', () => {

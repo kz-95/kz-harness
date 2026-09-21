@@ -5,6 +5,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 contextBridge.exposeInMainWorld('harness', {
   state: () => ipcRenderer.invoke('harness:state'),
   retry: () => ipcRenderer.invoke('harness:retry'),
+  useHere: () => ipcRenderer.invoke('harness:useHere'),
   openLogs: () => ipcRenderer.invoke('harness:openLogs'),
   menu: (at) => ipcRenderer.invoke('harness:menu', at),
   titlebar: () => ipcRenderer.invoke('harness:titlebar'),
