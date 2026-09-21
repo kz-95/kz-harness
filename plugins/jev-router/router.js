@@ -323,12 +323,19 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // Offline implies local-only; `localOnly` is the same restriction chosen on purpose,
   // with Jev still routing (it is a hosted call, so it needs the network either way).
   const localOnly = !!deps.offline || !!deps.localOnly
-  const agents = config.agents.filter((a) => a.enabled && !notReady.includes(a) && !outAtStart.includes(a) && (!localOnly || a.kind === 'local'))
+  // The mirror image: only agents that are NOT on this PC. Offline and local-only win over it,
+  // because they are statements about what the machine CAN do, while `remoteOnly` is only a
+  // preference about what it SHOULD do. Asking for remote agents with no network is a
+  // contradiction, and the honest answer is the offline restriction, not an empty pool.
+  const remoteOnly = !localOnly && !!deps.remoteOnly
+  const agents = config.agents.filter((a) => a.enabled && !notReady.includes(a) && !outAtStart.includes(a)
+    && (!localOnly || a.kind === 'local') && (!remoteOnly || a.kind !== 'local'))
   const out = outAtStart.map((a) => ({ id: a.id, until: quota[a.id].until ?? null })) // grows as agents hit limits
   const outLabel = () => { const e = earliest(out); return e ? ` (earliest reset ${hhmm(e)})` : '' }
   const tools = (config.tools ?? []).filter((t) => t.enabled !== false)
   if (agents.length === 0 && outAtStart.length) throw new Error(`all available agents are at their usage limits${outLabel()}: ${out.map((o) => `${o.id}${o.until ? ` until ${hhmm(o.until)}` : ''}`).join(', ')}`)
   if (agents.length === 0 && localOnly) throw new Error(`${deps.offline ? 'offline, and no local model is ready' : 'this run is local only, and no local model is ready'}. Download one in Settings → Jev setup → Local models (needs the internet once)`)
+  if (agents.length === 0 && remoteOnly) throw new Error('this run is online only, and no cloud or subscription agent is ready. Sign one in at Settings → Jev setup, or pick Jev Auto to use the local models on this PC')
   if (agents.length === 0) throw new Error(`no LLM agent is switched on and signed in${notReady.length ? ` (${notReady.map((a) => `${a.id}: ${deps.ready[a.id].detail}`).join('; ')})` : ''}. Open Settings → Plugins → Jev setup`)
   const byId = new Map(agents.map((a) => [a.id, a]))
   const blocked = notReady.find((a) => a.id === forceAgent)
@@ -336,6 +343,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   const limited = out.find((o) => o.id === forceAgent)
   if (limited) throw new Error(`${forceAgent} is at its usage limit${limited.until ? ` until ${hhmm(limited.until)}` : ''}`)
   if (forceAgent && localOnly && !byId.has(forceAgent) && config.agents.some((a) => a.id === forceAgent && a.kind !== 'local')) throw new Error(deps.offline ? `${forceAgent} needs the internet; offline, only local agents run (${[...byId.keys()].join(', ')})` : `${forceAgent} is not a local model; this run is local only (${[...byId.keys()].join(', ')})`)
+  if (forceAgent && remoteOnly && !byId.has(forceAgent) && config.agents.some((a) => a.id === forceAgent && a.kind === 'local')) throw new Error(`${forceAgent} runs on this PC; this run is online only (${[...byId.keys()].join(', ')})`)
   if (forceAgent && !byId.has(forceAgent)) throw new Error(`agent "${forceAgent}" is not enabled; enabled: ${[...byId.keys()].join(', ')}`)
   const review = deps.review ?? createReview(deps.jev, config.thresholds, deps.jevUnavailableReason)
   const near = (id) => quota[id]?.state === 'near'
@@ -377,7 +385,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   const need = {
     modalities: deps.inputModalities ?? ['text'],
     mutation: !answerOnly,
-    ...(localOnly ? { locality: 'local' } : {}),
+    ...(localOnly ? { locality: 'local' } : remoteOnly ? { locality: 'hosted' } : {}),
     ...(deps.offline ? { network: false } : {}),
     available: unavailableIds,
   }

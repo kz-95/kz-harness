@@ -64,6 +64,15 @@ export const VERDICTS = {
  * every routing decision worse.
  */
 const scrub = (text) => (typeof text === 'string' ? redactSecrets(text) : text)
+/**
+ * `scrub` every string inside a nested plain object or array. The track record is built from the
+ * person's own feedback, including the free text they typed in the Why? box, so it is the one
+ * payload on the routing call that can carry an arbitrary sentence. A key pasted into that box
+ * must not ride out with it, and the README promises keys are masked in everything sent to Jev.
+ */
+const scrubDeep = (v) => (Array.isArray(v) ? v.map(scrubDeep)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scrubDeep(x)]))
+    : scrub(v))
 
 function clip(text, max) {
   const s = scrub(text)
@@ -128,7 +137,7 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
     async route({ task, context, agents, tools = [], history, availability, trackRecord, handoff, capabilities }, signal) {
       const state = { task: scrub(task), workspace: context, recent_outcomes: history }
       if (availability) state.agent_availability = availability
-      if (trackRecord) state.agent_track_record = trackRecord
+      if (trackRecord) state.agent_track_record = scrubDeep(trackRecord)
       if (handoff) state.handoff = clip(handoff, 3000)
       const questions = {
         agent: choice(

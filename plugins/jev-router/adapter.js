@@ -11,18 +11,27 @@ export const JEV_PROVIDER = 'jev'
 const NO_PROJECT = resolve(fileURLToPath(new URL('../../no-project', import.meta.url))).toLowerCase()
 export const isNoProject = (cwd) => !!cwd && resolve(cwd).toLowerCase() === NO_PROJECT
 const MODEL = 'jev-auto'
-// Three ways to let Jev choose, by how much of the machine's outside world is in play.
+// Four ways to let Jev choose, by how much of the machine's outside world is in play.
 // Jev itself is a hosted call, so 'offline' drops it and falls back to the fixed rule.
+// 'local' and 'online' are mirrors: each keeps Jev routing and narrows the pool to one side.
+// 'offline' and a genuinely dead network both beat 'online', because those are statements about
+// what this machine CAN do, while 'online' is only a preference about what it SHOULD use.
 const JEV_MODELS = {
   'jev-auto': {
     mode: 'auto',
     name: 'Jev Auto',
     description: 'Every message goes straight to the Jev router, which picks Claude, Codex, DeepSeek or a tool, then reviews the result.',
   },
+  // Key order is menu order, and it reads as a gradient from the most off-machine to the least.
+  'jev-online': {
+    mode: 'online',
+    name: 'Jev Auto · Online',
+    description: 'Jev routes, but only over the cloud and subscription agents: Claude, Codex, DeepSeek. The local models on this PC are never picked, so nothing waits on your own hardware. Everything Jev Auto sends still applies, and the agent you are routed to sees your code.',
+  },
   'jev-local': {
     mode: 'local',
     name: 'Jev Auto · Local',
-    description: 'Jev routes, but only over the local models on this PC. Your code is only edited here; Jev still sees the task text, file names and a slice of the diff when it reviews. It also sends the handoff note from a previous task (up to 3000 characters, quoting an earlier agent\'s answer) on the routing call.',
+    description: 'Jev routes, but only over the local models on this PC. Your code is only edited here; Jev still sees the task text, file names, the answer, your check output and a slice of the diff when it reviews. It also sends the handoff note from a previous task (up to 3000 characters, quoting an earlier agent\'s answer) on the routing call.',
   },
   'jev-offline': {
     mode: 'offline',
@@ -244,7 +253,7 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       capability: deep ? 'reasoned_answer' : 'quick_answer',
       modalities: images ? ['text', 'image'] : ['text'],
       mutation: false,
-      ...(offline ? { locality: 'local', network: false } : {}),
+      ...(offline ? { locality: 'local', network: false } : mode === 'online' ? { locality: 'hosted' } : {}),
     }
     const ranked = await answerExecutors?.().then((list) => (list?.length ? rank(eligible(list, wanted), { simple: !deep }) : null)).catch(() => null)
     if (ranked?.length) {
@@ -277,7 +286,9 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       // A catalog that cannot be read still offers Jev Auto, so the picker never comes up empty.
       const list = await agents?.().catch(() => []) ?? []
       const hasLocal = list.some((a) => a.kind === 'local' && a.enabled !== false)
-      // The two local-only rows are pointless with no local model installed.
+      // Every extra row is about drawing a line between the local models and the rest, so with no
+      // local model installed there is no line to draw: the two local rows cannot run, and Online
+      // would be a second name for Jev Auto, which already has nothing but cloud agents to pick.
       const ways = hasLocal ? Object.keys(JEV_MODELS) : [MODEL]
       // A Jev row can carry an image only when the run it starts will end somewhere that
       // reads it. Saying so otherwise is worse than refusing: the engine stops blocking the
@@ -305,10 +316,12 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       const images = (lastTyped?.content ?? []).filter((b) => b?.type === 'image')
       // "Claude Code" or "Codex (GPT)" picked in the model menu: that agent, every message.
       const pickedAgent = agentIdOf(options.model) ?? undefined
-      // Jev Auto / Jev Auto Local / Offline: how wide the field of agents is.
+      // Jev Auto / Local / Online / Offline: how wide the field of agents is.
       let mode = modeOf(options.model)
       // A local-* effort means "run it locally on this size of model": it forces the
-      // agent and keeps the run local, whichever Jev row is picked.
+      // agent and keeps the run local, whichever Jev row is picked. That includes Online:
+      // the effort is a per-message choice and the row is a standing one, so the specific
+      // choice wins, exactly as it already does over plain Jev Auto.
       let effort = options.reasoningEffort
       let localForced
       if (!options.purpose && isLocalLevel(effort)) {

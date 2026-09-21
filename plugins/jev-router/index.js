@@ -588,6 +588,9 @@ export function apply(ctx, config) {
       // Offline: no Jev at all (fixed routing rule, deterministic review), so nothing waits on a dead network.
       // 'local' keeps Jev routing but only over local models; 'offline' also drops Jev.
       const localOnly = mode === 'local' || mode === 'offline'
+      // The mirror of localOnly. The router drops it when offline or local-only is in force, so a
+      // dead network reports the offline restriction rather than an empty agent pool.
+      const remoteOnly = mode === 'online'
       const offline = mode === 'offline' || await isOffline()
       const jev = offline ? null : await makeJev({ onTrace, runId, emit: onEvent })
       const agents = await enabledAgents()
@@ -639,6 +642,7 @@ export function apply(ctx, config) {
           jev,
           offline,
           localOnly,
+          remoteOnly,
           jevUnavailableReason: offline ? (mode === 'offline' ? 'offline mode: local models and checks only' : 'offline: no internet, checks only') : `${config.credentialRef} not configured`,
           // Capability routing: what each executor on this machine really is, so code can drop
           // the ones that cannot do this request before Jev is asked (and check its pick after).

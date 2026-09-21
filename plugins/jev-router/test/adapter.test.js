@@ -191,8 +191,9 @@ test('the local-only rows appear only when a local model is installed', async ()
 
   const withLocal = jevAdapter({ ctx: chat([]), route: async () => '', auxModel: aux, agents: async () => [...AGENTS, { id: 'qwen-local', kind: 'local', enabled: true, description: 'Qwen on this PC.' }] })
   const models = await withLocal.listModels('jev')
-  assert.deepEqual(models.map((m) => m.id), ['jev-auto', 'jev-local', 'jev-offline', 'agent-claude', 'agent-codex', 'agent-my-own-agent', 'agent-qwen-local'])
-  assert.deepEqual(models.slice(0, 3).map((m) => m.name), ['Jev Auto', 'Jev Auto · Local', 'Offline · Local only'])
+  assert.deepEqual(models.map((m) => m.id), ['jev-auto', 'jev-online', 'jev-local', 'jev-offline', 'agent-claude', 'agent-codex', 'agent-my-own-agent', 'agent-qwen-local'])
+  // Menu order is a gradient, most off-machine first.
+  assert.deepEqual(models.slice(0, 4).map((m) => m.name), ['Jev Auto', 'Jev Auto · Online', 'Jev Auto · Local', 'Offline · Local only'])
 })
 
 test('each Jev row routes in its own mode', async () => {
@@ -204,8 +205,8 @@ test('each Jev row routes in its own mode', async () => {
     auxModel: aux,
     agents: async () => AGENTS,
   })
-  for (const id of ['jev-auto', 'jev-local', 'jev-offline']) await runAs(a, id, 'do the thing')
-  assert.deepEqual(seen, ['auto', 'local', 'offline'])
+  for (const id of ['jev-auto', 'jev-online', 'jev-local', 'jev-offline']) await runAs(a, id, 'do the thing')
+  assert.deepEqual(seen, ['auto', 'online', 'local', 'offline'])
 })
 
 test('offline mode answers a question locally, never through the hosted chat model', async () => {

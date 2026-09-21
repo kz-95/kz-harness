@@ -69,7 +69,9 @@ export function validateExecutor(e) {
  * @param {string} [request.capability]        what the request needs
  * @param {string[]} [request.modalities]      what the input carries (default: text)
  * @param {boolean} [request.mutation]         true when files may be changed
- * @param {'local'|'hosted'} [request.locality] 'local' restricts everything to this PC
+ * @param {'local'|'hosted'} [request.locality] 'local' restricts everything to this PC, 'hosted'
+ *   is the mirror and keeps everything off it. Only these two values do anything: an unknown
+ *   string would filter nothing and read as "no restriction", so the caller must use one of them.
  * @param {boolean} [request.network]          false when there is no internet
  * @param {Set<string>} [request.available]    ids that are NOT usable right now (limits, signed out)
  * @param {Set<string>} [request.credentials]  credential names that exist; omit to skip the check
@@ -82,6 +84,7 @@ export function eligible(executors, request = {}) {
     if (!wants.every((m) => e.modalities.includes(m))) return false
     if (request.mutation && !e.mutation) return false
     if (request.locality === 'local' && e.locality !== 'local') return false
+    if (request.locality === 'hosted' && e.locality === 'local') return false
     if (request.network === false && e.network) return false
     if (request.available?.has?.(e.id)) return false
     if (request.credentials && e.credentials.some((c) => !request.credentials.has(c))) return false

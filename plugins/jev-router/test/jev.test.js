@@ -45,3 +45,27 @@ test('a key in a task, a diff excerpt or a message never reaches the payload', a
   assert.ok(assessed.includes('const key ='), 'the diff excerpt is still there')
   assert.ok(assessed.includes('1 file changed') && assessed.includes('a.js'))
 })
+
+test('a key typed into the feedback box does not ride out in the track record', async (t) => {
+  // agent_track_record is built from the person's own Like/Dislike reasons, so it is the one
+  // payload on the routing call that can carry an arbitrary typed sentence. It was the last
+  // unscrubbed field, while the README promised keys are masked in everything sent to Jev.
+  const { sent, restore } = capture()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+
+  await jev.route({
+    task: 'fix the parser',
+    context: { branch: 'main' },
+    agents: AGENTS,
+    history: [],
+    trackRecord: { claude: { cost_tier: 'subscription', feedback: { likes: 1, dislikes: 0, recent_reasons: [`it kept using ${KEY}`] } } },
+  })
+
+  const payload = JSON.stringify(sent[0])
+  assert.ok(!payload.includes(KEY), 'a key survived into the track record')
+  assert.match(payload, /sk-ant\.\.\.REDACTED/)
+  // The reason itself must survive: it is why the record is sent at all.
+  assert.ok(payload.includes('it kept using'), 'the reason text was gutted, not just the key')
+  assert.ok(payload.includes('subscription'), 'the rest of the record is untouched')
+})

@@ -102,7 +102,7 @@ Also get a Jev key from https://console.typesafe.ai/keys. Without it, KzH still 
 **1. Get the code.** The scripts assume `C:\Harness`.
 
 ```powershell
-git clone git@github.com:kz-95/kz-harness.git C:\Harness
+git clone https://github.com/kz-95/kz-harness.git C:\Harness
 ```
 
 **2. Add your keys** to `C:\Users\<you>\.kzh\.env`. It must be in `.kzh`, never in the repo. You can add more keys later in the app.
@@ -142,6 +142,16 @@ Start it from the icon. Double-clicking a `.ps1` file opens Notepad on purpose; 
 - Type a task (`Fix the bug in the user lookup function and make sure the tests pass.`) or a question (`how does the login flow work?`).
 - Force an agent with `/claude …`, `/codex …` or `/deepseek …`. `/auto …` lets Jev choose from any model. `/use claude ds` switches which agents may run.
 - The model menu's **Jev** section lists **Jev Auto** and one entry per enabled agent - **Claude Code**, **Codex (GPT)**, **DeepSeek agent**, plus any local or custom agent. Picking an agent sends every message to it with no routing question; the checks, the review and the queue still run. Switching an agent off takes it out of the menu.
+- Once you install a local model, three more Jev rows appear, in order from the most off-machine to the least. They all let Jev route; they differ only in how wide the field of agents is.
+
+  | Row | Picks from | Jev call |
+  |---|---|---|
+  | **Jev Auto** | everything enabled | yes |
+  | **Jev Auto · Online** | cloud and subscription agents only, never this PC | yes |
+  | **Jev Auto · Local** | the local models on this PC only | yes |
+  | **Offline · Local only** | the local models, by a fixed rule | no |
+
+  **Online** is for when you do not want to wait on your own hardware. Being offline, or picking a `local-*` effort on a single message, still overrides it: those say what the machine can do, while Online only says what it should prefer. With no local model installed none of these rows appear, because Jev Auto already has nothing but cloud agents to choose from.
 - **Export chat as Markdown** (Ctrl+Alt+M, or the header's ... menu): copy it, or save a `.md`. Tool calls and their output are included, folded into `<details>` blocks; untick that to export just the conversation.
 - **Show all transcripts** (top bar, next to the Jev inspector button; rebindable in Settings -> Shortcuts, empty by default): opens or closes every reasoning and tool transcript in the conversation at once, including ones that arrive afterwards. The label and `aria-expanded` follow the state, and the button is disabled when the conversation has none.
 - **Effort** (the model menu): `Auto` lets Jev pick from the task's complexity and risk. Picking a level by hand applies to background work only - the conversation stays responsive at every level.
@@ -418,7 +428,7 @@ Claude Code and Codex do not use keys at all: they sign in with your own account
 
 ## Privacy
 
-KzH has no telemetry of its own: there is no KzH endpoint and nothing here phones home. That is not the same as "little leaves this machine". The work itself goes out: your prompts and code go to whichever model you pick, and **every message you type also goes to TypeSafe**, so the router can classify it, along with the task text, a slice of your real `git diff` when a run is reviewed, and the folder's handoff note (`.kz-harness/handoff.md`) on every routing call once one exists, which quotes the previous task's answer verbatim and so routinely carries code from an earlier, unrelated task. What that means in full is the list below.
+KzH has no telemetry of its own: there is no KzH endpoint and nothing here phones home. That is not the same as "little leaves this machine". The work itself goes out: your prompts and code go to whichever model you pick, and **every message you type also goes to TypeSafe**, so the router can classify it, along with the task text, a slice of your real `git diff` when a run is reviewed, the agent's own answer to that task (first 2500 characters), your project's check output (test, lint, typecheck and build stdout, which prints whatever the run had in its environment), and the folder's handoff note (`.kz-harness/handoff.md`) on every routing call once one exists, which quotes the previous task's answer verbatim and so routinely carries code from an earlier, unrelated task. What that means in full is the list below.
 
 What was switched off is genuinely off, not just asked to be off: the DSH data features below were audited in the running app, and no hidden telemetry was found anywhere else. They are turned off in `config/cordis.patch.yml` and `Start-KzH.ps1`:
 
@@ -442,6 +452,7 @@ What stays:
 - DeepSeek now runs through DSH's generic pi-ai connector (provider `deepseek`, same `DEEPSEEK_API_KEY`, `https://api.deepseek.com`). A request carries your key, the conversation, and generic headers only: `User-Agent: deepseek-harness/<version>` (DSH has no switch for it) and the OpenAI SDK's `x-stainless-*` platform headers (OS, CPU, Node version). No user or session ID.
 - DeepSeek web search (`web_search`) sends your key, the search query and `User-Agent: deepseek-harness/0.0.1`; nothing else.
 - Online, besides the model calls:
+  - a `git fetch` against this repo's own remote at every start (`safeUpdate` in `app/main.js`), which fast-forwards a clean tree and refuses if `package.json` or `app/` changed. It contacts wherever you cloned from and nowhere else, and it is skipped when there is no remote;
   - the Jev/TypeSafe router calls, described above;
   - a connectivity probe to `api.typesafe.ai` (never DeepSeek), to tell "offline" from "no key": a HEAD request with no key and no content (2.5 s timeout, cached 30 s);
   - the DeepSeek balance check (Usage tab), which sends your DeepSeek key;
