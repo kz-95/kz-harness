@@ -206,6 +206,38 @@ test('an agent that never ran is reported as unknown, not as bad', async () => {
   assert.equal(t.deepseek.overall, 'no runs yet')
 })
 
+test('the cost tier Jev reads follows the operator\'s funding override, like every other cost reader', async () => {
+  const rows = [rec('/w', 'accepted', [{ agent: 'claude', role: 'primary', durationMs: 10 }])]
+  assert.equal(trackRecord(rows, '/w', AG, {}).deepseek.cost_tier, 'api', 'the setting: an api key reads as api')
+  const t = trackRecord(rows, '/w', AG, { economics: { deepseek: { marginalCost: 'low' }, claude: { marginalCost: 'metered' } } })
+  assert.equal(t.deepseek.cost_tier, 'subscription', 'a key declared flat-rate is a subscription at the margin')
+  assert.equal(t.claude.cost_tier, 'api', 'a subscription declared metered is billed per job')
+  const free = trackRecord(rows, '/w', [...AG, { id: 'qwen', kind: 'local' }], { economics: { deepseek: { marginalCost: 'none' } } })
+  assert.equal(free.deepseek.cost_tier, 'free', 'free, but not local')
+  assert.equal(free.qwen.cost_tier, 'free-local')
+  assert.equal(trackRecord(rows, '/w', AG, { economics: { deepseek: { marginalCost: 'cheap' } } }).deepseek.cost_tier, 'api', 'an unknown value changes nothing')
+})
+
+test('the router hands its funding override to the track record it sends', async () => {
+  const dir = repo()
+  let sent = null
+  await runRouted({
+    task: 'do a thing',
+    cwd: dir,
+    signal,
+    config: baseConfig({ resources: { economics: { deepseek: { marginalCost: 'low' } } } }),
+    deps: {
+      jev: { route: async (s) => { sent = s.trackRecord; return jevPick('deepseek', 0.9, { deepseek: 0.9 }) }, assess: async () => ({}) },
+      review: async () => ({ status: 'accepted', action: 'accept', quality: 0.9 }),
+      execute: async () => ({ stopReason: 'completed', answerText: 'done', diagnostic: null }),
+      history: { recent: async () => [], records: async () => [], append: async () => {} },
+      logAttempt: async () => {},
+    },
+  })
+  assert.ok(sent, 'Jev was sent a track record')
+  assert.equal(sent.deepseek.cost_tier, 'subscription')
+})
+
 // ---------------------------------------------------------------- split picks
 
 test('the reviewer pick and the fixer pick are separate answers, not one answer used twice', async () => {
@@ -249,4 +281,20 @@ test('an unsure local pick with no subscription anywhere near it is left alone',
   const { r, seen } = await run({ route: jevPick('qwen-local', 0.26, { 'qwen-local': 0.6, claude: 0.1, deepseek: 0.3 }) })
   assert.equal(seen[0], 'qwen-local', 'nothing was tied with it')
   assert.equal(r.routing.tiebrokeFrom, undefined)
+})
+
+// ---------------------------------------------------------------- dead config surface
+
+test('jev-review offers no config or service that nothing reads', async () => {
+  // It used to provide a `jevReview` service with its own Config (credentialRef, jevModel,
+  // jevTimeoutMs, thresholds), while router.js imports createReview directly and nothing injected
+  // the service, so every value a person set there was silently ignored. Whatever the review row
+  // provides must be something jev-router actually injects.
+  const review = await import('../../jev-review/index.js')
+  const router = await import('../index.js')
+  const provided = []
+  review.apply({ provide: (name) => provided.push(name), credentials: { resolve: async () => undefined } }, {})
+  for (const name of provided) assert.ok(router.inject.includes(name), `jev-review provides ${name}, which jev-router never injects`)
+  assert.equal(review.Config, undefined, 'a config schema nothing reads is not offered')
+  assert.equal(typeof review.createReview, 'function', 'the review policy itself is still there for the router')
 })

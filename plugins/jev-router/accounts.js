@@ -25,6 +25,13 @@ const ACTIVE_ENV = { deepseek: 'DEEPSEEK_API_KEY' }
 
 /** 'local' agents run a model on this PC (llama.cpp): free, no keys, no quota. */
 export const kindOf = (a) => (SUBSCRIPTION_PROVIDERS.includes(a.provider) ? 'subscription' : a.llm?.provider === 'local' ? 'local' : 'api')
+// What one more job on an agent costs at the margin, in the resources.js vocabulary. Who funds
+// the tokens is an ACCOUNT fact, so it is answered here with the rest of the billing knowledge
+// and routing asks for the property instead of testing a provider name. A live ResourceSnapshot
+// and the operator's config.resources.economics override both outrank this: it is only the
+// answer when nothing else has said anything.
+export const MARGINAL_COST_BY_KIND = Object.freeze({ local: 'none', subscription: 'low', api: 'metered' })
+export const marginalCostOf = (a) => (a ? MARGINAL_COST_BY_KIND[a.kind] ?? MARGINAL_COST_BY_KIND[kindOf(a)] : null) ?? 'metered'
 /** Key provider an api agent draws from: 'deepseek' for DSH's DeepSeek, else its BYOK llm provider. */
 export const keyProviderOf = (a) => (a.provider !== 'spawn' || a.llm?.provider === 'local' ? null : a.llm?.provider === 'deepseek-official' ? 'deepseek' : a.llm?.provider ?? null)
 

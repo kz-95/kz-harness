@@ -36,6 +36,19 @@ const SYSTEM = [
   'If the report is already readable prose, return it almost unchanged.',
 ].join(' ')
 
+// Link definitions a report carries for the client, not for a reader: router.js's agent chain
+// (the chips under an answer) and index.js's run mark (the run a verdict is credited to). The
+// markdown renderer drops them. The model is told to drop brackets, so they never go through it.
+const MACHINE_LINE = /^\[(?:jev-agents|jev-run)\]:\s*\S+\s*$/
+
+/** The report without its machine lines, and those lines, in order and exactly as written. */
+export function machineLines(text) {
+  const prose = []
+  const marks = []
+  for (const line of String(text ?? '').split('\n')) (MACHINE_LINE.test(line) ? marks : prose).push(line)
+  return { prose: prose.join('\n').trimEnd(), marks }
+}
+
 /** Rough token count of `text`: length divided by CHARS_PER_TOKEN, rounded up. */
 export function estimateTokens(text) {
   return Math.ceil(String(text ?? '').length / CHARS_PER_TOKEN)
@@ -149,10 +162,12 @@ export function createFormatter({ stream, chatModel, contextOf = () => null, log
       const window = Number(contextOf?.(model))
       const budget = Math.floor((Number.isFinite(window) && window > 0 ? window : FALLBACK_CTX) - reserveTokens)
       if (budget < MIN_BUDGET) return raw
-      const out = estimateTokens(raw) <= budget
-        ? await ask(model, reportPrompt(r, raw))
-        : await inParts(model, r, raw, budget)
-      return out == null ? raw : out
+      const { prose, marks } = machineLines(raw)
+      if (!prose.trim()) return raw
+      const out = estimateTokens(prose) <= budget
+        ? await ask(model, reportPrompt(r, prose))
+        : await inParts(model, r, prose, budget)
+      return out == null ? raw : marks.length ? `${out}\n\n${marks.join('\n')}` : out
     } catch (err) {
       log(`format: ${r?.jobId ?? '?'} posted as written: ${err.message}`)
       return raw

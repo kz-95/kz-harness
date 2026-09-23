@@ -20,7 +20,10 @@ test('terminal: only an existing DSH project folder', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'kz-term-'))
   const file = join(dir, 'f.txt')
   writeFileSync(file, '')
-  assert.equal(await workspaceDir(dir.toUpperCase(), [dir]), join(dir.toUpperCase()))
+  // The case-insensitive match is a Windows fact; on a case-sensitive file system the
+  // upper-cased folder does not exist, so the same assertion is made with the real name.
+  const spelled = process.platform === 'win32' ? dir.toUpperCase() : dir
+  assert.equal(await workspaceDir(spelled, [dir]), join(spelled))
   await assert.rejects(workspaceDir(dir, []), /not a harness project/)
   await assert.rejects(workspaceDir(file, [file]), /does not exist/)
   await assert.rejects(workspaceDir(join(dir, 'gone'), [join(dir, 'gone')]), /does not exist/)

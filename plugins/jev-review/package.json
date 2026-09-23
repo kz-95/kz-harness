@@ -2,10 +2,7 @@
   "name": "jev-review",
   "version": "0.1.0",
   "private": true,
-  "description": "DSH plugin: Jev judges each routed result (pass / second opinion / retry / human). Used by jev-router through the jevReview service.",
+  "description": "DSH plugin: Jev judges each routed result (pass / second opinion / retry / human). jev-router's router.js imports its createReview directly; the plugin row itself provides no service and takes no config.",
   "type": "module",
-  "main": "index.js",
-  "dependencies": {
-    "@deepseek-ai/schemastery": "3.18.2"
-  }
+  "main": "index.js"
 }

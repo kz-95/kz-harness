@@ -12,8 +12,10 @@ unless it says otherwise. Where something is unverified it says so.
 
 ```
 branch        main                         (primary; chore/initial-setup points at the same commit)
+              feat/adaptive-routing        adaptive routing, one commit on main e56bca7, 23 Sep, not merged
 remote        origin github.com/kz-95/kz-harness, PUBLIC
-tests         388 pass, 0 fail             (cd plugins/jev-router && npm test)
+tests         716 tests, 715 pass, 0 fail, 1 skipped  (npm --prefix plugins/jev-router test)
+              the one skip is Windows-only (engine zip unpack) and skips on Linux by design
 app           exe rebuilt 21 Sep 22:16, engine on 127.0.0.1:3080
 ```
 
@@ -22,22 +24,82 @@ before the first push, because a commit's author email is part of the object it 
 so it is cheap to change while nothing is published and impossible afterwards. Do not add a
 personal address back: set it per repo with `git config --local user.email`.
 
-```
-```
-
 Plugin-loaded check, the cheap signal worth keeping: from inside the running page,
 `/jev-router/usage` returns 200 and a bogus path returns 404. From a shell it is 401 for
 everything, because the API wants the engine's per-process token. If cordis ever marks the plugin
 INACTIVE the app still boots and looks normal, so that 404 is the only cheap sign every KzH
 feature is silently gone.
 
+## Where this was left, 23 Sep: read this first
+
+The adaptive router is finished on `feat/adaptive-routing`, as one commit on top of `main` (`e56bca7`).
+It is not merged, and it has never run in the app: everything below "Built but NOT observed" still applies to it.
+Work continues on the owner's PC from here, not in the cloud session that built it.
+
+That cloud session could not push.
+The Claude GitHub App had read access only to `kz-95/kz-harness`, so every `git push` and every GitHub API write returned 403.
+The branch therefore travelled as a git bundle, `adaptive-routing.bundle`, with `adaptive-routing.patch` holding the same commit as a patch.
+If the branch is already on GitHub (the app was given write access and a later push worked), fetch it from `origin` instead and skip the bundle.
+
+Picking it up, in PowerShell from the repo root:
+
+```
+git fetch origin main
+git fetch <folder>\adaptive-routing.bundle feat/adaptive-routing:feat/adaptive-routing
+git checkout feat/adaptive-routing
+cd plugins\jev-router; npm test; cd ..\..
+node scripts\kzh-routing-demo.mjs --learn 60
+git push -u origin feat/adaptive-routing
+```
+
+The bundle needs `e56bca7` already in the clone, which is what the first line makes sure of.
+If a local `feat/adaptive-routing` exists from an earlier bundle, switch off it and delete it first (`git checkout main`, then `git branch -D feat/adaptive-routing`): the commit was replaced, not added to, and git refuses to delete or fetch into the branch that is checked out.
+`git am adaptive-routing.patch` on a branch made from `origin/main` gives the same tree when the bundle will not load.
+`npm test` must show `# fail 0` in the summary block it prints last; the one Windows-only test (engine zip unpack) is skipped on Linux and runs on Windows, so the skipped count there is 0.
+`plugins/jev-review` no longer depends on `@deepseek-ai/schemastery`; a copy left in its `node_modules` is harmless, and `npm install` there prunes it.
+
+What a first start on this PC changes, so nothing in it is a surprise:
+
+- `client.js` changed, so it takes an app START, not a page reload (see the gotchas below).
+- Every routing domain starts at `JEV_PRIMARY`, so Jev still makes every routing decision.
+  A domain decides anything alone only after hundreds to thousands of verified samples (`shadowSamples` 250, `guardedSamples` 750 and `localOnlySamples` 1500 for a LOW-risk domain, double and four times that for MEDIUM and HIGH).
+- A routed run makes two Jev calls where the named-agent route made one: the task profile first, then the anonymous resource table and the judgments, because the second needs the first.
+  That is the price of the candidate table carrying capability numbers; it drops to one call, then none, as the domains mature.
+- New files appear under `~/.kzh/jev-router/` as runs happen: `routing-samples.jsonl`, `capability-evidence.jsonl`, `classifiers/`, `domains/` and `known-resources.json`.
+  Nothing existing is rewritten: `history.jsonl` and `feedback.jsonl` gain new fields on new rows only.
+- Verdicts given before this branch are not replayed as capability evidence; the routing prior still reads them as before.
+- To go back to the old behaviour without changing branch, set `routing.enabled: false` on the jev-router row of `~/.kzh/profiles/web/cordis.patch.yml`, the live copy the engine reads: Jev then routes over named agents as it did on `main`.
+  `config/cordis.patch.yml` is only the installer's template, and the installer does not rewrite a live file that already has a jev-router row, so changing the template alone changes nothing on this PC.
+  A patch replaces the row's whole `config`, so add `routing:` next to the fields already there rather than a row holding only it.
+
+What to do next, in order:
+
+1. **Watch it in the running app**, the one thing it has never had.
+   The checklist is the "Watch the adaptive router" item under "Open work" below, plus two new things: a routed run's view names every move the router made (`routing.moves`), and a Like on a routed answer stores a `runId` in `feedback.jsonl`.
+2. **Settle the feedback-privacy question** (the owner item below).
+3. **Open a pull request** from `feat/adaptive-routing` to `main` once it has been watched, and merge only when you decide to.
+4. Then the open work below, and the three items still open after the fix rounds.
+
 ## Open, and needing the OWNER, not an agent
 
-1. **Feedback privacy.** Up to three recent reason STRINGS ride the routing call to TypeSafe.
-   Keep, counts-and-tags-only, or local-only. Worth knowing before deciding: the bias that
-   actually moves a pick is computed locally at `router.js:537` from `feedback.jsonl`, so the
-   strings only flavour the single call they ride on. Nothing accumulates on the far side for
-   your benefit. Defaults are easy; the choice is not an engineering one.
+1. **Feedback privacy.** Up to three recent reason STRINGS ride the routing call to TypeSafe,
+   inside the per-agent track record, in both modes. With `routing.enabled: false` they go in
+   the legacy named call (`agent_track_record`). Under adaptive routing, the default,
+   `decision.js` now passes the id-to-key mapping, so they go in the resource call as
+   `candidate_track_record`, re-keyed to `RESOURCE_x` and with agent ids, display names,
+   providers, model ids (short ones such as `o3` included) and vendor words masked.
+   Each string is the chosen tag, when there is one, followed by the reason the person typed.
+   In both modes key-shaped secrets and `Bearer` tokens in it are redacted by the same scrubber the Markdown export uses.
+   In adaptive mode everything else goes out as typed, and in legacy mode no names are masked.
+   Keep, counts-and-tags-only, or local-only.
+   Worth knowing before deciding: the bias that actually moves a pick is computed locally by
+   `router.js` `feedbackPrior` from `feedback.jsonl` and applied to the resource pick's
+   probabilities in the `router.js` block that opens with the comment `// The feedback prior, applied.`
+   Under adaptive routing those probabilities come from the `resource_selection` domain: they are Jev's while that domain has Jev decide, the local classifier's when it answers for itself at a local rung, and the deterministic fallback's (all weight on one resource) when Jev is not configured, fails or has no answer.
+   With `routing.enabled: false` they are Jev's.
+   So the strings only flavour the single call they ride on.
+   Nothing accumulates on the far side for your benefit.
+   Defaults are easy; the choice is not an engineering one.
 2. **The `Use it here` holder test** is narrow but not ownership-proof: it can stop a manually
    started copy of the pinned engine on 3080, though it needs an explicit click and refuses
    anything whose command line is not our engine.
@@ -53,7 +115,7 @@ while it carries the person's own typed feedback reasons.
 
 These were raised and NOT fixed. None blocks publishing; all are real.
 
-- **`scripts/Set-TypeSafeKey.ps1:8`** writes `TYPESAFE_API_KEY` into the persistent HKCU user
+- **`scripts/Set-TypeSafeKey.ps1:7`** writes `TYPESAFE_API_KEY` into the persistent HKCU user
   environment, which `Start-KzH.ps1:21` reads back and which outranks `~/.kzh/.env`. The README
   says keys live in exactly one place, and its removal instructions only cover `.env`. A second
   copy nobody is told to rotate.
@@ -65,14 +127,15 @@ These were raised and NOT fixed. None blocks publishing; all are real.
 - **README start time** says 10 to 20 seconds; `app/main.js:49` measures about 40, plus an engine
   download on a first run.
 - **README says nothing hardcodes a machine**, but `C:\HarnessProjects` appears at
-  `app/main.js:536` and `Start-KzH.ps1:6`.
+  `app/main.js:536`, `Start-KzH.ps1:6` and `scripts/Install-Harness.ps1:74`, and
+  `scripts/Install-Harness.ps1:75` creates that folder when it is missing.
 - **`scripts/Install-Harness.ps1:60`** treats any `cordis.patch.yml` containing "jev-router" as
   configured, so a privacy setting added later never lands on a re-run, while the README says
   re-running does whatever is missing.
 
 Coverage gap worth knowing: no reviewer ran the app, ran the installer, or cloned to a clean
 machine. The broken clone URL was found by reading, not by trying it, so the install path is still
-unverified end to end. About fourteen of the items above came from a single lens and were not
+unverified end to end. Several of the eleven items above came from a single lens and were not
 independently re-derived.
 
 ## Open work an agent can do
@@ -83,11 +146,87 @@ independently re-derived.
   called with a `sessionId`). Recording task features at routing time and matching on them is the
   change. It touches the same function as the privacy question above, so settle that first.
 - **Exercise the gemma transfer against a real local model** (`plugins/jev-router/format.js`).
-  This is the only thing marked built-but-never-observed that a single real run would settle.
-- **Right-panel guide icons.** Six of seven rows use the same generic cube; only Workspace files
-  has a real folder icon, so something already makes that one different. Find what, then give the
-  rest relevant icons.
+  No real local call has ever been made, only fake streams.
+  One finished background result posted in the running app, with a local chat model installed, would settle it.
+- **Right-panel guide icons.** KzH registers seven guide rows in `plugins/jev-router/client.js` (Browser, Terminal, Background tasks, Subagents, Usage, Session overview, Jev inspector) and passes no icon for any of them, so all seven show the same generic cube.
+  Only Workspace files, the engine's own row, has a real folder icon, so something already makes that one different.
+  Find what, then give KzH's seven rows relevant icons.
 - **Stale line references in `progress/progress.html`**, if you touch it.
+- **Watch the adaptive router in the running app**, which is the one thing it has never had. Start
+  KzH, open the Jev inspector, and check three things: the **Router** tab lists all eight domains
+  with real sample counts, a routed run's reasoning block carries the `Jev decided; N Jev calls;
+  M candidates considered` line, and the Decisions tab shows the candidate table as the router
+  saw it, each `RESOURCE_x` key with its agent id next to it (the person sees the mapping; Jev
+  does not). Everything else about it is already exercised by
+  `node scripts/kzh-routing-demo.mjs --learn 60`, which needs no engine and no network.
+- **Benchmark evidence has no source yet.** `profiles.js` aggregates three kinds of evidence -
+  declared priors, published benchmarks and this harness's own verified runs - and only the first
+  and third ever arrive. Nothing writes a `benchmark` row or a `benchmark_prior`; the source is
+  weighed (reliability 0.7, 180-day half-life in `routing-policy.js`) but always empty. The
+  arithmetic is there and tested; a harness that fetches or imports results is not.
+- **A routing domain retrains in-process.** After a run settles, `index.js` evaluates every
+  domain in the background, at most once a minute; a domain first trains at 50 verified samples
+  and retrains after every 100 new ones. The routing call never waits for it, but it is
+  bounded synchronous work in the engine's own process, and a much larger sample store would
+  want it moved off.
+- **What the 23 Sep fix rounds left open.** Seven rounds of fixes, each checked by a second agent
+  that reproduced every defect with a probe, and every fix proven by a test that fails against
+  the old code.
+  Closed, so nobody re-opens them:
+  - Routing: every router swap (capability, tie-break, weekly gate, feedback, retry, `LOCAL_FIRST`
+    hand-over) goes only to an agent that can do the job, and none brings back an agent a hard
+    fact excluded; a capability outranks conservation and the gate, and the gate yields visibly
+    (`gateYielded`) only when nothing ungated can do it; `gateOverride` reaches the engine in a
+    wired install, and a gated resource the override does not keep is recorded as past its gate.
+  - Every move the router makes is recorded in `routing.moves` with its own target, and the report
+    and the inspector name each one, the tie-break included.
+  - A review the plan promised goes to the reviewer it named, whatever asked for it.
+  - The governor treats a measurement as the floor under an estimate at any confidence.
+    Its pressure from a balance is continuous at both floors for every floor setting except floors
+    of nothing (both 0, or one 0 and the other unset), where an empty balance reads 1 and a cent
+    above it gives no floor reading, so a share spent speaks if there is one and the resource
+    otherwise reads as unknown.
+    It refuses policy values its arithmetic cannot use, and conservation acts only on a resource
+    that is actually being used up.
+  - Masking: short model ids, a vendor word with a version, and a point release after any name are
+    masked; model aliases are not names; the routing call and the review call mask the same names
+    (`features.js` `identityNames`: id, display name, providers, model ids), including the model a
+    CLI agent really runs; no field is a hiding place from the masker.
+  - The review call says truthfully why each resource is outside the work table and carries the
+    numbers of one kept for review.
+  - Labels: a planned forced review is not a rescue; a strategy, conservation, second-opinion or
+    frontier answer is labelled by a run only where it could change that run.
+  - Verdicts: the client sends the run id every routed answer carries, so a verdict lands on its
+    own run; a verdict credits capability evidence once, relabels its run's routing samples, keeps
+    what it counted only when re-posted unchanged, and is withdrawn by a clear or a change even with
+    learning off, without bringing in a verdict given while learning was off; it relabels only the
+    samples its run labels, never one the engine left out on purpose.
+  - Maturity: recent accuracy and calibration read only rows the classifier was not trained on,
+    and a window too short to measure is not read as a regression; a pending regression, and a bad
+    window counted at the rung the domain holds, blocks promotion; a window needs new rows; every
+    rung up to the one lost is re-earned on new evidence; stepping down from a local rung settles
+    the bad windows; a retrained classifier at a local rung serves only after passing that rung's
+    gates.
+  - `resources.economics` reaches the engine, the executor ranking and the cost tier in the track
+    record Jev reads; the upgrade seed reads decision records; familiarity is counted by resource
+    id, not by the positional key; the local-model rewrite of a background result keeps the agent
+    chain and the run mark exactly as written.
+  Still open:
+  - Jev is offered only the capabilities some agent in the run's pool can carry out, so it cannot
+    name one nobody here has: on **Jev Auto · Local** a look-up (`web_research`) is classified as
+    something a local model can do and runs on it, and the router's "nothing here can do this"
+    refusal fires only for a capability that was offered but that no agent left in the pick pool
+    can do.
+    Offering the whole vocabulary so the code can refuse is a design choice for the owner, since it
+    also lets Jev name capabilities the machine could never run.
+  - A verdict on an answer from before the run mark existed is still credited by time: a FIRST
+    verdict on an older answer, given after a newer run in the same session had ended, lands on
+    that newer run.
+  - Executors: only local runs return `modelVersion`; a cloud or subscription executor that can
+    report the model it served should return it from `execute`, and `router.js` will record it.
+  - The `POST /jev-router/feedback` line itself is untested: `acceptVerdict` and `onVerdict` are
+    tested end to end with a real registry, training store and feedback log, but nothing drives
+    `apply()`, so the one line that calls `acceptVerdict` from the route is covered by reading only.
 
 Closed on the way past, so nobody re-opens them: the `README.md` dangling "described below" is gone
 (it reads "the list below" and resolves), and the one machine-specific path in the repo, a Windows
@@ -100,8 +239,36 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
 
 ## Built but NOT observed, do not claim these as working
 
-- The gemma 4 message transfer (`format.js`). No real local call has ever been made, only fake
-  streams. Its chunking, timeout and fallback paths are unit-tested.
+- **The whole adaptive router** (22 Sep, `feat/adaptive-routing`, audited and fixed 23 Sep). It is
+  covered by its own test files (`adaptive`, `classifier`, `decision`, `domains`, `governor`,
+  `jev`, `observability`, `policy`, `profiles`, `resources`, `training` under
+  `plugins/jev-router/test/`, plus the adaptive-routing cases added to the older `router` file; run
+  `node --test` on them for the current count) and driven end to end by `scripts/kzh-routing-demo.mjs`,
+  which runs the real policy, adapters, governor, capability registry, decision engine, broker,
+  routing loop, training store and maturity ladder with only the agents and Jev stood in for. That
+  is a real exercise of the code, but it is not the running app: no KzH start has been watched
+  route a task this way, and the inspector's new **Router** tab has never been seen render, for
+  the usual reason that a `client.js` change needs an app START. Reference:
+  [`adaptive-routing.md`](adaptive-routing.md); what it still does not do is the last section of
+  that file, not repeated here.
+- **Live provider quota through the new adapters.** `snapshotResources` reads the same
+  `usage.js` numbers the Usage tab has always shown, so the inputs are real, but the normalised
+  snapshot (`kind`, `scope`, `rolling`, `resetsAt`, `source`, `confidence`, `fieldSources`) has
+  only ever been built from those numbers in tests. Anthropic reports no plan name, so a Claude
+  plan is unknown unless `resources.plans` names it, and an unknown plan gets the default
+  conservation curve (60% to 85%), not the Max one (70% to 90%). Only `rolling_window` and
+  `monetary_budget` limits at scope `account` are ever produced; DeepSeek's `total`, `used` and
+  `ratioUsed` are derived from a locally seen high-water mark and labelled so.
+- **Jev review, as it really runs.** From `bb66efb` until the 23 Sep fix, every real Jev review
+  threw on the check shape jev-review passes (`checks.map` on `{ results, regressed, fixed,
+  failing }`) and silently fell back to the deterministic policy; the tests passed because they
+  handed over a bare array. Any review seen in that period was the fallback. The fixed path is
+  covered by tests only.
+
+- The gemma 4 message transfer (`format.js`).
+  No real local call has ever been made, only fake streams.
+  Its chunking and fallback paths are unit-tested, and so is keeping the agent chain and the run mark out of the rewrite.
+  Its timeout is not: no test sets `timeoutMs`, checks the `AbortSignal` passed to the stream, or runs a stream that outlasts the deadline.
 - The orphan-kill path of `Use it here`; only its holder classification was exercised.
 - The work-board indicator's LIVE state was rendered from server-shaped data, not a running task.
 - The context-row revert and the Overview Markdown (22 Sep). Unit-tested, but a `client.js` change
@@ -133,16 +300,36 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
 - Composer history: ArrowUp recalls the previous input, ArrowDown walks forward.
 - Left sidebar file tree beside the Workspaces search icon, one level at a time, 400-row cap,
   clicking a file opens it in the right sidebar.
-- App shell: the `ELECTRON_RUN_AS_NODE` false-positive startup refusal is fixed, and a
-  `Use it here` button recovers a port held by our own orphaned engine.
+- App shell: the `ELECTRON_RUN_AS_NODE` false-positive startup refusal is fixed.
+  On the port-busy screen only the holder classification behind `Use it here` was exercised: `inspectPortHolder` (`app/main.js`) sorts the process on port 3080 into `orphan`, `running` or `foreign`, and the button is shown only for `orphan`.
+  What a click then does (stop that process tree and start this app's engine, `useHere`) has never been observed, so it stays under Built but NOT observed.
 - `scripts/kzh-ui-test.mjs`: a dependency-free CDP tester that replaces Playwright here.
 
 ## Root causes worth keeping
 
+- **A masker's refusal fell back to the raw text.** The masker stopped matching `grok-2` inside
+  `grok-2.1`, which is right, since the longer string is a different version. A brand word had a
+  longer pattern to catch it, but a configured name that is no brand word had none, so the whole
+  version string went out verbatim. For a masker, "this is not that name" has to mean "mask it as
+  something else", never "leave it".
+- **A count outlived the rung it was about.** The bad-window count survived a rollback that did
+  not come from its own evaluation (a critical failure), rode the whole climb back, and made the
+  first bad window at the re-earned rung look "sustained". State that describes a rung has to be
+  settled when the rung is left, whatever took it.
+- **The weekly gate was never part of capability eligibility, while the code said it was.**
+  `router.js` built `unavailableIds` as `[...notReady, ...outAtStart, ...gatedIds].map((a) => a.id)`,
+  but `gatedIds` holds id STRINGS, and `'claude'.id` is `undefined`. So every gated agent counted as
+  capable, a checker reasoned from the line as written and reported the opposite bug, and the first
+  fix for it passed its tests against the old code. The lesson has two halves: a map over a mixed
+  array of objects and strings fails silently, and a new test is not a regression test until it has
+  been run against the code it claims to fix and seen to fail.
+
 1. **`requestAnimationFrame` NEVER fires in this renderer.** The window reports `document.hidden`
    true, `visibilityState hidden`, `outerWidth 0`, and a scheduled callback is never called, while
    `setTimeout` works normally. Any work deferred to a frame is a silent no-op. Every coalescer in
-   `client.js` was moved to `setTimeout`, and two tests fail if a frame scheduler is reintroduced.
+   `client.js` was moved to `setTimeout`, and three tests fail if a frame scheduler is reintroduced
+   into the shared `coalesce` helper: one in `test/togglehints.test.js` and two in
+   `test/transcripts.test.js`.
    This was the hidden cause of three features appearing broken.
 
 2. **The task store silently dropped writes.** `tasks.js` persists by writing a `.tmp` file and
@@ -193,10 +380,12 @@ helper's fallback: an unreachable primitives module costs formatting, never the 
 
 ## Standing setup, leave running
 
-- **Hourly balance watch**: scheduled task `kzh-deepseek-balance-watch`, running
-  `node scripts/check-deepseek-balance.mjs`. Exit 0 ok and SILENT, 1 soft handoff, 2 hard cut off,
-  3 could not check. Thresholds 255 soft / 240 hard. It fails open on a network error: a failure
-  to check is never reported as a zero balance. Verified working unattended.
+- **Hourly balance watch**: scheduled task `kzh-deepseek-balance-watch`, running `node scripts/check-deepseek-balance.mjs`.
+  Exit 0 ok, 1 soft handoff, 2 hard cut off, 3 could not check.
+  It prints one `balance-watch:` line on every run, exit 0 included, so the exit code, not the output, is what tells ok from a problem.
+  Thresholds 255 soft / 240 hard, read from `handoffAtBalance` and `minBalance` in `~/.kzh/jev-router/accounts.json`, with 10 and 5 used when they are unset.
+  It fails open on a network error: a failure to check is never reported as a zero balance.
+  Verified working unattended.
 - **Jev triage**: `scripts/jev-triage.mjs` merges duplicate review findings and drops ones with no
   testable claim, in one batched Jev call, about $0.0001. It FAILS OPEN: if Jev is unreachable
   every finding passes through untouched, because losing a real finding to a network error is
@@ -215,9 +404,10 @@ helper's fallback: an unreachable primitives module costs formatting, never the 
 
 ## Gotchas that will waste your time otherwise
 
-- Killing `Kz-harness.exe` does NOT stop the engine it spawned. The engine orphans on port 3080
-  and the next start sits on "another harness is already running on port 3080". Kill the
-  `node ... @deepseek-ai\dsh ... web` process too, and confirm 3080 is free before relaunching.
+- Killing `Kz-harness.exe` does NOT stop the engine it spawned.
+  The engine orphans on port 3080, and the next start stops on "A Kz-harness engine is still running on port 3080, left behind by an app that is no longer open" with a `Use it here` button.
+  That button's kill path has never been observed, so either click it and watch the log, or kill the `node ... @deepseek-ai\dsh ... web` process yourself and confirm 3080 is free before clicking Retry or relaunching.
+  "Another harness is already running on port 3080" now appears only while a live `Kz-harness.exe` still sits above the engine.
 - A `client.js` change needs an app START, not a page reload: the engine composes and caches the
   plugin bundle at startup.
 - `Input.dispatchKeyEvent` delivers NOTHING while the window is hidden. Keyboard checks must use
@@ -226,14 +416,24 @@ helper's fallback: an unreachable primitives module costs formatting, never the 
   `credentials: 'include'`, never from a shell.
 - App-shell changes (`app/**`) need `npm run package` before they reach the exe, and the app must
   be stopped first or packaging fails with EBUSY on the dist directory.
-- The exe refuses debug switches unless `KZH_DEBUG=1`, and then only with
-  `--remote-debugging-port=9222` for `scripts/kzh-ui-test.mjs`.
+- The exe refuses to start with a debug switch (`--inspect`, `--remote-debugging-port`, `--remote-debugging-pipe`, `--js-flags`, or `--inspect` in `NODE_OPTIONS`) unless `KZH_DEBUG=1` is set.
+  With it set, the exe starts with any of these switches and any port, but its fuses still ignore `--inspect` and `NODE_OPTIONS`.
+  For `scripts/kzh-ui-test.mjs`, start it with `--remote-debugging-port=9222`, the port the script uses unless `--port` or `KZH_CDP_PORT` sets another.
 - `~/.kzh/profiles` paths are SYMLINKS, and `grep -r` does not follow symlinked directories.
 
 ## How to verify the current claims
 
 ```
-cd plugins/jev-router && npm test                      # 388 pass expected
-node scripts/kzh-ui-test.mjs list                      # needs the app on a debug port
-node scripts/kzh-ui-test.mjs evalfile <file.js> 3080   # drive the page, in-page events only
+npm --prefix plugins/jev-router test                   # read the tests, pass, fail and skipped totals at the end
+node scripts/kzh-ui-test.mjs list                      # needs the app on a debug port (9222 by default)
+node scripts/kzh-ui-test.mjs evalfile <file.js> 3080   # drive the page whose URL contains 3080, in-page events only
 ```
+
+Run all three from the repo root.
+The `--prefix` form runs the tests inside `plugins/jev-router` without moving the shell, so `scripts/kzh-ui-test.mjs` still resolves.
+When the output is piped, the totals print as `# tests`, `# pass`, `# fail` and `# skipped`; in a terminal the same totals start with an info mark instead of `#`.
+
+`npm test` runs `node --test "test/*.test.js"`, and the node test runner prints the totals as its
+last lines. Those are the numbers the `tests` line under State records; if they disagree, the
+State line is stale, not the run. `# fail` must be 0, and on Linux `# skipped` is the one
+Windows-only test (engine zip unpack).

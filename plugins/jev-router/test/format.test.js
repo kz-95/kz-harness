@@ -105,6 +105,23 @@ test('a report that fits makes exactly one call and returns the rewrite', async 
   assert.equal(stream.calls.length, 1)
 })
 
+test('the agent chain and the run mark skip the model and come back exactly as written', async () => {
+  // They are link definitions the client reads (the chips, and the run a verdict is credited to).
+  // The model is told to drop brackets, and a rewrite that did would cost a background answer both.
+  const stream = countingStream(() => 'Clean prose.')
+  const format = createFormatter({ stream, chatModel: async () => 'gemma', contextOf: () => 16384 })
+  const chain = '[jev-agents]: kzh-agents-1-eyJhIjoxfQ'
+  const run = '[jev-run]: kzh-run-1-3f2a-run'
+  const out = await format({ jobId: 'j8', taskName: 'a thing', state: 'completed' }, `The raw report.\n\n${chain}\n\n${run}`)
+  assert.equal(out, `Clean prose.\n\n${chain}\n${run}`)
+  const sent = JSON.stringify(stream.calls[0].messages)
+  assert.ok(!sent.includes('kzh-agents-1-') && !sent.includes('kzh-run-1-'), 'the markers never reach the model')
+  // A failed rewrite still posts the report exactly as it came, markers in place.
+  const failed = createFormatter({ stream: failingStream(), chatModel: async () => 'gemma', contextOf: () => 16384 })
+  const raw = `Body.\n\n${run}`
+  assert.equal(await failed({ jobId: 'j9' }, raw), raw)
+})
+
 test('a report over the budget is split, rewritten in parts, and stitched', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'kz-format-'))
   const stream = countingStream((n) => `rewritten part ${n}`)

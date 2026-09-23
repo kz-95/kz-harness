@@ -157,3 +157,12 @@ test('createFeedback: an unreadable file reads as empty rather than throwing', a
   writeFileSync(file, 'not json at all\n')
   assert.deepEqual(await createFeedback({ file }).list(), [])
 })
+
+test('validFeedback: the run the answer came from is kept when given, checked, and not stored on a clear', () => {
+  const r = validFeedback(body({ runId: ' 0f8fad5b-d9cb-469f-a165-70867728950e ' }))
+  assert.equal(r.runId, '0f8fad5b-d9cb-469f-a165-70867728950e', 'the exact link from the message to its run')
+  assert.equal('runId' in validFeedback(body()), false, 'absent stays absent')
+  assert.throws(() => validFeedback(body({ runId: 'no spaces allowed' })), /runId/)
+  assert.throws(() => validFeedback(body({ runId: 'x'.repeat(81) })), /runId/)
+  assert.equal('runId' in validFeedback(body({ verdict: 'clear', runId: 'run-1' })), false, 'a clear needs only its keys')
+})
