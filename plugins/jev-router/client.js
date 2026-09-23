@@ -1358,6 +1358,7 @@ window.__ModuleLoader__.load({
     // ---- end pure display helpers
     const AUTHORITY = {
       local: ['ok', 'local router'],
+      code: ['ok', 'routing rules'],
       jev: ['', 'Jev'],
       fallback: ['warn', 'safe fallback'],
       none: ['', 'not asked'],

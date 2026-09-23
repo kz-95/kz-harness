@@ -488,10 +488,12 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
      *   task      (default on)  what the request needs: type, complexity, risk, the requirement
      *                           dimensions, skills, minimum and preferred tier, verification,
      *                           capability category, tools
-     *   resource  (when `candidates` is given)  which anonymous candidate should do the work
-     *                           and which execution strategy
-     *   judgments (when `candidates` is given)  second opinion, conservation, frontier review:
-     *                           three yes/no judgments that teach three domains of their own
+     *   resource  (when `candidates` is given)  how the work should be organised across the
+     *                           anonymous candidates: the execution strategy. WHICH candidate does
+     *                           it is not asked, because that is a comparison of numbers
+     *   judgments (when `candidates` is given)  the second opinion: one yes/no judgment that
+     *                           teaches a domain of its own. Conservation and the frontier review
+     *                           were here too, and are rules in code now for the same reason
      *   agent     (legacy: `agents` without `candidates`)  the old named-agent choice
      *
      * `ask.task` false skips the task group when a local classifier already produced the
@@ -505,9 +507,9 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
     async route({ task, context, agents = [], candidates, strategies, tools = [], history, availability, trackRecord, identities, handoff, capabilities, taskProfile, ask: want = {} }, signal) {
       const askTask = want.task !== false
       const askResource = !!candidates?.length && want.resource !== false
-      // The judgment nouls (second opinion, conservation, frontier review) are their own group:
-      // they teach three routing domains that mature on their own, so they must be askable
-      // without the resource choice and skippable when only the resource choice is still open.
+      // The judgment noul is its own group: it teaches a routing domain that matures on its own,
+      // so it must be askable without the strategy choice and skippable when only the strategy is
+      // still open.
       const askJudgments = !!candidates?.length && want.judgments !== false
       const carriesTable = askResource || askJudgments
       // The named-agent question never rides a call that carries the anonymous table: its
@@ -535,17 +537,14 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
             return { ...(anon ? anon.maskFree(rest) : rest), ...(key ? { first_resource: key } : {}) }
           })
         }
-        if (anon) {
-          // These two maps are keyed by agent id, and only their top level is: that key goes
-          // through the id->key mapping. Everything under it (task types, cost tiers) is the
-          // evidence itself, so only its free text is masked.
-          const byKey = (map) => Object.fromEntries(Object.entries(map ?? {}).map(([id, v]) => [anon.keyOf(id), v]).filter(([k]) => k))
-          if (availability) state.candidate_availability = anon.maskFree(byKey(availability))
-          if (trackRecord) state.candidate_track_record = anon.maskFree(scrubDeep(byKey(trackRecord)))
-        }
+        // The per-candidate track record and availability used to ride this call under the same
+        // keys, for the resource question to read. That question is gone, and state no question
+        // reads costs tokens and loses accuracy on the rest of it, so they are not sent at all.
       }
       if (handoff) state.handoff = clip(handoff, 3000)
-      if (carriesTable) state.candidates = candidateState(candidates)
+      // Only the call that asks the strategy question reads the table; a judgments-only call
+      // would be paying for a table nothing in it looks at.
+      if (askResource) state.candidates = candidateState(candidates)
       if (!askTask && taskProfile) state.task_profile = scrubDeep(taskProfile)
       const questions = {}
       if (askAgent) {
@@ -626,15 +625,11 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         }
       }
       if (askResource) {
-        const profileNote = askTask ? 'Judge the task from `task` itself.' : 'The task profile is `task_profile`: what the task needs, how complex and risky it is.'
-        questions.resource = choice(
-          {
-            question: 'Which candidate in `candidates` should do the work for `task`?',
-            focus: `${profileNote} Each candidate is anonymous: judge it only by its capability scores on the dimensions the task needs (a score with low confidence or few verified runs is a guess), its scarcity (subscription capacity is already paid for but runs out; spend scarce capacity where its extra capability matters and not on work a cheaper candidate can do), its expected cost including likely retries, its reliability and latency. Do not choose a candidate materially weaker than the task needs just because it is cheap.`
-              + (state.candidate_track_record ? ' `candidate_track_record` and `candidate_availability` use the same keys: how each candidate has done on earlier work here, and whether it is near a limit.' : ''),
-          },
-          Object.fromEntries(candidates.map((c) => [c.key, { what: candidateLine(c) }])),
-        )
+        // Which candidate does the work is not asked here. Ranking candidates means weighing
+        // capability against cost against scarcity, all of them numbers, and comparing magnitudes
+        // is the one thing a snap-judgment classifier cannot do: that decision is a rule in code
+        // (broker.js rankCandidates). What is left for a judgment is the shape of the run, which
+        // is a categorical choice over named strategies and nothing to do with arithmetic.
         const strategyKeys = (strategies?.length ? strategies : Object.keys(STRATEGIES)).filter((s) => STRATEGIES[s])
         if (strategyKeys.length > 1) {
           questions.strategy = choice(
@@ -651,11 +646,10 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         // routed run, so one whose answer nothing acts on is not asked: "is the cheapest enough"
         // is what the conservation question already decides, and a consistency-review answer had
         // no step that would carry it out.
-        Object.assign(questions, {
-          secondOpinion: noul('Would an independent second agent reviewing the result of `task` likely catch mistakes worth the extra time?'),
-          conserve: noul({ question: 'Should the scarce capacity of the most capable candidate in `candidates` be conserved for harder work than `task`?', focus: 'Yes when a cheaper candidate is likely enough for this task; no when the extra capability matters here.' }),
-          frontierReview: noul({ question: 'Should the strongest candidate in `candidates` review the result of `task` before it is accepted?', focus: 'Yes for security-sensitive, high-risk or subtle multi-module work; no for routine work the checks already cover.' }),
-        })
+        // Conservation and the frontier review are not here either: both weighed a candidate's
+        // scarcity or the task's risk against a threshold, which is arithmetic, and both are
+        // decided in code now (decision.js). What is left is one judgment about the task itself.
+        questions.secondOpinion = noul('Would an independent second agent reviewing the result of `task` likely catch mistakes worth the extra time?')
       }
       if (!Object.keys(questions).length) throw new Error('jev.route: nothing to ask')
       // Per-tool fits/params are speculative; only the handler's pick is used.
@@ -664,7 +658,6 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
       const handler = answers.handler?.choice ?? 'agent'
       const params = handler === 'agent' ? [] : Object.keys(tools.find((t) => t.id === handler)?.params ?? {})
       const profile = askTask ? profileFromAnswers(answers) : null
-      const validKey = (k) => candidates?.some((c) => c.key === k)
       return {
         model: usedModel,
         ...(askAgent ? {
@@ -673,19 +666,9 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
           agentProbabilities: answers.agent.probabilities,
         } : {}),
         ...(askResource ? {
-          resource: {
-            // A key outside the offered set (a mocked or confused answer) is not a pick.
-            chosenKey: validKey(answers.resource?.choice) ? answers.resource.choice : undefined,
-            confidence: answers.resource?.confidence,
-            probabilities: answers.resource?.probabilities ?? {},
-          },
           strategy: answers.strategy ? { choice: answers.strategy.choice, confidence: answers.strategy.confidence, probabilities: answers.strategy.probabilities ?? {} } : undefined,
         } : {}),
-        ...(askJudgments ? {
-          secondOpinion: answers.secondOpinion?.noul,
-          conserve: answers.conserve?.noul,
-          frontierReview: answers.frontierReview?.noul,
-        } : {}),
+        ...(askJudgments ? { secondOpinion: answers.secondOpinion?.noul } : {}),
         ...(profile ? {
           profile,
           // What the request needs. Undefined when no registry was wired, so nothing downstream

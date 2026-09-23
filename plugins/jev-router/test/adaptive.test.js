@@ -80,8 +80,9 @@ const verdict = (v, over = {}) => ({
   ...over,
 })
 
-/** A fake Jev whose resource pick and strategy the test names, recording what it was asked. */
-function fakeJev({ profile = profileOf(), pick, strategy = 'STANDARD_DIRECT', assess = () => verdict('accept') } = {}) {
+/** A fake Jev whose strategy the test names, recording what it was asked. Who does the work is
+ * not asked of it: a rule in code ranks the candidates. */
+function fakeJev({ profile = profileOf(), strategy = 'STANDARD_DIRECT', assess = () => verdict('accept') } = {}) {
   const calls = []
   return {
     calls,
@@ -89,12 +90,8 @@ function fakeJev({ profile = profileOf(), pick, strategy = 'STANDARD_DIRECT', as
       calls.push(args)
       const out = { model: 'jev-test' }
       if (args.ask?.task) { out.profile = profile; Object.assign(out, { taskType: profile.taskType, complexity: profile.complexity, risk: profile.risk, handler: 'agent' }) }
-      if (args.candidates && args.ask?.resource) {
-        const chosen = pick ? pick(args.candidates) : args.candidates[0]
-        out.resource = { chosenKey: chosen.key, confidence: 0.85, probabilities: Object.fromEntries(args.candidates.map((c) => [c.key, c.key === chosen.key ? 0.85 : 0.15 / Math.max(1, args.candidates.length - 1)])) }
-        out.strategy = { choice: strategy, confidence: 0.8, probabilities: { [strategy]: 0.8 } }
-      }
-      if (args.candidates && args.ask?.judgments) Object.assign(out, { secondOpinion: 0.2, conserve: 0.3, frontierReview: profile.risk >= 0.8 ? 0.9 : 0.1 })
+      if (args.candidates && args.ask?.resource) out.strategy = { choice: strategy, confidence: 0.8, probabilities: { [strategy]: 0.8 } }
+      if (args.candidates && args.ask?.judgments) out.secondOpinion = 0.2
       return out
     },
     assess: async (...a) => assess(...a),
@@ -206,15 +203,12 @@ test('the candidate table Jev sees carries capability evidence and no provider n
   }
 })
 
-test('scenario Q: a verified rescue labels the rescuer, not the teacher\'s pick', async () => {
+test('scenario Q: a verified rescue labels the rescuer, not the pick the ranking made', async () => {
   const dir = repo()
   const s = stack()
-  // Jev picks the first candidate; it fails, and the retry by another resource succeeds.
+  // The ranking picks; that resource fails, and the retry by another one succeeds.
   let attempt = 0
-  const jev = fakeJev({
-    pick: (cs) => cs[0],
-    assess: () => (attempt === 1 ? verdict('retry') : verdict('accept')),
-  })
+  const jev = fakeJev({ assess: () => (attempt === 1 ? verdict('retry') : verdict('accept')) })
   const used = []
   const execute = async (a) => {
     used.push(a.id)
@@ -231,19 +225,24 @@ test('scenario Q: a verified rescue labels the rescuer, not the teacher\'s pick'
   assert.ok(outcome, 'the run taught the resource domain something')
   assert.equal(outcome.verified, true)
   assert.equal(outcome.labelSource, 'verified_outcome')
-  assert.notEqual(outcome.chosenKey, sample.teacher.chosenKey, 'the label is the rescuer, not the pick that failed')
-  assert.equal(outcome.negativeKey, sample.teacher.chosenKey, 'and the failed pick is recorded as the negative')
+  assert.notEqual(outcome.chosenKey, sample.code.chosenKey, 'the label is the rescuer, not the pick that failed')
+  assert.equal(outcome.negativeKey, sample.code.chosenKey, 'and the failed pick is recorded as the negative')
 })
 
-test('a pick that worked confirms the teacher rather than contradicting it', async () => {
+test('a pick the ranking made and the run confirmed teaches nothing: the rule would be agreeing with itself', async () => {
+  // The same rule that keeps a mature local classifier from training on its own answers. A run
+  // that went as planned confirms whoever chose, and here the chooser is the ranking the local
+  // classifier is meant to learn past, so an accepted run is no evidence at all. Evidence that
+  // contradicts the pick is real either way, and scenario Q above shows it still gets through.
   const dir = repo()
   const s = stack()
-  const jev = fakeJev({ pick: (cs) => cs[0] })
+  const jev = fakeJev()
   const r = await runRouted({ task: 'make the test pass', cwd: dir, config, signal, deps: deps(s, jev, async () => fixer(dir)) })
   const sample = (await s.store.list({ domain: 'resource_selection' })).at(-1)
-  const outcome = labelFromRun('resource_selection', sample, r)
-  assert.equal(outcome.labelSource, 'teacher_confirmed')
-  assert.equal(outcome.chosenKey, sample.teacher.chosenKey)
+  assert.equal(sample.authority, 'code', 'the ranking decided it')
+  assert.equal(sample.teacher, null, 'no teacher was asked')
+  assert.ok(sample.code.chosenKey, 'and what the rule chose is on the sample, so an outcome can contradict it')
+  assert.equal(labelFromRun('resource_selection', sample, r), null)
 })
 
 test('scenario L: recorded execution evidence moves the effective capability, with no code change', async () => {
@@ -298,7 +297,7 @@ test('scenario AC: once the routing domains have matured, a normal run makes no 
   const s = stack({ root })
   // Teach every routing domain from runs that all look the same, which is what "in distribution"
   // means: the same kind of task, the same pool, the same answer.
-  const jev = fakeJev({ pick: (cs) => cs[0] })
+  const jev = fakeJev()
   for (let i = 0; i < 40; i++) {
     const dir = repo()
     const r = await runRouted({ task: `make the test pass ${i}`, cwd: dir, config, signal, deps: deps(s, jev, async () => fixer(dir)) })
@@ -312,7 +311,10 @@ test('scenario AC: once the routing domains have matured, a normal run makes no 
   const states = s.domains.states()
   const mature = Object.entries(states).filter(([, st]) => st.maturity === 'GUARDED_LOCAL' || st.maturity === 'LOCAL_ONLY').map(([id]) => id)
   assert.ok(mature.includes('task_classification'), `the task classifier matured (states: ${JSON.stringify(Object.fromEntries(Object.entries(states).map(([k, v]) => [k, v.maturity])))})`)
-  assert.ok(mature.includes('resource_selection'), 'and so did resource selection')
+  // Resource selection does not mature on runs like these, and that is the labelling rule working:
+  // the ranking made every pick, so forty accepted runs are forty rounds of a rule agreeing with
+  // itself. Only a run that contradicts a pick teaches this domain anything.
+  assert.ok(!mature.includes('resource_selection'), 'nothing contradicted a pick, so nothing was learned from them')
 
   // Now a run of the same shape: the domains that matured decide for themselves.
   const before = jev.calls.length
@@ -321,8 +323,9 @@ test('scenario AC: once the routing domains have matured, a normal run makes no 
   const asked = jev.calls.slice(before)
   const domainsReport = r.routing.decision.domains
   assert.equal(domainsReport.task_classification.authority, 'local', 'the task profile came from the local classifier')
-  assert.equal(domainsReport.resource_selection.authority, 'local', `and so did the resource pick (${JSON.stringify(domainsReport.resource_selection)})`)
+  assert.equal(domainsReport.resource_selection.authority, 'code', `and the ranking made the pick (${JSON.stringify(domainsReport.resource_selection)})`)
   assert.equal(asked.filter((c) => c.ask?.task).length, 0, 'no task-classification call was made')
+  assert.ok(asked.every((c) => !c.questions?.resource), 'and no call asked which resource should do the work')
   assert.equal(r.finalStatus, 'accepted')
   assert.match(formatReport(r), /local router decided|Jev and the local router decided/)
 })
@@ -421,7 +424,7 @@ test('no Jev call of an adaptive run names a resource anywhere: route and review
   })
   assert.ok(r.routing.decision, 'the decision engine routed this run')
   const tableCalls = sent.filter((c) => Array.isArray(c.state.candidates))
-  assert.ok(tableCalls.some((c) => c.questions.resource), 'the resource call carried the anonymous table')
+  assert.ok(tableCalls.some((c) => c.questions.strategy), 'the strategy call carried the anonymous table')
   assert.ok(tableCalls.some((c) => c.questions.reviewAgent), 'and so did the review call')
   for (const call of sent) {
     const kind = Object.keys(call.questions).includes('verdict') ? 'review' : 'route'
@@ -431,11 +434,11 @@ test('no Jev call of an adaptive run names a resource anywhere: route and review
   assert.equal(r.assessments[0].mode, 'jev', JSON.stringify(r.assessments[0]))
 })
 
-test('the production resource call carries the evidence under the anonymous keys, and still names nothing', async (t) => {
+test('the production strategy call carries the evidence under the anonymous keys, and still names nothing', async (t) => {
   // The guard above proves nothing leaks, and an empty call passes it too: without the decision
-  // engine's id-to-key mapping jev.js drops the track record, the availability and who ran each
-  // earlier task, and the teacher picks with no history at all. This walks the real stack (router,
-  // decision engine, jev.js) and checks the evidence arrived, keyed right, as well as anonymous.
+  // engine's id-to-key mapping jev.js drops who ran each earlier task, and the teacher answers
+  // with no history at all. This walks the real stack (router, decision engine, jev.js) and checks
+  // the evidence arrived, keyed right, as well as anonymous.
   const { sent, restore } = transport()
   t.after(restore)
   const dir = repo()
@@ -445,33 +448,25 @@ test('the production resource call carries the evidence under the anonymous keys
     task: 'make the failing test pass', cwd: dir, config: namedConfig, signal,
     deps: deps(s, jev, async () => fixer(dir), { history: namedHistory(dir), quota: namedQuota }),
   })
-  const call = sent.find((c) => c.questions.resource)
-  assert.ok(call, 'the decision engine asked the resource question')
-  assert.deepEqual(leaks(call), [], 'the resource call named a resource')
+  const call = sent.find((c) => c.questions.strategy)
+  assert.ok(call, 'the decision engine asked the strategy question')
+  assert.deepEqual(leaks(call), [], 'the strategy call named a resource')
   const { state } = call
   // Which key is which agent, from the run's own decision record: the test reads it, Jev never does.
   const keyOf = Object.fromEntries(r.routing.decision.candidates.map((c) => [c.id, c.key]))
   const offered = state.candidates.map((c) => c.key)
   assert.deepEqual(Object.keys(keyOf).sort(), ['claude', 'codex', 'deepseek'])
 
-  const record = state.candidate_track_record
-  assert.ok(record && Object.keys(record).length, 'the track record rides the resource call')
-  assert.deepEqual(Object.keys(record).sort(), [...offered].sort(), 'keyed by exactly the table keys')
-  // Each record sits under the key of the agent it describes, with its categorical facts intact.
-  assert.equal(record[keyOf.claude].here_by_task_type.implementation.attempts, 3, 'three runs by claude in this workspace')
-  assert.equal(record[keyOf.codex].availability, 'near limit')
-  assert.equal(record[keyOf.codex].feedback.dislikes, 1)
-  assert.equal(record[keyOf.codex].feedback.recent_reasons[0], `wrong agent: ${keyOf.codex} broke it, ${keyOf.claude} would not have`, 'a typed reason keeps its meaning under the keys')
-  assert.equal(record[keyOf.deepseek].cost_tier, 'api')
-  assert.equal(record[keyOf.claude].cost_tier, 'subscription')
-  assert.match(record[keyOf.deepseek].price_now, /^peak rate until/)
-  assert.deepEqual(state.candidate_availability, { [keyOf.claude]: 'ok', [keyOf.codex]: 'near limit', [keyOf.deepseek]: 'ok' })
+  assert.ok(offered.length >= 2, 'the anonymous table rode the call')
 
   // Who ran each earlier task, as the key of the agent that ran it.
   assert.deepEqual(state.recent_outcomes.map((h) => h.first_resource), [keyOf.claude, keyOf.codex, keyOf.claude, keyOf.deepseek, keyOf.claude])
   assert.ok(state.recent_outcomes.every((h) => h.task_type === 'implementation' && !('first_agent' in h)))
   assert.equal(state.agent_track_record, undefined)
-  assert.ok(call.questions.resource.instructions.focus.includes('candidate_track_record'), 'and the question tells the teacher to read it')
+  // The per-candidate track record and availability were read by the resource question alone, and
+  // that question is decided in code now, so nothing carries them any more.
+  assert.equal(state.candidate_track_record, undefined)
+  assert.equal(state.candidate_availability, undefined)
 })
 
 test('the retry pick is made over the anonymous machine data and lands on the agent that key stands for', async (t) => {

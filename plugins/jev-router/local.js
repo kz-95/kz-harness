@@ -389,6 +389,101 @@ export function rateModule(m, specs, variant, { installed = false } = {}) {
   return { fit: 'cpu', label: `CPU only (slow, ~${words(tps)} words/s est.)`, wordsPerSec: words(tps) }
 }
 
+/** Compute buffers and the scratch llama.cpp keeps beside the weights, whatever the context. */
+const COMPUTE_GB = 0.3
+/** What a token of context costs in the KV cache when the manifest does not say. */
+const FALLBACK_KV_GB_PER_TOKEN = 100 / 1024 / 1024
+
+/**
+ * What a token of context costs this model in the KV cache, in GB.
+ *
+ * The manifest may say outright (`kvGbPerToken`). Otherwise it is read back out of the figure the
+ * manifest does carry: `recommendedVramGB` is what the model wants at its own context size, so
+ * whatever that is over the weights, the compute buffers and the desktop's own reserve is the KV
+ * cache for that many tokens. A model with neither falls back to a flat guess, which is the only
+ * number here that is truly invented and the first one a measured run replaces.
+ */
+export function kvGbPerToken(m) {
+  if (Number.isFinite(m.kvGbPerToken)) return m.kvGbPerToken
+  const ctx = m.contextSize
+  const headroom = (m.recommendedVramGB ?? 0) - m.size / GB - COMPUTE_GB - RESERVE_GB
+  if (Number.isFinite(ctx) && ctx > 0 && headroom > 0) return headroom / ctx
+  return FALLBACK_KV_GB_PER_TOKEN
+}
+
+/**
+ * Roughly what this model will take here, in GB, split the way it will actually load: the weights
+ * and their KV cache ride whichever memory holds the layers, so the GPU's share is the share of
+ * layers it takes, and the rest stays in RAM. `RESERVE_GB` is the desktop and the CUDA context,
+ * which is spent the moment anything at all goes to the GPU.
+ *
+ * Every number is an estimate until the model has actually run once. `source` says which it is,
+ * so nothing shows a guess and a measurement in the same shape; `measured` is what a test run
+ * recorded for this model at this context size, and it wins outright when it is there.
+ *
+ * @param {object} m         manifest model entry
+ * @param {object} p
+ * @param {number} p.ctx     context size the model will run with
+ * @param {number} [p.vramGB] GPU memory the engine may use; 0 for a CPU-only run
+ * @param {object} [p.measured] a previous run's reading: { vramGB, ramGB }
+ * @returns {{ vramGB: number, ramGB: number, totalGB: number, gpuFraction: number, source: 'measured'|'estimated' }}
+ */
+export function estimateMemory(m, { ctx, vramGB = 0, measured = null } = {}) {
+  if (measured && Number.isFinite(measured.vramGB) && Number.isFinite(measured.ramGB)) {
+    return { ...measured, totalGB: measured.vramGB + measured.ramGB, gpuFraction: measured.gpuFraction ?? null, source: 'measured' }
+  }
+  const weights = m.size / GB
+  const kv = Math.max(0, ctx) * kvGbPerToken(m)
+  const live = weights + kv + COMPUTE_GB
+  // The same reading of the GPU's room rateModule uses, so the picker's speed and its memory can
+  // never describe two different splits of the same model.
+  const room = Math.max(0, vramGB - RESERVE_GB)
+  const gpuFraction = live > 0 ? Math.min(1, room / live) : 0
+  const onGpu = live * gpuFraction
+  return {
+    vramGB: r1(onGpu > 0 ? onGpu + RESERVE_GB : 0),
+    ramGB: r1(live - onGpu),
+    totalGB: r1(live + (onGpu > 0 ? RESERVE_GB : 0)),
+    gpuFraction: r1(gpuFraction),
+    source: 'estimated',
+  }
+}
+
+const r1 = (x) => Math.round(x * 10) / 10
+
+/**
+ * What the engine says it actually took, read from its own load report. llama.cpp prints one
+ * line per buffer it allocates - the weights, the KV cache and the compute scratch - each named
+ * by the device that holds it, so the split is read rather than guessed. A device named CPU is
+ * RAM and anything else is the GPU, which is the one assumption here and the one that holds for
+ * CUDA, Vulkan and Metal alike.
+ *
+ * Returns null until at least one buffer line has been seen, so a caller can tell "the engine
+ * has not said yet" from "the engine said nothing was allocated".
+ *
+ * @param {string[]} lines  the engine's output, in any order
+ * @returns {{ vramGB: number, ramGB: number, totalGB: number, gpuFraction: number }|null}
+ */
+export function readMemoryUsage(lines) {
+  let vramMiB = 0
+  let ramMiB = 0
+  let seen = false
+  for (const l of lines) {
+    const m = /(\S+)\s+(?:model|KV|compute)\s+buffer size\s*=\s*([\d.]+)\s*MiB/i.exec(String(l))
+    if (!m) continue
+    const mib = Number(m[2])
+    if (!Number.isFinite(mib)) continue
+    seen = true
+    if (/^cpu/i.test(m[1])) ramMiB += mib
+    else vramMiB += mib
+  }
+  if (!seen) return null
+  const vramGB = vramMiB / 1024
+  const ramGB = ramMiB / 1024
+  const total = vramGB + ramGB
+  return { vramGB: r1(vramGB), ramGB: r1(ramGB), totalGB: r1(total), gpuFraction: total > 0 ? r1(vramGB / total) : 0 }
+}
+
 /** Default context and GPU layers for a model on this PC (manifest values unless the PC is small). */
 // DSH's system prompt plus tool list alone is ~8.6k tokens, so a local model needs well over 8k of context.
 export const MIN_CTX = 12288
@@ -492,7 +587,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   let installing = Promise.resolve()
   const jobs = new Map() // module id -> { state: queued | downloading | extracting | done | failed, received, total, bytesPerSec, error }
 
-  const DEFAULTS = { chatModel: null, idleMinutes: 10, gpuLayers: null, keepWarm: false, loadAtStart: null }
+  const DEFAULTS = { chatModel: null, idleMinutes: 10, gpuLayers: null, keepWarm: false, loadAtStart: null, measured: {} }
   const loadMs = new Map() // model id -> last load time, for the "~8 s" estimate
   const readSettings = async () => ({ ...DEFAULTS, ...JSON.parse(await readFile(settingsFile, 'utf8').catch(() => '{}')) })
   async function setSettings(patch) {
@@ -517,11 +612,29 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       if (!(await installed()).some((m) => m.id === patch.chatModel)) throw new Error(`${patch.chatModel} is not installed`)
       s.chatModel = patch.chatModel
     }
+    await save(s)
+    return s
+  }
+
+  async function save(s) {
     await mkdir(dirname(settingsFile), { recursive: true })
     await writeFile(`${settingsFile}.tmp`, JSON.stringify(s, null, 2))
     await rename(`${settingsFile}.tmp`, settingsFile)
-    return s
   }
+
+  /**
+   * Keep what a real load took, under the model and the context size it was measured at, so the
+   * estimate is only ever shown for a pairing nothing has measured yet. A later reading replaces
+   * an earlier one: the newest run is the one that describes this machine as it is now.
+   */
+  async function recordMemory(modelId, ctx, memory) {
+    const s = await readSettings()
+    s.measured = { ...s.measured, [`${modelId}@${ctx}`]: { ...memory, at: new Date().toISOString() } }
+    await save(s)
+  }
+
+  /** What a run recorded for this model at this context size, or null if none has. */
+  const measuredFor = (s, modelId, ctx) => s.measured?.[`${modelId}@${ctx}`] ?? null
 
   // Install markers. Engine: <engineDir>/.installed/<id>.json once its zip was verified and unpacked.
   // Model/vision: <modelsDir>/.verified/<file>.json with the file's size, mtime and hash, so a 5 GB file is hashed once.
@@ -650,11 +763,14 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       ...(vision ? ['--mmproj', join(modelsDir, vision.file), '--no-mmproj-offload'] : ['--no-mmproj']),
     ]
     const child = spawn(exe, args, { cwd: engineDir, env: { ...process.env, LLAMA_API_KEY: key }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    const e = { child, modelId: m.id, port, key, ctx: d.ctx, vision: !!vision, startedAt: Date.now(), gpuLayers: null, tail: [] }
+    const e = { child, modelId: m.id, port, key, ctx: d.ctx, vision: !!vision, startedAt: Date.now(), gpuLayers: null, tail: [], memoryLines: [], memory: null }
     const onLine = (chunk) => {
       for (const l of String(chunk).split('\n')) {
         const off = /offloaded (\d+)\/(\d+) layers to GPU/.exec(l)
         if (off) e.gpuLayers = { gpu: Number(off[1]), total: Number(off[2]) }
+        // Kept apart from the tail, which is a short window for an error message and would have
+        // dropped these long before the engine finished reporting them.
+        if (/buffer size\s*=/i.test(l) && e.memoryLines.length < 60) e.memoryLines.push(l)
         if (l.trim()) { e.tail.push(l.trim()); if (e.tail.length > 30) e.tail.shift() }
       }
     }
@@ -669,7 +785,16 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       while (Date.now() < deadline) {
         if (child.exitCode !== null || engine !== e) throw new Error(`llama-server exited: ${e.tail.slice(-3).join(' | ')}`)
         const ok = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false)
-        if (ok) { e.loaded = true; loadMs.set(m.id, Date.now() - e.startedAt); log(`local: engine ready: ${m.id}, ${e.gpuLayers ? `${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : 'GPU layers unknown'}`); return }
+        if (ok) {
+          e.loaded = true
+          loadMs.set(m.id, Date.now() - e.startedAt)
+          // What it really took, at this context size, on this machine. Recorded against both, so
+          // a reading is never shown for a context it was not measured at.
+          e.memory = readMemoryUsage(e.memoryLines)
+          if (e.memory) { await recordMemory(m.id, d.ctx, e.memory); log(`local: ${m.id} took ${e.memory.vramGB} GB VRAM + ${e.memory.ramGB} GB RAM at ctx ${d.ctx}`) }
+          log(`local: engine ready: ${m.id}, ${e.gpuLayers ? `${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : 'GPU layers unknown'}`)
+          return
+        }
         await Promise.race([sleep(500), exited])
       }
       throw new Error('llama-server did not become ready within 5 minutes')
@@ -830,12 +955,21 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const s = await readSettings()
     const states = await Promise.all(modules.map(stateOf))
     const ready = engine ? await Promise.race([engine.ready.then(() => true, () => false), sleep(0).then(() => false)]) : false
+    // The context each model would really start with here, and the GPU room it would have, so the
+    // memory figures below describe the run this PC would actually get rather than a default one.
+    const specs = await getSpecs().catch(() => null)
+    const vramGB = specs ? usableVramGB(specs, await engineVariant() ?? 'cpu') : 0
+    const ctxs = new Map(await Promise.all(modules.map(async (m) => [m.id, m.kind === 'model' ? (await runDefaults(m)).ctx : null])))
     return {
-      engine: { installed: await engineInstalled(), variant: await engineVariant(), running: !!engine, ready, model: engine?.modelId ?? null, vision: !!engine?.vision, port: engine?.port ?? null, ctx: engine?.ctx ?? null, gpuLayers: engine?.gpuLayers ?? null, startedAt: engine?.startedAt ?? null, busy },
+      engine: { installed: await engineInstalled(), variant: await engineVariant(), running: !!engine, ready, model: engine?.modelId ?? null, vision: !!engine?.vision, port: engine?.port ?? null, ctx: engine?.ctx ?? null, gpuLayers: engine?.gpuLayers ?? null, memory: engine?.memory ?? null, startedAt: engine?.startedAt ?? null, busy },
       settings: { ...s, chatModel: await chatModel() },
       modules: modules.map((m, i) => ({
         id: m.id, kind: m.kind, variant: m.variant, for: m.for, name: m.name, file: m.file, size: m.size, license: m.license, notes: m.notes, source: m.source,
         agent: m.agent?.id ?? null, state: states[i], job: jobs.get(m.id) ?? null, badges: badgesOf(m),
+        // What it would take here at the context it would run with, measured if a run has ever
+        // reported it and a rough estimate until then. The caller shows which, never both.
+        memory: m.kind === 'model' ? estimateMemory(m, { ctx: ctxs.get(m.id), vramGB, measured: measuredFor(s, m.id, ctxs.get(m.id)) }) : null,
+        ctx: ctxs.get(m.id),
       })),
     }
   }

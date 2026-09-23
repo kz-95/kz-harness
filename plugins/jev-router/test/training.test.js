@@ -40,7 +40,7 @@ test('constants: the label sources, the outcome-backed subset and the authoritie
   assert.deepEqual([...LABEL_SOURCES], ['verified_outcome', 'human', 'teacher_confirmed', 'verified_negative'])
   for (const s of OUTCOME_BACKED) assert.ok(LABEL_SOURCES.includes(s), `${s} is a label source`)
   assert.equal(OUTCOME_BACKED.includes('verified_negative'), false, 'a negative alone does not back a label')
-  assert.deepEqual([...AUTHORITIES], ['jev', 'local', 'deterministic', 'fallback'])
+  assert.deepEqual([...AUTHORITIES], ['jev', 'local', 'code', 'deterministic', 'fallback'])
 })
 
 test('append stamps an id, the time and the feature schema version', async () => {
@@ -123,10 +123,14 @@ test('resource selection: no outcome for paused_limit, stopped or a handoff cont
   assert.equal(labelFromRun('resource_selection', s, record()).labelSource, 'teacher_confirmed')
 })
 
-test('resource selection: the local pick is the one confirmed when the local classifier had authority', () => {
+test('resource selection: a run that goes as planned never confirms the local classifier to itself', () => {
+  // The pick was the classifier's own, so "it worked" is it agreeing with itself. Training on that
+  // closes the loop, and the label would name a teacher nobody asked.
   const s = resourceSample('RESOURCE_C', { authority: 'local', teacher: null, local: { chosenKey: 'RESOURCE_A', probabilities: { RESOURCE_A: 0.97 }, confidence: 0.97, artifactVersion: 'resource_selection@1', ood: false } })
-  const out = labelFromRun('resource_selection', s, record({ attempts: [attempt('claude')] }))
-  assert.deepEqual([out.chosenKey, out.labelSource], ['RESOURCE_A', 'teacher_confirmed'])
+  assert.equal(labelFromRun('resource_selection', s, record({ attempts: [attempt('claude')] })), null)
+  // Evidence that contradicts it is real either way: a rescue still names the rescuer.
+  const rescued = labelFromRun('resource_selection', s, record({ attempts: [attempt('claude'), attempt('codex')] }))
+  assert.deepEqual([rescued.chosenKey, rescued.negativeKey, rescued.labelSource], ['RESOURCE_B', 'RESOURCE_A', 'verified_outcome'])
   assert.equal(labelFromRun('resource_selection', resourceSample('RESOURCE_C', { teacher: null }), record()), null, 'no pick at all is no evidence')
   // A local answer recorded beside a decision something else made is shadow data. It never ran,
   // so the run can neither confirm nor contradict it.
@@ -143,8 +147,11 @@ test('classification: feedback tags outrank the run, an accepted run confirms, t
   assert.deepEqual(labelFromRun('task_classification', s, record(), { feedback: misread }), { label: null, negativeLabel: 'implementation', labelSource: 'human', verified: true, details: { finalStatus: 'accepted', attempts: 1, escalated: false } })
   const scope = [{ runId: 'run-1', sessionId: 'other', messageId: 'm1', verdict: 'dislike', tag: 'wrong scope' }]
   assert.equal(labelFromRun('skill_selection', sample({ domain: 'skill_selection' }), record(), { feedback: scope }).labelSource, 'human', 'matched by runId')
+  // Only the routing tag counts: a plain thumbs-up is about the answer, not about who was picked.
+  const good = [{ ts: AFTER, sessionId: 'sess-1', messageId: 'm1', verdict: 'like', tag: 'good pick' }]
+  assert.deepEqual(labelFromRun('task_classification', s, record({ finalStatus: 'needs_human' }), { feedback: good }).label, 'implementation', 'a good-pick tag confirms even when the run stalled')
   const like = [{ ts: AFTER, sessionId: 'sess-1', messageId: 'm1', verdict: 'like' }]
-  assert.deepEqual(labelFromRun('task_classification', s, record({ finalStatus: 'needs_human' }), { feedback: like }).label, 'implementation', 'a like is a human confirmation even when the run stalled')
+  assert.equal(labelFromRun('task_classification', s, record({ finalStatus: 'needs_human' }), { feedback: like }), null, 'a bare like says nothing about the routing')
   const otherRun = [{ runId: 'run-9', sessionId: 'sess-1', messageId: 'm1', verdict: 'dislike', tag: 'misread my question' }]
   assert.equal(labelFromRun('task_classification', s, record(), { feedback: otherRun }).labelSource, 'teacher_confirmed', 'feedback on another run of the session is ignored')
   const otherAgent = [{ ts: AFTER, sessionId: 'sess-1', messageId: 'm1', verdict: 'dislike', tag: 'wrong scope', provider: 'codex' }]
@@ -294,14 +301,14 @@ test('a session verdict labels exactly one run: the last one that ended at or be
   const first = record({ runId: 'run-1', ts: '2026-09-21T01:00:00.000Z' })
   const second = record({ runId: 'run-2', ts: '2026-09-21T01:10:00.000Z' })
   const humanOn = (run, feedback, until) => labelFromRun('task_classification', s, run, { feedback, until })?.labelSource === 'human'
-  const between = [{ ts: '2026-09-21T01:05:00.000Z', sessionId: 'sess-1', messageId: 'm1', verdict: 'like' }]
+  const between = [{ ts: '2026-09-21T01:05:00.000Z', sessionId: 'sess-1', messageId: 'm1', verdict: 'like', tag: 'good pick' }]
   assert.deepEqual([humanOn(first, between, second.ts), humanOn(second, between)], [true, false], 'the Like between the runs labels the first only')
-  const after = [{ ts: '2026-09-21T01:15:00.000Z', sessionId: 'sess-1', messageId: 'm2', verdict: 'like' }]
+  const after = [{ ts: '2026-09-21T01:15:00.000Z', sessionId: 'sess-1', messageId: 'm2', verdict: 'like', tag: 'good pick' }]
   assert.deepEqual([humanOn(first, after, second.ts), humanOn(second, after)], [false, true], 'the Like after both labels the second only')
   // A verdict whose time cannot be read is about no run in particular, so it labels none.
-  assert.equal(humanOn(second, [{ sessionId: 'sess-1', messageId: 'm3', verdict: 'like' }]), false)
+  assert.equal(humanOn(second, [{ sessionId: 'sess-1', messageId: 'm3', verdict: 'like', tag: 'good pick' }]), false)
   // A verdict that names its run is matched by that alone.
-  assert.equal(humanOn(first, [{ runId: 'run-1', ts: '2026-09-21T00:00:00.000Z', sessionId: 'sess-1', messageId: 'm4', verdict: 'like' }], second.ts), true)
+  assert.equal(humanOn(first, [{ runId: 'run-1', ts: '2026-09-21T00:00:00.000Z', sessionId: 'sess-1', messageId: 'm4', verdict: 'like', tag: 'good pick' }], second.ts), true)
 })
 
 test('conservation: a stronger resource rescuing the run says conserving was wrong', () => {

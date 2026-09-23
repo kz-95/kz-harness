@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { badgesOf, buildCatalog, createConnectivity, createLocalModels, defaultsFor, detectSpecs, downloadVerified, installLlmCommand, llamaArgs, looksLikeQuestion, offlinePick, parseLlmArgs, pickEngineVariant, rateModule, readManifest, removeLlmCommand, specsLine, suggest, toWire, translate } from '../local.js'
+import { badgesOf, buildCatalog, estimateMemory, kvGbPerToken, readMemoryUsage, createConnectivity, createLocalModels, defaultsFor, detectSpecs, downloadVerified, installLlmCommand, llamaArgs, looksLikeQuestion, offlinePick, parseLlmArgs, pickEngineVariant, rateModule, readManifest, removeLlmCommand, specsLine, suggest, toWire, translate } from '../local.js'
 import { fileURLToPath } from 'node:url'
 import { formatReport, runRouted } from '../router.js'
 import { kindOf, keyProviderOf } from '../accounts.js'
@@ -204,6 +204,50 @@ test('engine build follows the hardware: CUDA 12/13 by driver, Vulkan for other 
   assert.equal(pickEngineVariant({ ...PC, cuda: 11.8 }, mods), 'vulkan')
   assert.equal(pickEngineVariant({ ...PC, gpus: [{ name: 'AMD Radeon', vendor: 'amd', vramGB: 8 }], cuda: null }, mods), 'vulkan')
   assert.equal(pickEngineVariant({ ...PC, gpus: [], cuda: null }, mods), 'cpu')
+})
+
+test('a rough memory estimate, before anything has run, that answers what a context size costs', () => {
+  const [, , big] = MANIFEST_MODULES
+  const ctx = 16384
+  // Nothing on the GPU: the whole model sits in RAM and no desktop reserve is spent.
+  const cpu = estimateMemory(big, { ctx, vramGB: 0 })
+  assert.equal(cpu.vramGB, 0)
+  assert.ok(cpu.ramGB > big.size / 1024 ** 3, 'the weights plus their context, so more than the file')
+  assert.equal(cpu.source, 'estimated')
+  // A bigger context costs only the KV cache, and costs it in proportion.
+  const wide = estimateMemory(big, { ctx: ctx * 2, vramGB: 0 })
+  assert.ok(wide.ramGB > cpu.ramGB)
+  assert.ok(Math.abs((wide.ramGB - cpu.ramGB) - kvGbPerToken(big) * ctx) < 0.2, `${cpu.ramGB} -> ${wide.ramGB}`)
+  // Room for all of it: everything on the GPU, and the desktop's reserve spent once.
+  const roomy = estimateMemory(big, { ctx, vramGB: 64 })
+  assert.equal(roomy.ramGB, 0)
+  assert.equal(roomy.gpuFraction, 1)
+  // Not enough room: it splits, and the two halves still add up to the whole model.
+  const split = estimateMemory(big, { ctx, vramGB: 4 })
+  assert.ok(split.vramGB > 0 && split.ramGB > 0, `${split.vramGB} / ${split.ramGB}`)
+  assert.ok(split.gpuFraction > 0 && split.gpuFraction < 1)
+  assert.ok(Math.abs(split.totalGB - (split.vramGB + split.ramGB)) < 0.15)
+  // A reading from a run that really happened is not an estimate and does not pretend to be one.
+  const real = estimateMemory(big, { ctx, vramGB: 4, measured: { vramGB: 3.2, ramGB: 1.1 } })
+  assert.deepEqual([real.vramGB, real.ramGB, real.source], [3.2, 1.1, 'measured'])
+})
+
+test('what the engine reports it took is read back per device, and says nothing until it has', () => {
+  // The engine names the device holding each buffer, so the split between the GPU and RAM is read
+  // rather than worked out: anything on a device called CPU is RAM, everything else is the GPU.
+  const lines = [
+    'load_tensors:        CUDA0 model buffer size =  4437.23 MiB',
+    'load_tensors:   CPU_Mapped model buffer size =   512.00 MiB',
+    'llama_kv_cache:      CUDA0 KV buffer size =   736.00 MiB',
+    'llama_context:       CUDA0 compute buffer size =   304.00 MiB',
+    'llama_context:        CPU compute buffer size =    24.01 MiB',
+    'srv    load_model: loading model',
+  ]
+  assert.deepEqual(readMemoryUsage(lines), { vramGB: 5.3, ramGB: 0.5, totalGB: 5.9, gpuFraction: 0.9 })
+  // A CPU-only run is not a GPU run that happened to take nothing.
+  assert.deepEqual(readMemoryUsage(['load_tensors:   CPU_Mapped model buffer size =  1024.00 MiB']), { vramGB: 0, ramGB: 1, totalGB: 1, gpuFraction: 0 })
+  // Nothing said yet is not nothing allocated, and the caller has to be able to tell them apart.
+  assert.equal(readMemoryUsage(['srv    load_model: loading model', '']), null)
 })
 
 test('fit rating: full GPU, GPU+CPU split with a speed estimate, CPU only, and hard blocks', () => {

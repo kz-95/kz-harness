@@ -392,10 +392,14 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
      * @param {Array<{ key: string, id?: string, features: object }>} [p.candidates] for a ranking domain
      * @param {null|(() => Promise<object|null>)} [p.jev]  the teacher call
      * @param {() => object} p.fallback  the deterministic safe answer
+     * @param {boolean} [p.codeAuthority]  the deterministic answer IS this domain's authority (a
+     *   rule in code decides it, as the resource ranking does), so it is reported as `code`
+     *   rather than `fallback`, which means the opposite: nobody could decide
      * @param {object} [p.context]    `extra` is stored on the training sample
      * @returns {Promise<object>} `{ authority, label|chosenKey, probabilities, confidence, local, teacher, reason, maturity, requiredConfidence, ood, jevCalled, sampleId }`
      */
-    async decide({ features, candidates, jev, fallback, context = {} } = {}) {
+    async decide({ features, candidates, jev, fallback, codeAuthority = false, context = {} } = {}) {
+      const deterministic = codeAuthority ? 'code' : 'fallback'
       const maturity = state.maturity
       const local = localAnswer(features, candidates)
       const unfamiliar = unfamiliarCandidates(candidates)
@@ -438,7 +442,7 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
           jevCalled = true
           teacher = await jev()
           if (teacher) answer = teacher
-          else { authority = 'fallback'; reason = 'the teacher had no answer for this question' }
+          else { authority = deterministic; reason = 'the teacher had no answer for this question' }
         } catch (err) {
           // Jev is down. A mature domain may still answer for itself when it is confident and the
           // input is familiar; an immature one must not invent a classification.
@@ -447,18 +451,18 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
             answer = local
             reason = `teacher unavailable (${err.message}); local classifier is confident and in distribution`
           } else {
-            authority = 'fallback'
+            authority = deterministic
             reason = `teacher unavailable (${err.message}); using the deterministic fallback`
           }
         }
       } else {
-        authority = 'fallback'
-        reason = isLocal(maturity) ? `${reason}, and no teacher is configured` : 'no teacher is configured and this domain has no local authority'
+        authority = deterministic
+        reason = codeAuthority ? 'a rule in code decides this domain' : isLocal(maturity) ? `${reason}, and no teacher is configured` : 'no teacher is configured and this domain has no local authority'
       }
       if (!answer) {
         answer = fallback ? fallback() : null
         if (!answer) throw new Error(`routing domain ${domain}: nothing could decide and no fallback was given`)
-        if (authority !== 'fallback') { authority = 'fallback'; reason = reason || 'no answer from the chosen authority' }
+        if (authority !== deterministic) { authority = deterministic; reason = reason || 'no answer from the chosen authority' }
       }
 
       // Every decision is a training candidate, whoever made it. This is the line that makes
@@ -473,6 +477,10 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
             teacher: teacher ? { label: teacher.label, chosenKey: teacher.chosenKey, probabilities: teacher.probabilities ?? {}, confidence: num(teacher.confidence, 0), model: teacher.model ?? null } : null,
             local: local ? { label: local.label, chosenKey: local.chosenKey, probabilities: local.probabilities ?? {}, confidence: num(local.confidence, 0), artifactVersion: local.artifactVersion ?? null, ood: !!ood.flag } : null,
             authority,
+            // Under code authority the run acted on the rule's own answer, and nothing else
+            // recorded it: without this the sample would have no pick for an outcome to
+            // contradict, and the local classifier could never learn from a run that went wrong.
+            ...(authority === 'code' ? { code: { label: answer.label, chosenKey: answer.chosenKey, probabilities: answer.probabilities ?? {}, confidence: num(answer.confidence, 0) } } : {}),
             // `extra` may be a function, because what is worth keeping is often only known once
             // the answer is in: the task domain stores the numeric profile the teacher produced,
             // which is what later lets a locally classified task type recover a real profile

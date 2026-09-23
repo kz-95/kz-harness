@@ -9,12 +9,17 @@
 // workspace is a hard rule of the harness), and a local-first strategy needs a local model.
 // Named models never appear: a "premium" resource is whichever candidate the capability
 // registry currently rates strongest for this task.
-import { STRATEGIES, tierAtLeast } from './routing-policy.js'
+import { STRATEGIES, resolvePolicy, tierAtLeast } from './routing-policy.js'
 
 const TIER_RANK = { weak: 0, unknown: 1, standard: 2, strong: 3, frontier: 4 }
 const rankOf = (c) => TIER_RANK[c.tier] ?? 1
-const fitOf = (c) => (typeof c.fit === 'number' ? c.fit : 0.5)
-const costOf = (c) => (typeof c.expectedCost?.total === 'number' ? c.expectedCost.total : 0.5)
+// Number.isFinite, not typeof: NaN is a number, and one of them reaching the ranking below
+// spreads through every score, leaves the sort comparing NaN so it keeps the input order, and
+// picks arbitrarily with nothing reported wrong. A missing reading is the neutral 0.5 instead.
+const num = (v, fallback) => (Number.isFinite(v) ? v : fallback)
+const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x))
+const fitOf = (c) => num(c.fit, 0.5)
+const costOf = (c) => num(c.expectedCost?.total, 0.5)
 
 /** Strategies that make sense as an opening move; the rest are transitions the review reaches. */
 export const OPENING_STRATEGIES = Object.freeze([
@@ -39,6 +44,91 @@ export function cheapestOf(candidates, { minimumTier = 'standard', except = [] }
   const ok = pool.filter((c) => c.tier === 'unknown' || tierAtLeast(c.tier, minimumTier))
   const from = ok.length ? ok : pool
   return [...from].sort((a, b) => costOf(a) - costOf(b) || fitOf(b) - fitOf(a) || String(a.id).localeCompare(String(b.id)))[0] ?? null
+}
+
+/**
+ * How far a candidate's capability numbers may be believed: the mean, over the dimensions this
+ * task depends on, of the recorded confidence discounted by how few verified runs stand behind
+ * it. A score nobody has measured is a prior, and a prior must not outweigh a measured one.
+ */
+function evidenceTrust(c, profile, policy) {
+  const caps = c.capabilities ?? {}
+  const wanted = Object.entries(profile.requirements ?? {}).filter(([d, w]) => w >= 0.5 && caps[d]).map(([d]) => d)
+  const dims = wanted.length ? wanted : Object.keys(caps)
+  if (!dims.length) return 0
+  const { evidenceRuns, evidenceFloor } = policy.ranking
+  let sum = 0
+  for (const d of dims) {
+    const v = caps[d] ?? {}
+    const conf = typeof v.confidence === 'number' ? v.confidence : 0
+    const runs = evidenceRuns > 0 ? Math.min(1, (v.samples ?? 0) / evidenceRuns) : 1
+    // The owner's priors are the starting point of every fresh install and must still steer the
+    // pick, so an unmeasured score counts a share of what a measured one would, never nothing.
+    sum += evidenceFloor + (1 - evidenceFloor) * conf * (0.5 + 0.5 * runs)
+  }
+  return sum / dims.length
+}
+
+/**
+ * Rank the eligible candidates for this task, in code. This is the resource pick: comparing
+ * capability against cost against scarcity is arithmetic over numbers, which is the one thing a
+ * snap-judgment classifier cannot do, so it is not asked of one.
+ *
+ * The rule, which is the rule the old prompt stated in words. A candidate whose known tier is
+ * under what the task needs is not picked at all while one that meets it exists, however cheap
+ * it is. Among the rest one score decides: the extra capability is worth only as much as the
+ * task needs it (its complexity or its risk, whichever is higher), the expected job cost always
+ * counts against a candidate, and scarce capacity counts against one exactly in proportion to
+ * how little this task needs what that capacity buys - which is what spends a subscription on
+ * the hard work and leaves the easy work to a cheaper candidate. A capability score with low
+ * confidence or few verified runs is pulled toward neutral first, so a guess cannot win on paper.
+ *
+ * The scores become probabilities through a softmax, so `probabilities` reads downstream exactly
+ * as a Choice answer's did, and the confidence is the margin between the first and the second:
+ * two candidates that score alike answer with half a confidence, and nothing downstream has to
+ * know that a rule rather than a judgment said so.
+ *
+ * @param {object} p
+ * @param {Array<object>} p.candidates  decision.js candidate shape (key, tier, fit, scarcity, expectedCost, capabilities)
+ * @param {object} [p.profile]          task profile (minimumCapability, complexity, risk, requirements)
+ * @param {object} [p.policy]           resolvePolicy result
+ * @returns {{ ordered: object[], chosenKey: string|null, probabilities: Record<string, number>, confidence: number, scores: Record<string, number> }}
+ */
+export function rankCandidates({ candidates = [], profile = {}, policy = resolvePolicy() } = {}) {
+  if (!candidates.length) return { ordered: [], chosenKey: null, probabilities: {}, confidence: 0, scores: {} }
+  const w = policy.ranking
+  const minimum = profile.minimumCapability ?? 'standard'
+  // The same reading of the floor cheapestOf uses: unknown is not insufficient, and when nothing
+  // meets the floor the whole pool is ranked, because a pick is still owed.
+  const meets = candidates.filter((c) => c.tier === 'unknown' || tierAtLeast(c.tier, minimum))
+  const pool = meets.length ? meets : candidates
+  // How much the extra capability is worth here, and never nothing: even routine work is worth
+  // doing well, so the task's own complexity and risk move this over the top half of the range
+  // rather than switching capability on and off.
+  // Number.isFinite, not typeof: one NaN here would spread through every score, the sort would
+  // silently keep the input order, and the pick would be arbitrary with nothing reported wrong.
+  // Clamped, because a complexity over 1 would turn the scarcity penalty below into a bonus.
+  const demand = clamp(Math.max(num(profile.complexity, 0.5), num(profile.risk, 0.5)), 0, 1)
+  const need = 0.5 + 0.5 * demand
+  const scores = {}
+  for (const c of pool) {
+    const trust = evidenceTrust(c, profile, policy)
+    const capability = 0.5 + (fitOf(c) - 0.5) * trust
+    const scarcity = clamp(num(c.scarcity, 0), 0, 1)
+    scores[c.key] = w.capabilityWeight * need * capability - w.costWeight * costOf(c) - w.scarcityWeight * (1 - demand) * scarcity
+  }
+  const ordered = [...pool].sort((a, b) => scores[b.key] - scores[a.key] || costOf(a) - costOf(b) || String(a.id ?? a.key).localeCompare(String(b.id ?? b.key)))
+  const top = scores[ordered[0].key]
+  // A temperature of zero is 0/0, which is NaN rather than the hard pick it reads like.
+  const weights = ordered.map((c) => Math.exp((scores[c.key] - top) / Math.max(w.temperature, 1e-6)))
+  const sum = weights.reduce((a, b) => a + b, 0)
+  const probabilities = Object.fromEntries(ordered.map((c, i) => [c.key, weights[i] / sum]))
+  // Every candidate the floor ruled out is still named, at zero, so a caller narrowing the
+  // answer to a smaller pool reads a refusal rather than a missing key.
+  for (const c of candidates) if (probabilities[c.key] === undefined) probabilities[c.key] = 0
+  const first = weights[0] / sum
+  const second = ordered.length > 1 ? weights[1] / sum : 0
+  return { ordered, chosenKey: ordered[0].key, probabilities, confidence: first / (first + second), scores }
 }
 
 /** Is `b` materially stronger than `a` for this task: a higher tier, or the same tier with a clearly better fit. */
