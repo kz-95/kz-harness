@@ -9,7 +9,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { eligibleStrategies, strongestOf } from '../broker.js'
+import { eligibleStrategies, rankCandidates, strongestOf } from '../broker.js'
 import { NO_CANDIDATES, candidateTier, classProfiles, createDecisionEngine, heuristicProfile, resolveSkills } from '../decision.js'
 import { createDomainRegistry } from '../domains.js'
 import { createCapabilityRegistry, loadPriors, subjectOf } from '../profiles.js'
@@ -52,10 +52,11 @@ const profileOf = (over = {}) => ({
 })
 
 /**
- * A fake Jev that classifies as told and picks the candidate `pick(candidates)` names. Records
- * every call so a test can see exactly what rode out.
+ * A fake Jev that classifies as told and answers the strategy question. Who does the work is no
+ * longer asked of it, so there is nothing here to pick with. Records every call so a test can
+ * see exactly what rode out.
  */
-function fakeJev({ profile = profileOf(), pick = (cs) => cs[0], strategy = 'STANDARD_DIRECT', conserve = 0.5 } = {}) {
+function fakeJev({ profile = profileOf(), strategy = 'STANDARD_DIRECT' } = {}) {
   const calls = []
   return {
     calls,
@@ -63,12 +64,8 @@ function fakeJev({ profile = profileOf(), pick = (cs) => cs[0], strategy = 'STAN
       calls.push(args)
       const out = { model: 'jev-test' }
       if (args.ask?.task !== false) { out.profile = profile; Object.assign(out, { taskType: profile.taskType, complexity: profile.complexity, risk: profile.risk, handler: 'agent' }) }
-      if (args.candidates && args.ask?.resource !== false) {
-        const chosen = pick(args.candidates)
-        out.resource = { chosenKey: chosen.key, confidence: 0.8, probabilities: Object.fromEntries(args.candidates.map((c) => [c.key, c.key === chosen.key ? 0.8 : 0.2 / Math.max(1, args.candidates.length - 1)])) }
-        out.strategy = { choice: strategy, confidence: 0.7, probabilities: { [strategy]: 0.7 } }
-      }
-      if (args.candidates && args.ask?.judgments !== false) Object.assign(out, { secondOpinion: 0.2, conserve, frontierReview: profile.risk >= 0.8 ? 0.9 : 0.1 })
+      if (args.candidates && args.ask?.resource !== false) out.strategy = { choice: strategy, confidence: 0.7, probabilities: { [strategy]: 0.7 } }
+      if (args.candidates && args.ask?.judgments !== false) out.secondOpinion = 0.2
       return out
     },
   }
@@ -79,7 +76,7 @@ const decide = (e, jev, over = {}) => e.decide({ task: 'implement the parser cha
 const byKey = (d, id) => d.candidates.find((c) => c.id === id)
 
 test('scenario A: a healthy subscription carries low scarcity and a subscription pick is honoured', async () => {
-  const jev = fakeJev({ pick: (cs) => cs.reduce((m, c) => (c.capabilities.coding?.score > (m.capabilities.coding?.score ?? 0) ? c : m)) })
+  const jev = fakeJev()
   const d = await decide(engine(), jev)
   const claude = byKey(d, 'claude')
   assert.ok(claude.scarcity < 0.3, `a subscription at 20% of its week is not scarce (${claude.scarcity})`)
@@ -98,15 +95,19 @@ test('scenario A: a healthy subscription carries low scarcity and a subscription
 test('scenario B: under pressure, trivial work sees a scarce subscription and a cheap capable candidate', async () => {
   const rows = usageRows({ claudeWeekly: 88, codexWeekly: 86, claudeReset: 5 * 24 * 60 })
   const profile = profileOf({ taskType: 'simple_change', complexity: 0.05, risk: 0.05, requirements: { coding: 0.4 }, minimumCapability: 'standard' })
-  const jev = fakeJev({ profile, pick: (cs) => cs.reduce((m, c) => ((c.expectedCost?.total ?? 1) < (m.expectedCost?.total ?? 1) ? c : m)) })
+  const jev = fakeJev({ profile })
   const d = await decide(engine(), jev, { snapshots: snapshots(rows) })
-  const claude = byKey(d, 'claude'); const ds = byKey(d, 'deepseek')
+  // The most capable resource is pressing and this work is trivial, so conservation keeps it back
+  // for harder work; its numbers are still on the record, under what may review rather than work.
+  const row = (id) => d.candidates.find((c) => c.id === id) ?? d.routing.decision.reviewOnly.find((c) => c.id === id)
+  const claude = row('claude'); const ds = row('deepseek')
   assert.ok(claude.scarcity >= 0.7, `88% of the week used, five days from the reset, is scarce (${claude.scarcity})`)
   assert.ok(ds.scarcity < claude.scarcity, 'the metered key is the cheap alternative while the subscription is spent')
   assert.ok(ds.expectedCost.total < claude.expectedCost.total, 'and that scarcity shows up in the expected job cost, which is what routing reads')
   assert.equal(d.routing.primaryAgent, 'deepseek', 'cheap capable work went to the cheap resource')
-  // Scarcity is contextual, not a rule: nothing removed the subscriptions from the pool.
-  assert.ok(d.candidates.some((c) => c.id === 'claude'), 'the scarce subscription is still a candidate')
+  // Scarcity is contextual, not a hard fact: the subscription is kept for review, not ruled out.
+  assert.ok(!d.excluded.some((e) => e.id === 'claude' && e.hard), 'the scarce subscription was never ruled out')
+  assert.ok(d.routing.decision.reviewOnly.some((c) => c.id === 'claude'), 'it is still there to judge the work')
   // The weak local model is a different matter: the owner's own prior puts it under the standard
   // floor for coding, so it is excluded as insufficient rather than kept as cheap.
   assert.ok(d.excluded.some((e) => e.id === 'qwen-local' && /floor/.test(e.reason)))
@@ -115,7 +116,7 @@ test('scenario B: under pressure, trivial work sees a scarce subscription and a 
 test('scenario C: a scarce frontier resource stays eligible for a critical security review, and the weaker one is floored out', async () => {
   const rows = usageRows({ claudeWeekly: 90, codexWeekly: 90 })
   const profile = profileOf({ taskType: 'security', complexity: 0.9, risk: 0.95, requirements: { security_review: 0.95, code_review: 0.9, coding: 0.3 }, minimumCapability: 'frontier', preferredCapability: 'frontier' })
-  const jev = fakeJev({ profile, pick: (cs) => cs.reduce((m, c) => (c.capabilities.security_review?.score > (m.capabilities.security_review?.score ?? 0) ? c : m)) })
+  const jev = fakeJev({ profile })
   const d = await decide(engine(), jev, { snapshots: snapshots(rows), gated: ['claude', 'codex'] })
   assert.ok(d.candidates.some((c) => c.id === 'claude'), 'the frontier-tier resource is eligible despite scarcity and its gate')
   assert.ok(!d.candidates.some((c) => c.id === 'deepseek'), 'the materially weaker resource is under the frontier floor')
@@ -157,7 +158,7 @@ test('the availability refusal carries the same code', async () => {
 })
 
 test('scenario J: a resource whose context window cannot hold the request is removed before any judgment', async () => {
-  const jev = fakeJev({ pick: (cs) => cs[0] })
+  const jev = fakeJev()
   const big = `fix ${'x'.repeat(70_000)}`
   const snaps = snapshots(usageRows()).map((s) => (s.resourceId === 'qwen-local' ? { ...s, hardware: { ...s.hardware, contextTokens: 16_384 } } : s))
   const d = await decide(engine(), jev, { task: big, snapshots: snaps })
@@ -173,7 +174,7 @@ test('scenario J: a resource whose context window cannot hold the request is rem
 
 test('scenario K: the owner priors reach Jev as anonymous machine-readable features, never as names', async () => {
   const profile = profileOf({ taskType: 'architecture', requirements: { architecture: 0.95, explanation: 0.9, coding: 0.3 } })
-  const jev = fakeJev({ profile, pick: (cs) => cs.reduce((m, c) => (c.capabilities.architecture?.score > (m.capabilities.architecture?.score ?? 0) ? c : m)) })
+  const jev = fakeJev({ profile })
   const d = await decide(engine(), jev)
   const sent = jev.calls.at(-1).candidates
   const keyOf = (id) => d.candidates.find((c) => c.id === id).key
@@ -233,10 +234,10 @@ test('a cold model version inherits a weak family prior and is marked cold in th
 function fakeDomains({ local = {} } = {}) {
   const ctl = (id) => ({
     state: () => ({ maturity: local[id] ? 'LOCAL_ONLY' : 'JEV_PRIMARY' }),
-    decide: async ({ jev, fallback }) => {
+    decide: async ({ jev, fallback, codeAuthority }) => {
       if (local[id]) return { ...local[id], authority: 'local', sampleId: `${id}#1` }
       const t = jev ? await jev() : null
-      return { ...(t ?? fallback()), authority: t ? 'jev' : 'fallback', teacher: t, sampleId: `${id}#1` }
+      return { ...(t ?? fallback()), authority: t ? 'jev' : codeAuthority ? 'code' : 'fallback', teacher: t, sampleId: `${id}#1` }
     },
   })
   return { get: (id) => ctl(id) }
@@ -245,12 +246,11 @@ const engineWith = (domains) => createDecisionEngine({ policy, domains, profiles
 const strongestCoder = (cs) => cs.reduce((m, c) => (c.capabilities.coding?.score > (m.capabilities.coding?.score ?? 0) ? c : m))
 const scarce = () => snapshots(usageRows({ claudeWeekly: 88, claudeReset: 5 * 24 * 60 }))
 
-test('conservation acts: a yes moves easy work off the scarce strongest resource, which stays available to review', async () => {
-  const d = await decide(engine(), fakeJev({ pick: strongestCoder, conserve: 0.9 }), { snapshots: scarce() })
-  assert.notEqual(d.routing.primaryAgent, 'claude', 'the conservation answer changed who does the work')
-  assert.deepEqual(d.routing.decision.conservation, { from: 'claude', to: d.routing.primaryAgent, confidence: 0.9, authority: 'jev' })
+test('conservation acts: easy work leaves the scarce strongest resource out of the pool, still available to review', async () => {
+  const d = await decide(engine(), fakeJev(), { snapshots: scarce() })
+  assert.notEqual(d.routing.primaryAgent, 'claude', 'the work is not on the resource whose allowance is pressing')
+  assert.deepEqual(d.routing.decision.conservation, { from: 'claude', to: d.routing.primaryAgent, confidence: 0.9, authority: 'code' })
   assert.equal(d.routing.conservedFrom, 'claude')
-  assert.equal(d.routing.agentConfidence, 0.9, 'the confidence reported is the judgment that placed this primary')
   assert.ok(d.excluded.some((e) => e.id === 'claude' && /conserved/.test(e.reason)), 'kept out of the work pool, and says why')
   assert.ok(!('claude' in d.routing.agentProbabilities), 'so no later re-read of the probabilities can hand the work straight back')
   assert.ok(d.plan.steps.every((st) => st.agent !== 'claude'), 'no work step runs on the conserved resource')
@@ -261,12 +261,14 @@ test('conservation acts: a yes moves easy work off the scarce strongest resource
   assert.ok(['standard', 'strong', 'frontier'].includes(to.tier))
 })
 
-test('conservation that says no, or cannot decide, leaves the pick alone', async () => {
-  for (const conserve of [0.1, 0.5]) {
-    const d = await decide(engine(), fakeJev({ pick: strongestCoder, conserve }), { snapshots: scarce() })
-    assert.equal(d.routing.primaryAgent, 'claude', `conserve ${conserve} does not move the work`)
-    assert.equal(d.routing.decision.conservation, null)
-  }
+test('work that needs the extra capability conserves nothing, however pressing the allowance', async () => {
+  // The same scarce resource as above. What changed is the task: hard and risky work is exactly
+  // what a subscription is kept for, so nothing leaves the pool and everything stays available.
+  const profile = profileOf({ complexity: 0.9, risk: 0.9 })
+  const d = await decide(engine(), fakeJev({ profile }), { snapshots: scarce() })
+  assert.equal(d.routing.decision.conservation, null)
+  assert.ok(d.candidates.some((c) => c.id === 'claude'), 'the scarce resource is still a candidate for the work')
+  assert.equal(d.domains.conservation.label, 'no')
 })
 
 test('conservation moves work only to a resource whose capability is known to meet the floor', async () => {
@@ -277,22 +279,23 @@ test('conservation moves work only to a resource whose capability is known to me
   const profile = profileOf({ taskType: 'architecture', requirements: { planning: 0.9, coding: 0.3 } })
   const agents = AGENTS.filter((a) => a.id === 'codex' || a.id === 'deepseek')
   const strongestPlanner = (cs) => cs.reduce((m, c) => (c.capabilities.planning?.score > (m.capabilities.planning?.score ?? 0) ? c : m))
-  const d = await decide(engine(), fakeJev({ profile, pick: strongestPlanner, conserve: 0.99 }), { agents, snapshots: snapshots(usageRows({ codexWeekly: 90 })) })
+  const d = await decide(engine(), fakeJev({ profile }), { agents, snapshots: snapshots(usageRows({ codexWeekly: 90 })) })
   assert.equal(byKey(d, 'codex').tier, 'frontier')
   assert.equal(byKey(d, 'deepseek').tier, 'unknown', 'the setting: the only alternative is unmeasured')
-  assert.equal(d.routing.primaryAgent, 'codex')
   assert.equal(d.routing.decision.conservation, null)
+  assert.ok(d.candidates.some((c) => c.id === 'codex'), 'the scarce resource keeps the work it alone is measured for')
 })
 
-test('when conservation moves the work, the resource pick is not handed to the run for labelling', async () => {
-  const d = await decide(engineWith(fakeDomains()), fakeJev({ pick: strongestCoder, conserve: 0.9 }), { snapshots: scarce() })
-  assert.ok(d.routing.decision.conservation, 'conservation moved the work')
+test('conserving a resource the ranking had already passed over leaves the pick itself labelled', async () => {
+  // The ranking would not spend a pressing allowance on easy work in the first place, so by the
+  // time conservation acts the pick is usually somebody else already. The run then runs exactly
+  // the resource the ranking chose, and can confirm or refute it as any other run would.
+  const d = await decide(engineWith(fakeDomains()), fakeJev(), { snapshots: scarce() })
+  assert.equal(d.routing.decision.conservation?.from, 'claude', 'the setting: the scarce resource was conserved')
   const domainsLabelled = d.samples.map((x) => x.domain)
-  assert.ok(!domainsLabelled.includes('resource_selection'), 'the run tests another resource; it cannot confirm or refute the pick')
-  assert.ok(domainsLabelled.includes('conservation'), 'the conservation decision is the one the run tests')
-  assert.equal(d.domains.resource_selection.movedBy, 'conservation')
-  const kept = await decide(engineWith(fakeDomains()), fakeJev({ pick: strongestCoder, conserve: 0.1 }), { snapshots: scarce() })
-  assert.ok(kept.samples.some((x) => x.domain === 'resource_selection'), 'an unmoved pick is labelled as before')
+  assert.ok(domainsLabelled.includes('resource_selection'), 'the pick ran, so the run tests it')
+  assert.ok(domainsLabelled.includes('conservation'), 'and the conservation decision is tested too')
+  assert.equal(d.domains.resource_selection.movedBy, undefined, 'nothing moved the pick')
 })
 
 test('the selected skill is handed to the router in the plan, in the SKILLS vocabulary', async () => {
@@ -348,39 +351,29 @@ test('with no snapshot, the billing kind and the economics override set the cost
   assert.equal(d2.candidates.find((x) => x.id === 'acme').marginalCost, 'metered')
 })
 
-test('conservation does not move a pick that is not the most capable candidate: it is already conserving', async () => {
-  const snaps = scarce()
-  const probe = await decide(engine(), fakeJev({ pick: strongestCoder, conserve: 0.1 }), { snapshots: snaps })
-  const top = strongestOf(probe.candidates)
-  const other = probe.candidates.find((c) => c.id !== top.id && c.tier !== 'unknown')
-  assert.ok(top && other, 'the setting: a most capable candidate and a measured alternative')
-  const pickOther = (cs) => cs.find((c) => c.key === other.key)
-  const d = await decide(engineWith(fakeDomains()), fakeJev({ pick: pickOther, conserve: 0.9 }), { snapshots: snaps })
-  assert.equal(d.routing.primaryAgent, other.id, 'the cheaper pick stands')
+test('a healthy allowance is nothing to conserve, so a yes that could not act is never labelled by the run', async () => {
+  // Nothing here is being used up: the governor calls every allowance healthy, so there is no
+  // capacity to spare and the question can decide nothing. A run that would have gone the same
+  // way either way must not be read back as confirming an answer that changed nothing.
+  const d = await decide(engineWith(fakeDomains()), fakeJev())
   assert.equal(d.routing.decision.conservation, null)
-  // A yes that could not act is not labelled by the run: the run is exactly what it would have
-  // been without the yes, so an accepted run would confirm a conservation that never happened.
-  assert.ok(!d.samples.some((x) => x.domain === 'conservation'), 'a yes that could not act stays teacher-only')
+  assert.ok(!d.samples.some((x) => x.domain === 'conservation'), 'an answer that could not act stays teacher-only')
   assert.ok(d.samples.some((x) => x.domain === 'resource_selection'), 'the pick itself ran and is labelled')
 })
 
 test('the conservation sample is labelled only when the answer decided what the run tests', async () => {
-  const run = (conserve) => decide(engineWith(fakeDomains()), fakeJev({ pick: strongestCoder, conserve }), { snapshots: scarce() })
-  const moved = await run(0.9)
-  assert.ok(moved.routing.decision.conservation)
-  assert.ok(moved.samples.some((x) => x.domain === 'conservation'), 'a yes that moved the work')
-  const no = await run(0.1)
+  const run = (profile) => decide(engineWith(fakeDomains()), fakeJev({ profile }), { snapshots: scarce() })
+  const conserved = await run(profileOf())
+  assert.ok(conserved.routing.decision.conservation)
+  assert.ok(conserved.samples.some((x) => x.domain === 'conservation'), 'a yes that kept the scarce resource back')
+  const no = await run(profileOf({ complexity: 0.9, risk: 0.9 }))
   assert.equal(no.routing.decision.conservation, null)
   assert.ok(no.samples.some((x) => x.domain === 'conservation'), 'a no where a yes would have acted')
-  const flip = await run(0.5)
-  assert.equal(flip.domains.conservation.label, 'yes', 'the setting: a coin flip reads yes')
-  assert.equal(flip.routing.decision.conservation, null, 'and moves nothing')
-  assert.ok(!flip.samples.some((x) => x.domain === 'conservation'), 'so the run cannot confirm it')
   // No measured target at all: a yes could not act either (see the planning-task test above).
   const profile = profileOf({ taskType: 'architecture', requirements: { planning: 0.9, coding: 0.3 } })
   const strongestPlanner = (cs) => cs.reduce((m, c) => (c.capabilities.planning?.score > (m.capabilities.planning?.score ?? 0) ? c : m))
   const agents = AGENTS.filter((a) => a.id === 'codex' || a.id === 'deepseek')
-  const stuck = await decide(engineWith(fakeDomains()), fakeJev({ profile, pick: strongestPlanner, conserve: 0.99 }), { agents, snapshots: snapshots(usageRows({ codexWeekly: 90 })) })
+  const stuck = await decide(engineWith(fakeDomains()), fakeJev({ profile }), { agents, snapshots: snapshots(usageRows({ codexWeekly: 90 })) })
   assert.equal(stuck.routing.decision.conservation, null)
   assert.ok(!stuck.samples.some((x) => x.domain === 'conservation'), 'a yes with nowhere to move the work stays teacher-only')
 })
@@ -392,7 +385,7 @@ test('end to end: a stronger resource rescuing a conserved run labels conservati
   const e = createDecisionEngine({ policy, domains, profiles: createCapabilityRegistry({ priors: PRIORS, policy }), priors: PRIORS, store, now: () => now })
   // Without the second frontier resource, the only measured place to move the work is a tier down.
   const agents = AGENTS.filter((a) => a.id !== 'codex')
-  const d = await decide(e, fakeJev({ pick: strongestCoder, conserve: 0.9 }), { agents, snapshots: scarce() })
+  const d = await decide(e, fakeJev(), { agents, snapshots: scarce() })
   const { from, to } = d.routing.decision.conservation ?? {}
   assert.ok(from && to, 'conservation moved the work')
   const ref = d.samples.find((x) => x.domain === 'conservation')
@@ -418,15 +411,15 @@ test('the strategies are eligible over the pool that does the work and the wider
   // the eligible strategies must count them too.
   const rows = usageRows({ claudeWeekly: 90, codexWeekly: 90 })
   const profile = profileOf({ taskType: 'security', complexity: 0.9, risk: 0.95, requirements: { security_review: 0.95, code_review: 0.9, coding: 0.3 }, minimumCapability: 'frontier', preferredCapability: 'frontier' })
-  const jev = fakeJev({ profile, pick: (cs) => cs[0] })
+  const jev = fakeJev({ profile })
   const d = await decide(engine(), jev, { snapshots: snapshots(rows), gated: ['claude', 'codex'] })
   assert.equal(d.candidates.length, 1, 'the setting: one resource does the work')
   assert.ok(d.routing.decision.strategies.includes('CHEAP_EXECUTE_FRONTIER_REVIEW'), 'a reviewer exists outside the work pool')
   assert.deepEqual(jev.calls.at(-1).strategies, d.routing.decision.strategies, 'and that is what Jev was offered')
   // After a conservation move the list is recomputed with the same arguments over the new pool.
   const snaps = scarce()
-  const unmoved = await decide(engine(), fakeJev({ pick: strongestCoder, conserve: 0.1 }), { snapshots: snaps })
-  const moved = await decide(engine(), fakeJev({ pick: strongestCoder, conserve: 0.9 }), { snapshots: snaps })
+  const unmoved = await decide(engine(), fakeJev({ profile: profileOf({ complexity: 0.9, risk: 0.9 }) }), { snapshots: snaps })
+  const moved = await decide(engine(), fakeJev(), { snapshots: snaps })
   assert.ok(moved.routing.decision.conservation)
   const expected = eligibleStrategies({ candidates: moved.candidates, reviewCandidates: unmoved.candidates, profile: moved.profile, answerOnly: false })
   assert.deepEqual(moved.routing.decision.strategies, expected)
@@ -444,8 +437,8 @@ test('after a conservation move the strategy is chosen over the pool that really
     const inner = fakeDomains()
     return { get: (id) => { const c = inner.get(id); return { ...c, decide: async (args) => { (seen[id] ??= []).push(args); return c.decide(args) } } } }
   }
-  const unmoved = await decide(engineWith(fakeDomains()), fakeJev({ pick: strongestCoder, conserve: 0.1 }), { agents: two, snapshots: scarce() })
-  const moved = await decide(engineWith(spy()), fakeJev({ pick: strongestCoder, conserve: 0.9 }), { agents: two, snapshots: scarce() })
+  const unmoved = await decide(engineWith(fakeDomains()), fakeJev({ profile: profileOf({ complexity: 0.9, risk: 0.9 }) }), { agents: two, snapshots: scarce() })
+  const moved = await decide(engineWith(spy()), fakeJev(), { agents: two, snapshots: scarce() })
   assert.equal(moved.routing.decision.conservation?.from, 'claude', 'the setting: conservation moved the work')
   assert.equal(moved.routing.primaryAgent, 'deepseek')
   assert.ok(unmoved.routing.decision.strategies.includes('CHEAP_THEN_PREMIUM_REVIEW'), 'two workers with a gap before the move')
@@ -559,13 +552,13 @@ test('every domain decision a run makes carries its run id, so a later verdict c
 test('a resource whose allowance is healthy is never conserved, however sure the judgment is', async () => {
   // 20% of the week used: the governor says spend normally. A confident "conserve" from Jev or a
   // matured classifier would otherwise send easy work to a second-best resource for no saving.
-  const d = await decide(engine(), fakeJev({ pick: strongestCoder, conserve: 0.95 }))
+  const d = await decide(engine(), fakeJev())
   assert.ok(byKey(d, 'claude').scarcity < 0.2, 'the setting: nothing is being used up')
   assert.equal(d.routing.primaryAgent, 'claude')
   assert.equal(d.routing.decision.conservation, null)
   assert.equal(d.routing.conservedFrom, undefined)
   // The same judgment against a scarce allowance still acts.
-  const scarceRun = await decide(engine(), fakeJev({ pick: strongestCoder, conserve: 0.95 }), { snapshots: scarce() })
+  const scarceRun = await decide(engine(), fakeJev(), { snapshots: scarce() })
   assert.equal(scarceRun.routing.conservedFrom, 'claude')
 })
 
@@ -614,7 +607,7 @@ test('the strategy domain is labelled only by a run that carries out its answer'
   assert.ok(ran.samples.some((x) => x.domain === 'execution_strategy'))
   // After conservation leaves one worker, CHEAP_THEN_PREMIUM_REVIEW cannot run; the run does not
   // get to "confirm" it.
-  const moved = await decide(engineWith(fakeDomains()), fakeJev({ pick: strongestCoder, conserve: 0.9, strategy: 'CHEAP_THEN_PREMIUM_REVIEW' }), { agents: two, snapshots: scarce() })
+  const moved = await decide(engineWith(fakeDomains()), fakeJev({ strategy: 'CHEAP_THEN_PREMIUM_REVIEW' }), { agents: two, snapshots: scarce() })
   assert.equal(moved.routing.conservedFrom, 'claude', 'the setting: conservation moved the work')
   assert.notEqual(moved.plan.strategy, 'CHEAP_THEN_PREMIUM_REVIEW')
   assert.ok(!moved.samples.some((x) => x.domain === 'execution_strategy'), 'a strategy that never ran is not labelled')
@@ -659,7 +652,7 @@ test('a judgment that cannot change the run is not labelled by it', async () => 
 })
 
 test('what cleared the hard facts but does not do the work is recorded with its numbers, for the review', async () => {
-  const d = await decide(engine(), fakeJev({ pick: strongestCoder, conserve: 0.9 }), { snapshots: scarce() })
+  const d = await decide(engine(), fakeJev(), { snapshots: scarce() })
   assert.equal(d.routing.conservedFrom, 'claude', 'the setting: claude was conserved')
   const conserved = d.routing.decision.reviewOnly.find((r) => r.id === 'claude')
   assert.ok(conserved, 'the conserved resource is kept to review, so its numbers are too')
@@ -685,4 +678,63 @@ test('a gated resource the frontier exception does not keep is recorded as past 
   assert.deepEqual(d.candidates.map((c) => c.id), ['codex'])
   assert.deepEqual(d.excluded.filter((e) => e.id === 'deepseek').map((e) => e.reason), ['past its weekly gate: kept for review only'])
   assert.deepEqual(d.routing.decision.reviewOnly.map((r) => r.id), ['deepseek'], 'and it is kept to review, with its numbers')
+})
+
+
+// --- the ranking itself ------------------------------------------------------------------------
+// Who does the work is a comparison of numbers, so it is a rule here rather than a question to a
+// snap-judgment classifier. These three are the rule's own corners: the floor it will not go
+// under, the scarcity that moves easy work off a scarce resource but not hard work, and what it
+// says when two candidates really are alike.
+const rankCaps = (score) => ({ coding: { score, confidence: 0.9, samples: 10 } })
+const SCARCE_STRONG = { id: 'sub', key: 'RESOURCE_A', tier: 'frontier', fit: 0.95, scarcity: 0.9, marginalCost: 'low', expectedCost: { total: 1.4 }, capabilities: rankCaps(0.95) }
+const CHEAP_STANDARD = { id: 'key', key: 'RESOURCE_B', tier: 'standard', fit: 0.6, scarcity: 0, marginalCost: 'metered', expectedCost: { total: 0.8 }, capabilities: rankCaps(0.6) }
+const rankProfile = (over = {}) => ({ minimumCapability: 'standard', complexity: 0.2, risk: 0.1, requirements: { coding: 0.8 }, ...over })
+
+test('the ranking refuses a candidate under the tier the task needs, however cheap it is', () => {
+  const weak = { id: 'tiny', key: 'RESOURCE_C', tier: 'weak', fit: 0.5, scarcity: 0, expectedCost: { total: 0.1 }, capabilities: rankCaps(0.4) }
+  const r = rankCandidates({ candidates: [weak, SCARCE_STRONG], profile: rankProfile({ minimumCapability: 'strong', complexity: 0.3, risk: 0.2 }), policy })
+  assert.equal(r.chosenKey, 'RESOURCE_A', 'the cheapest candidate is under the floor, so it is not the pick')
+  assert.equal(r.probabilities.RESOURCE_C, 0, 'and it is named at zero rather than left out')
+  // The floor is the requirement, not a preference: it holds when being cheap is all the task wants.
+  const easy = rankCandidates({ candidates: [weak, SCARCE_STRONG], profile: rankProfile({ minimumCapability: 'strong' }), policy })
+  assert.equal(easy.chosenKey, 'RESOURCE_A')
+})
+
+test('scarcity moves easy work off a scarce strong candidate, and leaves work that needs it alone', () => {
+  const pool = [SCARCE_STRONG, CHEAP_STANDARD]
+  const easy = rankCandidates({ candidates: pool, profile: rankProfile(), policy })
+  assert.equal(easy.chosenKey, 'RESOURCE_B', 'a cheaper candidate covers this, so the scarce capacity is kept')
+  const hard = rankCandidates({ candidates: pool, profile: rankProfile({ complexity: 0.9, risk: 0.8 }), policy })
+  assert.equal(hard.chosenKey, 'RESOURCE_A', 'here the extra capability is what the task needs, so it is spent')
+  // Nothing but the scarcity: the same easy task with the allowance untouched keeps the strong one.
+  const roomy = rankCandidates({ candidates: [{ ...SCARCE_STRONG, scarcity: 0, expectedCost: { total: 0.5 } }, CHEAP_STANDARD], profile: rankProfile(), policy })
+  assert.equal(roomy.chosenKey, 'RESOURCE_A')
+})
+
+test('a missing or unreadable number never decides the pick by accident', () => {
+  // NaN is a number, so a typeof test lets one through. One of them reaching a score makes every
+  // score NaN, the sort then compares NaN and silently keeps the input order, and the pick is
+  // whichever candidate happened to be listed first, with nothing anywhere reporting a problem.
+  const broken = { ...CHEAP_STANDARD, id: 'bad', key: 'RESOURCE_G', fit: NaN, scarcity: NaN, expectedCost: { total: NaN } }
+  const r = rankCandidates({ candidates: [broken, SCARCE_STRONG], profile: rankProfile({ complexity: NaN, risk: undefined }), policy })
+  assert.ok(Object.values(r.probabilities).every(Number.isFinite), `every probability is a number: ${JSON.stringify(r.probabilities)}`)
+  assert.ok(Number.isFinite(r.confidence) && r.chosenKey)
+  // And a temperature of zero is 0/0, which reads like a hard pick and is not one.
+  const cold = rankCandidates({ candidates: [CHEAP_STANDARD, SCARCE_STRONG], profile: rankProfile(), policy: { ...policy, ranking: { ...policy.ranking, temperature: 0 } } })
+  assert.ok(Number.isFinite(cold.confidence) && cold.chosenKey, 'a zero temperature still answers')
+})
+
+test('a near tie answers with a low confidence, and a clear winner with a high one', () => {
+  const twin = { ...CHEAP_STANDARD, id: 'key2', key: 'RESOURCE_D' }
+  const tie = rankCandidates({ candidates: [CHEAP_STANDARD, twin], profile: rankProfile(), policy })
+  assert.equal(tie.confidence, 0.5, 'two candidates that score alike are a coin flip, and say so')
+  assert.ok(Math.abs(tie.probabilities.RESOURCE_B - tie.probabilities.RESOURCE_D) < 1e-9)
+  const clear = rankCandidates({ candidates: [CHEAP_STANDARD, { ...SCARCE_STRONG, scarcity: 0.99, expectedCost: { total: 3 } }], profile: rankProfile(), policy })
+  assert.ok(clear.confidence > 0.9, `a real gap is not a coin flip: ${clear.confidence}`)
+  // A capability score nobody has verified is a guess, and counts for less than a measured one.
+  const guessed = { ...SCARCE_STRONG, id: 'cold', key: 'RESOURCE_E', scarcity: 0, expectedCost: { total: 0.8 }, capabilities: { coding: { score: 0.95, confidence: 0.3, samples: 0 } } }
+  const measured = { ...SCARCE_STRONG, id: 'known', key: 'RESOURCE_F', scarcity: 0, expectedCost: { total: 0.8 }, fit: 0.8, capabilities: rankCaps(0.8) }
+  const r = rankCandidates({ candidates: [guessed, measured], profile: rankProfile({ complexity: 0.9, risk: 0.8 }), policy })
+  assert.equal(r.chosenKey, 'RESOURCE_F', 'the lower but measured score wins over the higher guess')
 })

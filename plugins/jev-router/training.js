@@ -24,7 +24,7 @@ export const LABEL_SOURCES = Object.freeze(['verified_outcome', 'human', 'teache
 /** The label sources that count as outcome-backed: the run itself, or a person, said so. */
 export const OUTCOME_BACKED = Object.freeze(['verified_outcome', 'teacher_confirmed', 'human'])
 /** Who answered the decision the sample records. */
-export const AUTHORITIES = Object.freeze(['jev', 'local', 'deterministic', 'fallback'])
+export const AUTHORITIES = Object.freeze(['jev', 'local', 'code', 'deterministic', 'fallback'])
 
 const WORK_ROLES = new Set(['primary', 'retry'])
 // A label or tag value that belongs to another module's vocabulary, checked when this file loads.
@@ -64,7 +64,7 @@ export function normalizeSample(sample, { now }) {
   // non-string category refused now is one that cannot quietly poison every artifact after it.
   validateFeatures(sample.input.features)
   for (const c of Array.isArray(sample.input.candidates) ? sample.input.candidates : []) validateFeatures(c?.features ?? {})
-  const { id, ts, runId, domain, input, teacher, local, authority, extra } = sample
+  const { id, ts, runId, domain, input, teacher, local, code, authority, extra } = sample
   return {
     id: typeof id === 'string' && id ? id : randomUUID(),
     ts: typeof ts === 'string' && ts ? ts : now(),
@@ -76,6 +76,7 @@ export function normalizeSample(sample, { now }) {
     input,
     teacher: teacher ?? null,
     local: local ?? null,
+    code: code ?? null,
     authority: AUTHORITIES.includes(authority) ? authority : 'fallback',
     outcome: null,
     ...(extra && typeof extra === 'object' ? { extra } : {}),
@@ -211,20 +212,22 @@ const labelOf = (p) => (p ? (p.label ?? p.chosenKey ?? null) : null)
 
 /**
  * The answer the run actually acted on: the local one when the local classifier had authority,
- * otherwise the teacher's. It is the pick a label confirms or contradicts. A local answer under
- * any other authority is shadow data that never ran, and a fallback or deterministic pick the
- * sample does not record is nothing the run can confirm, so both yield no pick and no label.
+ * the rule's own when a rule in code did, otherwise the teacher's. It is the pick a label
+ * confirms or contradicts. A local answer under any other authority is shadow data that never
+ * ran, and a fallback or deterministic pick the sample does not record is nothing the run can
+ * confirm, so both yield no pick and no label.
  */
-const pickOf = (sample) => (sample?.authority === 'local' ? sample.local ?? null : sample?.teacher ?? null)
+const pickOf = (sample) => (sample?.authority === 'local' ? sample.local ?? null : sample?.authority === 'code' ? sample.code ?? null : sample?.teacher ?? null)
 
 /**
  * A run that went as planned only confirms a pick somebody else made. Under local authority the
  * pick is the classifier's own, so "it worked" is the classifier agreeing with itself: training on
- * it closes the loop, and the label would name a teacher that was never asked. Evidence that
- * contradicts the pick - a rescue, a negative outcome, a person's tag - is real either way and
- * still gets through; only the agreeing label is dropped.
+ * it closes the loop, and the label would name a teacher that was never asked. A rule in code is
+ * the same case: an accepted run would teach the classifier to reproduce the rule it is meant to
+ * learn past. Evidence that contradicts the pick - a rescue, a negative outcome, a person's tag -
+ * is real either way and still gets through; only the agreeing label is dropped.
  */
-const confirms = (sample, outcome) => (sample?.authority === 'local' ? null : outcome)
+const confirms = (sample, outcome) => (sample?.authority === 'local' || sample?.authority === 'code' ? null : outcome)
 
 const attemptsOf = (record) => (Array.isArray(record?.attempts) ? record.attempts : [])
 const workAttempts = (record) => attemptsOf(record).filter((a) => a && WORK_ROLES.has(a.role) && !a.limitHit)

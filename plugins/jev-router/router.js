@@ -1305,7 +1305,7 @@ export function decisionAuthority(R) {
   if (!list.length) return R?.mode === 'jev' || R?.mode === 'local' ? 'jev' : 'none'
   const set = new Set(list)
   if (set.size === 1) return list[0]
-  if (set.has('fallback') && !set.has('jev') && !set.has('local')) return 'fallback'
+  if (set.has('fallback') && !set.has('jev') && !set.has('local') && !set.has('code')) return 'fallback'
   return 'mixed'
 }
 
@@ -1356,7 +1356,7 @@ export function formatReport(r) {
   const R = r.routing
   const lines = []
   const who = decisionAuthority(R)
-  const decided = who === 'local' ? 'local router decided' : who === 'mixed' ? 'Jev and the local router decided' : who === 'fallback' ? 'safe fallback, nothing could decide' : 'Jev decided'
+  const decided = who === 'local' ? 'local router decided' : who === 'code' ? 'routing rules decided' : who === 'mixed' ? 'Jev and the local router decided' : who === 'fallback' ? 'safe fallback, nothing could decide' : 'Jev decided'
   const modeLabel = { jev: `AUTO (${decided})`, manual: `MANUAL /${R.primaryAgent}`, fallback: 'AUTO, JEV UNAVAILABLE: routing fallback activated', offline: 'OFFLINE: local models only', local: `AUTO (${decided}), LOCAL MODELS ONLY` }[R.mode]
   lines.push(`**Jev router** · ${modeLabel}${R.mode !== 'offline' && r.offline ? ' · OFFLINE: local models only' : ''}`)
   if (R.mode === 'fallback') lines.push(`Fallback reason: ${R.reason}. Default agent: ${R.primaryAgent}`)

@@ -124,10 +124,12 @@ const TRACK = {
   deepseek: { cost_tier: 'api', availability: 'ok', here_by_task_type: {}, overall: 'no runs yet' },
 }
 
-test('a routing call with the anonymous table names no agent in any field, and keeps the evidence under the keys', async (t) => {
+test('a routing call with the anonymous table names no agent in any field, and sends nothing no question reads', async (t) => {
   // Findings 4, 12 and 17: the table was anonymous, but the same call carried recent_outcomes,
   // agent_availability and agent_track_record keyed by the real ids, with the same facts as the
-  // table, so the names lined up with the keys trivially.
+  // table, so the names lined up with the keys trivially. The per-candidate track record and
+  // availability have since gone entirely: the resource question that read them is decided in
+  // code now, and state no question reads costs tokens and accuracy on the state that is read.
   const { sent, restore } = captureCalls()
   t.after(restore)
   const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
@@ -143,11 +145,8 @@ test('a routing call with the anonymous table names no agent in any field, and k
   assert.equal(s.recent_outcomes[0].first_resource, 'RESOURCE_A', 'the history row is re-keyed to the table key')
   assert.equal(s.recent_outcomes[1].first_resource, undefined, 'a resource outside the table gets no key nothing describes')
   assert.equal(s.recent_outcomes[1].outcome, 'needs_human', 'and the rest of the row survives')
-  assert.equal(s.candidate_availability.RESOURCE_B, 'near limit')
-  assert.equal(s.candidate_track_record.RESOURCE_A.overall.accepted_rate, 0.75)
-  assert.equal(s.candidate_track_record.RESOURCE_A.feedback.recent_reasons[0], 'good pick: RESOURCE_A fixed it where [resource] gave up', 'a typed reason keeps its meaning under the key')
-  assert.match(s.candidate_track_record.RESOURCE_B.price_now, /off-peak rate right now/)
-  assert.deepEqual(Object.keys(s.candidate_track_record).sort(), ['RESOURCE_A', 'RESOURCE_B'], 'no record for a resource the table does not offer')
+  assert.equal(s.candidate_track_record, undefined, 'no question reads it, so it is not sent')
+  assert.equal(s.candidate_availability, undefined)
   assert.equal(s.agent_track_record, undefined)
   assert.equal(s.agent_availability, undefined)
 })
@@ -276,11 +275,11 @@ const localTrack = () => ({
   },
 })
 
-test('a local agent keeps its cost tier and its per-task-type record: structured values and keys are never masked', async (t) => {
+test('a local agent is re-keyed in the history like any other, and its generic words survive', async (t) => {
   // The masker treated every configured string as a name and rewrote every string and object key
-  // in the channel, so with a name of 'local' the one categorical cost fact went out as
-  // 'free-[resource]' (or 'free-RESOURCE_A' with one local agent), and a task type that is also
-  // an agent id became a key.
+  // it carried, so with a name of 'local' a categorical fact went out as 'free-[resource]', and a
+  // task type that is also an agent id became a key. The history row is the channel that still
+  // rides this call, so it is the one that proves a generic word is not a name.
   const { sent, restore } = captureCalls()
   t.after(restore)
   const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
@@ -291,14 +290,9 @@ test('a local agent keeps its cost tier and its per-task-type record: structured
     taskProfile: { complexity: 0.2, risk: 0.1 }, ask: { task: false, resource: true, judgments: false },
   })
   const s = sent[0].state
-  const rec = s.candidate_track_record.RESOURCE_A
-  assert.equal(rec.cost_tier, 'free-local', 'the cost tier is a category, not text to mask')
-  assert.deepEqual(Object.keys(rec.here_by_task_type).sort(), ['implementation', 'review'], 'task-type keys stay task types')
-  assert.equal(rec.here_by_task_type.implementation.note, 'too few attempts to judge')
-  // Free text is still masked, by the specific names only: the model id is this resource, 'local' is a word.
-  assert.equal(rec.feedback.recent_reasons[0], 'RESOURCE_A did the review fine, local is fast')
-  assert.deepEqual(s.recent_outcomes[0], { task_type: 'review', attempts: 1, outcome: 'accepted', first_resource: 'RESOURCE_A' })
-  assert.equal(s.candidate_availability.RESOURCE_A, 'ok')
+  assert.deepEqual(s.recent_outcomes[0], { task_type: 'review', attempts: 1, outcome: 'accepted', first_resource: 'RESOURCE_A' }, 'the task type stays a task type and only the runner becomes a key')
+  assert.equal(s.candidate_track_record, undefined)
+  assert.equal(s.candidate_availability, undefined)
   assert.ok(!JSON.stringify(s).toLowerCase().includes('qwen'), 'and the specific names are gone')
 })
 
@@ -317,11 +311,8 @@ test('with two local agents a shared generic word is still not a name, and a tas
     trackRecord: track, taskProfile: { complexity: 0.2, risk: 0.1 }, ask: { task: false, resource: true, judgments: false },
   })
   const s = sent[0].state
-  assert.deepEqual(Object.keys(s.candidate_track_record).sort(), ['RESOURCE_A', 'RESOURCE_B'], 'the id-keyed map is re-keyed through the mapping')
-  for (const k of ['RESOURCE_A', 'RESOURCE_B']) assert.equal(s.candidate_track_record[k].cost_tier, 'free-local')
-  assert.deepEqual(Object.keys(s.candidate_track_record.RESOURCE_B.here_by_task_type), ['review'])
-  assert.equal(s.candidate_track_record.RESOURCE_B.feedback.recent_reasons[0], 'the review agent missed a bug in review', 'a task-type word is not a name')
-  assert.deepEqual(s.recent_outcomes.map((h) => [h.task_type, h.first_resource]), [['review', 'RESOURCE_B'], ['debugging', 'RESOURCE_A']])
+  assert.deepEqual(s.recent_outcomes.map((h) => [h.task_type, h.first_resource]), [['review', 'RESOURCE_B'], ['debugging', 'RESOURCE_A']], 'an id that is also a task-type word is re-keyed where it is the runner and left alone where it is the type')
+  assert.deepEqual(leaks(sent[0]), [])
 })
 
 test('the masker refuses generic names and leaves keys and categorical values alone', () => {
@@ -521,15 +512,17 @@ test('a review-only resource is weighed on its numbers, and a reason the record 
   assert.ok(!/executor registry/.test(what), what)
 })
 
-test('the routing call asks no question whose answer nothing reads', async (t) => {
-  // cheapSufficient and consistencyReview were asked on every routed run and never read.
+test('the routing call asks no question whose answer nothing reads, and none that weighs numbers', async (t) => {
+  // cheapSufficient and consistencyReview were asked on every routed run and never read. The
+  // resource pick, the conservation judgment and the frontier review are gone for the other
+  // reason: each of them handed Jev numbers and asked which was bigger, which it cannot do.
   const { sent, restore } = captureCalls()
   t.after(restore)
   const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
   const r = await jev.route({ task: 'fix it', context: {}, candidates: TABLE, identities: IDS, ask: { task: true, resource: true, judgments: true } })
   const asked = Object.keys(sent[0].questions)
-  assert.ok(!asked.includes('cheapSufficient') && !asked.includes('consistencyReview'), asked.join(', '))
-  for (const q of ['secondOpinion', 'conserve', 'frontierReview', 'resource', 'taskType', 'needsTests']) assert.ok(asked.includes(q), `${q} is still asked`)
+  for (const q of ['cheapSufficient', 'consistencyReview', 'resource', 'conserve', 'frontierReview']) assert.ok(!asked.includes(q), `${q} is still asked`)
+  for (const q of ['secondOpinion', 'strategy', 'taskType', 'needsTests']) assert.ok(asked.includes(q), `${q} is no longer asked`)
   assert.ok(!('cheapSufficient' in r))
   assert.deepEqual(r.profile.verification, [], 'needsTests at 0.3 asks for no checks, and nothing else rides verification')
 })

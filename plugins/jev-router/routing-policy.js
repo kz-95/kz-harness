@@ -296,6 +296,27 @@ export const ROUTING_DEFAULTS = Object.freeze({
   // with a frontier review. They are not a floor under any answer - a Jev "no" at any risk stands
   // (decision.js judgment()).
   minimumReview: Object.freeze({ riskForReview: 0.6, riskForFrontierReview: 0.8 }),
+  // The resource ranking (broker.js rankCandidates), which is the authority on which candidate
+  // does the work. Unitless weights over one score per candidate: what the extra capability is
+  // worth on a task that needs it, what the expected job cost counts against it, and what
+  // spending scarce subscription capacity on work that does not need it counts against it.
+  // `evidenceRuns` is how many verified runs a capability score needs before it is trusted in
+  // full; under that it is discounted toward neutral, because an unmeasured score is a guess,
+  // and `evidenceFloor` is the share of its confidence that survives with no runs at all.
+  // `temperature` turns the score gaps into probabilities: lower makes the leader more certain.
+  ranking: Object.freeze({
+    capabilityWeight: 2.0, costWeight: 0.6, scarcityWeight: 0.8,
+    evidenceRuns: 5, evidenceFloor: 0.5, temperature: 0.25,
+  }),
+  // The two judgments answered in code rather than asked of a snap classifier, because both are
+  // comparisons of numbers. Conservation reads the governor's own pressure level for the scarce
+  // resource and asks only whether this task is easy enough to spend it elsewhere; the frontier
+  // review reads the task's risk against the minimumReview cuts above. Both answer with a
+  // probability, so the judgment carries a confidence the way one from anywhere else does.
+  codeJudgments: Object.freeze({
+    conserve: Object.freeze({ high: { easy: 0.9, hard: 0.3 }, increasing: { easy: 0.7, hard: 0.2 }, otherwise: 0.1 }),
+    frontierReview: Object.freeze({ risky: 0.9, frontierWork: 0.7, otherwise: 0.15 }),
+  }),
   // Where the machine-readable capability priors live, relative to the harness root.
   priorsFile: 'config/capability-priors.json',
 })

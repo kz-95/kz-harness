@@ -3,9 +3,15 @@
 // The router hands this the request and the pool of agents its hard filters let through; the
 // engine hands back the routing object the loop runs on. In between, each routing domain is
 // asked in turn through its own controller (domains.js), which is what lets task classification
-// mature locally while resource selection still asks Jev: the controller decides who is
+// mature locally while another domain still asks Jev: the controller decides who is
 // authoritative, and this file only supplies the inputs, the teacher call and a deterministic
-// fallback per domain.
+// answer per domain.
+//
+// Not every domain has a teacher. Which resource does the work, whether a scarce allowance is
+// worth spending here, and whether the strongest resource should review are all comparisons of
+// numbers, and a snap-judgment classifier cannot compare magnitudes. Those three are rules in
+// code, reported as `code` rather than `fallback`, which means the opposite: nobody could decide.
+// Their local classifiers still learn, from the runs that contradict a rule's answer.
 //
 // Inputs that reach Jev or a local classifier are the machine-readable ones: the capability
 // registry's effective profiles (profiles.js), the governor's scarcity and cost signals
@@ -20,16 +26,19 @@
 // a mature domain costs nothing.
 import { MARGINAL_COST_BY_KIND, kindOf, marginalCostOf } from './accounts.js'
 import { CHARS_PER_TOKEN } from './capabilities.js'
-import { OPENING_STRATEGIES, cheapestOf, eligibleStrategies, planStrategy, strongestOf } from './broker.js'
+import { OPENING_STRATEGIES, cheapestOf, eligibleStrategies, planStrategy, rankCandidates, strongestOf } from './broker.js'
 import { anonymize, candidateFeatures, identityNames, mergeFeatures, poolFeatures, profileFeatures, taskTextFeatures } from './features.js'
-import { CURVE_KNEES, expectedJobCost, governorSignals } from './governor.js'
+import { CURVE_KNEES, conservationHint, expectedJobCost, governorSignals } from './governor.js'
 import { subjectOf } from './profiles.js'
 import { DIMENSIONS, REQUIREMENT_DIMENSIONS, SKILLS, TASK_DIMENSIONS, TASK_SKILLS, tierAtLeast, tierOf } from './routing-policy.js'
 
+// Which domains a Jev call group is asked for. Resource selection, conservation and the frontier
+// review are missing on purpose: each of them is a comparison of numbers, which a rule in code
+// decides here, so none of them can open a call.
 const GROUP_DOMAINS = Object.freeze({
   task: ['task_classification', 'skill_selection'],
-  resource: ['resource_selection', 'execution_strategy'],
-  judgments: ['second_opinion', 'conservation', 'frontier_escalation'],
+  resource: ['execution_strategy'],
+  judgments: ['second_opinion'],
 })
 const NOT_LOCAL = new Set(['JEV_PRIMARY', 'SHADOW', 'ROLLBACK', 'GUARDED_LOCAL'])
 // Capabilities that name no particular ability: every agent can answer, and 'other' and
@@ -499,33 +508,36 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
 
     // --- 3. resource selection -------------------------------------------------------------------
     const idOf = (key) => pool.find((c) => c.key === key)?.id
-    const deterministicPick = () => {
-      // Cheapest candidate that meets the floor; the strongest when the task wants frontier and
-      // one is there. Not a judgment, a safe default that the report labels as such.
-      const c = (profile.preferredCapability === 'frontier' && (profile.risk ?? 0) >= policy.minimumReview.riskForReview ? strongestOf(pool) : null) ?? cheapestOf(pool, { minimumTier: minimum }) ?? pool[0]
-      return { chosenKey: c.key, probabilities: Object.fromEntries(pool.map((x) => [x.key, x.id === c.id ? 1 : 0])), confidence: 0.5 }
+    // Who does the work is ranked in code (broker.js), not asked of Jev: the pick weighs capability
+    // against expected cost against scarcity, and weighing numbers against each other is the one
+    // thing a snap-judgment classifier cannot do. The ranking is this domain's authority, so it is
+    // reported as `code` and never as `fallback`, which means the opposite: nobody could decide.
+    const codePick = () => {
+      const r = rankCandidates({ candidates: pool, profile, policy })
+      return { chosenKey: r.chosenKey, probabilities: r.probabilities, confidence: r.confidence }
     }
     // The domain controller speaks `chosenKey` (the contract's ranking shape); this file works in
     // `key`. One conversion, so a fallback answer cannot arrive as an undefined pick.
     const asPick = (answer, authority, extra = {}) => ({ key: answer.chosenKey ?? answer.key, probabilities: answer.probabilities ?? {}, confidence: answer.confidence ?? 0.5, authority, ...extra })
     const resCtl = controller('resource_selection')
+    // The controller still runs, because the local classifier still learns this domain from what
+    // the runs do: it shadows the ranking, and once its own evidence earns it authority it decides.
     const resDecision = resCtl ? await resCtl.decide({
       features: pFeatures,
       candidates: candidateRows,
-      jev: jev ? async () => { const r = await askJev('resource'); return r.resource?.chosenKey ? { chosenKey: r.resource.chosenKey, probabilities: r.resource.probabilities ?? {}, confidence: r.resource.confidence ?? 0.5, model: r.model, raw: r } : null } : null,
-      fallback: deterministicPick,
+      jev: null,
+      fallback: codePick,
+      codeAuthority: true,
     }) : null
     let pick = null
     if (resDecision?.chosenKey && idOf(resDecision.chosenKey)) pick = asPick(resDecision, resDecision.authority)
-    else if (!resCtl && jev) {
-      try { const r = await askJev('resource'); if (r.resource?.chosenKey) pick = asPick(r.resource, 'jev') } catch (err) { if (signal?.aborted) throw err; pick = asPick(deterministicPick(), 'fallback', { reason: String(err?.message ?? err) }) }
-    }
+    else if (!resCtl) pick = asPick(codePick(), 'code')
     if (!pick || !idOf(pick.key)) {
-      // A key the post-filter removed: the best remaining by the same probabilities, else the safe default.
+      // A key the post-filter removed: the best remaining by the same probabilities, else the ranking.
       const best = Object.entries(pick?.probabilities ?? {}).filter(([k]) => idOf(k)).sort((a, b) => b[1] - a[1])[0]
       pick = best
         ? { key: best[0], probabilities: pick.probabilities, confidence: best[1], authority: pick.authority, narrowed: true }
-        : asPick(deterministicPick(), pick?.authority ?? 'fallback', { narrowed: true })
+        : asPick(codePick(), pick?.authority ?? 'code', { narrowed: true })
     }
     domainReport.resource_selection = report(resDecision, { label: pick.key })
 
@@ -535,18 +547,24 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // same on all three paths, so nothing downstream has to know which one answered.
     // `labelled: false` keeps the sample teacher-only: the caller pushes it for outcome labelling
     // itself, once it knows whether the answer changed anything the run could test.
-    const judgment = async (domain, key, fallbackYes, { labelled = true } = {}) => {
+    // `code` is a rule that answers the judgment here with a probability, for the two that are
+    // comparisons of numbers rather than snap judgments. Where it is given no teacher is asked and
+    // the rule is the authority, exactly as the resource ranking is.
+    const judgment = async (domain, key, fallbackYes, { labelled = true, code = null } = {}) => {
       const asJudgment = (p, authority, model) => ({ label: p >= 0.5 ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), authority, model })
-      const fallback = () => ({ label: fallbackYes ? 'yes' : 'no', probabilities: { yes: fallbackYes ? 1 : 0, no: fallbackYes ? 0 : 1 }, confidence: 0.5, authority: 'fallback' })
+      const fallback = () => (code ? asJudgment(code()) : { label: fallbackYes ? 'yes' : 'no', probabilities: { yes: fallbackYes ? 1 : 0, no: fallbackYes ? 0 : 1 }, confidence: 0.5, authority: 'fallback' })
       const ctl = controller(domain)
       let d
       if (ctl) {
         d = await ctl.decide({
           features: pFeatures,
-          jev: jev ? async () => { const r = await askJev('judgments'); const p = r[key]; return typeof p === 'number' ? { label: p >= 0.5 ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), model: r.model } : null } : null,
+          jev: jev && !code ? async () => { const r = await askJev('judgments'); const p = r[key]; return typeof p === 'number' ? { label: p >= 0.5 ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), model: r.model } : null } : null,
           fallback,
+          codeAuthority: !!code,
           context: { extra: { candidates: tierTable } },
         })
+      } else if (code) {
+        d = { ...asJudgment(code()), authority: 'code' }
       } else if (jev) {
         try {
           const r = await askJev('judgments')
@@ -566,45 +584,60 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
 
     // --- 4. conservation ------------------------------------------------------------------------
     // Whether the scarce capacity of the most capable candidate should be kept for harder work
-    // than this. The governor only prices scarcity (it is a signal, never a rule); this is the
-    // judgment that acts on it, and it acts the way the weekly gate does: the conserved resource
-    // leaves the work pool and stays available to review. It is asked after the resource pick and
-    // before the strategy, because it can only move work off the pick, and the strategy must be
-    // planned around whoever really does the work.
+    // than this. The governor only prices scarcity (it is a signal, never a rule); this is what
+    // acts on it, and it acts the way the weekly gate does: the conserved resource leaves the work
+    // pool and stays available to review. It comes after the resource pick and before the
+    // strategy, because it can change who works, and the strategy must be planned around whoever
+    // really does it.
+    //
+    // The ranking already declines to spend a pressing allowance on work a cheaper candidate
+    // covers, so by the time this runs the work has often moved of its own accord. What is left is
+    // to make that stick: taking the resource out of the pool is what stops a mid-run hand-over
+    // from spending the very capacity the ranking just kept back, and it is still there to review.
     //
     // The hard limits are code: a local model has nothing to conserve, nor does a resource whose
-    // allowance is healthy; a pick that is not the most
-    // capable candidate is already conserving it; and the work moves only to a candidate whose
-    // KNOWN tier meets the floor, because moving work off a resource known to be capable onto one
-    // nobody has measured is a gamble, not a saving. That one rule also covers an unmet floor and
-    // a gate that yielded to a frontier floor: in both, nothing else has a known tier at the
-    // floor, so the scarce resource keeps the work it alone can do. A coin flip (exactly 0.5) is
-    // not a decision to override the pick.
+    // allowance is healthy, and the work moves only to a candidate whose KNOWN tier meets the
+    // floor, because moving work off a resource known to be capable onto one nobody has measured
+    // is a gamble, not a saving. That one rule also covers an unmet floor and a gate that yielded
+    // to a frontier floor: in both, nothing else has a known tier at the floor, so the scarce
+    // resource keeps the work it alone can do. A coin flip (exactly 0.5) conserves nothing.
     let primary = pool.find((c) => c.id === idOf(pick.key))
     const mostCapable = strongestOf(pool)
     const scarceTop = !!mostCapable && mostCapable.source !== 'local' && (mostCapable.scarcity ?? 0) >= CURVE_KNEES.aggressive
-    // Whether a yes could move anything, decided before the question is asked: the limits above,
-    // and a target whose known tier meets the floor. The resource judgment's own ranking decides
-    // among the rest, then the cheaper.
     // Nothing is conserved that is not being used up: the governor calls a resource under its
     // first knee "healthy, spend normally", and sparing an allowance that is barely touched is not
-    // conservation, it is a second-best pick. Unknown usage argues for nothing either way, so it
-    // cannot justify moving the work. A judgment (Jev, or a matured classifier) decides WHETHER to
-    // conserve a scarce resource; whether there is anything to conserve is a fact, and stays in code.
-    const worthConserving = typeof primary.scarcity === 'number' && primary.scarcity >= CURVE_KNEES.start
-    const canConserve = primary.id === mostCapable?.id && primary.source !== 'local' && primary.marginalCost !== 'none' && worthConserving
+    // conservation, it is a second-best pick. Unknown usage argues for nothing either way.
+    const worthConserving = typeof mostCapable?.scarcity === 'number' && mostCapable.scarcity >= CURVE_KNEES.start
+    const canConserve = !!mostCapable && mostCapable.source !== 'local' && mostCapable.marginalCost !== 'none' && worthConserving
     const ranked = pick.probabilities ?? {}
     const costOf = (c) => (typeof c.expectedCost?.total === 'number' ? c.expectedCost.total : 0.5)
-    const target = canConserve
-      ? pool.filter((c) => c.id !== primary.id && c.tier !== 'unknown' && tierAtLeast(c.tier, minimum))
-        .sort((a, b) => (ranked[b.key] ?? 0) - (ranked[a.key] ?? 0) || costOf(a) - costOf(b) || String(a.id).localeCompare(String(b.id)))[0] ?? null
-      : null
-    const conservation = await judgment('conservation', 'conserve', scarceTop && (profile.complexity ?? 0.5) < 0.5 && risk < policy.minimumReview.riskForReview, { labelled: false })
+    // Who does the work once the scarce one is out. When the ranking already chose somebody else
+    // that is the answer; otherwise the best of the rest by the ranking, then the cheaper.
+    const known = (c) => c.id !== mostCapable.id && c.tier !== 'unknown' && tierAtLeast(c.tier, minimum)
+    const target = !canConserve ? null
+      : known(primary) ? primary
+        : pool.filter(known).sort((a, b) => (ranked[b.key] ?? 0) - (ranked[a.key] ?? 0) || costOf(a) - costOf(b) || String(a.id).localeCompare(String(b.id)))[0] ?? null
+    // Answered in code, because it was never a snap judgment: the governor already read this
+    // resource's own allowance against its plan's curve and said how hard it is pressing, which is
+    // a comparison of numbers. All that is left is whether this task is the one worth spending it
+    // on, and that is the task's own complexity and risk against the cuts the policy already sets.
+    const easyEnoughToMoveOff = (profile.complexity ?? 0.5) < 0.5 && risk < policy.minimumReview.riskForReview
+    const conserveProbability = () => {
+      const cuts = policy.codeJudgments.conserve
+      const { level } = conservationHint(signals.get(mostCapable?.id) ?? {}, profile, policy)
+      // `exhausted` is past `high`, not below it. Nothing reaches here with that level today,
+      // because it means the resource is unavailable and an unavailable one is not a candidate at
+      // all, but read by its own name it would fall through to the cut meant for a healthy
+      // allowance, and the resource under the most pressure would be the one never conserved.
+      const band = level === 'exhausted' || level === 'high' ? cuts.high : level === 'increasing' ? cuts.increasing : null
+      return band ? (easyEnoughToMoveOff ? band.easy : band.hard) : cuts.otherwise
+    }
+    const conservation = await judgment('conservation', 'conserve', scarceTop && easyEnoughToMoveOff, { labelled: false, code: conserveProbability })
     let conserved = null
-    if ((prob(conservation) ?? 0) > 0.5 && target) {
-      conserved = { from: primary.id, to: target.id, confidence: r2(conservation.confidence), authority: conservation.authority ?? null }
-      excluded.push({ id: primary.id, reason: 'conserved for harder work: kept for review only' })
-      pool = pool.filter((c) => c.id !== primary.id)
+    if ((prob(conservation) ?? 0) > 0.5 && target && target.id !== mostCapable.id) {
+      conserved = { from: mostCapable.id, to: target.id, confidence: r2(conservation.confidence), authority: conservation.authority ?? null }
+      excluded.push({ id: mostCapable.id, reason: 'conserved for harder work: kept for review only' })
+      pool = pool.filter((c) => c.id !== mostCapable.id)
       primary = target
       // What the strategy and the remaining judgments see is the pool the work really has.
       strategies = strategiesFor(pool)
@@ -616,8 +649,11 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // flip that reads 'yes' but moved nothing leave the run exactly as it would have been, so
     // an accepted run would confirm a 'yes' that never happened. Those stay teacher-only.
     if (conservation?.sampleId && (conserved || (target && !yes(conservation)))) samples.push({ domain: 'conservation', id: conservation.sampleId })
-    if (resDecision?.sampleId && !conserved) samples.push({ domain: 'resource_selection', id: resDecision.sampleId })
-    if (conserved) domainReport.resource_selection = { ...domainReport.resource_selection, movedBy: 'conservation' }
+    // The pick is still the pick unless conservation took the work off it: a run that conserved a
+    // resource the ranking had already passed over tests exactly the resource the ranking chose.
+    const pickMoved = primary.id !== idOf(pick.key)
+    if (resDecision?.sampleId && !pickMoved) samples.push({ domain: 'resource_selection', id: resDecision.sampleId })
+    if (pickMoved) domainReport.resource_selection = { ...domainReport.resource_selection, movedBy: 'conservation' }
 
     // --- 5. strategy and the remaining judgments ------------------------------------------------
     const stratCtl = controller('execution_strategy')
@@ -632,7 +668,9 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     let strategyPick = null
     const stratDecision = stratCtl ? await stratCtl.decide({
       features: pFeatures,
-      jev: jev ? async () => { const r = await askJev('resource'); return r.strategy?.choice ? { label: r.strategy.choice, probabilities: r.strategy.probabilities ?? {}, confidence: r.strategy.confidence ?? 0.5, model: r.model } : null } : null,
+      // One eligible strategy is nothing to choose between, and it is now the only question the
+      // resource call carries: asking would buy a call whose answer is already known.
+      jev: jev && strategies.length > 1 ? async () => { const r = await askJev('resource'); return r.strategy?.choice ? { label: r.strategy.choice, probabilities: r.strategy.probabilities ?? {}, confidence: r.strategy.confidence ?? 0.5, model: r.model } : null } : null,
       fallback: strategyFallback,
       context: { allowed: strategies, extra: { candidates: tierTable } },
     }) : null
@@ -640,7 +678,7 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
       const label = strategies.includes(stratDecision.label) ? stratDecision.label
         : Object.entries(stratDecision.probabilities ?? {}).filter(([k]) => strategies.includes(k)).sort((a, b) => b[1] - a[1])[0]?.[0] ?? strategyFallback().label
       strategyPick = { label, confidence: stratDecision.confidence, authority: stratDecision.authority, restricted: label !== stratDecision.label }
-    } else if (!stratCtl && jev) {
+    } else if (!stratCtl && jev && strategies.length > 1) {
       try {
         const r = await askJev('resource')
         strategyPick = r.strategy?.choice && strategies.includes(r.strategy.choice) ? { label: r.strategy.choice, confidence: r.strategy.confidence, authority: 'jev' } : { ...strategyFallback(), authority: 'fallback' }
@@ -653,7 +691,17 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
 
     // Both are labelled below, and only where their answer could change the run (see there).
     const secondOpinion = await judgment('second_opinion', 'secondOpinion', risk >= policy.minimumReview.riskForReview, { labelled: false })
-    const frontier = await judgment('frontier_escalation', 'frontierReview', risk >= policy.minimumReview.riskForFrontierReview, { labelled: false })
+    // Answered in code for the same reason: it read the task's risk against a threshold, and a
+    // threshold is arithmetic. Risky work gets the strongest reviewer; work that is merely risky
+    // enough to review gets one too when what it needs is frontier capability, which is where a
+    // subtle mistake is least likely to be caught by the checks alone.
+    const frontierProbability = () => {
+      const cuts = policy.codeJudgments.frontierReview
+      if (risk >= policy.minimumReview.riskForFrontierReview) return cuts.risky
+      const wantsFrontier = profile.minimumCapability === 'frontier' || profile.preferredCapability === 'frontier' || (profile.requirements?.security_review ?? 0) >= 0.5
+      return risk >= policy.minimumReview.riskForReview && wantsFrontier ? cuts.frontierWork : cuts.otherwise
+    }
+    const frontier = await judgment('frontier_escalation', 'frontierReview', risk >= policy.minimumReview.riskForFrontierReview, { labelled: false, code: frontierProbability })
 
     // --- 6. the plan and the routing object -----------------------------------------------------
     // Who may judge: everything that cleared the hard facts, not only what cleared the capability
@@ -702,7 +750,7 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
       primaryAgent: primary.id,
       // When conservation moved the work, the pick's confidence was about the resource it moved
       // away from; what put this primary here is the conservation judgment, at its confidence.
-      agentConfidence: conserved ? conservation.confidence : pick.confidence,
+      agentConfidence: pickMoved ? conservation.confidence : pick.confidence,
       ...(conserved ? { conservedFrom: conserved.from } : {}),
       agentProbabilities,
       capability: profile.capability,

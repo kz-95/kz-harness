@@ -40,7 +40,7 @@ test('constants: the label sources, the outcome-backed subset and the authoritie
   assert.deepEqual([...LABEL_SOURCES], ['verified_outcome', 'human', 'teacher_confirmed', 'verified_negative'])
   for (const s of OUTCOME_BACKED) assert.ok(LABEL_SOURCES.includes(s), `${s} is a label source`)
   assert.equal(OUTCOME_BACKED.includes('verified_negative'), false, 'a negative alone does not back a label')
-  assert.deepEqual([...AUTHORITIES], ['jev', 'local', 'deterministic', 'fallback'])
+  assert.deepEqual([...AUTHORITIES], ['jev', 'local', 'code', 'deterministic', 'fallback'])
 })
 
 test('append stamps an id, the time and the feature schema version', async () => {
