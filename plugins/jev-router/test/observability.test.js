@@ -92,7 +92,8 @@ const helpers = (() => {
   const start = client.indexOf('// ---- pure display helpers')
   const end = client.indexOf('// ---- end pure display helpers')
   assert.ok(start > 0 && end > start, 'the pure helper block is marked')
-  const src = [grab(/const pct = .*\n/), grab(/const evidenceNote = .*\n/), client.slice(start, end)].join('\n')
+  // [^\r\n], not `.`: `.` stops at \r, so with a Windows (CRLF) checkout `.*\n` never matches.
+  const src = [grab(/const pct = [^\r\n]*/), grab(/const evidenceNote = [^\r\n]*/), client.slice(start, end)].join('\n')
   return new Function(`${src}\nreturn { pct, evidenceNote, provenanceOf, limitText, gateNotes, moveNotes }`)()
 })()
 
