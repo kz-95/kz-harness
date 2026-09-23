@@ -874,7 +874,7 @@ test('a verdict relabels only the samples its run labels, never one the engine l
   const r1 = run({ runId: 'run-1', ts: T0, routing: { taskType: 'implementation', primaryAgent: 'claude', decision: { samples: [{ domain: 'task_classification', id: task.id }] } } })
   h.history.push(r1)
   await h.training.resolveOutcome(task.id, labelFromRun('task_classification', await h.training.get(task.id), r1))
-  const out = await h.give({ verdict: 'like' }, later(1))
+  const out = await h.give({ verdict: 'like', tag: 'good pick' }, later(1))
   assert.deepEqual(out.relabelled, [task.id], 'the run\'s own sample is relabelled')
   assert.equal((await h.training.get(skill.id)).outcome, null, 'the one the engine left out stays unlabelled')
 })

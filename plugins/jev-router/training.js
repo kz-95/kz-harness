@@ -217,6 +217,15 @@ const labelOf = (p) => (p ? (p.label ?? p.chosenKey ?? null) : null)
  */
 const pickOf = (sample) => (sample?.authority === 'local' ? sample.local ?? null : sample?.teacher ?? null)
 
+/**
+ * A run that went as planned only confirms a pick somebody else made. Under local authority the
+ * pick is the classifier's own, so "it worked" is the classifier agreeing with itself: training on
+ * it closes the loop, and the label would name a teacher that was never asked. Evidence that
+ * contradicts the pick - a rescue, a negative outcome, a person's tag - is real either way and
+ * still gets through; only the agreeing label is dropped.
+ */
+const confirms = (sample, outcome) => (sample?.authority === 'local' ? null : outcome)
+
 const attemptsOf = (record) => (Array.isArray(record?.attempts) ? record.attempts : [])
 const workAttempts = (record) => attemptsOf(record).filter((a) => a && WORK_ROLES.has(a.role) && !a.limitHit)
 const accepted = (record) => String(record.finalStatus ?? '').startsWith('accepted') || record.finalStatus === 'answered'
@@ -287,7 +296,7 @@ function labelResourceSelection(sample, record) {
   if (noEvidence(record)) return null
   if (accepted(record)) {
     if (!last) return null
-    if (last.agent === pickId) return { chosenKey: key, labelSource: 'teacher_confirmed', ...base }
+    if (last.agent === pickId) return confirms(sample, { chosenKey: key, labelSource: 'teacher_confirmed', ...base })
     const rescuer = cands.keyOf(last.agent)
     // The rescuer is the label; the pick becomes the negative. A rescuer outside the candidate
     // table still proves the pick wrong, but names nobody the classifier could have chosen.
@@ -308,9 +317,10 @@ function labelClassification(sample, record, feedback, until) {
   const base = { verified: true, details: details(record) }
   const rows = feedbackFor(record, feedback, workAttempts(record).at(-1)?.agent, until)
   if (rows.some((f) => MISREAD_TAGS.has(f.tag))) return { label: null, negativeLabel: label, labelSource: 'human', ...base }
-  if (rows.some((f) => f.tag === GOOD_PICK || f.verdict === 'like')) return { label, labelSource: 'human', ...base }
+  // An explicit routing tag only: a plain thumbs-up is about the answer, not about who was picked.
+  if (rows.some((f) => f.tag === GOOD_PICK)) return { label, labelSource: 'human', ...base }
   if (noEvidence(record)) return null
-  if (accepted(record)) return { label, labelSource: 'teacher_confirmed', ...base }
+  if (accepted(record)) return confirms(sample, { label, labelSource: 'teacher_confirmed', ...base })
   return null
 }
 
@@ -354,7 +364,7 @@ function labelStrategy(domain, sample, record) {
     const covering = domain === 'execution_strategy' ? rescue : domain === 'conservation' ? 'no' : 'yes'
     if (covering !== label) return { label: covering, negativeLabel: label, labelSource: 'verified_outcome', ...base }
   }
-  return { label, labelSource: 'teacher_confirmed', ...base }
+  return confirms(sample, { label, labelSource: 'teacher_confirmed', ...base })
 }
 
 function labelDisposition(sample, record) {
@@ -373,7 +383,7 @@ function labelDisposition(sample, record) {
   else if (later.length) needed = later[0].agent === decided.agent ? RETRY_SAME_TIER : RETRY_OTHER
   else if (accepted(record)) needed = PASS
   if (!needed) return null
-  return needed === label ? { label, labelSource: 'teacher_confirmed', ...base } : { label: needed, negativeLabel: label, labelSource: 'verified_outcome', ...base }
+  return needed === label ? confirms(sample, { label, labelSource: 'teacher_confirmed', ...base }) : { label: needed, negativeLabel: label, labelSource: 'verified_outcome', ...base }
 }
 
 /**
