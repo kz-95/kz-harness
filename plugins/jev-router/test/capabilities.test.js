@@ -178,3 +178,18 @@ test('a chat model answers questions and may never change the project', () => {
   assert.deepEqual(eligible(list, { capability: 'project_change', mutation: true }).some((e) => e.kind === 'chat'), false,
     'no chat model is ever handed a change')
 })
+
+test('the cost class comes from the billing kind and the economics override, never the provider name', () => {
+  const agents = [
+    { id: 'acme', name: 'Acme', provider: 'acme-cli', kind: 'subscription', enabled: true },
+    { id: 'renamed', name: 'Renamed', provider: 'claude-code', kind: 'api', enabled: true },
+    { id: 'byok', name: 'Key', provider: 'spawn', kind: 'api', enabled: true, llm: { provider: 'deepseek', model: 'deepseek-flash' } },
+  ]
+  const list = executorsFrom({ agents, economics: { byok: { marginalCost: 'low' } } })
+  const cost = (id) => list.find((e) => e.id === id).cost
+  assert.equal(cost('acme'), 'subscription', 'an unfamiliar provider on a subscription is not metered')
+  assert.equal(cost('renamed'), 'metered', 'a subscription CLI name does not outrank the kind it was given')
+  assert.equal(cost('byok'), 'subscription', 'the operator override outranks the kind')
+  // rank() sorts on it, which is what a capability swap lands on.
+  assert.deepEqual(rank(list.filter((e) => e.id !== 'byok')).map((e) => e.id), ['acme', 'renamed'])
+})

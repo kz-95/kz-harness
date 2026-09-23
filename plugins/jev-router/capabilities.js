@@ -9,6 +9,7 @@
 // Facts stay in code: availability, credentials, modality support, mutation permission and
 // size limits are decided here, never delegated to Jev (see the Jev quick reference rules 4
 // and 10 - it cannot count, compare or know what is installed).
+import { MARGINAL_COST_BY_KIND, kindOf, marginalCostOf } from './accounts.js'
 
 /** The outcome categories a request can need. Descriptions are what Jev is asked to choose between. */
 export const CAPABILITIES = Object.freeze({
@@ -93,7 +94,16 @@ export function eligible(executors, request = {}) {
   })
 }
 
+const contextBytesOf = (a, local, localContextSize) => {
+  const tokens = Number.isFinite(a.llm?.contextSize) && a.llm.contextSize > 0 ? a.llm.contextSize
+    : local && Number.isFinite(localContextSize) && localContextSize > 0 ? localContextSize : null
+  return tokens === null ? null : tokens * CHARS_PER_TOKEN
+}
+
 const COST_ORDER = { free: 0, subscription: 1, metered: 2 }
+// The executor cost class for a marginal cost in the resources.js vocabulary: 'none' runs on this
+// PC, 'low' draws on a window already paid for, 'metered' bills per token.
+const COST_OF_MARGINAL = Object.freeze({ none: 'free', low: 'subscription', metered: 'metered' })
 const LATENCY_ORDER = { fast: 0, medium: 1, slow: 2 }
 const isTool = (e) => (e.kind === 'tool' ? 0 : 1)
 const isLocal = (e) => (e.locality === 'local' ? 0 : 1)
@@ -144,21 +154,37 @@ const IMAGE_WORK = ['ocr', 'image_inspection']
 /**
  * Turn the live catalog into executor declarations.
  *
- * Everything here is a fact this process already knows - the agent's kind, its provider, the
+ * Everything here is a fact this process already knows - the agent's billing kind, the
  * manifest's role, whether it can be handed an image - so no model is asked what it can do.
+ *
+ * The cost class comes from the agent's billing kind (`a.kind`, which index.js sets through
+ * accounts.js kindOf) and the operator's economics override, never from the provider's name:
+ * rank() sorts on it, so a name test here would decide which executor a capability swap lands on.
  *
  * @param {object} p
  * @param {Array<object>} [p.agents]  config.agents entries (kind/provider/role/llm)
  * @param {Array<object>} [p.tools]   config.tools (deterministic scripts)
  * @param {Array<{provider: string, model: string, name?: string}>} [p.chat] chat models for direct answers
  * @param {(agentId: string) => boolean} [p.seesImages] agents that can be handed an image
+ * @param {Record<string, {marginalCost?: string}>} [p.economics] config.resources.economics
  */
-export function executorsFrom({ agents = [], tools = [], chat = [], seesImages = () => false } = {}) {
+/**
+ * Characters per token, in every context-size estimate: here, where an agent's context window
+ * becomes a maximum input, and in decision.js contextEstimate, which sizes the request. Both sides
+ * must use the same unit or the registry and the engine would disagree about what fits.
+ */
+export const CHARS_PER_TOKEN = 4
+
+export function executorsFrom({ agents = [], tools = [], chat = [], seesImages = () => false, economics = {}, localContextSize = null } = {}) {
   const out = []
   for (const a of agents) {
     if (a.enabled === false) continue
-    const local = a.kind === 'local'
-    const subscription = a.provider === 'claude-code' || a.provider === 'codex'
+    // An agent not yet stamped with its kind (a caller that skipped index.js) gets the one
+    // accounts.js would give it: that is where billing knowledge lives, not here.
+    const kind = Object.hasOwn(MARGINAL_COST_BY_KIND, a.kind) ? a.kind : kindOf(a)
+    const local = kind === 'local'
+    const override = economics?.[a.id]?.marginalCost
+    const marginal = Object.hasOwn(COST_OF_MARGINAL, override) ? override : marginalCostOf({ ...a, kind })
     const capabilities = [...AGENT_BASE, ...(seesImages(a.id) ? IMAGE_WORK : [])]
     if (!local) capabilities.push('web_research') // a hosted agent can also look things up
     out.push(validateExecutor({
@@ -172,10 +198,13 @@ export function executorsFrom({ agents = [], tools = [], chat = [], seesImages =
       network: !local,
       locality: local ? 'local' : 'hosted',
       latency: local ? (a.role === 'fast' ? 'fast' : 'medium') : 'slow',
-      cost: local ? 'free' : subscription ? 'subscription' : 'metered',
+      cost: COST_OF_MARGINAL[marginal] ?? 'metered',
       credentials: a.credentialRef ? [a.credentialRef] : [],
       verification: ['checks', 'review'],
-      maxInputBytes: null,
+      // The context window, where one is known (a local model's, from its own setting or the
+      // local-model default), as a maximum input in the same units the request is sized in. A
+      // request that does not fit is a hard fact: eligible() drops the agent before any judgment.
+      maxInputBytes: contextBytesOf(a, local, localContextSize),
     }))
   }
   for (const t of tools) {

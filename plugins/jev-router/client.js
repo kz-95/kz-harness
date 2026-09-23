@@ -1243,15 +1243,16 @@ window.__ModuleLoader__.load({
       limit_reached: ['bad', 'Stopped: limit reached'],
     }
 
-    function WhatHappened({ s }) {
+    /** `decisionCard`: the decision card is rendered beside this one and carries the gate notes itself. */
+    function WhatHappened({ s, decisionCard = false }) {
       const R = s.routed?.routing
       if (!R) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'What the code did'), h('div', { className: 'muted' }, s.error ? s.error.message : 'Routing…'))
       const kind = s.routed.tool ? 'tool' : R.mode === 'jev' ? 'agent' : R.mode
       const badge = { tool: 'tool', agent: 'agent', manual: 'manual', fallback: 'fallback' }[kind]
       const line = s.routed.tool
         ? `Jev picked tool ${s.routed.tool} (fits ${pct(R.toolFits)}, args ${pct(R.toolArgConfidence)}); no LLM needed`
-        : R.mode === 'jev' ? `Jev picked ${R.primaryAgent} (confidence ${pct(R.agentConfidence)})`
-          : R.mode === 'manual' ? `You forced ${R.primaryAgent}` : `Jev unavailable (${R.reason}); default agent ${R.primaryAgent}`
+        : R.mode === 'jev' ? `Jev picked ${movesOf(R)[0]?.from ?? R.primaryAgent} (confidence ${pct(R.agentConfidence)})`
+          : R.mode === 'manual' ? `You forced ${R.primaryAgent}` : `Jev unavailable (${R.reason}); default agent ${movesOf(R)[0]?.from ?? R.primaryAgent}`
       const rows = []
       if (R.mode === 'jev') {
         rows.push(['Task type', `${R.taskType} (${pct(R.taskTypeConfidence)})`], ['Complexity', pct(R.complexity)], ['Risk', pct(R.risk)],
@@ -1262,6 +1263,10 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'card' },
         h('div', { className: 'label' }, 'What the code did'),
         h('div', null, h('span', { className: cx('badge', badge) }, badge), line),
+        // The decision card says this when it is shown (it renders only with a decision record);
+        // anywhere else, the Overview ledger included, this is the only place.
+        ...(R.decision && decisionCard ? [] : gateNotes(R).map((t, i) => h('div', { className: 'why', key: `gate${i}` }, t))),
+        ...moveNotes(R).map((t, i) => h('div', { className: 'why', key: `move${i}` }, t)),
         rows.length ? h('dl', null, ...rows.flatMap(([k, v]) => [h('dt', { key: `t${k}` }, k), h('dd', { key: `d${k}` }, v)])) : null,
         s.attempts.length ? h('div', { style: { marginTop: 12 } }, h('div', { className: 'label' }, 'Steps'),
           h('ol', { className: 'steps' }, ...s.attempts.map((a) => h('li', { key: a.index },
@@ -1275,6 +1280,242 @@ window.__ModuleLoader__.load({
             a.review ? h('div', { className: 'why' }, 'Review → ', h('b', null, a.review.action), `: ${a.review.why}`) : null)))) : null,
         st ? h('div', { style: { marginTop: 10 } }, 'Final: ', h('span', { className: cx('pill', st[0]) }, st[1]), s.final.statusReason ? h('span', { className: 'why' }, ` ${s.final.statusReason}`) : null) : null,
         s.error ? h('div', { className: 'err' }, s.error.message) : null)
+    }
+
+    // How sure a number is, as words: a score nobody has much evidence for must not read like one
+    // that hundreds of runs stand behind.
+    const evidenceNote = (c) => (c == null ? '' : c >= 0.75 ? 'well evidenced' : c >= 0.4 ? 'some evidence' : 'little evidence')
+
+    // ---- pure display helpers: no React, no state. test/observability.test.js evaluates this
+    // block on its own (the runner cannot import a classic script), so nothing in it may reach
+    // outside it except `pct` and `evidenceNote`.
+
+    // Where one figure of a limit came from and how far it can be trusted, read exactly as
+    // resources.js provenanceOf reads it: the figure's own `fieldSources` entry when it has one,
+    // else the limit's. A limit's `source` and `confidence` are its measured figure's; a share
+    // spent worked out from a locally observed high-water mark carries its own, much lower, entry,
+    // and printing it under the limit's would present an estimate as the provider's word.
+    const provenanceOf = (l, field) => {
+      const unit = (c) => (typeof c === 'number' && c >= 0 && c <= 1 ? c : 0)
+      const own = l?.fieldSources?.[field]
+      if (own) return { source: own.source, confidence: unit(own.confidence) }
+      return { source: typeof l?.source === 'string' ? l.source : 'unknown', confidence: unit(l?.confidence) }
+    }
+    const SOURCE_WORDS = {
+      provider_api: 'from the provider',
+      provider_cli: 'from the provider CLI',
+      local_cache: 'cached',
+      local_observation: 'observed locally',
+      estimate: 'estimated',
+      manual: 'entered by hand',
+      unknown: 'source unknown',
+    }
+    const provenanceNote = (p) => `${SOURCE_WORDS[p.source] ?? String(p.source).replace(/_/g, ' ')}, ${evidenceNote(p.confidence)}`
+
+    /**
+     * One limit as a line: each figure with where it came from, at its own confidence. When every
+     * figure shares one provenance it is said once; when they differ (a measured balance next to
+     * an estimated share spent) each says its own, so the estimate reads as one.
+     */
+    const limitText = (l) => {
+      const figures = []
+      if (l.ratioUsed != null) figures.push([`${pct(l.ratioUsed)} used`, provenanceOf(l, 'ratioUsed')])
+      if (l.unit && l.unit !== 'percent' && l.remaining != null) figures.push([`${l.remaining} ${l.unit} left`, provenanceOf(l, 'remaining')])
+      if (!figures.length) return `${l.id} unknown`
+      const [, first] = figures[0]
+      if (figures.every(([, p]) => p.source === first.source && p.confidence === first.confidence)) return `${l.id} ${figures.map(([t]) => t).join(', ')} (${provenanceNote(first)})`
+      return `${l.id} ${figures.map(([t, p]) => `${t} (${provenanceNote(p)})`).join(', ')}`
+    }
+
+    /**
+     * Why the pick stands although its weekly gate says otherwise, in words. The decision engine
+     * keeps a gated resource for frontier work (`decision.gateOverride`); the router itself lets
+     * the gate yield (`gateYielded`) when nothing ungated can do the request, or when everything
+     * is gated. The second can happen with no decision record at all.
+     */
+    const gateNotes = (R) => {
+      if (!R) return []
+      const out = []
+      if (R.decision?.gateOverride) out.push(`${R.primaryAgent} was kept despite its weekly gate: this task needs frontier capability nothing else has`)
+      if (R.gateYielded === 'capability') out.push(`${R.primaryAgent} was kept despite its weekly gate: every agent that can do this request is past its gate`)
+      else if (R.gateYielded === 'everything_gated') out.push(`${R.primaryAgent} was kept despite its weekly gate: every agent is past its gate`)
+      else if (R.gateYielded) out.push(`${R.primaryAgent} was kept despite its weekly gate (${String(R.gateYielded).replace(/_/g, ' ')})`)
+      return out
+    }
+    /**
+     * Every move the router made of its own (a capability swap, a near-tie tie-break, the weekly
+     * gate, the feedback prior), in order, in the words router.js moveLine writes into the report.
+     * A record from before `moves` was kept has only the `<kind>From` fields, each then read as a
+     * move to the final primary, which is all that record knows.
+     */
+    const MOVE_FIELD = { capability: 'capabilityFrom', tiebreak: 'tiebrokeFrom', gate: 'gatedFrom', feedback: 'feedbackFrom' }
+    const movesOf = (R) => (Array.isArray(R?.moves) ? R.moves : Object.entries(MOVE_FIELD).filter(([, f]) => R?.[f]).map(([kind, f]) => ({ kind, from: R[f], to: R.primaryAgent })))
+    const moveNotes = (R) => movesOf(R).map((m) => (m.kind === 'capability' ? `${m.from} cannot do this (${R.capability ?? 'capability unclear'}): ${m.to} took the work`
+      : m.kind === 'tiebreak' ? `${m.from} was barely ahead of ${m.to}, a near tie, and ${m.to} costs less at the margin: ${m.to} took the work`
+        : m.kind === 'gate' ? `Work moved off ${m.from} (past its weekly gate) to ${m.to}`
+          : m.kind === 'feedback' ? `Feedback moved the pick off ${m.from} to ${m.to}`
+            : `Work moved from ${m.from} to ${m.to}`))
+    // ---- end pure display helpers
+    const AUTHORITY = {
+      local: ['ok', 'local router'],
+      jev: ['', 'Jev'],
+      fallback: ['warn', 'safe fallback'],
+      none: ['', 'not asked'],
+    }
+
+    /**
+     * What the adaptive router decided and why: which routing domain was answered by whom, the
+     * anonymous candidates with the capability evidence and scarcity they were judged on, what
+     * was excluded before any judgment, and the strategy that came out of it.
+     */
+    function RoutingDecision({ s }) {
+      const R = s.routed?.routing
+      const d = R?.decision
+      if (!d) return null
+      const pill = (tone, text, title) => h('span', { className: cx('pill', tone), title }, text)
+      const domainRows = Object.entries(d.domains ?? {}).map(([id, v]) => {
+        const [tone, who] = AUTHORITY[v.authority] ?? ['', v.authority]
+        return h('li', { key: id },
+          h('div', null,
+            h('b', null, id.replace(/_/g, ' ')),
+            pill(tone, who),
+            v.maturity ? pill('', v.maturity.replace(/_/g, ' ').toLowerCase()) : null,
+            v.confidence != null ? pill(v.requiredConfidence != null && v.confidence < v.requiredConfidence ? 'warn' : 'ok', `${pct(v.confidence)}${v.requiredConfidence != null ? ` of ${pct(v.requiredConfidence)} needed` : ''}`) : null,
+            v.ood?.flag ? pill('warn', 'out of distribution') : null),
+          h('div', { className: 'why' }, v.label ? `→ ${v.label}. ` : '', v.reason ?? ''),
+          v.local && v.teacher && (v.local.label ?? v.local.chosenKey) !== (v.teacher.label ?? v.teacher.chosenKey)
+            ? h('div', { className: 'why' }, `shadow: the local router would have said ${v.local.label ?? v.local.chosenKey} (${pct(v.local.confidence)})`)
+            : null)
+      })
+      const candidates = (d.candidates ?? []).map((c) => {
+        const caps = Object.entries(c.capabilities ?? {}).map(([dim, v]) => `${dim.replace(/_/g, ' ')} ${pct(v.score)} (${evidenceNote(v.confidence)}${v.samples ? `, ${v.samples} runs` : ''})`)
+        return h('li', { key: c.key },
+          h('div', null,
+            h('b', null, c.key), h('code', { style: { marginLeft: 6 } }, c.id),
+            pill(c.id === R.primaryAgent ? 'ok' : '', c.tier),
+            pill('', c.source),
+            c.cold ? pill('warn', 'new, little evidence') : null),
+          h('div', { className: 'why' },
+            `fit ${pct(c.fit)} · scarcity ${c.scarcity == null ? 'unknown' : pct(c.scarcity)}`,
+            c.resetInMinutes != null ? ` (resets in ${Math.round(c.resetInMinutes)} min)` : '',
+            ` · expected cost ${c.expectedCost?.class ?? 'unknown'} · ${c.latency}`,
+            c.plan ? ` · ${c.plan} plan` : '',
+            ` · ${c.evidenceSamples ?? 0} verified runs behind its profile`),
+          caps.length ? h('div', { className: 'why' }, caps.join(' · ')) : null)
+      })
+      const p = d.plan ?? {}
+      const extras = [p.steps?.some((x) => x.role === 'plan') ? `plan by ${p.steps.find((x) => x.role === 'plan').agent}` : '', p.reviewer ? `review by ${p.reviewer}` : '', p.parallelWith ? `second opinion from ${p.parallelWith}` : ''].filter(Boolean)
+      return h('div', { className: 'card' },
+        h('div', { className: 'label' }, 'How the router decided'),
+        h('div', null,
+          h('span', { className: cx('badge', d.jevCalls ? 'agent' : 'tool') }, d.jevCalls ? `${d.jevCalls} Jev call${d.jevCalls === 1 ? '' : 's'}` : 'no Jev call'),
+          `${R.strategy ?? 'STANDARD_DIRECT'}${extras.length ? ` (${extras.join(', ')})` : ''}`),
+        p.notes?.length ? h('div', { className: 'why' }, p.notes.join('; ')) : null,
+        ...gateNotes(R).map((t, i) => h('div', { className: 'why', key: `gate${i}` }, t)),
+        d.belowFloor ? h('div', { className: 'why' }, `nothing meets the ${d.minimumCapability} bar this task asks for; the strongest available reviews`) : null,
+        domainRows.length ? h('div', { style: { marginTop: 10 } }, h('div', { className: 'label' }, 'Who decided what'), h('ul', { className: 'plain' }, ...domainRows)) : null,
+        candidates.length ? h('div', { style: { marginTop: 10 } }, h('div', { className: 'label' }, 'Candidates, as the router saw them'), h('ul', { className: 'plain' }, ...candidates)) : null,
+        d.excluded?.length
+          ? h('div', { style: { marginTop: 10 } }, h('div', { className: 'label' }, 'Not offered'),
+            h('ul', { className: 'plain' }, ...d.excluded.map((e) => h('li', { key: e.id }, h('code', null, e.id), h('span', { className: 'why' }, ` ${e.reason}`)))))
+          : null)
+    }
+
+    /** The adaptive router's own state: GET /jev-router/routing, refreshed while the tab is open. */
+    function useRouting(visible, every = 10_000) {
+      const [data, setData] = useState(null)
+      const [error, setError] = useState('')
+      const [busy, setBusy] = useState(false)
+      const load = useCallback(async () => {
+        setBusy(true)
+        try { setData(await api('/jev-router/routing')); setError('') } catch (e) { setError(e.message) } finally { setBusy(false) }
+      }, [])
+      useEffect(() => {
+        if (!visible) return
+        let stop = false
+        let timer
+        const tick = async () => { if (!stop) await load(); if (!stop) timer = setTimeout(tick, every) }
+        tick()
+        return () => { stop = true; clearTimeout(timer) }
+      }, [visible, every, load])
+      return { data, error, busy, load }
+    }
+
+    const MATURITY_TONE = { JEV_PRIMARY: '', SHADOW: '', GUARDED_LOCAL: 'warn', LOCAL_ONLY: 'ok', ROLLBACK: 'bad' }
+    const MATURITY_WORDS = {
+      JEV_PRIMARY: 'Jev decides; the local router is not trained yet',
+      SHADOW: 'Jev decides; the local router predicts alongside it and is being scored',
+      GUARDED_LOCAL: 'the local router decides when it is confident and the case is familiar',
+      LOCAL_ONLY: 'the local router decides normal cases with no Jev call',
+      ROLLBACK: 'local authority suspended; Jev decides until it is earned back',
+    }
+
+    /**
+     * The Router view: how far each routing domain has matured, what is blocking the next step,
+     * and what the capability registry currently believes about each resource and on what
+     * evidence. This is the tab that answers "why did it pick that, and who decided".
+     */
+    function RouterView({ data, error, busy, onRefresh }) {
+      if (error) return h('div', { className: 'err', role: 'alert' }, error)
+      if (!data) return h('div', { className: 'empty' }, busy ? 'Reading the router…' : 'No routing state yet.')
+      if (!data.enabled) return h('div', { className: 'empty' }, 'Adaptive routing is switched off in the config; Jev routes every task.')
+      const pill = (tone, text, title) => h('span', { className: cx('pill', tone), title }, text)
+      const domains = Object.entries(data.domains ?? {}).map(([id, d]) => {
+        const gates = d.progress?.gates ?? []
+        const done = gates.filter((g) => g.ok).length
+        return h('details', { className: 'q', key: id },
+          h('summary', null,
+            h('div', null, h('b', null, id.replace(/_/g, ' ')), pill(MATURITY_TONE[d.maturity] ?? '', d.maturity.replace(/_/g, ' ').toLowerCase()), pill('', `${d.riskClass.toLowerCase()} risk`)),
+            h('div', { className: 'ans' }, d.progress?.next ? `${done}/${gates.length} toward ${d.progress.next.replace(/_/g, ' ').toLowerCase()}` : 'fully matured')),
+          h('div', { className: 'muted', style: { margin: '6px 0' } }, MATURITY_WORDS[d.maturity] ?? ''),
+          h('div', { className: 'why' },
+            `${d.samples?.verified ?? 0} verified samples`,
+            d.samples?.outcomeBacked != null ? `, ${d.samples.outcomeBacked} proved by a run or a person` : '',
+            d.artifact ? `, classifier ${d.artifact.sampleCount} samples` : d.artifactReason ? `, no classifier (${d.artifactReason})` : ''),
+          d.rollbackReason ? h('div', { className: 'err' }, `Rolled back (${d.rollbackSeverity}): ${d.rollbackReason}`) : null,
+          gates.length
+            ? h('ul', { className: 'plain' }, ...gates.map((g) => h('li', { key: g.name },
+              pill(g.ok ? 'ok' : 'warn', g.ok ? 'met' : 'not yet'),
+              ` ${g.name}: ${g.actual ?? 'unknown'} ${g.atMost ? 'against a ceiling of' : 'against'} ${g.required}`)))
+            : null,
+          d.lastEvaluation?.drift ? h('div', { className: 'why' }, `drift: ${d.lastEvaluation.drift.level}${d.lastEvaluation.drift.worst ? ` (worst ${d.lastEvaluation.drift.worst.feature} at ${d.lastEvaluation.drift.worst.value})` : ''}`) : null,
+          typeof d.oodRate === 'number' ? h('div', { className: 'why' }, `${pct(d.oodRate)} of recent decisions were unfamiliar`) : null)
+      })
+      const resources = (data.resources ?? []).map((r) => h('li', { key: r.id },
+        h('div', null, h('b', null, r.id), pill('', r.source), r.plan?.name ? pill('', r.plan.name) : null,
+          r.availability?.state && r.availability.state !== 'ok' ? pill('warn', r.availability.state) : null,
+          r.stale ? pill('warn', 'stale reading') : null),
+        h('div', { className: 'why' },
+          // Every figure carries its own provenance. The snapshot's usageSource and confidence are
+          // its best limit's measured figure, so printing them once for the whole line put an
+          // estimated share spent under the provider's name and its "well evidenced".
+          r.limits?.length ? r.limits.map(limitText).join(' · ') : `no limits reported (${provenanceNote({ source: r.usageSource ?? 'unknown', confidence: r.confidence })})`,
+          r.governor?.scarcity != null ? ` · scarcity ${pct(r.governor.scarcity)} (${evidenceNote(r.governor.scarcityConfidence ?? 0)})` : ' · scarcity unknown'),
+        r.availability?.reason ? h('div', { className: 'why' }, r.availability.reason) : null))
+      const profiles = (data.profiles ?? []).map((p) => {
+        const dims = Object.entries(p.dimensions ?? {}).sort((a, b) => b[1].score - a[1].score)
+        return h('details', { className: 'q', key: p.id },
+          h('summary', null,
+            h('div', null, h('b', null, p.id), p.subject?.model ? h('code', { style: { marginLeft: 6 } }, p.subject.model) : null, p.cold ? pill('warn', 'new') : null),
+            h('div', { className: 'ans' }, `${p.samples ?? 0} observations`)),
+          h('ul', { className: 'plain' }, ...dims.map(([dim, v]) => h('li', { key: dim },
+            h('div', { className: 'row' }, h('span', null, dim.replace(/_/g, ' ')), h('span', null, pct(v.score))),
+            h('div', { className: 'bar' }, h('i', { style: { width: `${Math.max(0, Math.min(1, v.score)) * 100}%` } })),
+            h('div', { className: 'why' },
+              `${evidenceNote(v.confidence)}`,
+              v.prior ? ` · started from a ${v.prior.source.replace(/_/g, ' ')} of ${pct(v.prior.score)}` : '',
+              v.execution ? ` · ${v.execution.n} runs here, trend ${v.execution.trend}` : '',
+              v.benchmark ? ` · benchmark ${pct(v.benchmark.score)}` : '')))))
+      })
+      return h('div', null,
+        h('div', { className: 'head' },
+          h('div', { className: 'label', style: { margin: 0 } }, data.learning ? 'The router is learning from every routed task' : 'Learning is switched off: Jev decides and nothing is recorded'),
+          h('button', { onClick: onRefresh, disabled: busy }, busy ? 'Reading…' : 'Refresh')),
+        h('div', { className: 'card' }, h('div', { className: 'label' }, 'Routing domains'), ...domains),
+        h('div', { className: 'card' }, h('div', { className: 'label' }, 'Resources, as the provider adapters report them'), h('ul', { className: 'plain' }, ...resources)),
+        h('div', { className: 'card' }, h('div', { className: 'label' }, 'What each resource is believed to be good at'),
+          h('div', { className: 'why', style: { margin: '4px 0 8px' } }, 'Priors are the owner\'s starting observations. Recorded runs, reviews and feedback move them; an unknown dimension stays unknown.'),
+          ...profiles))
     }
 
     function Question({ q }) {
@@ -1318,7 +1559,8 @@ window.__ModuleLoader__.load({
           ...runs.slice().reverse().map((r) => h('option', { key: r.id, value: r.id }, `${new Date(r.startedAt).toLocaleTimeString()} · ${r.task.slice(0, 60)}`))) : null,
         h('div', { className: 'why', style: { marginTop: 6 } }, `Task: ${run.task}`),
         h(Stats, { s }),
-        h(WhatHappened, { s }),
+        h(WhatHappened, { s, decisionCard: true }),
+        h(RoutingDecision, { s }),
         h(Questions, { traces: s.traces }))
     }
 
@@ -2402,7 +2644,7 @@ window.__ModuleLoader__.load({
       const nav = info?.tab?.navigation
       useEffect(() => {
         const v = nav?.params?.view
-        if (['decisions', 'subagents', 'jobs', 'usage'].includes(v)) setView(v)
+        if (['decisions', 'subagents', 'jobs', 'usage', 'router'].includes(v)) setView(v)
       }, [nav?.revision, nav?.params?.view])
       const runs = useRuns(sessionId, visible)
       const entries = useSessions?.((s) => s.subagentsByParent?.[sessionId]?.entries) ?? EMPTY
@@ -2413,6 +2655,7 @@ window.__ModuleLoader__.load({
       names.use()
       useEffect(() => { if (visible) loadNames() }, [visible])
       const { usage, error: usageErr, busy: usageBusy, load: loadUsage } = useUsage(visible)
+      const routing = useRouting(visible && view === 'router')
       const [agents, setAgents] = useState(null)
       const [chipBusy, setChipBusy] = useState(false)
       const [chipErr, setChipErr] = useState('')
@@ -2428,9 +2671,11 @@ window.__ModuleLoader__.load({
         h('h3', null, 'Jev inspector'),
         h(AgentChips, { agents, usage, busy: chipBusy, onToggle: toggle }),
         chipErr ? h('div', { className: 'err', role: 'alert' }, chipErr) : null,
-        h('div', { className: 'tabs', role: 'tablist' }, tab('decisions', 'Decisions', runs.length), tab('subagents', 'Subagents', liveKids), tab('jobs', 'Background', live), tab('usage', 'Usage', limited)),
-        view === 'decisions' ? h(Decisions, { runs }) : view === 'subagents' ? h(Subagents, { sessionId, entries })
-          : view === 'usage' ? h(UsageView, { usage, error: usageErr, busy: usageBusy, onRefresh: () => loadUsage(true), onSaved: () => loadUsage(false) }) : h(Tasks, { sessionId, runs, jobs, entries, tasks }))
+        h('div', { className: 'tabs', role: 'tablist' }, tab('decisions', 'Decisions', runs.length), tab('router', 'Router'), tab('subagents', 'Subagents', liveKids), tab('jobs', 'Background', live), tab('usage', 'Usage', limited)),
+        view === 'decisions' ? h(Decisions, { runs })
+          : view === 'router' ? h(RouterView, { ...routing, onRefresh: routing.load })
+            : view === 'subagents' ? h(Subagents, { sessionId, entries })
+              : view === 'usage' ? h(UsageView, { usage, error: usageErr, busy: usageBusy, onRefresh: () => loadUsage(true), onSaved: () => loadUsage(false) }) : h(Tasks, { sessionId, runs, jobs, entries, tasks }))
     }
 
     // ---------- plan limits beside the composer ----------
@@ -2752,10 +2997,12 @@ window.__ModuleLoader__.load({
     /** A durable run's detail, read from the stored record's own fields (never reshaped). */
     function HistoryRunDetail({ record }) {
       const R = record.routing ?? {}
-      const line = R.mode === 'jev' ? `Jev picked ${R.primaryAgent ?? '?'}` : R.mode === 'manual' ? `You forced ${R.primaryAgent ?? '?'}` : `Mode ${R.mode ?? '?'}`
+      const line = R.mode === 'jev' ? `Jev picked ${movesOf(R)[0]?.from ?? R.primaryAgent ?? '?'}` : R.mode === 'manual' ? `You forced ${R.primaryAgent ?? '?'}` : `Mode ${R.mode ?? '?'}`
       return h('div', { className: 'card' },
         h('div', { className: 'label' }, 'Stored run record'),
         h('div', null, line, Number.isFinite(R.risk) ? h('span', { className: 'why' }, ` · risk ${pct(R.risk)}`) : null),
+        ...gateNotes(R).map((t, i) => h('div', { className: 'why', key: `gate${i}` }, t)),
+        ...moveNotes(R).map((t, i) => h('div', { className: 'why', key: `move${i}` }, t)),
         record.workspace ? h('div', { className: 'why' }, record.workspace) : null,
         (record.attempts ?? []).length ? h('ol', { className: 'steps' }, ...record.attempts.map((a, i) => h('li', { key: i },
           h('div', null, h('b', null, a.agent ?? '?'), h('span', { className: 'pill' }, a.role ?? ''),
@@ -2956,8 +3203,8 @@ window.__ModuleLoader__.load({
                   h('option', { value: '' }, 'Choose…'), ...(provider?.models ?? []).map((m) => h('option', { key: m.id, value: m.id }, m.name)))),
                 h('dt', null, h('label', { htmlFor: 'jevi-i' }, 'Name')),
                 h('dd', null, h('input', { id: 'jevi-i', type: 'text', required: true, pattern: '[a-z][a-z0-9_-]{0,31}', placeholder: 'e.g. kimi', value: form.id, onChange: (e) => setForm({ ...form, id: e.target.value.toLowerCase() }) })),
-                h('dt', null, h('label', { htmlFor: 'jevi-d' }, 'Good at')),
-                h('dd', null, h('input', { id: 'jevi-d', type: 'text', required: true, placeholder: 'What Jev should send it, e.g. quick fixes and tests', value: form.description, onChange: (e) => setForm({ ...form, description: e.target.value }), style: { width: '100%' } }))),
+                h('dt', null, h('label', { htmlFor: 'jevi-d' }, 'What it is')),
+                h('dd', null, h('input', { id: 'jevi-d', type: 'text', required: true, placeholder: 'What it is, e.g. Mistral API, paid per token', value: form.description, onChange: (e) => setForm({ ...form, description: e.target.value }), style: { width: '100%' } }))),
               h('div', { style: { marginTop: 10 } }, h('button', { className: 'btn primary', type: 'submit' }, 'Add agent')))),
 
         h('div', { className: 'card' },
@@ -3769,6 +4016,19 @@ window.__ModuleLoader__.load({
       return null
     }
 
+    // The run an answer came from, as route() wrote it (index.js withRunMark): a link reference
+    // definition the markdown renderer drops, like the chain marker. It is the one exact link from
+    // a message to its run; without it the server can only guess the run by time, and a verdict on
+    // an older answer given after a newer run ended would be credited to the newer run.
+    const RUN_MARK = /^\[jev-run\]:\s*kzh-run-1-([\w-]{1,80})\s*$/gm
+
+    /** The run id the message names, '' when none. A turn that reports several runs is judged on the last, as its provenance is. */
+    function messageRunId(text) {
+      let id = ''
+      for (const m of String(text ?? '').matchAll(RUN_MARK)) id = m[1]
+      return id
+    }
+
     /**
      * The attribution a verdict stores. A routed answer's chain marker names only its agent, and
      * that agent id is exactly what router.js resolves a verdict to first (feedbackPrior checks the
@@ -3809,6 +4069,8 @@ window.__ModuleLoader__.load({
       ...(f.suggestedAgent ? { suggestedAgent: f.suggestedAgent } : {}),
       ...(f.provider ? { provider: f.provider } : {}),
       ...(f.model ? { model: f.model } : {}),
+      // Sent with every verdict and every edit of one, like the attribution; a clear needs no run.
+      ...(f.verdict && f.runId ? { runId: f.runId } : {}),
     })
 
     // The "should have been" picker is the same enabled-agent list the setup page and the model
@@ -3880,7 +4142,7 @@ window.__ModuleLoader__.load({
         try {
           await post('/jev-router/feedback', feedbackBody({
             sessionId, messageId, verdict: next.verdict, reason: next.reason, tag: next.tag,
-            suggestedAgent: next.suggestedAgent, provider, model: prov.model,
+            suggestedAgent: next.suggestedAgent, provider, model: prov.model, runId: messageRunId(text),
           }))
         } catch (e) {
           setState(prev)
@@ -4012,7 +4274,7 @@ window.__ModuleLoader__.load({
       // cannot be imported by node. `taskLabels` is the copy the anti-drift test compares with
       // adapter.js TASK_LABELS on the server. The two start* schedulers are exposed with stubbable
       // DOM globals so a test can prove a pass lands on a timer while no frame is ever delivered.
-      __test: { Markdown, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs },
+      __test: { Markdown, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs },
       apply(ctx) {
         sessionsApi = ctx.sessions
         sidebarRight = ctx.sidebarRight

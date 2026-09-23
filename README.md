@@ -36,7 +36,9 @@ flowchart TD
 
 1. **You type** in the Kz-harness window. The **Jev Auto** model is the default, so every message goes straight to the router, with no chat model in front of it.
 2. **Jev sorts it:** is this *work in the project* or *a question*? Questions get a direct answer from a chat model. The **No project** workspace is chat-only.
-3. **Jev routes the work** in a single fast call. It picks the agent, reads the task type, complexity and risk, and decides whether tests must pass and whether a second opinion or a person is worth it. Agents that are signed out, switched off or at your usage limit are never picked.
+3. **The router picks who does the work.** Code strikes out first: an agent that is signed out, switched off, out of quota, too small for the task's context, or missing a tool or modality the task needs is never a candidate, and no model is ever asked about it. What is left is judged on what it is good at, what a job on it would really cost, and how much of your plan is left. Jev answers that judgment at first.
+   Once a routing domain has been right often enough, on outcomes that were actually verified, its local classifier answers in place of Jev whenever it is confident and the input looks familiar.
+   Jev's routing questions are batched into calls, so a call is skipped only when every domain it carries answers locally; see [It learns: adaptive routing](#it-learns-adaptive-routing).
 4. **The agent works** inside your project folder. If it hits its usage limit mid-task, an API-key agent switches to your next key; a subscription agent (Claude ↔ Codex) hands the task to its peer, along with a **handoff note** (`.kz-harness/handoff.md`).
 5. **Deterministic checks run:** the git diff, plus your project's `typecheck`, `lint`, `test` and `build` scripts. A check that passed before must still pass.
 6. **Jev reviews** with small yes/no questions (did it do the task? all of it? anything unrelated? regression risk? does it need a person?). Code decides from those answers: pass, second opinion, retry, or hand it to you.
@@ -71,7 +73,7 @@ Only the model and API calls you choose go online. KzH switches off DSH's data c
 
 - **Kz-harness.exe:** its own window, name and icon, a start screen with a live log, a colored log window (Ctrl+Shift+L), a tray icon, and DevTools on F12. Closing it stops everything it started.
 - **Header like Claude desktop:** buttons for **Terminal**, **Background tasks**, **Browser** and **Jev inspector**, plus a **⋮** menu (Files, Usage, focus mode, settings). Every action has a hotkey you can change in **Settings → Shortcuts**.
-- **Right sidebar** (opens at 20% width; change it in Settings → Shortcuts):
+- **Right sidebar** (opens at 24% width; change it in Settings → Shortcuts):
   - **Jev inspector:** timings, the pick and its reasons, every step with that agent's own answer, and every question Jev was asked with its probabilities.
   - **Overview:** the whole session as one time-ordered ledger: your messages and the assistant's, tool calls, context and compaction, then the routed runs, background tasks and subagents. Filter chips by kind, and every row expands to the inspector's own detail (see [The work board, history and feedback](#the-work-board-history-and-feedback)).
   - **Background tasks:** Jev runs, background jobs and subagents, each with a live timer, output and **Stop**.
@@ -222,14 +224,19 @@ Three deliberate choices:
 A forced agent (`/claude`, or picking one in the model menu) is never swapped: an explicit choice
 beats the policy. When the gate does move work, the report says so, and the reasoning line reads
 `claude is 92% into its weekly window (gate 90%): codex takes the work, claude stays for review`.
+The gate moves work only to an agent that can actually do it. When nothing under the gate can (only
+the gated agent reads the attached image, say), the gate yields and the report says `Kept claude
+despite its weekly gate: nothing ungated can do this request`, because saving a subscription window
+is not worth routing a job to an agent that cannot do it.
 
 ### When an agent runs out mid-task
 
 Nothing is lost. The harness writes `.kz-harness/handoff.md` from the evidence so far, hands the
-task to another agent with that note in its prompt, and carries on. The replacement is the cheapest
-one that is not itself past a gate, so a spent subscription is never handed work that just moves
-the problem. If no agent is left, the run pauses with the handoff saved and asking to *continue*
-later picks it up.
+task to another agent with that note in its prompt, and carries on.
+The replacement for work is the agent's peer (Claude Code and Codex are each other's by default; an agent's own `peer` overrides that) when the peer can do the job and is not itself past its weekly gate.
+Otherwise it is the next agent by Jev's ranking that can do the job, preferring one that is not past its gate, and only when every such agent is past its gate does one of them take the work.
+A review hand-over follows the same order among the agents no fact rules out, other than the one whose work is under review, and ignores the gate, because judging is what a gated agent is kept for.
+If no agent that can take over is left, the run pauses with the handoff saved and asking to *continue* later picks it up.
 
 ### API keys get two tiers as well
 
@@ -277,15 +284,26 @@ These are plugin features (`plugins/jev-router/client.js`), loaded by the engine
   - The routing tags (`wrong agent`, `misread my question`, `wrong scope`, `good pick`) are statements about the pick and may move Jev's probabilities within a bounded bias (weight 0.15, ramped over the first three votes, reading the newest 20). An untagged verdict votes too.
   - The answer-only tags (`not enough detail`, `too slow`, `good answer`) never move a pick; their text and tag still ride the routing prompt as context.
   - A written reason always reaches the routing prompt, with its tag in front when one was picked.
-  - A `should have been` suggestion is stronger and can switch the pick outright, but only to an agent this run could really have used: enabled, capable and not past its weekly gate. Clearing a verdict appends a tombstone row, so an earlier verdict is never lost by a clear.
+  - A `should have been` suggestion is stronger and can switch the pick outright, but only to an agent this run could really have used: enabled, capable, not past its weekly gate, and not one the router is conserving for harder work. Clearing a verdict appends a tombstone row, so an earlier verdict is never lost by a clear.
+  - A verdict is also capability evidence about the agent that answered, recorded once, when it is given, for the run its answer came from.
+    Every routed answer ends with an invisible run mark and the verdict is sent with it, so it lands on exactly that run, even after newer runs in the session.
+    An answer from before the mark falls back to the run an earlier form of the same verdict was credited to, else the last run of the session that had ended when that answer was first judged.
+    Changing it replaces what it counted; clearing it, or re-tagging it `too slow`, withdraws it, with learning off too; uninstalling the agent that answered does not.
+    The same verdict relabels that run's routing decisions: a `misread my question` teaches the task classifier that run was misread.
   - Verdicts are stored locally, one append-only row each, in `<DSH_HOME>/jev-router/feedback.jsonl` (`~/.kzh/jev-router/feedback.jsonl`). The bias is small and ramped, so a handful of clicks will not change picks: no accuracy improvement is measurable until real verdicts accumulate.
 
 ## How Jev decides
 
-Jev is TypeSafe's System One model. It answers typed questions with calibrated probabilities and never writes code. KzH follows the [Jev docs](https://docs.typesafe.ai/introduction): each call batches all its questions, each question is one judgment, and **code** makes the decision.
+Jev is TypeSafe's System One model. It answers typed questions with calibrated probabilities and never writes code. KzH follows the [Jev docs](https://docs.typesafe.ai/introduction): each call batches all its questions, each question is one judgment, and **code** makes the decision. Jev is also the teacher: once a routing domain's local classifier has been right often enough on verified outcomes, it answers that domain's questions itself ([It learns](#it-learns-adaptive-routing)).
+Even a mature domain still sends an unconfident or unfamiliar case to Jev.
+Questions are asked in whole groups: the task type rides with the skill and the rest of the task profile, the resource with the strategy, and the three judgments (second opinion, conservation, frontier review) with each other.
+So a mature domain's question is still asked while another domain in its group needs Jev, and a call is made only when some domain it serves needs Jev: the calls below are what a cold router does, not a fixed price.
 
-- **Before running** (one call): which agent, the task type, complexity and risk, whether a second opinion, a person or passing tests are needed, whether any tool fits exactly (and its arguments), whether the task continues an earlier handoff, **what kind of outcome the request needs** (below), and **whether a question also asks for work** (below). Only small facts are sent (the task, file-type counts, script and dependency names, changed file names, recent outcomes, and the folder's handoff note when it has one, which quotes the previous task's answer and so can carry code from it); whole source files never are.
-- **After each run** (one call over the diff, the checks and the answer): addressed, complete, unrelated changes, regression risk, needs a person, and which agent should go next.
+- **Before running** (at most two calls, batched): first what the task *is* - its type, complexity, risk, what a resource would need to be good at, whether tests must pass, whether any tool fits exactly (and its arguments), whether it continues an earlier handoff, whether a person should inspect the result, and **what kind of outcome the request needs** (below).
+  **Whether a question also asks for work** (below) is not asked here: it rides the separate, earlier call that sorts a message into a question or a task.
+  Then, knowing that, which resource should take it, how to organise the work across resources, whether a second opinion is worth it, whether the strongest resource should review the result, and whether to keep the most capable resource's scarce capacity for harder work.
+  A call is skipped only when every routing domain it serves answers locally for that task: the first serves task classification and skill selection, the second resource selection, the execution strategy, the second opinion, conservation and frontier escalation. Only small facts are sent (the task, the branch, file-type counts, script and dependency names, up to 30 changed file names, recent outcomes naming the resource that ran them only by its `RESOURCE_x` key, an anonymised candidate table with no provider or model names in it, and the folder's handoff note when it has one, which quotes the previous task's answer and so can carry code from it); whole source files never are. With `routing.enabled: false` the older single call is made instead, and it names the agents and carries their track record (see [Privacy](#privacy)).
+- **After each attempt** (one call per attempt, over the diff, the checks and the latest answer, so a run with a retry or a second review makes more than one; a plan step, an attempt stopped by a usage limit, a reviewer that failed and a plain question get none): addressed, complete, unrelated changes, regression risk, needs a person, and which agent should review or fix next. Under adaptive routing those two picks are made over the same anonymous candidate data as the routing pick, and the key Jev chooses is turned back into an agent in code.
 
 ### One message can do both
 
@@ -300,7 +318,13 @@ The two judgments are asked separately (is this a question to answer, and does i
 
 ### What the request needs (capabilities)
 
-Every executor on this machine declares what it can do, and **code decides who is capable before Jev is asked**. Jev then chooses among candidates that can actually do the work, and code checks its pick afterwards - so a capability mismatch cannot be routed. This is what lets non-code work be routed at all: the old question was only "question or coding task", which has nowhere to put OCR, a document or a look-up.
+Every executor on this machine declares what it can do, and **code decides who is capable before Jev is asked**.
+Jev then chooses among candidates that can actually do the work, and code checks its pick afterwards and swaps it for a capable agent.
+An agent excluded by `routing.disabledResources` or `allowedResources` counts as unavailable here too, so it is never offered as able, and a `LOCAL_FIRST` strategy's local step is dropped for the pick when it cannot do what Jev named.
+Every move the router makes of its own (the capability swap, the tie-break, the weekly-gate swap, feedback, a retry, the `LOCAL_FIRST` hand-over) goes only to an agent that can do the job.
+A capability outranks conservation and the weekly gate, so when only a conserved or gated agent can do it, that agent takes the work.
+Jev is offered only the capabilities some agent in the run can carry out, so it cannot name one nobody here has: in **Jev Auto · Local** a look-up (`web_research`) is classified as something a local model can do and runs on it, rather than being refused.
+This is what lets non-code work be routed at all: the old question was only "question or coding task", which has nowhere to put OCR, a document or a look-up.
 
 | Capability | Example | Preferred path |
 |---|---|---|
@@ -315,14 +339,42 @@ Every executor on this machine declares what it can do, and **code decides who i
 | `project_change` | Implement or fix something | a mutating agent, with checks and review |
 | `human_required` | A missing permission or a choice only you can make | the request stops and asks you |
 
-Nothing is delegated that code can settle: availability, sign-in, limits, modality support, write permission, input size, price and arithmetic stay in code. A request nothing here can do says so instead of running anyway, and `human_required` stops the run rather than letting an agent guess at an answer it is not allowed to give. A capability below its confidence threshold still runs normally, and picking an agent by hand always wins.
+Nothing is delegated that code can settle: availability, sign-in, limits, modality support, write permission, input size, price and arithmetic stay in code. A request whose input, file changes or size nothing here can handle says so instead of running anyway, and `human_required` stops the run rather than letting an agent guess at an answer it is not allowed to give. A capability below its confidence threshold still runs normally, and picking an agent by hand always wins.
 
+### It learns: adaptive routing
+
+Jev starts as the teacher, not the permanent decision maker. Every routing decision and every verified outcome is recorded, and a **routing domain** - task classification, resource selection, review necessity, escalation, and four more - earns the right to decide for itself once it has been right often enough. Full reference: [`docs/adaptive-routing.md`](docs/adaptive-routing.md).
+
+- **No kind of work is assigned to a provider in code.** There is no "frontend goes to Claude" rule and no "architecture goes to GPT" rule. What each model family is believed to be good at lives in [`config/capability-priors.json`](config/capability-priors.json) as scores with a confidence on each, per dimension (coding, first-pass quality, code review, security review, system design, explanation, reliability, and so on).
+  Speed and cost are not priors and the file refuses them: the governor reads a latency class from whether a resource is local, an API or a subscription, and a cost from its funding and how scarce its quota is.
+  They are **evidence, not rules**: every run this harness verifies is more evidence, and a family that keeps failing a dimension loses it, whatever the file says.
+  Add a provider by adding a row.
+  A few things are still decided by name: a `claude-code` or `codex` provider makes an agent a subscription (cost routing reads only the billing kind that follows), which failure text counts as a usage limit, and which agents can take an attached image; at a usage limit the agents with ids `claude` and `codex` hand over to each other by default, unless an agent sets its own `peer`.
+  [`docs/adaptive-routing.md`](docs/adaptive-routing.md) lists where. There is no benchmark source yet: the priors plus this harness's own runs are all the evidence there is.
+- **The classifier never sees a brand in the candidate table.** Candidates reach it and Jev as `RESOURCE_A`, `RESOURCE_B`, described only by their measured numbers - so what it learns is "the one that is strong at review and has quota left", never "the one called Claude". A new model is a new candidate, not a new code path. The task text, the handoff note and, at review, the answer and the diff are not anonymised, so a name that appears in the work itself still reaches Jev.
+- **Quota is read per provider and normalised.** Each provider's adapter keeps its own semantics (a rolling 5-hour window, a weekly window, a prepaid balance, nothing at all) and reports one shape: used, remaining, ratio, when it resets, and where each number came from.
+  A figure worked out rather than measured carries its own source and a lower confidence: DeepSeek reports only the balance, so its share spent is labelled an estimate and weighed as one.
+  The measured balance, read against the floors you set, is the floor of the reading: an estimate that says less was spent is ignored, and one that says more raises the reading only as far as it is trusted, so a guess can make a shortage look worse, never better.
+  The inspector's Router tab shows each figure with its own source and confidence, so the estimated share reads as an estimate.
+- **The governor spends the plan on purpose.** It knows how close a window is to resetting, so 88% used with twenty minutes to go is not the same emergency as 88% used on a Monday, and it prices a job as what it will really cost - the attempt, the likely retry, the review and the chance of escalation - before choosing. Subscription first, but not subscription-wasteful: with the default weights a subscription stops looking cheaper than an unpressured metered key at 65% of its binding limit (60% on a Pro or Plus plan, 74% on Max or Team).
+- **The skill and conservation decisions act.** The skill the work mainly calls for is written into the worker's instructions (and the planner's, when a strategy plans first) and shown in the report as `Skill:`. When the conservation judgment says the most capable resource's scarce capacity should be kept for harder work, the work moves to another resource whose known tier meets the task's floor; the router's own tie-break, feedback and weekly-gate swaps do not hand it back, the conserved resource stays available to review, and the report says `Work kept off <agent> to conserve it for harder work`. Only a resource that is actually being used up can be conserved: on an allowance the governor calls healthy, no judgment, however sure, moves the work. And a capability is a hard fact, so when only the conserved resource can do what the task needs, it does the work anyway.
+- **Model versions are real only for local models.** A local model's record is keyed by the SHA-256 of its weights. Claude Code, Codex and API models report no version they served, so they are keyed by model name, and a silent upgrade behind the same name inherits the old record for at most 45 days.
+- **Earning it is slow and losing it is fast.** A domain climbs `JEV_PRIMARY → SHADOW → GUARDED_LOCAL → LOCAL_ONLY`, never skipping a rung.
+  Every rung needs a minimum number of verified samples, and SHADOW needs only that and a trained classifier.
+  GUARDED_LOCAL and LOCAL_ONLY also need holdout and recent accuracy and macro F1 above a floor, recall on every significant class above a floor, calibration error under a ceiling, and almost no confident mistakes.
+  LOCAL_ONLY also needs a minimum share of outcome-backed labels (proved by a run or a person, not the teacher agreeing with itself), a minimum holdout size and enough samples in every significant class. Anything high-risk needs far more of all of it. One critical failure, a drift in what tasks look like, a task unlike anything it was trained on, or a plain accuracy regression pulls the privilege back to a lower rung or all the way to Jev, and re-earning it needs new evidence plus two good windows in a row.
+- **Facts are never voted on.** Availability, sign-in, exhausted quota, context length, a missing tool or modality, and admin switches are filtered in code before any classifier or any Jev call sees the field. A confident model cannot route a task to an agent that is signed out.
+- **Watch it.** The inspector's **Router** tab shows every domain, its state, how many samples it has, what it is still waiting on, and what pulled it back if something did. Each run says who Jev picked, every move the router made after that and where it went, and when the weekly gate yielded. `node scripts/kzh-routing-demo.mjs --learn 60` runs the whole thing headless and prints the same picture.
+
+Turn it off with `routing.enabled: false` (the router asks Jev the way it always did, over named agents), or keep the routing and stop the learning with `routing.learn: false`. With routing off, Jev picks agents from their `description`, and the default descriptions now say only what each agent is and how it is paid for (a local model's: which model, on this PC, free, private, offline), so on defaults that legacy pick has little but cost and the track record to go on. If you route that way, write your own descriptions.
+
+### After the run
 
 | Situation | Action |
 |---|---|
 | The agent failed, a passing check now fails, or required checks fail | retry (never accepted) |
 | "needs a person" ≥ 0.6 | human |
-| quality ≥ the accept bar | accept (a second opinion first, if routing asked for one and code changed) |
+| quality ≥ the accept bar | accept (a second opinion first when routing asked for one: the second-opinion routing decision, whether or not code changed; with no routing decision, `thresholds.secondOpinion` on changed code) |
 | quality ≤ 0.3 | retry with another agent |
 | in between | second opinion, then human |
 
@@ -330,6 +382,7 @@ Nothing is delegated that code can settle: availability, sign-in, limits, modali
 - **Accept bar:** scales with the task's risk: 0.55 (risk < 0.25), 0.70 (< 0.6), 0.85 above that.
 - **Limits:** 3 attempts, 2 reviews, 5 rounds.
 - **Model:** Jev is pinned to `jev-1.13.0`, so the thresholds keep their meaning.
+- **Parallel second opinion:** when a strategy has a second resource answer the same request alongside the first, the report compares the two answers word by word, in any script and with short numbers counted, and says whether they agree (a word comparison, not a judgment), that a side sent nothing back, or that both answered but could not be compared. It also says whose answer is shown: the last attempt that answered, and the second opinion only when nothing else did.
 
 ## Usage limits and handoff
 
@@ -359,7 +412,7 @@ KzH can run open models on your own PC with [llama.cpp](https://github.com/ggml-
 | Gemma 4 E4B, QAT Q4_0, `google/gemma-4-E4B-it-qat-q4_0-gguf` (4.8 GB) | `gemma-local` | all 43 layers on the GPU, ~47 tokens/s |
 | Gemma 4 E4B vision add-on (0.9 GB, optional) | `gemma-local` reads images | runs on the CPU (not tested yet) |
 
-**What they do:** once a model is installed, its agent appears in Jev setup and switches on. Jev may pick it like any other agent; its description says it is free, private and offline-capable but weaker, so it gets simple edits, explanations and summaries. The installed model also answers direct questions when DeepSeek fails (before an agent is asked), and it shows in the model picker as *Local (llama.cpp)*. Thinking is off and the context is 16,384 tokens (12,288 on PCs with less than 12 GB RAM), so a local agent's run can hit the context limit on big tasks.
+**What they do:** once a model is installed, its agent appears in Jev setup and switches on. It is a candidate like any other agent: under adaptive routing it competes on its capability priors (the `local-small` family in `config/capability-priors.json`) and its own record, with no marginal cost and nothing to conserve; with `routing.enabled: false` Jev reads its description, which says only what it is: the model and its quantisation, running on this PC through llama.cpp, free, private and working offline. The installed model also answers direct questions when DeepSeek fails (before an agent is asked), and it shows in the model picker as *Local (llama.cpp)*. Thinking is off and the context is 16,384 tokens (12,288 on PCs with less than 12 GB RAM), so a local agent's run can hit the context limit on big tasks.
 
 **Offline:** KzH checks `api.typesafe.ai` (2.5 s timeout, cached 30 s). When it does not answer:
 - only local agents can run; Jev is not asked;
@@ -381,7 +434,7 @@ Claude Code, Codex, DeepSeek and API-key models need the internet and are skippe
 | `role`, `rank`, `hfRepo` | `best-quality`, `fast` or `vision-addon`; lower rank = better quality; Hugging Face repo for the download-count tie-breaker |
 | `minVramGB`, `recommendedVramGB`, `minRamGB` | Fit hints: `recommendedVramGB` = VRAM to run fully on the GPU (plus ~0.8 GB for the desktop), `minRamGB` = below this it won't fit |
 | `chatTemplate`, `contextSize`, `maxContext`, `gpuLayers` | Template note (the GGUF's own, with `--jinja`), default and maximum context, `auto` or a number of GPU layers |
-| `agent` | `{ id, description }`: the router agent this model backs; the description is what Jev reads when choosing |
+| `agent` | `{ id, description }`: the router agent this model backs. Say what it is, not what it is good at. With `routing.enabled: false` the description is what Jev reads when choosing; adaptive routing shows it to Jev only for the review and retry picks of a run with no decision record (a forced agent, or a run whose decision engine fell back) |
 
 Only add GGUF files published by the model's own organization; if there is none, don't add a random uploader's copy.
 
@@ -448,7 +501,17 @@ What stays:
 - The app refuses debug ports and inspectors unless started with `KZH_DEBUG=1`. The exe's Electron "fuses" block Node mode, `NODE_OPTIONS` and `--inspect`.
 - The harness page gets no camera, microphone or notifications.
 - Keys and tokens are masked in logs, in the Markdown export, and in everything sent to Jev.
-- Your run history and usage logs are files on this PC (`~/.kzh/jev-router/`) and are never uploaded. Summaries drawn from them do go to TypeSafe with every routing call: per past run the task type, the agent picked, how many attempts and how it ended (`recent_outcomes`), and per agent its attempt count, accepted rate here, average seconds, limit hits and cost tier (`agent_track_record`). No task text and no file contents from old runs. Answer feedback lives only on this PC too, in `~/.kzh/jev-router/feedback.jsonl`: your verdict, its optional tag and the reason you typed. Its derived summary does ride the routing call: per agent the Like/Dislike counts and up to three recent reasons, so a reason you type can leave with the next routing call. The one earlier-task text that does leave is the handoff note above: it lives in the project (`.kz-harness/handoff.md`), not in these logs, and the first 3000 characters of it ride with every routing call in that folder.
+- **The router's candidate table carries no provider or model names, but it does send numbers the older named routing call never did: capability scores with their confidence, scarcity, minutes to a reset, an expected cost figure, a reliability score, a verified-run count and, at review, each one's fit for the task.** When Jev is asked which resource should take a task, or (under adaptive routing) at review which one should judge or fix it, the candidates go out as `RESOURCE_A`, `RESOURCE_B`, with only their measured properties on them: capability scores and tier, how scarce each is, how long until it resets, whether it is a subscription, an API key or local, its relative cost, latency and reliability, and how many verified runs back it.
+  No account name, no key, no plan name or price, no balance, no model id, no file path.
+  In the same call the past runs name the resource that ran them only by its key, each candidate's track record and availability ride under its key too (below), and the review call names earlier attempts by key (a tool step keeps its `tool:<id>`).
+  At review, a resource that is not a candidate for the work goes out under a key as well, with why it is out (a hard fact, or policy and judgment such as the weekly gate or conservation) and, when it may still review, the same measured properties.
+  Free text in those channels (your feedback reasons, price notes, error diagnostics) is masked: an agent's id, display name or model id, the model a CLI agent really runs by its own config, or a vendor word such as `claude`, `qwen` or `grok`, reads as a key or `[resource]`, and so does a vendor word with a version on it (`qwen2.5`, `gpt-4o`) or a model id with a point release after it (`grok-2.1`).
+  Only specific names are masked, so categories such as `local`, a task type or a cost tier are left alone, while a short model id such as `o3` is masked like any other.
+  That is as far as the anonymity goes: the task text, the workspace facts, the handoff note (a harness-written one lists earlier attempts by agent id) and, at review, the answer, the diff and the check output go out as they are, so a name in the work itself reaches Jev.
+  The same anonymised table is what the local classifier is trained on, which is why it cannot learn a brand preference from it.
+- **What the router learns stays here.** `routing-samples.jsonl`, `capability-evidence.jsonl`, the trained classifiers under `classifiers/`, the domain states under `domains/` and `known-resources.json` are files on this PC and are never uploaded. They hold routing features only: task type, complexity, risk, requirement scores, quota ratios, agent ids, which resource ran and whether the outcome was verified. Your diffs, your answers and your file contents are not in them, and the task text is not stored either - the classifier needs a bag of words, so what is written down is word and word-pair counts hashed into 2048 anonymous buckets, which is not the sentence you typed and cannot be turned back into it.
+- **Your run history does hold your words.** `history.jsonl` keeps, per routed run, the task text as you typed it, the workspace's full path, up to 30 uncommitted file paths, each attempt's error diagnostic and changed file paths, and the first 1000 characters of each attempt's answer. `tasks.jsonl` keeps the task text of the last 100 background tasks and each finished report, clipped to 20,000 characters, which includes the answer. Nothing redacts a key out of either, or out of a reason typed into `feedback.jsonl`. All of them stay on this PC in `~/.kzh/jev-router/` and are never uploaded, but they are plain text on disk.
+- Summaries drawn from the history do go to TypeSafe with every routing call: per past run in this folder the task type, how many attempts and how it ended (`recent_outcomes`); under adaptive routing (the default) without the agent that ran it, which the resource call replaces with that resource's `RESOURCE_x` key. No task text and no file contents from old runs. With `routing.enabled: false`, each past run also names its agent, and per agent the call carries its attempt count, accepted rate here, average seconds, limit hits, cost tier and availability (`agent_track_record`, `agent_availability`), plus the derived answer feedback: per agent the Like/Dislike counts and up to three recent reasons, so a reason you type can leave with the next routing call. Under adaptive routing the same track record, feedback reasons included, rides the resource call as `candidate_track_record`, with availability as `candidate_availability`, both keyed `RESOURCE_x` and with names masked in the reasons as above, but otherwise as typed; the task call carries neither. Answer feedback itself lives only on this PC, in `~/.kzh/jev-router/feedback.jsonl`: your verdict, its optional tag and the reason you typed, and its Like/Dislike counts still move picks locally. The one earlier-task text that does leave is the handoff note above: it lives in the project (`.kz-harness/handoff.md`), not in these logs, and the first 3000 characters of it ride with every routing call in that folder.
 - DeepSeek now runs through DSH's generic pi-ai connector (provider `deepseek`, same `DEEPSEEK_API_KEY`, `https://api.deepseek.com`). A request carries your key, the conversation, and generic headers only: `User-Agent: deepseek-harness/<version>` (DSH has no switch for it) and the OpenAI SDK's `x-stainless-*` platform headers (OS, CPU, Node version). No user or session ID.
 - DeepSeek web search (`web_search`) sends your key, the search query and `User-Agent: deepseek-harness/0.0.1`; nothing else.
 - Online, besides the model calls:
@@ -483,11 +546,22 @@ KzH settings live in `~/.kzh/profiles/web/cordis.patch.yml`; the installer write
         limits: { maxAttempts: 3, maxReviews: 2, maxRounds: 5 }
         thresholds:
           accept: { low: 0.55, medium: 0.7, high: 0.85 }
-          secondOpinion: 0.6
+          secondOpinion: 0.6                                # only for a run with no routing decision
           humanReview: 0.7
           needsTests: 0.5
           tool: 0.5
         checks: { enabled: true, scripts: [typecheck, lint, test, build] }
+        routing:                                            # the adaptive router
+          enabled: true                                     # false: ask Jev every time, as before
+          learn: true                                       # false: no routing samples, no local authority
+          disabledResources: []                             # agent ids the router may never pick
+          allowedResources: []                              # when set, the only agent ids it may pick
+          capabilityTiers: { standard: 0.5, strong: 0.75, frontier: 0.88 }   # the defaults
+          minimumReview: { riskForReview: 0.6, riskForFrontierReview: 0.8 }  # the defaults; see below
+          # gates, governor, retrain, drift, minClassRecall and priorsFile all default from routing-policy.js
+        resources:                                          # what a provider's API does not report
+          plans: { claude: max, codex: plus }               # agent id -> plan: picks the conservation curve
+          economics: { deepseek: { marginalCost: metered } }  # agent id -> none, low or metered
         productionWorkspaces: ['C:\Work\production-app']   # Jev is told these are production-critical
         savings:                                            # assumptions behind "Saved by Jev"
           baseline: { name: 'Chat LLM front desk', inputPerMTok: 0.28, outputPerMTok: 1.10, outputTokens: 300, latencyMs: 4000 }
@@ -498,6 +572,9 @@ KzH settings live in `~/.kzh/profiles/web/cordis.patch.yml`; the installer write
 ```
 
 - **Tools** get their parameters as `JEV_ARG_<NAME>` and the task text on stdin, never in the command line.
+- **`routing`** tunes the adaptive router. Every threshold it can take has a default in `plugins/jev-router/routing-policy.js`, which is the single place any of them is written down; anything omitted here keeps that default. Only the key names in `routing-policy.js` do anything, and most blocks are passed through unchecked, so a misspelt key is accepted and silently ignored: check the name there before relying on it. `gates` is per risk class (`LOW`, `MEDIUM`, `HIGH`) and decides how much evidence a routing domain needs before it may decide without Jev - raising them makes the router slower to trust itself, never less correct. `minimumReview` is the rule used when neither Jev nor a trusted local classifier answers the review questions: risk at or above `riskForReview` asks for a second opinion before any accepted work result, changed code or not, and at or above `riskForFrontierReview` adds a review by the strongest other resource; the same risk cuts steer the other fallbacks (the resource pick, conservation, the strategy). It does not force a review when Jev has answered. The `governor` values and the rollback destinations are checked at start-up, and one the arithmetic cannot use stops the plugin with the key's name. `minClassRecall` (default 0.85) is the per-class recall floor for promotion; a value under `gates.<RISK>.minClassRecall` holds the domains of that risk class to their own floor instead. `disabledResources` and `allowedResources` apply even with `enabled: false`. [`docs/adaptive-routing.md`](docs/adaptive-routing.md) explains what each one means.
+- **`resources.plans`** names an agent's plan (`pro`, `plus`, `max`, `team`) when its provider does not report one. Claude's never does, so without an entry here Claude uses the default conservation curve, not the Max one. Codex reports its own plan.
+- **`resources.economics`** says how a job on an agent is funded (`none`, `low` or `metered`) when its billing kind gets that wrong. It reaches every reader of the funding: the agent's resource snapshot, the decision engine's fallback for an agent with no snapshot, the executor registry's cost class that orders the capability swap, the low-confidence tie-break, and the cost tier in the track record Jev reads.
 - **API-key agents** are added in the app (Settings → Models, then Jev setup); other subagent providers are added under `agents`.
 - **`auxModel`** is the chat model for direct answers, session titles and compaction. Unset, it follows this machine: the installed local chat model first, else the first enabled agent that pins a provider and model. Set both to pin one, and titles, compaction and direct answers then run on that model rather than DeepSeek.
 
@@ -510,8 +587,9 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 | Keys | `~/.kzh/.env`, and nowhere else (see [API keys](#api-keys)). The Claude and Codex logins stay in `~/.claude` and `~/.codex`. |
 | KzH settings | `~/.kzh/profiles/web/cordis.patch.yml`, `~/.kzh/settings.yaml` |
 | Accounts, limits, switches, hotkeys | `~/.kzh/jev-router/` (`accounts.json`, `agents.json`, `hotkeys.json`) |
-| History and usage | `~/.kzh/jev-router/history.jsonl`, `usage.jsonl` |
-| Background tasks | `~/.kzh/jev-router/tasks.jsonl` (the last 100 finished tasks and their reports) |
+| History and usage | `~/.kzh/jev-router/history.jsonl` (per routed run: the task text as typed, the workspace path, changed file paths, the routing decision and the first 1000 characters of each answer) and `usage.jsonl` (per agent attempt and Jev call: tokens, cost, quota) |
+| What the router learned | `~/.kzh/jev-router/routing-samples.jsonl` (one row per decision and its verified outcome), `capability-evidence.jsonl` (what each resource turned out to be good at), `classifiers/` (the trained models, each with a checksum), `domains/` (how far each routing domain has got) and `known-resources.json` (the agent ids the resource domain has seen). Deleting them is safe: the router falls back to Jev and starts learning again. |
+| Background tasks | `~/.kzh/jev-router/tasks.jsonl` (the last 100 tasks: their text and, once finished, their reports) |
 | Answer feedback | `~/.kzh/jev-router/feedback.jsonl` (your Like/Dislike verdicts, their tags and reasons) |
 | Chats (what the export reads) | `~/.kzh/sessions/<workspace>/<session>/session.v3.jsonl.zstd`, written by the engine |
 | Projects | `C:\HarnessProjects` by default. `C:\Harness\no-project` is the chat-only workspace. |
@@ -537,15 +615,17 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 |---|---|
 | `app/` | The Electron app. `main.js` starts and stops the engine and holds the security switches, the in-app browser and updates. `preload.js` is a narrow bridge. `ui/` is the start screen and log. `package.mjs` builds `Kz-harness.exe`. |
 | `plugins/jev-router/` | Routing (`router.js`), Jev questions (`jev.js`), the Jev Auto model and direct answers (`adapter.js`), usage and savings (`usage.js`), accounts and keys (`accounts.js`), login checks (`setup.js`), git and checks (`workspace.js`), and the browser half (`client.js`: inspector, task list, setup, shortcuts, header, brand, local-model pickers), local models and offline mode (`local.js`), the background-task queue (`tasks.js`), and the Markdown export (`export.js`). |
-| `plugins/jev-review/` | Review policy (the `jevReview` service). |
+| `plugins/jev-router/`, adaptive routing | Every threshold in one file (`routing-policy.js`), the feature schema and the anonymiser (`features.js`), provider quota adapters (`resources.js`), conservation and expected job cost (`governor.js`), capability priors and evidence (`profiles.js`), the local classifier with its calibration and artifacts (`classifier.js`), the training store (`training.js`), the maturity ladder with drift, OOD and rollback (`domains.js`), the decision engine (`decision.js`) and the strategy broker (`broker.js`). Reference: [`docs/adaptive-routing.md`](docs/adaptive-routing.md). |
+| `plugins/jev-review/` | Review policy (`createReview`), imported directly by `router.js`. It provides no service and takes no config of its own: review thresholds are the jev-router row's `thresholds`. |
 | `config/cordis.patch.yml` | KzH settings and privacy switches, used by the installer |
 | `config/local-models.json` | The local-model manifest: engine builds and models, with official source, size and SHA256 |
-| `scripts/` | `Install-Harness.ps1`, `Update-Harness.ps1`, `ensure-no-project.mjs`, `Set-TypeSafeKey.ps1`, `patch-codex-effort.mjs`, `patch-dsh-branding.mjs` |
+| `config/capability-priors.json` | What each model family is believed to be good at, per dimension, with a confidence on each. Starting evidence for the router, overridden by what it measures here. |
+| `scripts/` | `Install-Harness.ps1`, `Update-Harness.ps1`, `ensure-no-project.mjs`, `Set-TypeSafeKey.ps1`, `patch-codex-effort.mjs`, `patch-dsh-branding.mjs`, `kzh-routing-demo.mjs` (the router, headless, with no engine and no network) |
 | `Start-KzH.ps1` / `.cmd` | Starts the engine: pinned version, privacy settings, Codex helper, branding patch, "No project" workspace |
 | `docs/` | [`docs/README.md`](docs/README.md) is the index: what each document covers and when to reach for it. [`docs/handoff.md`](docs/handoff.md) is the living handoff, and the place to start when picking the work up cold. |
 | `progress/progress.html` | Per-item record of what is verified, built, partial or open. It tracks the tree, so the percentage goes down when a defect is found. |
 
-Tests: `cd plugins\jev-router` then `npm test`. They cover routing, review policy, tools, limits and handoff, accounts, usage and savings, direct answers, process handling, hotkeys, background tasks and their queue, the subscription-first gate, time-of-day pricing, the Markdown export, the work board's row model, composer history, the file tree, answer feedback, the Overview ledger, and local models / offline mode (no network, no real llama-server). Some are tripwires rather than behaviour tests: they fail if an animation-frame scheduler comes back into `client.js` (it never fires in this renderer) or if the keyed `context` chat node is registered again.
+Tests: `cd plugins\jev-router` then `npm test`. They cover routing, review policy, tools, limits and handoff, accounts, usage and savings, direct answers, process handling, hotkeys, background tasks and their queue, the subscription-first gate, time-of-day pricing, the Markdown export, the work board's row model, composer history, the file tree, answer feedback, the Overview ledger, local models / offline mode (no network, no real llama-server), and the adaptive router end to end: provider quota adapters, the governor's conservation and expected cost, capability evidence, the local classifier with its calibration and out-of-distribution checks, the training store, the maturity ladder with every promotion gate, drift and rollback, and what the inspector is allowed to show. Some are tripwires rather than behaviour tests: they fail if an animation-frame scheduler comes back into `client.js` (it never fires in this renderer) or if the keyed `context` chat node is registered again.
 
 ## UI checks without Playwright
 

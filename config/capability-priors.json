@@ -1,0 +1,69 @@
+{
+  "about": "Capability priors for the KzH adaptive router: the owner's initial observations of what each model family is good at, on the routing dimensions in plugins/jev-router/routing-policy.js. Every number here is evidence, not a routing rule: it seeds a family's profile at the stated confidence and evidence recorded by KzH from real runs, reviews and feedback overtakes it as it accumulates, so an out-of-date score corrects itself. Benchmark evidence has a slot in the schema, but nothing imports or records any benchmark yet. To edit: give a family a `match` (the providers it runs under and a regular expression over model ids) and one `{ score, confidence, source }` per dimension you have actually observed; leave a dimension out rather than guess, because an absent dimension is reported as unknown at zero confidence and a guessed one is reported as a fact. Add an entry under `models` (keyed by the exact model id) when one version deserves its own numbers; it wins over its family. A model recognised only by its provider inherits the family prior at reduced confidence.",
+  "version": 1,
+  "families": {
+    "anthropic-claude": {
+      "match": { "providers": ["claude-code"], "modelPattern": "^claude" },
+      "capabilities": {
+        "coding": { "score": 0.93, "confidence": 0.6, "source": "owner_prior" },
+        "code_review": { "score": 0.95, "confidence": 0.6, "source": "owner_prior" },
+        "security_review": { "score": 0.95, "confidence": 0.6, "source": "owner_prior" },
+        "first_pass_quality": { "score": 0.9, "confidence": 0.6, "source": "owner_prior" },
+        "debugging": { "score": 0.9, "confidence": 0.6, "source": "owner_prior" },
+        "architecture": { "score": 0.88, "confidence": 0.6, "source": "owner_prior" },
+        "explanation": { "score": 0.86, "confidence": 0.6, "source": "owner_prior" },
+        "general_reasoning": { "score": 0.92, "confidence": 0.6, "source": "owner_prior" },
+        "long_context": { "score": 0.9, "confidence": 0.6, "source": "owner_prior" },
+        "tool_use": { "score": 0.92, "confidence": 0.6, "source": "owner_prior" },
+        "reliability": { "score": 0.9, "confidence": 0.6, "source": "owner_prior" }
+      }
+    },
+    "openai-gpt": {
+      "match": { "providers": ["codex"], "modelPattern": "^(gpt|o[0-9])" },
+      "capabilities": {
+        "explanation": { "score": 0.96, "confidence": 0.6, "source": "owner_prior" },
+        "architecture": { "score": 0.95, "confidence": 0.6, "source": "owner_prior" },
+        "system_design": { "score": 0.95, "confidence": 0.6, "source": "owner_prior" },
+        "planning": { "score": 0.95, "confidence": 0.6, "source": "owner_prior" },
+        "general_reasoning": { "score": 0.93, "confidence": 0.6, "source": "owner_prior" },
+        "coding": { "score": 0.9, "confidence": 0.6, "source": "owner_prior" },
+        "debugging": { "score": 0.88, "confidence": 0.6, "source": "owner_prior" },
+        "code_review": { "score": 0.86, "confidence": 0.6, "source": "owner_prior" },
+        "security_review": { "score": 0.84, "confidence": 0.6, "source": "owner_prior" },
+        "long_context": { "score": 0.88, "confidence": 0.6, "source": "owner_prior" },
+        "tool_use": { "score": 0.9, "confidence": 0.6, "source": "owner_prior" },
+        "reliability": { "score": 0.88, "confidence": 0.6, "source": "owner_prior" }
+      }
+    },
+    "deepseek": {
+      "match": { "providers": ["deepseek", "deepseek-official"], "modelPattern": "^deepseek" },
+      "capabilities": {
+        "coding": { "score": 0.85, "confidence": 0.5, "source": "owner_prior" },
+        "general_reasoning": { "score": 0.8, "confidence": 0.5, "source": "owner_prior" },
+        "debugging": { "score": 0.8, "confidence": 0.5, "source": "owner_prior" },
+        "explanation": { "score": 0.8, "confidence": 0.5, "source": "owner_prior" },
+        "architecture": { "score": 0.75, "confidence": 0.5, "source": "owner_prior" },
+        "security_review": { "score": 0.7, "confidence": 0.5, "source": "owner_prior" },
+        "code_review": { "score": 0.75, "confidence": 0.5, "source": "owner_prior" },
+        "reliability": { "score": 0.8, "confidence": 0.5, "source": "owner_prior" },
+        "tool_use": { "score": 0.78, "confidence": 0.5, "source": "owner_prior" }
+      }
+    },
+    "local-small": {
+      "match": { "providers": ["local"], "modelPattern": ".*" },
+      "capabilities": {
+        "coding": { "score": 0.45, "confidence": 0.5, "source": "owner_prior" },
+        "general_reasoning": { "score": 0.45, "confidence": 0.5, "source": "owner_prior" },
+        "explanation": { "score": 0.55, "confidence": 0.5, "source": "owner_prior" },
+        "debugging": { "score": 0.4, "confidence": 0.5, "source": "owner_prior" },
+        "architecture": { "score": 0.35, "confidence": 0.5, "source": "owner_prior" },
+        "security_review": { "score": 0.3, "confidence": 0.5, "source": "owner_prior" },
+        "code_review": { "score": 0.35, "confidence": 0.5, "source": "owner_prior" },
+        "long_context": { "score": 0.3, "confidence": 0.5, "source": "owner_prior" },
+        "tool_use": { "score": 0.5, "confidence": 0.5, "source": "owner_prior" },
+        "reliability": { "score": 0.6, "confidence": 0.5, "source": "owner_prior" }
+      }
+    }
+  },
+  "models": {}
+}

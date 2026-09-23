@@ -103,3 +103,108 @@ test('built-in limit matcher ignores completed runs that merely mention rate lim
   assert.equal(builtinLimit({ stopReason: 'completed', answerText: 'added a rate limit to the API' }).hit, false)
   assert.equal(builtinLimit({ stopReason: 'error', diagnostic: 'exit 1: TypeError' }).hit, false)
 })
+
+// --- the routing policy itself (routing-policy.js) ------------------------------------------
+
+test('the per-class recall floor is tierable by risk, with the global value as the default', async () => {
+  const { ROUTING_DEFAULTS, RISK_CLASSES, gatesFor, resolvePolicy } = await import('../routing-policy.js')
+  const base = resolvePolicy()
+  for (const rc of RISK_CLASSES) assert.equal(base.gates[rc].minClassRecall, base.minClassRecall, `${rc} inherits the global floor`)
+  const tiered = resolvePolicy({ gates: { HIGH: { minClassRecall: 0.95 } } })
+  assert.equal(tiered.gates.HIGH.minClassRecall, 0.95, 'a risk class can demand more')
+  assert.equal(tiered.gates.LOW.minClassRecall, 0.85, 'and the others keep the global')
+  assert.equal(gatesFor(tiered, 'frontier_escalation').minClassRecall, 0.95, 'a domain reads it from its own gate block')
+  assert.equal(gatesFor(tiered, 'task_classification').minClassRecall, 0.85)
+  const raised = resolvePolicy({ minClassRecall: 0.9, gates: { LOW: { minClassRecall: 0.8 } } })
+  assert.deepEqual(RISK_CLASSES.map((rc) => raised.gates[rc].minClassRecall), [0.8, 0.9, 0.9], 'the global is the default, a tier value wins')
+  assert.throws(() => resolvePolicy({ gates: { MEDIUM: { minClassRecall: 1.5 } } }), /gates\.MEDIUM\.minClassRecall/)
+  assert.throws(() => resolvePolicy({ minClassRecall: -0.1 }), /minClassRecall/)
+  assert.equal(ROUTING_DEFAULTS.gates.HIGH.minClassRecall, undefined, 'the frozen defaults are never written to')
+})
+
+test('the policy carries no threshold that nothing reads', async () => {
+  const { resolvePolicy } = await import('../routing-policy.js')
+  // `lowConfidence` duplicated the operator's config.policy.minRoutingConfidence, which is the
+  // number router.js's low-confidence handling really reads; a second copy only invites changing
+  // the wrong one and seeing nothing happen.
+  assert.equal('lowConfidence' in resolvePolicy(), false)
+})
+
+test('the subscription-to-metered crossover falls where the policy comment says', async () => {
+  const { resolvePolicy } = await import('../routing-policy.js')
+  const { CURVE_KNEES, conservationCurve, expectedJobCost } = await import('../governor.js')
+  const policy = resolvePolicy()
+  const profile = { risk: 0.5, requirements: { coding: 0.8 } }
+  const cand = (marginalCost, scarcity) => ({ marginalCost, scarcity, scarcityConfidence: 1, reliability: { score: 0.8, confidence: 0.5 }, capabilities: { coding: { score: 0.8, confidence: 0.5 } } })
+  const total = (mc, s) => expectedJobCost({ candidate: cand(mc, s), profile, policy }).total
+  const bisect = (f, lo = 0, hi = 1) => { for (let i = 0; i < 60; i++) { const m = (lo + hi) / 2; if (f(m)) lo = m; else hi = m } return lo }
+  const gap = bisect((s) => total('low', s) < total('metered', 0))
+  const { marginal, scarcityWeight } = policy.governor.cost
+  assert.ok(Math.abs(gap - (marginal.metered - marginal.low) / scarcityWeight) < 1e-6, `a subscription loses once 0.3 more scarce (${gap})`)
+  const curves = { default: policy.governor.conservation.default, ...policy.governor.conservation.plans }
+  const at = Object.fromEntries(Object.entries(curves).map(([k, c]) => [k, Math.round(bisect((p) => conservationCurve(p, c) < gap) * 100)]))
+  assert.deepEqual(at, { default: 65, pro: 60, plus: 60, max: 74, team: 74 }, 'the pressure at which it happens, per plan')
+  for (const c of Object.values(curves)) assert.ok(conservationCurve(c.aggressiveAt, c) === CURVE_KNEES.aggressive && gap < CURVE_KNEES.aggressive, 'well before the aggressive knee, not past it')
+})
+
+test('a rollback destination must be under every rung it rolls back from', async () => {
+  const { resolvePolicy } = await import('../routing-policy.js')
+  // Accepted before: a "severe regression" from GUARDED_LOCAL that moved the domain UP to
+  // LOCAL_ONLY with no gates, and wiped the rollback record on the way.
+  assert.throws(() => resolvePolicy({ rollback: { severeTo: 'LOCAL_ONLY' } }), /rollback\.severeTo must be below GUARDED_LOCAL/)
+  assert.throws(() => resolvePolicy({ rollback: { significantTo: 'GUARDED_LOCAL' } }), /rollback\.significantTo must be below GUARDED_LOCAL/)
+  assert.throws(() => resolvePolicy({ rollback: { minorTo: 'LOCAL_ONLY' } }), /rollback\.minorTo must be below LOCAL_ONLY/)
+  assert.throws(() => resolvePolicy({ rollback: { minorTo: 'nowhere' } }), /rollback\.minorTo must be a maturity state/)
+  // Every rung under the source, and the ROLLBACK waiting state, is a real way down.
+  for (const to of ['JEV_PRIMARY', 'SHADOW', 'ROLLBACK']) {
+    assert.equal(resolvePolicy({ rollback: { severeTo: to, significantTo: to } }).rollback.severeTo, to)
+  }
+  assert.equal(resolvePolicy({ rollback: { minorTo: 'SHADOW' } }).rollback.minorTo, 'SHADOW')
+  assert.doesNotThrow(() => resolvePolicy())
+})
+
+test('the governor values the arithmetic depends on are checked like the gates are', async () => {
+  const { resolvePolicy } = await import('../routing-policy.js')
+  const bad = [
+    [{ staleConfidence: -1 }, /governor\.staleConfidence/],
+    [{ staleConfidence: 2 }, /governor\.staleConfidence/],
+    [{ staleConfidence: '0.5' }, /governor\.staleConfidence/],
+    [{ staleAfterMinutes: -5 }, /governor\.staleAfterMinutes/],
+    [{ staleAfterMinutes: Infinity }, /governor\.staleAfterMinutes/],
+    [{ resetProximityWeight: 1.5 }, /governor\.resetProximityWeight/],
+    [{ budgetSoftMultiple: 1 }, /governor\.budgetSoftMultiple/],
+    [{ budgetSoftMultiple: 0.5 }, /governor\.budgetSoftMultiple/],
+    [{ cost: { scarcityWeight: -1 } }, /governor\.cost\.scarcityWeight/],
+    [{ cost: { marginal: { metered: NaN } } }, /governor\.cost\.marginal\.metered/],
+    [{ conservation: { default: { startAt: 1.2 } } }, /governor\.conservation\.default\.startAt/],
+    [{ conservation: { default: { startAt: 0.9, aggressiveAt: 0.5 } } }, /governor\.conservation\.default/],
+    [{ conservation: { plans: { pro: { startAt: 0.5, aggressiveAt: -1 } } } }, /governor\.conservation\.plans\.pro\.aggressiveAt/],
+  ]
+  for (const [governor, why] of bad) assert.throws(() => resolvePolicy({ governor }), why, JSON.stringify(governor))
+  // A governor that is not a block at all says so, rather than failing on a property read.
+  for (const governor of [null, 'fast', [1]]) assert.throws(() => resolvePolicy({ governor }), /routing policy: governor must be an object/, JSON.stringify(governor))
+  // The edges that still mean something are accepted: no trust in stale usage, no reset discount,
+  // a plan curve of its own.
+  for (const governor of [{ staleConfidence: 0 }, { staleConfidence: 1 }, { resetProximityWeight: 0 }, { staleAfterMinutes: 0 }, { budgetSoftMultiple: 1.01 }, { conservation: { plans: { enterprise: { startAt: 0.8, aggressiveAt: 0.8 } } } }]) {
+    assert.doesNotThrow(() => resolvePolicy({ governor }), JSON.stringify(governor))
+  }
+})
+
+test('the minimum review thresholds are described as the fallback they are, not a floor', async () => {
+  // decision.js passes them only as the fallback of the second-opinion and frontier judgments; a
+  // Jev "no" at any risk stands. The policy file is where the README sends operators to read what
+  // a key means, so it must not promise a review the code does not force.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('../routing-policy.js', import.meta.url), 'utf8')
+  // The whole comment block over the key, however long it grows.
+  const above = src.slice(0, src.indexOf('minimumReview: Object.freeze')).split('\n').slice(0, -1)
+  const note = above.slice(above.findLastIndex((l) => !l.trim().startsWith('//')) + 1).join('\n')
+  assert.doesNotMatch(note, /always gets an independent review/)
+  assert.match(note, /FALLBACK/)
+  assert.match(note, /not a floor/)
+  // An operator who edits these keys also moves the fallback resource pick, the fallback
+  // conservation answer and the fallback strategy, so the note says so.
+  assert.match(note, /resource pick/)
+  assert.match(note, /conservation/)
+  assert.match(note, /strategy/)
+})

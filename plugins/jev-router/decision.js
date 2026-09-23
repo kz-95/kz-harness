@@ -1,0 +1,767 @@
+// The decision engine: one routing decision, made domain by domain.
+//
+// The router hands this the request and the pool of agents its hard filters let through; the
+// engine hands back the routing object the loop runs on. In between, each routing domain is
+// asked in turn through its own controller (domains.js), which is what lets task classification
+// mature locally while resource selection still asks Jev: the controller decides who is
+// authoritative, and this file only supplies the inputs, the teacher call and a deterministic
+// fallback per domain.
+//
+// Inputs that reach Jev or a local classifier are the machine-readable ones: the capability
+// registry's effective profiles (profiles.js), the governor's scarcity and cost signals
+// (governor.js), the task profile. Candidates are anonymous (RESOURCE_A ...) on both paths.
+// Hard facts are applied here in code and never delegated: an unavailable resource, a context
+// window the input would not fit, a capability floor the task requires. What is left is
+// judgment, and judgment is what the domains learn.
+//
+// One Jev call per run at most in the common case: the first domain that needs Jev triggers a
+// batched call carrying every question group some not-yet-local domain may still need; later
+// domains read from the same answer. A domain that is LOCAL_ONLY contributes no questions, so
+// a mature domain costs nothing.
+import { MARGINAL_COST_BY_KIND, kindOf, marginalCostOf } from './accounts.js'
+import { CHARS_PER_TOKEN } from './capabilities.js'
+import { OPENING_STRATEGIES, cheapestOf, eligibleStrategies, planStrategy, strongestOf } from './broker.js'
+import { anonymize, candidateFeatures, identityNames, mergeFeatures, poolFeatures, profileFeatures, taskTextFeatures } from './features.js'
+import { CURVE_KNEES, expectedJobCost, governorSignals } from './governor.js'
+import { subjectOf } from './profiles.js'
+import { DIMENSIONS, REQUIREMENT_DIMENSIONS, SKILLS, TASK_DIMENSIONS, TASK_SKILLS, tierAtLeast, tierOf } from './routing-policy.js'
+
+const GROUP_DOMAINS = Object.freeze({
+  task: ['task_classification', 'skill_selection'],
+  resource: ['resource_selection', 'execution_strategy'],
+  judgments: ['second_opinion', 'conservation', 'frontier_escalation'],
+})
+const NOT_LOCAL = new Set(['JEV_PRIMARY', 'SHADOW', 'ROLLBACK', 'GUARDED_LOCAL'])
+// Capabilities that name no particular ability: every agent can answer, and 'other' and
+// 'human_required' are not work anyone is being chosen for.
+const NOT_WORK_CAPABILITIES = new Set(['quick_answer', 'reasoned_answer', 'other', 'human_required'])
+const r2 = (x) => (typeof x === 'number' ? Math.round(x * 100) / 100 : x)
+
+/**
+ * The refusal for "every candidate failed a hard fact". It carries a code because the caller must
+ * treat it differently from every other failure: an outage falls back to a default agent, but this
+ * cannot, since the only agents left to fall back to are the ones just excluded. A code rather
+ * than a message match, so rewording the message can never quietly turn the stop back into a
+ * fallback. `excluded` rides along so the caller can say who was ruled out and why.
+ */
+export const NO_CANDIDATES = 'NO_CANDIDATES'
+
+const noCandidates = (message, excluded) => Object.assign(new Error(message), { code: NO_CANDIDATES, excluded: excluded.map((e) => ({ ...e })) })
+
+const isSkill = (s) => typeof s === 'string' && Object.hasOwn(SKILLS, s)
+
+/**
+ * The skills the work is done with, always in SKILLS vocabulary: the chosen primary when it is a
+ * known skill, else the one the task type calls for, and at most three known supporting skills.
+ * The router puts these into the worker's instructions, so a label outside the vocabulary (a task
+ * type such as `refactor` passed off as a skill) would tell the worker nothing.
+ */
+export function resolveSkills(skills, taskType) {
+  const primary = isSkill(skills?.primary) ? skills.primary : TASK_SKILLS[taskType] ?? 'implementation'
+  const supporting = [...new Set((Array.isArray(skills?.supporting) ? skills.supporting : []).filter((s) => isSkill(s) && s !== primary))].slice(0, 3)
+  return { primary, supporting }
+}
+
+/**
+ * A safe task profile from the text alone, for when neither Jev nor a trusted local classifier
+ * can answer. Deterministic and deliberately unconfident: every number is 0.5 except what the
+ * words plainly say, and the profile says so through `heuristic: true`.
+ */
+export function heuristicProfile(task) {
+  const t = String(task ?? '').toLowerCase()
+  const type = /\b(security|auth|vulnerab|secret|token|permission)\b/.test(t) ? 'security'
+    : /\b(test|spec|coverage)\b/.test(t) ? 'testing'
+      : /\b(bug|fix|error|fail|crash|broken|exception)\b/.test(t) ? 'debugging'
+        : /\b(review|audit)\b/.test(t) ? 'review'
+          : /\b(refactor|rename|restructure|clean ?up)\b/.test(t) ? 'refactor'
+            : /\b(doc|readme|comment)\b/.test(t) ? 'documentation'
+              : /\b(design|architect|plan|strategy)\b/.test(t) ? 'architecture'
+                : /\b(explain|how|why|what|investigate|understand)\b/.test(t) ? 'investigation'
+                  : /\b(typo|constant|one[- ]line)\b/.test(t) ? 'simple_change'
+                    : 'implementation'
+  const requirements = {}
+  for (const d of TASK_DIMENSIONS[type] ?? []) if (REQUIREMENT_DIMENSIONS.includes(d)) requirements[d] = 0.7
+  return {
+    taskType: type, taskTypeConfidence: 0.3, complexity: 0.5, risk: type === 'security' ? 0.7 : 0.5,
+    requirements, skills: { primary: TASK_SKILLS[type] ?? 'implementation', supporting: [] },
+    minimumCapability: 'standard', preferredCapability: 'strong', verification: ['checks'],
+    needsSecondOpinion: 0.5, needsHumanReview: 0.3, needsTests: 0.7, heuristic: true,
+  }
+}
+
+/** Numeric parts of a profile, the only thing a training sample keeps of it. */
+export function profileNumbers(profile = {}) {
+  const out = { complexity: profile.complexity, risk: profile.risk, needsSecondOpinion: profile.needsSecondOpinion, needsHumanReview: profile.needsHumanReview, needsTests: profile.needsTests }
+  for (const d of REQUIREMENT_DIMENSIONS) out[`req_${d}`] = profile.requirements?.[d]
+  for (const k of Object.keys(out)) if (typeof out[k] !== 'number') delete out[k]
+  return out
+}
+
+/**
+ * The mean numeric profile per task type, from the teacher profiles in the training store. This
+ * is how a locally classified task type becomes a full profile without a regression model: the
+ * class average of what Jev said for that type, with the spread reported as confidence.
+ */
+export function classProfiles(rows) {
+  const acc = new Map()
+  for (const r of rows) {
+    // The same rule as domains.js truthOf: once a row has an outcome, the teacher's label is never
+    // the truth. A refuted answer (a person's "misread my question", a verified negative) records
+    // what the task was NOT; reading the teacher's label there averaged a misread task's numbers
+    // into the very type it was not, and every later task classified as that type inherited them.
+    const label = r.outcome ? r.outcome.label ?? null : r.teacher?.label
+    const nums = r.extra?.profile
+    if (!label || !nums) continue
+    const a = acc.get(label) ?? { n: 0, sum: {}, sq: {}, tiers: { minimum: {}, preferred: {} } }
+    a.n++
+    for (const [k, v] of Object.entries(nums)) { if (typeof v !== 'number') continue; a.sum[k] = (a.sum[k] ?? 0) + v; a.sq[k] = (a.sq[k] ?? 0) + v * v }
+    // The capability tiers the teacher named for this kind of task, counted rather than averaged:
+    // they are categories, and the one it said most often is the one to reproduce.
+    for (const which of ['minimum', 'preferred']) {
+      const t = r.extra?.tiers?.[which]
+      if (typeof t === 'string') a.tiers[which][t] = (a.tiers[which][t] ?? 0) + 1
+    }
+    acc.set(label, a)
+  }
+  const modal = (counts) => Object.entries(counts).sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))[0]?.[0] ?? null
+  const out = {}
+  for (const [label, a] of acc) {
+    const mean = {}; let spread = 0; let k = 0
+    for (const key of Object.keys(a.sum)) { mean[key] = a.sum[key] / a.n; const v = a.sq[key] / a.n - mean[key] ** 2; spread += Math.sqrt(Math.max(0, v)); k++ }
+    out[label] = { n: a.n, mean, spread: k ? spread / k : 0, tiers: { minimum: modal(a.tiers.minimum), preferred: modal(a.tiers.preferred) } }
+  }
+  return out
+}
+
+/** A profile from a locally predicted task type and the class averages. */
+export function profileFromClass(label, probabilities, classes, { capability } = {}) {
+  const c = classes?.[label]
+  const m = c?.mean ?? {}
+  const requirements = {}
+  for (const d of REQUIREMENT_DIMENSIONS) if (typeof m[`req_${d}`] === 'number') requirements[d] = m[`req_${d}`]
+  if (!Object.keys(requirements).length) for (const d of TASK_DIMENSIONS[label] ?? []) if (REQUIREMENT_DIMENSIONS.includes(d)) requirements[d] = 0.7
+  const top = Object.entries(requirements).sort((a, b) => b[1] - a[1])[0]?.[1] ?? 0.5
+  // The tier the teacher actually named for this kind of task, when it is known. Falling back to
+  // a rule read off the requirement scores would make the local path demand a different class of
+  // resource than the teacher ever asked for, which is a different routing decision wearing the
+  // same label; the rule is only for a class nothing has been recorded about yet.
+  const tiers = c?.tiers ?? {}
+  return {
+    taskType: label, taskTypeConfidence: probabilities?.[label], taskTypeProbabilities: probabilities,
+    complexity: m.complexity ?? 0.5, risk: m.risk ?? 0.5, requirements,
+    skills: { primary: TASK_SKILLS[label] ?? 'implementation', supporting: [] },
+    capability,
+    minimumCapability: tiers.minimum ?? (top >= 0.85 ? 'frontier' : top >= 0.65 ? 'strong' : 'standard'),
+    preferredCapability: tiers.preferred ?? (top >= 0.7 ? 'frontier' : 'strong'),
+    verification: (m.needsTests ?? 0.7) >= 0.5 ? ['checks'] : [],
+    needsSecondOpinion: m.needsSecondOpinion ?? 0.5, needsHumanReview: m.needsHumanReview ?? 0.3, needsTests: m.needsTests ?? 0.7,
+    classSamples: c?.n ?? 0, classSpread: c?.spread,
+  }
+}
+
+/**
+ * Effective tier of a candidate for a task: the requirement-weighted score over the dimensions
+ * this task actually leans on and the registry can speak to.
+ *
+ * The bar is the capability's STATED confidence (the owner's own prior, or the confidence real
+ * evidence has earned), not the registry's saturating precision figure. A precision figure needs
+ * dozens of observations to pass any threshold, so reading the bar off it would mean no capability
+ * floor existed at all until a machine had routed for weeks: every candidate would be 'unknown',
+ * and a request that needs frontier judgment would be as happy with a 4B local model. A prior the
+ * owner wrote down is knowledge, and it is allowed to exclude; a weak family guess about an
+ * unrecognised model (its confidence is discounted at source) is not.
+ */
+export function candidateTier(capabilities, requirements, policy) {
+  const entries = Object.entries(requirements ?? {}).filter(([, r]) => typeof r === 'number' && r > 0)
+  // The dimensions the task really leans on, or all of them when it leans on none strongly: an
+  // easy task must still get a tier, otherwise every candidate reads 'unknown' and the floor,
+  // the strategy and the report all lose the one number they were about to use.
+  const strong = entries.filter(([, r]) => r >= 0.5)
+  let sum = 0; let w = 0
+  for (const [d, r] of (strong.length ? strong : entries)) {
+    const cap = capabilities?.[d]
+    if (!cap || (cap.stated ?? cap.confidence ?? 0) < policy.floorConfidence) continue
+    sum += r * cap.score; w += r
+  }
+  if (!w) return { tier: 'unknown', score: null }
+  return { tier: tierOf(sum / w, policy.capabilityTiers), score: sum / w }
+}
+
+/** Rough size of what the agent must read: the task, the handoff note and a context reserve. */
+export const contextEstimate = (task, handoff) => Math.ceil((String(task ?? '').length + String(handoff ?? '').length) / CHARS_PER_TOKEN) + 4000
+
+/**
+ * @param {object} p
+ * @param {object} p.policy      resolvePolicy() result
+ * @param {object} p.domains     createDomainRegistry() result: get(domain) -> controller
+ * @param {object} p.profiles    createCapabilityRegistry() result
+ * @param {object} p.priors      loaded priors (for subjectOf)
+ * @param {object} [p.store]     training store, for class profiles
+ * @param {object} [p.economics] config.resources.economics: agent id -> { marginalCost }, the
+ *   operator's word on how a job is funded; a decide() call may pass its own
+ * @param {Function} [p.now]
+ * @param {Function} [p.log]
+ */
+export function createDecisionEngine({ policy, domains, profiles, priors, store, economics: configuredEconomics, now = () => Date.now(), log = () => {} }) {
+  // The class averages behind a locally classified task type, cached for a minute because they
+  // move slowly. An empty result is never cached: on a cold start there is nothing to average
+  // yet, and holding that emptiness for a minute would hand the first runs of a freshly matured
+  // task classifier a generic profile instead of the one it learned.
+  let classCache = { at: 0, value: {} }
+  const classProfilesFor = async () => {
+    if (!store) return {}
+    const fresh = now() - classCache.at < 60_000 && Object.keys(classCache.value).length > 0
+    if (fresh) return classCache.value
+    try {
+      const value = classProfiles(await store.list({ domain: 'task_classification' }))
+      classCache = { at: now(), value }
+      return value
+    } catch { return classCache.value }
+  }
+
+  const controllerOf = (id) => domains?.get?.(id) ?? null
+  const maturityOf = (id) => controllerOf(id)?.state?.()?.maturity ?? 'JEV_PRIMARY'
+
+  /**
+   * One decision. Returns `{ routing, profile, candidates, excluded, plan, domains, samples, jevCalls }`.
+   * `routing` is the shape router.js already reads (primaryAgent, agentProbabilities, taskType ...),
+   * extended with `strategy`, `profile`, `decision`.
+   *
+   * `modelOf` and `versionOf` ((agent, model) => string | undefined) name the subject a profile is
+   * read for, exactly as profiles.js keys the evidence it records. `economics` is
+   * config.resources.economics (agent id -> { marginalCost }), for agents with no snapshot yet.
+   */
+  async function decide({ task, context, history, handoff, tools = [], agents = [], gated = [], snapshots = [], modelOf, versionOf, economics = configuredEconomics, answerOnly = false, modalities = ['text'], capabilitySet, availability, trackRecord, jev, jevUnavailableReason, signal, emit, runId, capableFor, everyAgent } = {}) {
+    // Every sample this decision writes carries the run it belongs to, so a verdict given later
+    // about that run's answer can find and relabel them (index.js onVerdict).
+    const controller = (id) => {
+      const c = controllerOf(id)
+      return c && runId ? { ...c, decide: (args = {}) => c.decide({ ...args, context: { ...(args.context ?? {}), runId } }) } : c
+    }
+    const jevCalls = []
+    const samples = []
+    const domainReport = {}
+    const signals = governorSignals({ snapshots, policy, now })
+    const disabled = new Set(policy.disabledResources ?? [])
+    const allowed = policy.allowedResources?.length ? new Set(policy.allowedResources) : null
+    const excluded = []
+    const snapById = new Map(snapshots.map((s) => [s.resourceId, s]))
+
+    // --- candidates: facts first, judgment later ---------------------------------------------
+    const subjects = new Map()
+    const build = (a, taskType) => {
+      // versionOf rides along exactly as modelOf does, so the subject read here has the same key
+      // as the one evidenceFromRun records against: a reported version must not split them.
+      const subject = subjects.get(a.id) ?? subjectOf(a, { modelOf, versionOf, priors })
+      subjects.set(a.id, subject)
+      const prof = profiles.profileOf(subject, taskType ? { taskType } : {})
+      const capabilities = {}
+      for (const d of DIMENSIONS) {
+        const p = prof.dimensions?.[d]
+        if (!p) continue
+        // `confidence` is how much evidence stands behind the score and saturates slowly;
+        // `stated` is how sure whoever last spoke about it was, which is what a floor may act on.
+        capabilities[d] = { score: p.score, confidence: p.confidence, samples: p.samples ?? 0, stated: Math.max(p.prior?.confidence ?? 0, p.confidence ?? 0) }
+      }
+      const sig = signals.get(a.id) ?? {}
+      const snap = snapById.get(a.id)
+      // Who funds the work is an account fact. A live snapshot says it first; without one the
+      // agent's billing kind does (index.js sets it through accounts.js kindOf, which is where
+      // provider knowledge lives), and the operator's economics override outranks the kind's
+      // default cost. Never a provider-name test here: a new resource funded the same way must be
+      // routed the same way the moment its kind says so.
+      const kind = Object.hasOwn(MARGINAL_COST_BY_KIND, a.kind) ? a.kind : kindOf(a)
+      const source = snap?.source ?? kind
+      const override = economics?.[a.id]?.marginalCost
+      const operatorCost = Object.values(MARGINAL_COST_BY_KIND).includes(override) ? override : null
+      return {
+        id: a.id,
+        source,
+        capabilities,
+        subject,
+        scarcity: sig.scarcity ?? null,
+        scarcityConfidence: sig.scarcityConfidence ?? 0,
+        resetProximity: sig.resetProximity ?? null,
+        resetInMinutes: sig.resetInMinutes ?? null,
+        marginalCost: sig.marginalCost ?? operatorCost ?? marginalCostOf({ ...a, kind }),
+        latency: sig.latencyClass ?? (source === 'local' ? 'medium' : 'slow'),
+        availability: sig.availability ?? 'unknown',
+        reliability: capabilities.reliability ?? { score: 0.5, confidence: 0, samples: 0 },
+        cold: !!prof.cold,
+        evidenceSamples: prof.samples ?? 0,
+        contextTokens: snap?.hardware?.contextTokens ?? null,
+        plan: sig.plan ?? null,
+      }
+    }
+    let pool = []
+    for (const a of agents) {
+      const sig = signals.get(a.id)
+      // `hard` marks a fact about the resource, not a judgment about this task: the router must
+      // honour it on every move it makes of its own (a swap, a retry, a review), not only here.
+      if (disabled.has(a.id)) { excluded.push({ id: a.id, reason: 'disabled by configuration', hard: true }); continue }
+      if (allowed && !allowed.has(a.id)) { excluded.push({ id: a.id, reason: 'not in the allowed resources', hard: true }); continue }
+      if (sig?.unavailable) { excluded.push({ id: a.id, reason: sig.unavailable, hard: true }); continue }
+      pool.push(build(a))
+    }
+    if (!pool.length) throw noCandidates(`no resource is available: ${excluded.map((e) => `${e.id} (${e.reason})`).join(', ') || 'no agents'}`, excluded)
+    const names = anonymize(pool)
+    for (const c of pool) c.key = names.keyOf(c.id)
+    // How jev.js re-keys the per-agent evidence (track record, availability, who ran it) onto the
+    // table's keys instead of dropping it. Every agent is listed, so an excluded one's name is
+    // masked too; only a pool agent has a key. The names are the ones the review call masks too
+    // (features.js identityNames): the id, the display name, the providers and the model ids. The
+    // masker keeps only the SPECIFIC ones, so a generic token ('local', 'spawn') is never masked
+    // inside values that have nothing to do with any agent, while a provider word that names one
+    // agent ('claude-code', 'openrouter') no longer rides out of this call when the review call
+    // already hid it.
+    const identities = (everyAgent?.length ? [...new Map([...everyAgent, ...agents].map((a) => [a.id, a])).values()] : agents).map((a) => ({
+      id: a.id,
+      key: names.keyOf(a.id),
+      names: [...new Set([a.id, ...identityNames(a, modelOf)].filter((n) => typeof n === 'string' && n.trim()))],
+    }))
+
+    // --- the Jev calls ---------------------------------------------------------------------------
+    // Two groups, and at most one call each. They cannot be one call: what the resource judgment
+    // needs to see (each candidate's tier and fit for THIS task, and the expected job cost that
+    // follows from them) only exists once the task profile does. Batching them anyway would hand
+    // Jev a candidate table with the capability numbers missing, which is the one thing the design
+    // insists must reach it. Within a group every question still rides together.
+    //
+    // A group whose domains have all matured locally is never asked, so a fully mature router
+    // makes no call at all, and a half-mature one makes exactly the call it still needs.
+    let profile = null
+    let strategies = []
+    const calls = new Map()
+    const groupOpen = (group) => GROUP_DOMAINS[group].some((id) => NOT_LOCAL.has(maturityOf(id)))
+    const askJev = (group) => {
+      if (!jev) throw new Error(jevUnavailableReason ?? 'Jev unavailable')
+      const wanted = group === 'task' ? 'task' : 'resource'
+      if (calls.has(wanted)) return calls.get(wanted)
+      const ask = wanted === 'task'
+        ? { task: true, resource: false, judgments: false }
+        // The resource call carries whichever of its two groups is still open, so a mature
+        // resource domain does not pay for questions a judgment domain still needs, or the reverse.
+        : { task: false, resource: group === 'resource' || groupOpen('resource'), judgments: group === 'judgments' || groupOpen('judgments') }
+      // What rides out is anonymous by construction: the key and the machine-readable properties,
+      // never the agent id, the provider or the model the subject names. Building the list here
+      // rather than letting jev.js strip fields means a field added to a candidate cannot leak by
+      // being forgotten in a scrubber.
+      const candidates = pool.map((c) => ({
+        key: c.key, tier: c.tier, capabilities: c.capabilities, source: c.source,
+        scarcity: c.scarcity, scarcityConfidence: c.scarcityConfidence, resetInMinutes: c.resetInMinutes,
+        marginalCost: c.marginalCost, expectedCost: c.expectedCost, latency: c.latency,
+        availability: c.availability, reliability: c.reliability, evidenceSamples: c.evidenceSamples, cold: c.cold,
+      }))
+      const promise = jev.route({
+        task, context, history, tools, availability, trackRecord, handoff, capabilities: capabilitySet,
+        candidates: wanted === 'resource' ? candidates : undefined,
+        identities: wanted === 'resource' ? identities : undefined,
+        strategies: strategies.length ? strategies : OPENING_STRATEGIES,
+        taskProfile: wanted === 'resource' && profile ? profileNumbers(profile) : undefined,
+        ask,
+      }, signal).then((r) => { jevCalls.push({ group: wanted, ask, model: r.model }); return r })
+      calls.set(wanted, promise)
+      return promise
+    }
+
+    // --- 1. task classification ------------------------------------------------------------------
+    const textFeatures = taskTextFeatures(task, { context, modalities })
+    const classes = await classProfilesFor()
+    const taskCtl = controller('task_classification')
+    const taskDecision = taskCtl ? await taskCtl.decide({
+      features: textFeatures,
+      jev: jev ? async () => { const r = await askJev('task'); return r.profile ? { label: r.profile.taskType, probabilities: r.profile.taskTypeProbabilities ?? { [r.profile.taskType]: r.profile.taskTypeConfidence ?? 1 }, confidence: r.profile.taskTypeConfidence ?? 0.5, model: r.model, raw: r } : null } : null,
+      fallback: () => { const p = heuristicProfile(task); return { label: p.taskType, probabilities: { [p.taskType]: 1 }, confidence: p.taskTypeConfidence, raw: { profile: p } } },
+      // The numbers the teacher put on this task ride the sample, so a task type decided locally
+      // later can be turned back into a full profile from the class average rather than a
+      // generic one. Numbers only: no task text ever reaches the store.
+      context: {
+        extra: ({ teacher: t, answer }) => {
+          const p = t?.raw?.profile ?? answer?.raw?.profile
+          return p ? { profile: profileNumbers(p), tiers: { minimum: p.minimumCapability, preferred: p.preferredCapability } } : {}
+        },
+      },
+    }) : null
+    let routed = null
+    if (taskDecision?.authority === 'jev' && taskDecision.teacher?.raw?.profile) { routed = taskDecision.teacher.raw; profile = routed.profile }
+    else if (taskDecision?.authority === 'fallback' && taskDecision.teacher?.raw?.profile) profile = taskDecision.teacher.raw.profile
+    else if (taskDecision?.authority === 'local') profile = profileFromClass(taskDecision.label, taskDecision.probabilities, classes, {})
+    else if (taskDecision?.authority === 'fallback') profile = heuristicProfile(task)
+    else if (!taskCtl && jev) { try { routed = await askJev('task'); profile = routed.profile } catch (err) { if (signal?.aborted) throw err; profile = { ...heuristicProfile(task), fallbackReason: String(err?.message ?? err) } } }
+    else profile = heuristicProfile(task)
+    if (!profile) profile = heuristicProfile(task)
+    if (taskDecision?.sampleId) samples.push({ domain: 'task_classification', id: taskDecision.sampleId, profile: profileNumbers(profile) })
+    domainReport.task_classification = report(taskDecision, { label: profile.taskType })
+
+    // Skill selection rides the same features and the same teacher answer. Skill is HOW the work
+    // is done, not WHO does it, so it never touches the candidate pool: it is handed to the router
+    // in the plan (plan.skill) for the worker's instructions. Whoever the domain made authoritative
+    // decides it, Jev included: when the task type came from a mature local classifier and the
+    // skill domain still asks Jev, Jev's skill is the one the run uses, not a copy of the task type.
+    const skillCtl = controller('skill_selection')
+    let skillAuthority = profile.heuristic ? 'fallback' : 'profile'
+    let skillDecision = null
+    if (skillCtl) {
+      const d = await skillCtl.decide({
+        features: textFeatures,
+        jev: jev ? async () => { const r = await askJev('task'); return r.profile?.skills ? { label: r.profile.skills.primary, probabilities: {}, confidence: r.profile.skillConfidence ?? 0.5, model: r.model, raw: { supporting: r.profile.skills.supporting ?? [] } } : null } : null,
+        fallback: () => ({ label: resolveSkills(profile.skills, profile.taskType).primary, probabilities: {}, confidence: 0.3 }),
+      })
+      if (d?.label) {
+        const supporting = d.authority === 'jev' ? d.teacher?.raw?.supporting ?? profile.skills?.supporting : profile.skills?.supporting
+        profile = { ...profile, skills: { primary: d.label, supporting: supporting ?? [] } }
+        skillAuthority = d.authority
+      }
+      skillDecision = d
+    }
+    // What the worker is told is always a SKILLS entry. When the answer was outside that
+    // vocabulary (a task type such as `refactor` offered as a skill), the skill the run uses is
+    // the task type's own, chosen by the deterministic rule, so that is the authority reported,
+    // and the label shown is the skill that really rides the plan, with the raw answer beside it.
+    const rawSkill = profile.skills?.primary
+    profile = { ...profile, skills: resolveSkills(profile.skills, profile.taskType) }
+    const skillMappedFrom = rawSkill !== profile.skills.primary ? rawSkill ?? null : undefined
+    if (skillMappedFrom !== undefined) skillAuthority = 'fallback'
+    if (skillCtl) {
+      // A mapped answer is not what the run used, so the run cannot confirm it: labelling it
+      // would teach the skill domain an off-vocabulary label from runs that used another skill.
+      // The sample stays teacher-only, as the resource pick does when conservation moves it.
+      if (skillDecision?.sampleId && skillMappedFrom === undefined) samples.push({ domain: 'skill_selection', id: skillDecision.sampleId })
+      domainReport.skill_selection = {
+        ...report(skillDecision, { label: profile.skills.primary }),
+        label: profile.skills.primary,
+        ...(skillMappedFrom !== undefined ? { authority: 'fallback', decidedBy: skillDecision?.authority ?? 'none', mappedFrom: skillMappedFrom } : {}),
+      }
+    }
+
+    // --- 2. hard facts that need the profile ----------------------------------------------------
+    const need = contextEstimate(task, handoff)
+    const namedWork = typeof profile.capability === 'string' && !NOT_WORK_CAPABILITIES.has(profile.capability) ? profile.capability : null
+    const canDoNamed = namedWork && typeof capableFor === 'function' ? capableFor(namedWork) : null
+    pool = pool.map((c) => build(agents.find((a) => a.id === c.id), profile.taskType)).map((c) => ({ ...c, key: names.keyOf(c.id) }))
+    const kept = []
+    for (const c of pool) {
+      if (typeof c.contextTokens === 'number' && c.contextTokens < need) { excluded.push({ id: c.id, reason: `context window ${c.contextTokens} tokens is under the ${need} this request needs`, hard: true }); continue }
+      // The capability the task profile names is a hard fact too, and it is applied here, before
+      // the resource and strategy judgments, not only re-checked by the router afterwards: a
+      // resource that cannot do it (a local model with no network, asked to look something up) is
+      // not a candidate to be weighed, and must not be picked as a parallel answerer either.
+      if (canDoNamed && !canDoNamed.has(c.id)) { excluded.push({ id: c.id, reason: `cannot do what this request needs (${profile.capability})`, hard: true }); continue }
+      const t = candidateTier(c.capabilities, profile.requirements, policy)
+      c.tier = t.tier; c.tierScore = t.score
+      c.fit = candidateFeatures(profile, c).numeric.fit
+      kept.push(c)
+    }
+    const minimum = profile.minimumCapability ?? 'standard'
+    const floorOk = kept.filter((c) => c.tier === 'unknown' || tierAtLeast(c.tier, minimum))
+    let belowFloor = false
+    if (floorOk.length) { for (const c of kept) if (!floorOk.includes(c)) excluded.push({ id: c.id, reason: `capability tier ${c.tier} is under the ${minimum} floor this task needs` }); pool = floorOk }
+    else { pool = kept; belowFloor = true }
+    // The subscription gate is a hard policy the operator set (router.js enforces it on the pick),
+    // with one exception decided here in code: a task that needs frontier capability which no
+    // ungated resource has keeps the gated frontier resource for the work. Otherwise a gated
+    // resource is not a candidate for the work at all; it stays available to review.
+    const gatedSet = new Set(gated ?? [])
+    let gateOverride = false
+    if (gatedSet.size && pool.some((c) => gatedSet.has(c.id))) {
+      const ungated = pool.filter((c) => !gatedSet.has(c.id))
+      const ungatedFrontier = ungated.some((c) => tierAtLeast(c.tier, 'frontier'))
+      if (minimum === 'frontier' && !ungatedFrontier && pool.some((c) => gatedSet.has(c.id) && tierAtLeast(c.tier, 'frontier'))) {
+        gateOverride = true
+        // Only the gated frontier resource is kept for the work; any other gated one is past its
+        // gate like always, and the record says so (the review call tells Jev why each resource
+        // is outside the work table, and an unrecorded one could only be guessed at).
+        for (const c of pool) if (gatedSet.has(c.id) && !tierAtLeast(c.tier, 'frontier')) excluded.push({ id: c.id, reason: 'past its weekly gate: kept for review only' })
+        pool = pool.filter((c) => !gatedSet.has(c.id) || tierAtLeast(c.tier, 'frontier'))
+      } else if (ungated.length) {
+        for (const c of pool) if (gatedSet.has(c.id)) excluded.push({ id: c.id, reason: 'past its weekly gate: kept for review only' })
+        pool = ungated
+      }
+    }
+    if (!pool.length) throw noCandidates(`no resource can take this request: ${excluded.map((e) => `${e.id} (${e.reason})`).join(', ')}`, excluded)
+    for (const c of pool) {
+      const snap = snapById.get(c.id)
+      c.expectedCost = expectedJobCost({ snapshot: snap, candidate: c, profile, policy })
+    }
+    // Who may review is wider than who may do the work (see reviewPool below), and the plan is
+    // built over both, so the strategies it may choose from are too. The same call is made again
+    // if conservation moves the work, so the two paths can never disagree about what is eligible.
+    const strategiesFor = (work) => eligibleStrategies({ candidates: work, reviewCandidates: kept.length ? kept : work, profile, answerOnly })
+    strategies = strategiesFor(pool)
+    // The tier of every resource that cleared the hard facts, for the samples of the domains that
+    // are labelled by what the run did rather than by who it picked (the strategy and the yes/no
+    // judgments). Without it the training rule that recognises a stronger resource rescuing the
+    // run has nothing to compare, and can never fire. Ids, keys and tier names only.
+    const tierTable = kept.map((c) => ({ id: c.id, key: c.key, tier: c.tier }))
+    const poolStats = { size: pool.length, bestFit: Math.max(...pool.map((c) => c.fit)), cheapestFit: (cheapestOf(pool, { minimumTier: minimum })?.fit) ?? 0 }
+    const candidateRows = pool.map((c) => ({ key: c.key, id: c.id, features: candidateFeatures(profile, c, poolStats) }))
+    let pFeatures = mergeFeatures(profileFeatures(profile), poolFeatures(profile, pool))
+
+    // --- 3. resource selection -------------------------------------------------------------------
+    const idOf = (key) => pool.find((c) => c.key === key)?.id
+    const deterministicPick = () => {
+      // Cheapest candidate that meets the floor; the strongest when the task wants frontier and
+      // one is there. Not a judgment, a safe default that the report labels as such.
+      const c = (profile.preferredCapability === 'frontier' && (profile.risk ?? 0) >= policy.minimumReview.riskForReview ? strongestOf(pool) : null) ?? cheapestOf(pool, { minimumTier: minimum }) ?? pool[0]
+      return { chosenKey: c.key, probabilities: Object.fromEntries(pool.map((x) => [x.key, x.id === c.id ? 1 : 0])), confidence: 0.5 }
+    }
+    // The domain controller speaks `chosenKey` (the contract's ranking shape); this file works in
+    // `key`. One conversion, so a fallback answer cannot arrive as an undefined pick.
+    const asPick = (answer, authority, extra = {}) => ({ key: answer.chosenKey ?? answer.key, probabilities: answer.probabilities ?? {}, confidence: answer.confidence ?? 0.5, authority, ...extra })
+    const resCtl = controller('resource_selection')
+    const resDecision = resCtl ? await resCtl.decide({
+      features: pFeatures,
+      candidates: candidateRows,
+      jev: jev ? async () => { const r = await askJev('resource'); return r.resource?.chosenKey ? { chosenKey: r.resource.chosenKey, probabilities: r.resource.probabilities ?? {}, confidence: r.resource.confidence ?? 0.5, model: r.model, raw: r } : null } : null,
+      fallback: deterministicPick,
+    }) : null
+    let pick = null
+    if (resDecision?.chosenKey && idOf(resDecision.chosenKey)) pick = asPick(resDecision, resDecision.authority)
+    else if (!resCtl && jev) {
+      try { const r = await askJev('resource'); if (r.resource?.chosenKey) pick = asPick(r.resource, 'jev') } catch (err) { if (signal?.aborted) throw err; pick = asPick(deterministicPick(), 'fallback', { reason: String(err?.message ?? err) }) }
+    }
+    if (!pick || !idOf(pick.key)) {
+      // A key the post-filter removed: the best remaining by the same probabilities, else the safe default.
+      const best = Object.entries(pick?.probabilities ?? {}).filter(([k]) => idOf(k)).sort((a, b) => b[1] - a[1])[0]
+      pick = best
+        ? { key: best[0], probabilities: pick.probabilities, confidence: best[1], authority: pick.authority, narrowed: true }
+        : asPick(deterministicPick(), pick?.authority ?? 'fallback', { narrowed: true })
+    }
+    domainReport.resource_selection = report(resDecision, { label: pick.key })
+
+    // One yes/no judgment. With its domain controller wired the controller decides who answers;
+    // without one (a fresh install, or a caller that passed no registry) the batched Jev answer is
+    // read directly, and with no Jev either the deterministic rule stands in. The shape is the
+    // same on all three paths, so nothing downstream has to know which one answered.
+    // `labelled: false` keeps the sample teacher-only: the caller pushes it for outcome labelling
+    // itself, once it knows whether the answer changed anything the run could test.
+    const judgment = async (domain, key, fallbackYes, { labelled = true } = {}) => {
+      const asJudgment = (p, authority, model) => ({ label: p >= 0.5 ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), authority, model })
+      const fallback = () => ({ label: fallbackYes ? 'yes' : 'no', probabilities: { yes: fallbackYes ? 1 : 0, no: fallbackYes ? 0 : 1 }, confidence: 0.5, authority: 'fallback' })
+      const ctl = controller(domain)
+      let d
+      if (ctl) {
+        d = await ctl.decide({
+          features: pFeatures,
+          jev: jev ? async () => { const r = await askJev('judgments'); const p = r[key]; return typeof p === 'number' ? { label: p >= 0.5 ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), model: r.model } : null } : null,
+          fallback,
+          context: { extra: { candidates: tierTable } },
+        })
+      } else if (jev) {
+        try {
+          const r = await askJev('judgments')
+          d = typeof r[key] === 'number' ? asJudgment(r[key], 'jev', r.model) : fallback()
+        } catch (err) {
+          if (signal?.aborted) throw err
+          d = fallback()
+        }
+      } else d = fallback()
+      if (d?.sampleId && labelled) samples.push({ domain, id: d.sampleId })
+      domainReport[domain] = report(d, { label: d?.label })
+      return d
+    }
+    const yes = (d) => (d ? d.label === 'yes' : false)
+    const prob = (d) => (d ? d.probabilities?.yes ?? (d.label === 'yes' ? 1 : 0) : undefined)
+    const risk = profile.risk ?? 0.5
+
+    // --- 4. conservation ------------------------------------------------------------------------
+    // Whether the scarce capacity of the most capable candidate should be kept for harder work
+    // than this. The governor only prices scarcity (it is a signal, never a rule); this is the
+    // judgment that acts on it, and it acts the way the weekly gate does: the conserved resource
+    // leaves the work pool and stays available to review. It is asked after the resource pick and
+    // before the strategy, because it can only move work off the pick, and the strategy must be
+    // planned around whoever really does the work.
+    //
+    // The hard limits are code: a local model has nothing to conserve, nor does a resource whose
+    // allowance is healthy; a pick that is not the most
+    // capable candidate is already conserving it; and the work moves only to a candidate whose
+    // KNOWN tier meets the floor, because moving work off a resource known to be capable onto one
+    // nobody has measured is a gamble, not a saving. That one rule also covers an unmet floor and
+    // a gate that yielded to a frontier floor: in both, nothing else has a known tier at the
+    // floor, so the scarce resource keeps the work it alone can do. A coin flip (exactly 0.5) is
+    // not a decision to override the pick.
+    let primary = pool.find((c) => c.id === idOf(pick.key))
+    const mostCapable = strongestOf(pool)
+    const scarceTop = !!mostCapable && mostCapable.source !== 'local' && (mostCapable.scarcity ?? 0) >= CURVE_KNEES.aggressive
+    // Whether a yes could move anything, decided before the question is asked: the limits above,
+    // and a target whose known tier meets the floor. The resource judgment's own ranking decides
+    // among the rest, then the cheaper.
+    // Nothing is conserved that is not being used up: the governor calls a resource under its
+    // first knee "healthy, spend normally", and sparing an allowance that is barely touched is not
+    // conservation, it is a second-best pick. Unknown usage argues for nothing either way, so it
+    // cannot justify moving the work. A judgment (Jev, or a matured classifier) decides WHETHER to
+    // conserve a scarce resource; whether there is anything to conserve is a fact, and stays in code.
+    const worthConserving = typeof primary.scarcity === 'number' && primary.scarcity >= CURVE_KNEES.start
+    const canConserve = primary.id === mostCapable?.id && primary.source !== 'local' && primary.marginalCost !== 'none' && worthConserving
+    const ranked = pick.probabilities ?? {}
+    const costOf = (c) => (typeof c.expectedCost?.total === 'number' ? c.expectedCost.total : 0.5)
+    const target = canConserve
+      ? pool.filter((c) => c.id !== primary.id && c.tier !== 'unknown' && tierAtLeast(c.tier, minimum))
+        .sort((a, b) => (ranked[b.key] ?? 0) - (ranked[a.key] ?? 0) || costOf(a) - costOf(b) || String(a.id).localeCompare(String(b.id)))[0] ?? null
+      : null
+    const conservation = await judgment('conservation', 'conserve', scarceTop && (profile.complexity ?? 0.5) < 0.5 && risk < policy.minimumReview.riskForReview, { labelled: false })
+    let conserved = null
+    if ((prob(conservation) ?? 0) > 0.5 && target) {
+      conserved = { from: primary.id, to: target.id, confidence: r2(conservation.confidence), authority: conservation.authority ?? null }
+      excluded.push({ id: primary.id, reason: 'conserved for harder work: kept for review only' })
+      pool = pool.filter((c) => c.id !== primary.id)
+      primary = target
+      // What the strategy and the remaining judgments see is the pool the work really has.
+      strategies = strategiesFor(pool)
+      pFeatures = mergeFeatures(profileFeatures(profile), poolFeatures(profile, pool))
+    }
+    // The conservation answer is labelled by the run only when it decided something the run
+    // tests: a yes that moved the work, or a no where a yes would have. A yes that could not act
+    // (the pick was not the most capable, or nothing measured could take the work) and a coin
+    // flip that reads 'yes' but moved nothing leave the run exactly as it would have been, so
+    // an accepted run would confirm a 'yes' that never happened. Those stay teacher-only.
+    if (conservation?.sampleId && (conserved || (target && !yes(conservation)))) samples.push({ domain: 'conservation', id: conservation.sampleId })
+    if (resDecision?.sampleId && !conserved) samples.push({ domain: 'resource_selection', id: resDecision.sampleId })
+    if (conserved) domainReport.resource_selection = { ...domainReport.resource_selection, movedBy: 'conservation' }
+
+    // --- 5. strategy and the remaining judgments ------------------------------------------------
+    const stratCtl = controller('execution_strategy')
+    const strategyFallback = () => {
+      const risk = profile.risk ?? 0.5
+      const cheapish = primary.marginalCost !== 'low' || primary.tier === 'standard' || primary.tier === 'weak'
+      const label = risk >= policy.minimumReview.riskForFrontierReview && cheapish && strategies.includes('CHEAP_EXECUTE_FRONTIER_REVIEW') ? 'CHEAP_EXECUTE_FRONTIER_REVIEW'
+        : primary.source === 'local' && strategies.includes('LOCAL_FIRST') ? 'LOCAL_FIRST'
+          : primary.tier === 'frontier' ? 'PREMIUM_DIRECT' : cheapish && strategies.includes('CHEAP_DIRECT') ? 'CHEAP_DIRECT' : 'STANDARD_DIRECT'
+      return { label, probabilities: { [label]: 1 }, confidence: 0.5 }
+    }
+    let strategyPick = null
+    const stratDecision = stratCtl ? await stratCtl.decide({
+      features: pFeatures,
+      jev: jev ? async () => { const r = await askJev('resource'); return r.strategy?.choice ? { label: r.strategy.choice, probabilities: r.strategy.probabilities ?? {}, confidence: r.strategy.confidence ?? 0.5, model: r.model } : null } : null,
+      fallback: strategyFallback,
+      context: { allowed: strategies, extra: { candidates: tierTable } },
+    }) : null
+    if (stratDecision?.label) {
+      const label = strategies.includes(stratDecision.label) ? stratDecision.label
+        : Object.entries(stratDecision.probabilities ?? {}).filter(([k]) => strategies.includes(k)).sort((a, b) => b[1] - a[1])[0]?.[0] ?? strategyFallback().label
+      strategyPick = { label, confidence: stratDecision.confidence, authority: stratDecision.authority, restricted: label !== stratDecision.label }
+    } else if (!stratCtl && jev) {
+      try {
+        const r = await askJev('resource')
+        strategyPick = r.strategy?.choice && strategies.includes(r.strategy.choice) ? { label: r.strategy.choice, confidence: r.strategy.confidence, authority: 'jev' } : { ...strategyFallback(), authority: 'fallback' }
+      } catch (err) {
+        if (signal?.aborted) throw err
+        strategyPick = { ...strategyFallback(), authority: 'fallback' }
+      }
+    } else strategyPick = { ...strategyFallback(), authority: 'fallback' }
+    domainReport.execution_strategy = report(stratDecision, { label: strategyPick.label })
+
+    // Both are labelled below, and only where their answer could change the run (see there).
+    const secondOpinion = await judgment('second_opinion', 'secondOpinion', risk >= policy.minimumReview.riskForReview, { labelled: false })
+    const frontier = await judgment('frontier_escalation', 'frontierReview', risk >= policy.minimumReview.riskForFrontierReview, { labelled: false })
+
+    // --- 6. the plan and the routing object -----------------------------------------------------
+    // Who may judge: everything that cleared the hard facts, not only what cleared the capability
+    // floor and the weekly gate. A gated subscription is kept for review by design, and a strong
+    // resource that missed a frontier floor still reads a diff better than nobody.
+    const reviewPool = kept.length ? kept : pool
+    const plan = planStrategy({ strategy: strategyPick.label, primaryId: primary.id, candidates: pool, reviewCandidates: reviewPool, profile, answerOnly })
+    // The strategy domain is labelled by the run only when the run carries out ITS answer. A label
+    // mapped to another because it was not eligible (after conservation, say), or one the broker
+    // could not build with these candidates, would have the run confirm a strategy it never tried
+    // - the same guard the resource and skill samples already have.
+    if (stratDecision?.sampleId && plan.strategy === stratDecision.label) samples.push({ domain: 'execution_strategy', id: stratDecision.sampleId })
+    // The skill rides the plan because the plan is what the loop runs: the router writes it into
+    // the instructions of every step that does the work (see router.js basePrompt).
+    plan.skill = { ...profile.skills, description: SKILLS[profile.skills.primary], authority: skillAuthority, ...(skillMappedFrom !== undefined ? { mappedFrom: skillMappedFrom } : {}) }
+    if (conserved) plan.notes.push(`${conserved.from} conserved for harder work: ${conserved.to} does it, ${conserved.from} stays available to review`)
+    // The same rule as conservation and the strategy: a judgment is labelled by the run only when
+    // its answer could have changed the run, or an accepted run confirms a 'yes' that never
+    // happened (and a failed one refutes it). A frontier review changes the run only when the plan
+    // did not already have one, the floor does not add one anyway, a reviewer exists, and the run
+    // reviews at all: an answer-only run never does.
+    const strongestReviewer = strongestOf(reviewPool, { except: [primary.id] })
+    const frontierCouldAct = !answerOnly && !plan.frontierReview && !belowFloor && !!strongestReviewer
+    if (yes(frontier) && frontierCouldAct) { plan.reviewer = strongestReviewer.id; plan.forceReview = true; plan.frontierReview = true; plan.notes.push('frontier review added by the frontier-escalation domain') }
+    if (frontier?.sampleId && frontierCouldAct) samples.push({ domain: 'frontier_escalation', id: frontier.sampleId })
+    if (belowFloor) {
+      if (strongestReviewer) { plan.reviewer = strongestReviewer.id; plan.forceReview = true; plan.frontierReview = true }
+      plan.notes.push(`no candidate meets the ${minimum} floor; the strongest available reviews`)
+    }
+    // A second opinion is asked for only of accepted work that no review has seen (jev-review), so
+    // a plan that already promises a review, or an answer-only run, which is never reviewed, gets
+    // the same run whatever the answer was.
+    if (secondOpinion?.sampleId && !answerOnly && !plan.forceReview) samples.push({ domain: 'second_opinion', id: secondOpinion.sampleId })
+    // One row per resource as the review call and the inspector read it: the numbers the choice
+    // was made over, and never a name beyond the id the router maps back from.
+    const rowOf = (c) => ({
+      id: c.id, key: c.key, source: c.source, tier: c.tier, fit: r2(c.fit), scarcity: r2(c.scarcity), scarcityConfidence: r2(c.scarcityConfidence),
+      resetInMinutes: c.resetInMinutes == null ? null : Math.round(c.resetInMinutes), marginalCost: c.marginalCost, expectedCost: c.expectedCost ? { total: r2(c.expectedCost.total), class: c.expectedCost.class } : null,
+      latency: c.latency, availability: c.availability, cold: c.cold, evidenceSamples: c.evidenceSamples, plan: c.plan,
+      capabilities: Object.fromEntries(Object.entries(c.capabilities).filter(([d]) => (profile.requirements?.[d] ?? 0) >= 0.5 || d === 'reliability').map(([d, v]) => [d, { score: r2(v.score), confidence: r2(v.confidence), samples: v.samples }])),
+    })
+    const agentProbabilities = Object.fromEntries(Object.entries(pick.probabilities ?? {}).map(([k, p]) => [idOf(k), p]).filter(([id]) => id))
+    for (const c of pool) if (agentProbabilities[c.id] === undefined) agentProbabilities[c.id] = 0
+    const routing = {
+      model: routed?.model ?? jevCalls[0]?.model,
+      primaryAgent: primary.id,
+      // When conservation moved the work, the pick's confidence was about the resource it moved
+      // away from; what put this primary here is the conservation judgment, at its confidence.
+      agentConfidence: conserved ? conservation.confidence : pick.confidence,
+      ...(conserved ? { conservedFrom: conserved.from } : {}),
+      agentProbabilities,
+      capability: profile.capability,
+      capabilityConfidence: profile.capabilityConfidence,
+      taskType: profile.taskType,
+      taskTypeConfidence: profile.taskTypeConfidence,
+      complexity: profile.complexity,
+      risk: profile.risk,
+      needsSecondOpinion: secondOpinion ? prob(secondOpinion) : profile.needsSecondOpinion,
+      needsHumanReview: profile.needsHumanReview,
+      needsTests: profile.needsTests,
+      continueHandoff: profile.continueHandoff,
+      handler: routed?.handler ?? 'agent',
+      handlerConfidence: routed?.handlerConfidence,
+      toolFits: routed?.toolFits,
+      toolArgConfidence: routed?.toolArgConfidence,
+      toolArgs: routed?.toolArgs,
+      strategy: plan.strategy,
+      profile,
+      decision: {
+        candidates: pool.map(rowOf),
+        // What cleared the hard facts but is not doing the work (past its weekly gate, under the
+        // capability floor, conserved): it can still review, and the review call weighs it on the
+        // same numbers as the work table, not on a bare "not a candidate".
+        reviewOnly: kept.filter((c) => !pool.includes(c)).map(rowOf),
+        excluded,
+        belowFloor,
+        gateOverride,
+        conservation: conserved,
+        minimumCapability: minimum,
+        strategies,
+        plan: { ...plan, notes: plan.notes },
+        domains: domainReport,
+        judgments: { secondOpinion: prob(secondOpinion), conserve: prob(conservation), frontierReview: prob(frontier) },
+        jevCalls: jevCalls.length,
+        samples: samples.map(({ domain, id }) => ({ domain, id })),
+      },
+    }
+    emit?.('decision', { at: now(), decision: routing.decision, profile: profileNumbers(profile), taskType: profile.taskType, strategy: plan.strategy, primary: primary.id })
+    return { routing, profile, candidates: pool, excluded, plan, domains: domainReport, samples, jevCalls }
+  }
+
+  return { decide, classProfiles: classProfilesFor }
+}
+
+/** The per-domain line the inspector shows: who decided, at what maturity, how sure, and why. */
+function report(d, { label } = {}) {
+  if (!d) return { authority: 'none', label }
+  return {
+    authority: d.authority,
+    maturity: d.maturity,
+    label: d.label ?? d.chosenKey ?? label,
+    confidence: r2(d.confidence),
+    requiredConfidence: r2(d.requiredConfidence),
+    ood: d.ood ?? null,
+    reason: d.reason,
+    jevCalled: !!d.jevCalled,
+    teacher: d.teacher ? { label: d.teacher.label ?? d.teacher.chosenKey, confidence: r2(d.teacher.confidence) } : null,
+    local: d.local ? { label: d.local.label ?? d.local.chosenKey, confidence: r2(d.local.confidence), ood: d.local.ood } : null,
+    sampleId: d.sampleId ?? null,
+  }
+}

@@ -178,7 +178,24 @@ export function line(e) {
     case 'loading': return e.text
     case 'start': return `Task received${e.forceAgent ? ` (forced: ${e.forceAgent})` : ''}`
     case 'jev': return `Jev ${e.trace.phase}: ${e.trace.questions.filter((q) => q.used).length}/${e.trace.questions.length} questions in ${e.trace.ms} ms`
-    case 'routed': return e.tool ? `Routed to tool ${e.tool}` : `Routed to ${e.routing.primaryAgent} (${e.routing.mode})`
+    case 'routed': {
+      if (e.tool) return `Routed to tool ${e.tool}`
+      const strategy = e.plan?.strategy && e.plan.strategy !== 'STANDARD_DIRECT' ? `, ${e.plan.strategy.toLowerCase().replace(/_/g, ' ')}` : ''
+      const reviewer = e.plan?.reviewer ? `, ${e.plan.reviewer} reviews` : ''
+      return `Routed to ${e.routing.primaryAgent} (${e.routing.mode})${strategy}${reviewer}`
+    }
+    // Who decided, at what maturity, and how the candidates compared. One line: the inspector's
+    // Decisions tab carries the full table.
+    case 'decision': {
+      const by = Object.entries(e.decision?.domains ?? {}).filter(([, d]) => d.authority && d.authority !== 'none')
+      const local = by.filter(([, d]) => d.authority === 'local').map(([id]) => id.replace(/_/g, ' '))
+      const calls = e.decision?.jevCalls ?? 0
+      const who = local.length ? `local router decided ${local.join(', ')}` : 'Jev decided'
+      const seen = e.decision?.candidates?.length ?? 0
+      return `${who}; ${calls ? `${calls} Jev call${calls === 1 ? '' : 's'}` : 'no Jev call'}; ${seen} candidate${seen === 1 ? '' : 's'} considered`
+    }
+    case 'tiebreak': return `Jev could not tell ${e.from} from ${e.to} (confidence ${e.confidence == null ? 'unknown' : Math.round(e.confidence * 100)}%): ${e.to} takes the work as the standing policy`
+    case 'stalled': return `${e.attempts} work attempts in a row changed no files (${(e.agents ?? []).join(', ')}): stopping instead of spending again`
     case 'checks': return `Baseline checks: ${e.checks.map((c) => `${c.name} ${c.passed ? 'pass' : 'FAIL'}`).join(', ')}`
     case 'capability': return `${e.from} cannot do this (${e.capability ?? 'capability unclear'}): ${e.to} takes the work`
     case 'attempt_start': return `Running ${e.agent} (${e.role})…`

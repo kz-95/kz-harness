@@ -23,8 +23,9 @@
 
 # Router plugin. Agents, limits and thresholds are configurable here; omitted
 # fields use the defaults in the plugin's Config schema.
-# jev-review judges every result (pass / second opinion / retry / human);
-# the router calls it through the `jevReview` service.
+# jev-review holds the review code that judges every result (pass / second
+# opinion / retry / human). The router imports it directly; this row only keeps
+# the plugin listed, and it does nothing at runtime.
 - insert:
     - id: jev-review
       name: 'C:/Harness/plugins/jev-review/index.js'

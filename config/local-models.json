@@ -116,7 +116,7 @@
       "gpuLayers": "auto",
       "agent": {
         "id": "qwen-local",
-        "description": "Qwen3 8B on this PC (llama.cpp): free, private, works offline, but much weaker and slower than the cloud agents. Good for simple edits, explanations and summaries; not for hard multi-file work."
+        "description": "Qwen3 8B (Q4_K_M GGUF) running on this PC through llama.cpp: free, private, works offline."
       }
     },
     {
@@ -144,7 +144,7 @@
       "gpuLayers": "auto",
       "agent": {
         "id": "gemma-local",
-        "description": "Gemma 4 E4B on this PC (llama.cpp): free, private, works offline, fast but the weakest agent. Good for short explanations, summaries and tiny edits; not for multi-file or tricky work."
+        "description": "Gemma 4 E4B (QAT Q4_0 GGUF) running on this PC through llama.cpp: free, private, works offline."
       }
     },
     {

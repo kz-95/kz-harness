@@ -7,7 +7,8 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { formatReport, runRouted } from '../router.js'
+import { compareAnswers, formatReport, runRouted } from '../router.js'
+import { NO_CANDIDATES } from '../decision.js'
 
 const config = {
   agents: [
@@ -606,4 +607,744 @@ test('routing: an answer-only dislike cannot move the pick, a routing dislike do
   const suggest = [fbRow({ messageId: 'm1', tag: 'not enough detail', suggestedAgent: 'claude' })]
   const r3 = await runRouted({ task: 'fix', cwd: dir3, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir3), history: fbHistory(suggest) } })
   assert.equal(r3.attempts[0].agent, 'codex', 'the suggestion is ignored behind an answer-only tag')
+})
+
+// ---------- hard facts, marginal cost, and the strategy's own steps ----------
+// Regressions for six defects: a provider NAME deciding a routing swap, admin exclusions that
+// only decision.js honoured, a filtered-out field swallowed into a fallback, a tool offered to
+// Jev that could not run, a second opinion that replaced the answer instead of being compared
+// with it, and a strategy's executor overwritten before it ever ran.
+
+const ADAPTIVE_AGENTS = [
+  { id: 'claude', provider: 'claude-code', description: 'a subscription the code knows by name', enabled: true },
+  { id: 'deepseek', provider: 'spawn', description: 'a metered key', enabled: true, llm: { provider: 'deepseek', model: 'deepseek-flash' } },
+  { id: 'acme', provider: 'acme-subscription', description: 'a subscription this code has never heard of', enabled: true },
+  { id: 'qwen-local', kind: 'local', provider: 'spawn', description: 'a model on this PC', enabled: true },
+]
+const adaptiveConfig = (extra = {}) => ({
+  agents: ADAPTIVE_AGENTS,
+  tools: [],
+  fallbackAgent: 'claude',
+  limits: { maxAttempts: 4, maxReviews: 2, maxRounds: 6 },
+  thresholds: { accept: { low: 0.55, medium: 0.7, high: 0.85 }, secondOpinion: 0.6, humanReview: 0.7, needsTests: 0.5, tool: 0.5 },
+  productionWorkspaces: [],
+  agentTimeoutMs: 20_000,
+  checks: {},
+  effort: {},
+  ...extra,
+})
+const accept = async () => ({ status: 'accepted', action: 'accept', quality: 0.9 })
+const quiet = { recent: async () => [], records: async () => [], append: async () => {} }
+const pick = (primaryAgent, agentConfidence, agentProbabilities, over = {}) => ({
+  primaryAgent, agentConfidence, agentProbabilities,
+  taskType: 'implementation', complexity: 0.3, risk: 0.3, needsSecondOpinion: 0.1, needsHumanReview: 0.1, needsTests: 0.1, ...over,
+})
+/** One run with the review forced to accept, recording which agents were actually executed. */
+async function adaptiveRun({ config: cfg = adaptiveConfig(), deps = {}, task = 'do a thing', answerOnly = false, answers = {} } = {}) {
+  const dir = repo()
+  const seen = []
+  const r = await runRouted({
+    task, cwd: dir, config: cfg, answerOnly, signal,
+    deps: {
+      review: accept,
+      execute: async (a) => { seen.push(a.id); return { stopReason: 'completed', answerText: answers[a.id] ?? 'done', diagnostic: null } },
+      history: quiet,
+      ...deps,
+    },
+  })
+  return { r, seen }
+}
+
+test('the indifference tie-break follows marginal cost, so a subscription this code never heard of wins it', async () => {
+  const cfg = adaptiveConfig({ resources: { economics: { acme: { marginalCost: 'low' } } } })
+  const jev = { route: async () => pick('deepseek', 0.3, { deepseek: 0.36, acme: 0.34, 'qwen-local': 0.3 }), assess: async () => ({}) }
+  const { r, seen } = await adaptiveRun({ config: cfg, deps: { jev } })
+  assert.equal(r.routing.primaryAgent, 'acme', 'the swap is about what a job costs at the margin, not who the provider is')
+  assert.equal(r.routing.tiebrokeFrom, 'deepseek')
+  assert.equal(seen[0], 'acme')
+})
+
+test('a resource declared metered is not the tie-break answer, whatever its provider is called', async () => {
+  const cfg = adaptiveConfig({ resources: { economics: { claude: { marginalCost: 'metered' } } } })
+  const jev = { route: async () => pick('deepseek', 0.3, { deepseek: 0.36, claude: 0.34 }), assess: async () => ({}) }
+  const { r, seen } = await adaptiveRun({ config: cfg, deps: { jev } })
+  assert.equal(r.routing.tiebrokeFrom, undefined, 'nothing tied is cheap at the margin, so nothing moves')
+  assert.equal(seen[0], 'deepseek')
+})
+
+test('the run\'s own decision snapshot says what a job costs before any default does', async () => {
+  const decide = async () => ({
+    routing: { ...pick('deepseek', 0.3, { deepseek: 0.36, claude: 0.34 }), decision: { candidates: [{ id: 'deepseek', marginalCost: 'low' }, { id: 'claude', marginalCost: 'metered' }] } },
+    plan: null,
+  })
+  const { r, seen } = await adaptiveRun({ deps: { decide } })
+  assert.equal(r.routing.tiebrokeFrom, undefined, 'the pick is already the low-marginal-cost one')
+  assert.equal(seen[0], 'deepseek')
+})
+
+test('an admin-disabled resource is out of the pool, so no later swap can hand it the work', async () => {
+  let offered = null
+  const cfg = adaptiveConfig({ routing: { disabledResources: ['claude'] } })
+  const jev = { route: async ({ agents }) => { offered = agents.map((a) => a.id); return pick('deepseek', 0.3, { deepseek: 0.36, claude: 0.34 }) }, assess: async () => ({}) }
+  const { r, seen } = await adaptiveRun({ config: cfg, deps: { jev } })
+  assert.ok(!offered.includes('claude'), 'never offered')
+  assert.equal(r.routing.tiebrokeFrom, undefined, 'the tie-break cannot resurrect it either')
+  assert.ok(!seen.includes('claude'), `claude took the work anyway: ${seen.join(', ')}`)
+})
+
+test('an allow-list is a hard fact: a pick outside it is replaced, not honoured', async () => {
+  const cfg = adaptiveConfig({ routing: { allowedResources: ['deepseek'] } })
+  const jev = { route: async () => pick('claude', 0.9, { claude: 0.9 }), assess: async () => ({}) }
+  const { r, seen } = await adaptiveRun({ config: cfg, deps: { jev } })
+  assert.equal(r.routing.primaryAgent, 'deepseek')
+  assert.deepEqual(seen, ['deepseek'])
+})
+
+test('excluding every resource stops the run, and a manual pick cannot reach an excluded one', async () => {
+  const dir = repo()
+  const all = adaptiveConfig({ routing: { disabledResources: ['claude', 'deepseek', 'acme', 'qwen-local'] } })
+  await assert.rejects(
+    runRouted({ task: 'fix', cwd: dir, config: all, signal, deps: { jev: null, execute: noop, history: history() } }),
+    /excluded by the routing policy/,
+  )
+  const one = adaptiveConfig({ routing: { disabledResources: ['claude'] } })
+  await assert.rejects(
+    runRouted({ task: 'fix', cwd: dir, config: one, forceAgent: 'claude', signal, deps: { jev: null, execute: noop, history: history() } }),
+    /claude is excluded by the routing policy \(disabled by configuration\)/,
+  )
+})
+
+test('every candidate filtered out stops the run instead of routing to an excluded resource', async () => {
+  // Both of the engine's refusals, including the context-window one whose wording the first
+  // version of this stop did not match: the router keys on the code, not on the message.
+  const refusals = [
+    'no resource is available: claude (disabled by configuration), deepseek (not in the allowed resources)',
+    'no resource can take this request: claude (context window 8192 tokens is under the 17600 this request needs)',
+  ]
+  for (const message of refusals) {
+    const dir = repo()
+    const seen = []
+    await assert.rejects(
+      runRouted({
+        task: 'fix', cwd: dir, config: adaptiveConfig(), signal,
+        deps: {
+          decide: async () => { throw Object.assign(new Error(message), { code: NO_CANDIDATES, excluded: [] }) },
+          execute: async (a) => { seen.push(a.id); return { stopReason: 'completed', answerText: 'done' } },
+          review: accept, history: quiet,
+        },
+      }),
+      (err) => err.message === message,
+    )
+    assert.deepEqual(seen, [], `nothing ran for "${message.split(':')[0]}"; the refusal was not swallowed into a fallback`)
+  }
+})
+
+test('an engine that merely crashed still falls back: only a filtered-out field stops the run', async () => {
+  const jev = { route: async () => pick('claude', 0.9, { claude: 0.9 }), assess: async () => ({}) }
+  const { r, seen } = await adaptiveRun({ deps: { decide: async () => { throw new Error('ECONNRESET') }, jev } })
+  assert.equal(r.routing.mode, 'fallback')
+  assert.deepEqual(seen, ['claude'])
+})
+
+test('a tool that cannot take the attached input is never offered to Jev', async () => {
+  const dir = repo()
+  const agents = [
+    { id: 'claude', provider: 'claude-code', description: 'a', enabled: true },
+    { id: 'deepseek', provider: 'spawn', description: 'b', enabled: true },
+  ]
+  const cfg = { ...adaptiveConfig(), agents, tools }
+  const executors = executorsFrom({ agents, tools, seesImages: (id) => id === 'claude' })
+  const offered = []
+  const jev = { route: async (args) => { offered.push(args.tools.map((t) => t.id)); return pick('claude', 0.9, { claude: 0.9 }) }, assess: async () => ({}) }
+  await runRouted({
+    task: 'read the receipt', cwd: dir, config: cfg, signal,
+    deps: { jev, review: accept, execute: noop, history: quiet, executors, inputModalities: ['image'] },
+  })
+  assert.deepEqual(offered[0], [], 'the text-only script is dropped before judgment, not after it')
+})
+
+test('a tool this run can actually use is still offered', async () => {
+  const dir = repo()
+  const agents = [{ id: 'claude', provider: 'claude-code', description: 'a', enabled: true }]
+  const cfg = { ...adaptiveConfig(), agents, tools }
+  const executors = executorsFrom({ agents, tools })
+  const offered = []
+  const jev = { route: async (args) => { offered.push(args.tools.map((t) => t.id)); return pick('claude', 0.9, { claude: 0.9 }) }, assess: async () => ({}) }
+  await runRouted({
+    task: 'what is the weather', cwd: dir, config: cfg, signal,
+    deps: { jev, review: accept, execute: noop, history: quiet, executors, inputModalities: ['text'] },
+  })
+  assert.deepEqual(offered[0], ['weather'])
+})
+
+const parallelPlan = (over = {}) => ({ strategy: 'PARALLEL_SECOND_OPINION', steps: [{ role: 'primary', agent: 'deepseek' }], reviewer: null, forceReview: false, frontierReview: false, parallelWith: 'claude', fallbackOrder: [], notes: [], ...over })
+const parallelDecide = async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), strategy: 'PARALLEL_SECOND_OPINION' }, plan: parallelPlan() })
+
+test('a parallel second opinion is compared, and the answer shown is the primary\'s', async () => {
+  const answers = {
+    deepseek: 'The primary says the cache is warmed on boot by the loader',
+    claude: 'Totally unrelated: rabbits enjoy carrots throughout winter',
+  }
+  const { r } = await adaptiveRun({ answerOnly: true, deps: { decide: parallelDecide }, answers })
+  assert.equal(r.finalStatus, 'answered')
+  assert.equal(r.lastAnswer, answers.deepseek, 'the opinion was pushed last but it is not the answer')
+  assert.match(r.lastAnswerBy, /^deepseek/)
+  assert.equal(r.secondOpinion.agent, 'claude')
+  assert.equal(r.secondOpinion.compared, true)
+  assert.equal(r.secondOpinion.agree, false)
+  const report = formatReport(r)
+  assert.match(report, /Second opinion \(claude\)/)
+  assert.match(report, /DIFFER/)
+  assert.match(report, /rabbits enjoy carrots/, 'the disagreeing answer is shown, not silently dropped')
+})
+
+test('two answers that say the same thing are reported as agreeing', async () => {
+  const answers = {
+    deepseek: 'The cache is warmed on boot by the loader',
+    claude: 'The cache is warmed on boot by the loader process',
+  }
+  const { r } = await adaptiveRun({ answerOnly: true, deps: { decide: parallelDecide }, answers })
+  assert.equal(r.secondOpinion.agree, true)
+  assert.ok(r.secondOpinion.similarity > 0.6)
+  assert.match(formatReport(r), /the two answers agree/)
+})
+
+const localFirstPlan = (fallbackOrder = []) => ({ strategy: 'LOCAL_FIRST', steps: [{ role: 'primary', agent: 'qwen-local' }], reviewer: null, forceReview: false, frontierReview: false, parallelWith: null, fallbackOrder, notes: [] })
+
+test('a strategy that puts a different executor in the primary step is respected, not overwritten', async () => {
+  const decide = async () => ({ routing: { ...pick('claude', 0.9, { claude: 0.9 }), strategy: 'LOCAL_FIRST' }, plan: localFirstPlan(['claude']) })
+  const { r, seen } = await adaptiveRun({ deps: { decide } })
+  assert.equal(seen[0], 'qwen-local', 'the local model went first, as LOCAL_FIRST said it would')
+  assert.deepEqual(r.plan.steps, [{ role: 'primary', agent: 'qwen-local' }])
+  assert.match(formatReport(r), /qwen-local does the work under this strategy/)
+})
+
+const directPlan = (agent, over = {}) => ({ strategy: 'STANDARD_DIRECT', steps: [{ role: 'primary', agent }], reviewer: null, forceReview: false, frontierReview: false, parallelWith: null, fallbackOrder: [], notes: [], ...over })
+
+test('a primary step the router really did reassign still follows the swap', async () => {
+  // claude is past its weekly gate, and the step names claude ITSELF, so the gate swap moves the
+  // primary and the step must move with it rather than keep naming the resource just rejected.
+  // (This used to name qwen-local in the step, which never tested the step following anything.)
+  const decide = async () => ({ routing: pick('claude', 0.9, { deepseek: 0.9, 'qwen-local': 0.1 }), plan: directPlan('claude') })
+  const quota = { claude: { kind: 'subscription', state: 'ok', weeklyPercent: 95 } }
+  const { r, seen } = await adaptiveRun({ deps: { decide, quota } })
+  assert.equal(r.routing.gatedFrom, 'claude')
+  assert.equal(r.routing.primaryAgent, 'deepseek')
+  assert.equal(seen[0], 'deepseek', 'the step followed the reassignment')
+  assert.deepEqual(r.plan.steps, [{ role: 'primary', agent: 'deepseek' }])
+})
+
+test('a step naming the agent the tie-break moved off follows the tie-break', async () => {
+  // deepseek passes every hard check, so only "the step names the swapped-from agent" can move it.
+  const cfg = adaptiveConfig({ resources: { economics: { acme: { marginalCost: 'low' } } } })
+  const decide = async () => ({ routing: pick('deepseek', 0.3, { deepseek: 0.36, acme: 0.34 }), plan: directPlan('deepseek') })
+  const { r, seen } = await adaptiveRun({ config: cfg, deps: { decide } })
+  assert.equal(r.routing.tiebrokeFrom, 'deepseek')
+  assert.equal(seen[0], 'acme', 'the step did not keep the agent the tie-break rejected')
+})
+
+test('every move the router makes is recorded with where it went, and the report says each one', async () => {
+  const cfg = adaptiveConfig({ resources: { economics: { acme: { marginalCost: 'low' } } } })
+  const decide = async () => ({ routing: pick('deepseek', 0.3, { deepseek: 0.36, acme: 0.34 }), plan: directPlan('deepseek') })
+  const { r } = await adaptiveRun({ config: cfg, deps: { decide } })
+  assert.deepEqual(r.routing.moves, [{ kind: 'tiebreak', from: 'deepseek', to: 'acme' }])
+  // The tie-break was the one move the report never mentioned.
+  assert.match(formatReport(r), /deepseek was barely ahead of acme, a near tie, and acme costs less at the margin: acme took the work/)
+  // Two moves in one run: each names its own target, not the final primary twice.
+  const twoHops = { ...r, routing: { ...r.routing, primaryAgent: 'claude', capability: 'web_research', moves: [{ kind: 'capability', from: 'qwen-local', to: 'acme' }, { kind: 'gate', from: 'acme', to: 'claude' }] } }
+  const report = formatReport(twoHops)
+  assert.match(report, /qwen-local cannot do this \(web_research\): acme took the work/)
+  assert.match(report, /Work moved off acme \(past its weekly gate\) to claude/)
+  // A record from before moves were kept still reads, from its fields.
+  const legacy = { ...r, routing: { ...r.routing, moves: undefined, primaryAgent: 'claude', gatedFrom: 'acme', tiebrokeFrom: undefined } }
+  assert.match(formatReport(legacy), /Work moved off acme \(past its weekly gate\) to claude/)
+})
+
+test('a swap of the resource BEHIND a LOCAL_FIRST step leaves the local model its step', async () => {
+  // The gate moves the routed resource from claude to deepseek. That says nothing against the
+  // local model, so LOCAL_FIRST still runs it first instead of going inert under its own label.
+  const decide = async () => ({ routing: { ...pick('claude', 0.9, { deepseek: 0.9, 'qwen-local': 0.1 }), strategy: 'LOCAL_FIRST' }, plan: localFirstPlan(['claude', 'deepseek']) })
+  const quota = { claude: { kind: 'subscription', state: 'ok', weeklyPercent: 95 } }
+  const { r, seen } = await adaptiveRun({ deps: { decide, quota } })
+  assert.equal(r.routing.gatedFrom, 'claude')
+  assert.equal(r.routing.primaryAgent, 'deepseek')
+  assert.equal(seen[0], 'qwen-local', 'the local model still went first')
+  assert.deepEqual(r.plan.steps, [{ role: 'primary', agent: 'qwen-local' }])
+})
+
+test('a kept strategy step must pass the capability Jev named, like the pick had to', async () => {
+  // LOCAL_FIRST puts qwen-local first, but the request is web_research and a local model has no
+  // network. Keeping the step because it is "enabled" ran exactly the mismatch routing forbids.
+  const decide = async () => ({ routing: { ...pick('claude', 0.9, { claude: 0.9 }), strategy: 'LOCAL_FIRST', capability: 'web_research' }, plan: localFirstPlan(['claude']) })
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS })
+  const { r, seen } = await adaptiveRun({ deps: { decide, executors } })
+  assert.ok(!seen.includes('qwen-local'), `a model with no network ran a look-up: ${seen.join(', ')}`)
+  assert.equal(seen[0], 'claude')
+  assert.deepEqual(r.plan.steps, [{ role: 'primary', agent: 'claude' }])
+})
+
+test('the strategy\'s fallback order is what takes over when its executor fails', async () => {
+  const dir = repo()
+  const seen = []
+  const decide = async () => ({ routing: { ...pick('claude', 0.9, { claude: 0.9 }), strategy: 'LOCAL_FIRST' }, plan: localFirstPlan(['acme']) })
+  const r = await runRouted({
+    task: 'answer me', cwd: dir, config: adaptiveConfig(), answerOnly: true, signal,
+    deps: {
+      decide,
+      execute: async (a) => {
+        seen.push(a.id)
+        return a.id === 'acme' ? { stopReason: 'completed', answerText: 'done' } : { stopReason: 'error', diagnostic: 'not available', answerText: '' }
+      },
+      review: accept, history: quiet,
+    },
+  })
+  // LOCAL_FIRST promises "the local model goes first; the routed resource takes over on failure"
+  // (broker.js writes exactly that note), so claude is the first hand-over, and the strategy's own
+  // order decides after it - not the generic ranking. (This test once expected acme straight
+  // after the local model, which is the promise broken.)
+  assert.deepEqual(seen, ['qwen-local', 'claude', 'acme'], 'the hand-over kept the promise, then followed the strategy')
+  assert.equal(r.finalStatus, 'answered')
+})
+
+// ---------- round three: exclusions in the capability path, hand-overs, conservation, skill ----------
+
+test('a policy-excluded agent is not counted as able to do the request', async () => {
+  // claude and deepseek could look this up, but the policy excludes both; the local model left
+  // cannot. Signing them out stops the run, and excluding them must stop it the same way rather
+  // than let the excluded agents fool the guard and run the job on the one that cannot do it.
+  const dir = repo()
+  const agents = [
+    { id: 'claude', provider: 'claude-code', description: 'a', enabled: true },
+    { id: 'deepseek', provider: 'spawn', description: 'b', enabled: true },
+    { id: 'qwen-local', kind: 'local', provider: 'spawn', description: 'c', enabled: true },
+  ]
+  const cfg = { ...adaptiveConfig(), agents, routing: { disabledResources: ['claude', 'deepseek'] } }
+  let offered = null
+  const ran = []
+  const jev = {
+    route: async ({ capabilities }) => { offered = capabilities; return pick('qwen-local', 0.9, { 'qwen-local': 0.9 }, { capability: 'web_research', capabilityConfidence: 0.9 }) },
+    assess: async () => ({}),
+  }
+  await assert.rejects(
+    runRouted({ task: 'what is the latest release?', cwd: dir, config: cfg, answerOnly: true, signal, deps: { jev, review: accept, execute: async (a) => { ran.push(a.id); return { stopReason: 'completed', answerText: 'x' } }, history: quiet, executors: executorsFrom({ agents }) } }),
+    /nothing here can do this request as "web_research"/,
+  )
+  assert.deepEqual(ran, [], 'nothing ran anyway')
+  assert.equal(offered.includes('web_research'), false, 'and only an excluded agent has it, so it was never offered')
+})
+
+test('the policy-exclusion stop names the policy only when the policy alone emptied the pool', async () => {
+  const dir = repo()
+  const agents = [
+    { id: 'claude', provider: 'claude-code', description: 'a', enabled: true },
+    { id: 'deepseek', provider: 'spawn', description: 'b', enabled: true },
+  ]
+  const until = new Date(Date.now() + 3_600_000).toISOString()
+  const cfg = { ...adaptiveConfig(), agents, routing: { disabledResources: ['claude'] } }
+  await assert.rejects(
+    runRouted({ task: 'fix', cwd: dir, config: cfg, signal, deps: { jev: null, quota: { deepseek: { state: 'exhausted', until } }, execute: noop, history: history() } }),
+    (err) => /usage limits/.test(err.message) && /earliest reset/.test(err.message) && !/excluded by the routing policy/.test(err.message),
+  )
+})
+
+/** A review that rejects the first work attempt with `first`, then accepts. */
+const rejectOnce = (first) => {
+  let n = 0
+  return async () => (n++ === 0 ? { status: 'rejected', action: 'retry', why: 'wrong', ...first } : { status: 'accepted', action: 'accept', why: 'ok' })
+}
+
+test('Jev\'s retry ranking outranks a plain strategy\'s generic fallback order', async () => {
+  // broker.js gives every plan a fallbackOrder; only a strategy that put someone else in the
+  // primary step promised a hand-over, so here Jev's ranking for this failure decides.
+  const decide = async () => ({ routing: pick('deepseek', 0.9, { deepseek: 0.9 }), plan: directPlan('deepseek', { fallbackOrder: ['acme', 'claude'] }) })
+  const review = rejectOnce({ disposition: 'RETRY_DIFFERENT_RESOURCE', retryAgentProbabilities: { claude: 0.95, acme: 0.03, 'qwen-local': 0.02 } })
+  const { seen } = await adaptiveRun({ deps: { decide, review } })
+  assert.deepEqual(seen, ['deepseek', 'claude'])
+})
+
+test('with no retry ranking from Jev, the fallback order still decides', async () => {
+  const decide = async () => ({ routing: pick('deepseek', 0.9, { deepseek: 0.9 }), plan: directPlan('deepseek', { fallbackOrder: ['acme', 'claude'] }) })
+  const review = rejectOnce({ disposition: 'RETRY_DIFFERENT_RESOURCE' })
+  const { seen } = await adaptiveRun({ deps: { decide, review } })
+  assert.deepEqual(seen, ['deepseek', 'acme'])
+})
+
+test('a second review goes to the reviewer the plan named, whatever asked for it', async () => {
+  // The plan promised acme's (frontier) review. The review asks for a second review on its own
+  // account, the second-opinion judgment's yes, and ranks claude for it. The run counts as
+  // reviewed after one review, so handing it to claude would mean acme never looked at the work.
+  const decide = async () => ({ routing: pick('deepseek', 0.9, { deepseek: 0.9 }), plan: directPlan('deepseek', { reviewer: 'acme', forceReview: true, frontierReview: true }) })
+  let n = 0
+  const review = async () => (n++ === 0
+    ? { action: 'second_review', why: 'routing asked for a second opinion', reviewAgentProbabilities: { claude: 0.95, acme: 0.05 } }
+    : { status: 'accepted', action: 'accept', why: 'ok' })
+  const { r, seen } = await adaptiveRun({ deps: { decide, review } })
+  assert.deepEqual(seen, ['deepseek', 'acme'])
+  assert.equal(r.finalStatus, 'accepted')
+})
+
+test('the review call is handed the model each CLI agent really runs, so it can mask it', async () => {
+  let given = null
+  const jev = { route: async () => pick('deepseek', 0.9, { deepseek: 0.9 }), assess: async (input) => { given = input.modelOf; return verdict('accept') } }
+  const modelOf = (a) => (a?.id === 'claude' ? 'o3-pro' : undefined)
+  await adaptiveRun({ deps: { jev, modelOf, review: undefined } })
+  assert.equal(typeof given, 'function', 'the review call got no modelOf, so an agent that has not run yet keeps its model name')
+  assert.equal(given({ id: 'claude' }), 'o3-pro')
+})
+
+test('a LOCAL_FIRST hand-over is kept even when Jev ranks someone else', async () => {
+  const decide = async () => ({ routing: { ...pick('claude', 0.9, { claude: 0.9 }), strategy: 'LOCAL_FIRST' }, plan: localFirstPlan(['claude', 'acme']) })
+  const review = rejectOnce({ disposition: 'WRONG', retryAgentProbabilities: { acme: 0.95, claude: 0.05 } })
+  const { seen } = await adaptiveRun({ deps: { decide, review } })
+  assert.deepEqual(seen, ['qwen-local', 'claude'], 'the strategy promised claude takes over')
+})
+
+test('a parallel opinion is not "already worked", so the fallback order may still hand over to it', async () => {
+  const dir = repo()
+  const seen = []
+  const decide = async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), strategy: 'PARALLEL_SECOND_OPINION' }, plan: parallelPlan({ fallbackOrder: ['claude', 'acme'] }) })
+  const r = await runRouted({
+    task: 'answer me', cwd: dir, config: adaptiveConfig(), answerOnly: true, signal,
+    deps: {
+      decide, review: accept, history: quiet,
+      execute: async (a) => { seen.push(a.id); return a.id === 'deepseek' ? { stopReason: 'error', diagnostic: 'boom', answerText: '' } : { stopReason: 'completed', answerText: `${a.id} says the cache warms on boot` } },
+    },
+  })
+  assert.deepEqual(seen, ['deepseek', 'claude', 'claude'], 'claude only gave an opinion, so it takes over the work')
+  assert.equal(r.finalStatus, 'answered')
+})
+
+test('the second-opinion line says whose answer is shown when it is not the primary\'s', async () => {
+  // The primary came back empty and the opinion answered: its answer is shown, so saying
+  // "the answer below is the primary's" was false.
+  const { r } = await adaptiveRun({ answerOnly: true, deps: { decide: parallelDecide }, answers: { deepseek: '', claude: 'The cache is warmed on boot' } })
+  assert.equal(r.lastAnswer, 'The cache is warmed on boot')
+  const report = formatReport(r)
+  assert.doesNotMatch(report, /The answer below is the primary's/)
+  assert.match(report, /the answer below is the second opinion from claude/)
+  assert.match(report, /nothing came back to compare/)
+  // The primary failed and a retry answered: that retry is who the person is reading.
+  const dir = repo()
+  const failed = await runRouted({
+    task: 'answer me', cwd: dir, config: adaptiveConfig(), answerOnly: true, signal,
+    deps: {
+      decide: async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), strategy: 'PARALLEL_SECOND_OPINION' }, plan: parallelPlan({ fallbackOrder: ['acme'] }) }),
+      review: accept, history: quiet,
+      execute: async (a) => (a.id === 'deepseek' ? { stopReason: 'error', diagnostic: 'boom', answerText: '' } : { stopReason: 'completed', answerText: `${a.id} answered` }),
+    },
+  })
+  assert.equal(failed.lastAnswer, 'acme answered')
+  const second = formatReport(failed)
+  assert.doesNotMatch(second, /The answer below is the primary's/)
+  assert.match(second, /The answer below is acme's \(retry\)/)
+})
+
+test('answers in any script, and short numeric answers, are compared rather than reported empty', async () => {
+  const { compareAnswers } = await import('../router.js')
+  assert.deepEqual(compareAnswers('42', '42'), { compared: true, similarity: 1, agree: true })
+  assert.equal(compareAnswers('Кэш прогревается при загрузке', 'Кэш прогревается при загрузке сервера').agree, true)
+  assert.equal(compareAnswers('Le cache est préchargé au démarrage', 'Le cache est préchargé au démarrage').agree, true)
+  assert.equal(compareAnswers('缓存在启动时预热', '缓存在启动时预热').compared, true)
+  // Nothing came back is one thing; two answers with nothing to measure is another.
+  assert.equal(compareAnswers('', 'an answer').empty, true)
+  // Two short answers with no word in common are compared, and differ.
+  assert.deepEqual(compareAnswers('a b', 'c d'), { compared: true, similarity: 0, agree: false })
+  // Only answers with no words at all are left uncompared.
+  const odd = compareAnswers('...', '!!!')
+  assert.equal(odd.compared, false)
+  assert.equal(odd.empty, false)
+  const report = formatReport({
+    routing: { mode: 'manual', primaryAgent: 'deepseek' }, availability: { out: [], near: [] }, limits: [], baseline: [], assessments: [],
+    attempts: [{ agent: 'deepseek', role: 'primary', stopReason: 'completed', durationMs: 1, changedFiles: [], answerExcerpt: '...' }, { agent: 'claude', role: 'opinion', stopReason: 'completed', durationMs: 1, changedFiles: [], answerExcerpt: '!!!' }],
+    secondOpinion: { agent: 'claude', ...odd }, finalStatus: 'answered', statusReason: '', lastAnswer: '...',
+  })
+  assert.match(report, /could not be compared word for word/)
+  assert.doesNotMatch(report, /nothing came back/)
+})
+
+test('the router\'s own swaps do not hand conserved work back to the resource it was kept off', async () => {
+  // decision.js moved the work off claude to conserve it. Three net Likes for claude would
+  // otherwise promote it straight back through the feedback re-read.
+  const conservedDecide = (over = {}) => async () => ({
+    routing: { ...pick('deepseek', 0.9, { claude: 0.5, deepseek: 0.5 }), conservedFrom: 'claude', decision: { candidates: [] }, ...over },
+    plan: directPlan('deepseek'),
+  })
+  const likes = [1, 2, 3].map((i) => fbRow({ messageId: `m${i}`, verdict: 'like', provider: 'claude' }))
+  const fed = await adaptiveRun({ deps: { decide: conservedDecide(), history: fbHistory(likes) } })
+  assert.deepEqual(fed.seen, ['deepseek'], 'feedback did not pull the work back')
+  assert.equal(fed.r.routing.feedbackFrom, undefined)
+  assert.match(formatReport(fed.r), /Work kept off claude to conserve it for harder work; it stays available to review/)
+  // The low-confidence tie-break would pick claude too: it is the low-marginal-cost one in the tie.
+  const cfg = adaptiveConfig({ policy: { minRoutingConfidence: 0.95 } })
+  const tied = await adaptiveRun({ config: cfg, deps: { decide: conservedDecide({ agentConfidence: 0.3, agentProbabilities: { deepseek: 0.36, claude: 0.34 } }) } })
+  assert.deepEqual(tied.seen, ['deepseek'], 'the tie-break did not pull the work back either')
+  assert.equal(tied.r.routing.tiebrokeFrom, undefined)
+})
+
+test('the plan\'s skill reaches the worker, the planner, the record and the report', async () => {
+  const skill = { primary: 'debugging', description: 'Finding the cause of incorrect behaviour and fixing it', supporting: ['testing'], authority: 'jev' }
+  const prompts = {}
+  const decide = async () => ({
+    routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), decision: { candidates: [] } },
+    plan: { ...directPlan('deepseek'), strategy: 'PREMIUM_PLAN_CHEAP_EXECUTE', steps: [{ role: 'plan', agent: 'claude' }, { role: 'primary', agent: 'deepseek' }], skill },
+  })
+  const { r } = await adaptiveRun({ deps: { decide, execute: async (a, prompt) => { prompts[a.id] = prompt; return { stopReason: 'completed', answerText: 'done' } } } })
+  const line = 'Approach this mainly as debugging work (Finding the cause of incorrect behaviour and fixing it). It also draws on testing.'
+  const worker = prompts.deepseek.split('\n')
+  assert.equal(worker[worker.findIndex((l) => l.startsWith('Workspace: ')) + 1], line, 'the line right after the workspace line')
+  assert.ok(prompts.claude.includes(line), 'the plan step gets it too')
+  assert.deepEqual(r.plan.skill, skill, 'history keeps it')
+  assert.match(formatReport(r), /^- Skill: debugging \(\+ testing\)$/m)
+})
+
+test('a plan without a skill gets no invented one', async () => {
+  const prompts = []
+  const decide = async () => ({ routing: pick('deepseek', 0.9, { deepseek: 0.9 }), plan: directPlan('deepseek') })
+  const { r } = await adaptiveRun({ deps: { decide, execute: async (a, prompt) => { prompts.push(prompt); return { stopReason: 'completed', answerText: 'done' } } } })
+  assert.doesNotMatch(prompts[0], /Approach this mainly as/)
+  assert.equal(r.plan.skill, undefined)
+  assert.doesNotMatch(formatReport(r), /- Skill:/)
+  // The router's own fallback plan has none either.
+  const fb = await adaptiveRun({ deps: { jev: null, execute: async (a, prompt) => { prompts.push(prompt); return { stopReason: 'completed', answerText: 'done' } } } })
+  assert.doesNotMatch(prompts[1], /Approach this mainly as/)
+  assert.equal(fb.r.plan.skill, undefined)
+})
+
+test('the model an executor says it served is kept on the attempt, and never invented', async () => {
+  const served = { claude: { modelVersion: 'opus-2026-09-01' }, deepseek: { model: 'deepseek-v4-0922' }, acme: {} }
+  for (const [agent, extra] of Object.entries(served)) {
+    const { r } = await adaptiveRun({ deps: { jev: { route: async () => pick(agent, 0.9, { [agent]: 0.9 }), assess: async () => ({}) }, execute: async () => ({ stopReason: 'completed', answerText: 'done', ...extra }) } })
+    assert.equal(r.attempts[0].agent, agent)
+    const want = extra.modelVersion ?? extra.model
+    if (want) assert.equal(r.attempts[0].modelVersion, want)
+    else assert.equal('modelVersion' in r.attempts[0], false, 'an executor that reports nothing gets no field')
+  }
+})
+
+// ---------- the weekly gate is policy, and the engine may override it ----------
+
+test('with the capability registry wired, a gated agent still reaches the decision engine', async () => {
+  // Scenario C in a real install: the gate is cost policy that a frontier floor may outrank, so
+  // the engine has to SEE the gated frontier resource to be able to keep it. Asked with the gate
+  // counted as unavailability, no gated agent was ever "capable" once executors were wired.
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS })
+  let offered = null
+  const decide = async (args) => { offered = args.agents.map((a) => a.id); return { routing: pick('deepseek', 0.9, { deepseek: 0.9 }), plan: directPlan('deepseek') } }
+  const quota = { claude: { kind: 'subscription', state: 'ok', weeklyPercent: 95 } }
+  await adaptiveRun({ deps: { decide, quota, executors } })
+  assert.ok(offered.includes('claude'), `the gated agent was offered to the engine (offered: ${offered})`)
+})
+
+test('an engine override of the weekly gate survives the router\'s capability checks', async () => {
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS })
+  const decide = async () => ({
+    routing: { ...pick('claude', 0.9, { claude: 0.9 }, { taskType: 'security', risk: 0.95 }), decision: { gateOverride: true, candidates: [{ id: 'claude', key: 'RESOURCE_A' }] } },
+    plan: directPlan('claude'),
+  })
+  const quota = { claude: { kind: 'subscription', state: 'ok', weeklyPercent: 95 } }
+  const { r, seen } = await adaptiveRun({ deps: { decide, quota, executors } })
+  assert.equal(seen[0], 'claude', 'the resource the engine kept past its gate did the work')
+  assert.equal(r.routing.capabilityFrom, undefined, 'no capability swap undid the override')
+  assert.equal(r.routing.gatedFrom, undefined, 'and no gate swap')
+})
+
+// ---------- every swap respects the capability: hard facts outrank conservation and the gate ----------
+
+test('a conserved agent that alone can do the named job takes it: a capability outranks conservation', async () => {
+  const two = ADAPTIVE_AGENTS.filter((a) => a.id === 'claude' || a.id === 'qwen-local')
+  const executors = executorsFrom({ agents: two })
+  const decide = async () => ({ routing: { ...pick('qwen-local', 0.9, { 'qwen-local': 0.9 }), capability: 'web_research', conservedFrom: 'claude' }, plan: directPlan('qwen-local') })
+  const { r, seen } = await adaptiveRun({ config: adaptiveConfig({ agents: two }), deps: { decide, executors } })
+  assert.deepEqual(seen, ['claude'], 'the local model cannot look anything up, so the conserved agent does')
+  assert.equal(r.routing.capabilityFrom, 'qwen-local')
+})
+
+test('after a tie-break, a LOCAL_FIRST hand-over goes to the new routed resource, not the one it moved off', async () => {
+  const cfg = adaptiveConfig({ resources: { economics: { acme: { marginalCost: 'low' } } } })
+  const decide = async () => ({ routing: { ...pick('deepseek', 0.3, { deepseek: 0.36, acme: 0.34, 'qwen-local': 0.3 }), strategy: 'LOCAL_FIRST' }, plan: localFirstPlan(['deepseek', 'acme']) })
+  const seen = []
+  const { r } = await adaptiveRun({
+    config: cfg,
+    answerOnly: true,
+    deps: { decide, execute: async (a) => { seen.push(a.id); return a.id === 'qwen-local' ? { stopReason: 'error', diagnostic: 'not loaded', answerText: '' } : { stopReason: 'completed', answerText: 'done' } } },
+  })
+  assert.equal(r.routing.tiebrokeFrom, 'deepseek', 'the setting: the tie-break moved the routed resource')
+  assert.deepEqual(seen, ['qwen-local', 'acme'], 'the metered agent the tie-break moved off did not take over')
+})
+
+test('the tie-break never moves the work onto an agent that cannot do it', async () => {
+  const cfg = adaptiveConfig({ resources: { economics: { acme: { marginalCost: 'low' } } } })
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS, seesImages: (id) => id === 'deepseek' })
+  const decide = async () => ({ routing: pick('deepseek', 0.3, { deepseek: 0.36, acme: 0.34 }), plan: directPlan('deepseek') })
+  const { r, seen } = await adaptiveRun({ config: cfg, deps: { decide, executors, inputModalities: ['image'] } })
+  assert.equal(r.routing.tiebrokeFrom, undefined, 'acme cannot read the image, so it is not a tie-break target')
+  assert.equal(seen[0], 'deepseek')
+})
+
+test('the weekly gate yields when nothing ungated can do the job, and the report says so', async () => {
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS, seesImages: (id) => id === 'claude' })
+  const decide = async () => ({ routing: pick('claude', 0.9, { claude: 0.9 }), plan: directPlan('claude') })
+  const quota = { claude: { kind: 'subscription', state: 'ok', weeklyPercent: 95 } }
+  const { r, seen } = await adaptiveRun({ deps: { decide, quota, executors, inputModalities: ['image'] } })
+  assert.equal(seen[0], 'claude', 'only claude can read the image; moving the work would route a mismatch')
+  assert.equal(r.routing.gatedFrom, undefined)
+  assert.equal(r.routing.gateYielded, 'capability')
+  const report = formatReport(r)
+  assert.match(report, /despite its weekly gate: nothing ungated can do this request/)
+  assert.doesNotMatch(report, /kept for review only: claude/, 'the agent that did the work is not also listed as held back')
+})
+
+test('a retry, ranked or named, never goes to an agent that cannot do the job', async () => {
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS, seesImages: (id) => id === 'deepseek' || id === 'claude' })
+  const decide = async () => ({ routing: pick('deepseek', 0.9, { deepseek: 0.9 }), plan: directPlan('deepseek') })
+  for (const assessment of [
+    { status: 'retry', action: 'retry', disposition: 'RETRY_DIFFERENT_RESOURCE', retryAgentProbabilities: { acme: 0.9, claude: 0.1 } },
+    { status: 'retry', action: 'retry', disposition: 'RETRY_DIFFERENT_RESOURCE', retryAgent: 'acme', retryAgentProbabilities: { acme: 0.9 } },
+  ]) {
+    let calls = 0
+    const review = async () => (calls++ === 0 ? { quality: 0.2, ...assessment } : { status: 'accepted', action: 'accept', quality: 0.9 })
+    const { seen } = await adaptiveRun({ deps: { decide, executors, review, inputModalities: ['image'] } })
+    assert.deepEqual(seen.slice(0, 2), ['deepseek', 'claude'], `${assessment.retryAgent ? 'named' : 'ranked'}: acme cannot read the image`)
+  }
+})
+
+test('two identical one-word answers are compared, and agree', () => {
+  for (const [a, b] of [['ok', 'ok'], ['no', 'No.'], ['Да', 'да']]) {
+    const c = compareAnswers(a, b)
+    assert.equal(c.compared, true, `${a} / ${b}`)
+    assert.equal(c.agree, true)
+  }
+  assert.equal(compareAnswers('yes', 'no').agree, false)
+})
+
+test('a local-only run emptied with the policy\'s help says so, instead of sending you to download a model you have', async () => {
+  const cfg = adaptiveConfig({ routing: { disabledResources: ['qwen-local'] } })
+  await assert.rejects(
+    runRouted({ task: 'fix', cwd: repo(), config: cfg, signal, deps: { localOnly: true, review: accept, history: quiet, execute: async () => ({ stopReason: 'completed', answerText: 'done' }) } }),
+    /no local model is ready \(qwen-local is disabled by configuration\)\. Allow it in the routing settings/,
+  )
+})
+
+test('a Jev-routed local-only run refuses a job nothing on this PC can do, instead of running it anyway', async () => {
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS })
+  const decide = async () => ({ routing: { ...pick('qwen-local', 0.9, { 'qwen-local': 0.9 }), capability: 'web_research' }, plan: directPlan('qwen-local') })
+  const seen = []
+  await assert.rejects(
+    runRouted({ task: 'what changed in node 24', cwd: repo(), config: adaptiveConfig(), signal, deps: { localOnly: true, decide, executors, review: accept, history: quiet, execute: async (a) => { seen.push(a.id); return { stopReason: 'completed', answerText: 'done' } } } }),
+    /nothing on this PC can do this request as "web_research"/,
+  )
+  assert.deepEqual(seen, [], 'the local model was not handed a look-up it cannot do')
+})
+
+// ---------- round five: every move honours every hard fact, and every strategy does what it says ----------
+
+test('an agent whose context window cannot hold the request is out before any judgment, online and offline', async () => {
+  const small = ADAPTIVE_AGENTS.map((a) => (a.id === 'qwen-local' ? { ...a, llm: { provider: 'local', model: 'q', contextSize: 2048 } } : a))
+  const executors = executorsFrom({ agents: small })
+  const big = `fix ${'x'.repeat(40_000)}`
+  let offered = null
+  const decide = async (args) => { offered = args.agents.map((a) => a.id); return { routing: pick('deepseek', 0.9, { deepseek: 0.9 }), plan: directPlan('deepseek') } }
+  await adaptiveRun({ config: adaptiveConfig({ agents: small }), task: big, deps: { decide, executors } })
+  assert.ok(offered && !offered.includes('qwen-local'), `the 2k local model was never offered for a 10k-token request (offered: ${offered})`)
+  // Offline only the local model could run, and it cannot hold the request: the run stops rather
+  // than hand the work to a model that would truncate it.
+  const seen = []
+  await assert.rejects(
+    runRouted({ task: big, cwd: repo(), config: adaptiveConfig({ agents: small }), signal, deps: { offline: true, executors, review: accept, history: quiet, execute: async (a) => { seen.push(a.id); return { stopReason: 'completed', answerText: 'done' } } } }),
+    /room for about \d+ tokens of context/,
+  )
+  assert.deepEqual(seen, [])
+})
+
+test('an agent the engine excluded as a fact is never handed the work by a router swap or a retry', async () => {
+  const excluded = { excluded: [{ id: 'deepseek', reason: 'context window 1000 tokens is under the 4005 this request needs', hard: true }], candidates: [{ id: 'claude', key: 'RESOURCE_A', tier: 'frontier' }, { id: 'acme', key: 'RESOURCE_B', tier: 'strong' }] }
+  // The weekly gate moves the work off claude: never onto deepseek.
+  const gatedDecide = async () => ({ routing: { ...pick('claude', 0.9, { claude: 0.9, deepseek: 0.5 }), decision: excluded }, plan: directPlan('claude') })
+  const quota = { claude: { kind: 'subscription', state: 'ok', weeklyPercent: 95 } }
+  const gated = await adaptiveRun({ deps: { decide: gatedDecide, quota } })
+  assert.equal(gated.r.routing.gatedFrom, 'claude', 'the setting: the gate moved the work')
+  assert.ok(!gated.seen.includes('deepseek'), `deepseek cannot hold the request (ran: ${gated.seen})`)
+  // A retry Jev names outright: not deepseek either.
+  let calls = 0
+  const review = async () => (calls++ === 0 ? { quality: 0.2, status: 'retry', action: 'retry', disposition: 'RETRY_DIFFERENT_RESOURCE', retryAgent: 'deepseek', retryAgentProbabilities: { deepseek: 0.9 } } : { status: 'accepted', action: 'accept', quality: 0.9 })
+  const retried = await adaptiveRun({ deps: { decide: async () => ({ routing: { ...pick('claude', 0.9, { claude: 0.9 }), decision: excluded }, plan: directPlan('claude') }), review } })
+  assert.equal(retried.seen[0], 'claude')
+  assert.ok(!retried.seen.includes('deepseek'), `the named retry was refused (ran: ${retried.seen})`)
+})
+
+test('a usage-limit hand-over goes only to an agent that can do the job, not to the usual peer', async () => {
+  const three = [
+    { id: 'claude', provider: 'claude-code', description: 'a', enabled: true },
+    { id: 'codex', provider: 'codex', description: 'b', enabled: true },
+    { id: 'deepseek', provider: 'spawn', description: 'c', enabled: true, llm: { provider: 'deepseek', model: 'deepseek-flash' } },
+  ]
+  const executors = executorsFrom({ agents: three, seesImages: (id) => id !== 'codex' })
+  let first = true
+  const seen = []
+  await runRouted({
+    task: 'read this screenshot', cwd: repo(), config: adaptiveConfig({ agents: three }), signal,
+    deps: {
+      decide: async () => ({ routing: pick('claude', 0.9, { claude: 0.9 }), plan: directPlan('claude') }),
+      executors, inputModalities: ['image'], review: accept, history: quiet,
+      isLimitError: (a) => (a.id === 'claude' && first ? (first = false, { hit: true, until: null }) : { hit: false }),
+      execute: async (a) => { seen.push(a.id); return { stopReason: 'completed', answerText: 'done' } },
+    },
+  })
+  assert.deepEqual(seen, ['claude', 'deepseek'], 'codex is claude\'s usual stand-in, but it cannot read the image')
+})
+
+test('the parallel answerer and the planner are work: never the conserved resource, never one that cannot do it', async () => {
+  const cands = [{ id: 'deepseek', key: 'RESOURCE_A', tier: 'strong', fit: 0.8 }, { id: 'claude', key: 'RESOURCE_B', tier: 'frontier', fit: 0.9 }, { id: 'acme', key: 'RESOURCE_C', tier: 'strong', fit: 0.7 }]
+  const parallel = (with_, over = {}) => async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), decision: { candidates: cands }, ...over }, plan: { ...directPlan('deepseek', { strategy: 'PARALLEL_SECOND_OPINION', parallelWith: with_ }) } })
+  // claude was conserved: it may review, not answer the whole task beside the worker.
+  const kept = await adaptiveRun({ answerOnly: true, deps: { decide: parallel('claude', { conservedFrom: 'claude' }) } })
+  assert.ok(!kept.seen.includes('claude'), `the conserved resource did not answer (ran: ${kept.seen})`)
+  assert.equal(kept.r.plan.parallelWith, 'acme', 'the strongest agent that could stand beside the worker did')
+  // The planner writes the plan: the same rule.
+  const planned = await adaptiveRun({ deps: { decide: async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), decision: { candidates: cands }, conservedFrom: 'claude' }, plan: { ...directPlan('deepseek', { strategy: 'PREMIUM_PLAN_CHEAP_EXECUTE' }), steps: [{ role: 'plan', agent: 'claude' }, { role: 'primary', agent: 'deepseek' }] } }) } })
+  assert.ok(!planned.seen.includes('claude'), `the conserved resource did not plan (ran: ${planned.seen})`)
+})
+
+test('a reviewer the strategy requires is replaced, not dropped, when a swap makes it the worker', async () => {
+  const cfg = adaptiveConfig({ resources: { economics: { acme: { marginalCost: 'low' } } } })
+  const cands = [{ id: 'claude', key: 'RESOURCE_A', tier: 'frontier', fit: 0.9 }, { id: 'deepseek', key: 'RESOURCE_B', tier: 'strong', fit: 0.8 }, { id: 'acme', key: 'RESOURCE_C', tier: 'strong', fit: 0.7 }]
+  const decide = async () => ({
+    routing: { ...pick('deepseek', 0.3, { deepseek: 0.36, acme: 0.34 }), decision: { candidates: cands } },
+    plan: directPlan('deepseek', { strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW', reviewer: 'acme', forceReview: true, frontierReview: true }),
+  })
+  const seen = []
+  const { r } = await adaptiveRun({ config: cfg, deps: { decide, execute: async (a) => { seen.push(a.id); return { stopReason: 'completed', answerText: 'done' } } } })
+  assert.equal(r.routing.tiebrokeFrom, 'deepseek', 'the setting: the tie-break made the planned reviewer the worker')
+  assert.equal(r.plan.reviewer, 'claude', 'the strongest other resource reviews instead')
+  assert.equal(r.plan.forceReview, true, 'and the review the strategy promises still happens')
+})
+
+test('a failed LOCAL_FIRST step hands over to the routed resource even when the review says retry the same tier', async () => {
+  const decide = async () => ({ routing: { ...pick('claude', 0.9, { claude: 0.9 }), strategy: 'LOCAL_FIRST' }, plan: localFirstPlan(['claude']) })
+  let calls = 0
+  const review = async () => (calls++ === 0 ? { quality: 0.1, status: 'retry', action: 'retry', disposition: 'RETRY_SAME_TIER' } : { status: 'accepted', action: 'accept', quality: 0.9 })
+  const seen = []
+  await adaptiveRun({ deps: { decide, review, execute: async (a) => { seen.push(a.id); return a.id === 'qwen-local' ? { stopReason: 'error', diagnostic: 'model not loaded', answerText: '' } : { stopReason: 'completed', answerText: 'done' } } } })
+  assert.deepEqual(seen.slice(0, 2), ['qwen-local', 'claude'], 'the promised hand-over, not the local model again')
+})
+
+test('a tool that cannot do the capability Jev named does not run', async () => {
+  const weather = { id: 'weather', description: 'weather lookup', command: 'x', params: { units: { question: 'Units?', options: { c: 'C', f: 'F' } } } }
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS, tools: [weather] })
+  let toolRan = false
+  const decide = async () => ({ routing: { ...pick('claude', 0.9, { claude: 0.9 }), capability: 'web_research', handler: 'weather', toolFits: 0.9, toolArgConfidence: 0.8, toolArgs: { units: 'f' } }, plan: directPlan('claude') })
+  const { seen } = await adaptiveRun({ config: adaptiveConfig({ tools: [weather] }), deps: { decide, executors, runTool: async () => { toolRan = true; return { stopReason: 'completed', answerText: '72F' } } } })
+  assert.equal(toolRan, false, 'a weather script is not a web research executor')
+  assert.equal(seen[0], 'claude')
+})
+
+test('each attempt ends under its own index when a parallel opinion rides along', async () => {
+  const cands = [{ id: 'deepseek', key: 'RESOURCE_A', tier: 'strong' }, { id: 'claude', key: 'RESOURCE_B', tier: 'frontier' }]
+  const decide = async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), decision: { candidates: cands } }, plan: directPlan('deepseek', { strategy: 'PARALLEL_SECOND_OPINION', parallelWith: 'claude' }) })
+  const events = []
+  await adaptiveRun({ answerOnly: true, deps: { decide, emit: (e) => events.push(e) } })
+  const starts = events.filter((e) => e.type === 'attempt_start').map((e) => [e.index, e.agent])
+  const ends = events.filter((e) => e.type === 'attempt_end').map((e) => [e.index, e.attempt.agent])
+  assert.deepEqual(starts, [[0, 'deepseek'], [1, 'claude']])
+  assert.deepEqual(ends.sort(), [[0, 'deepseek'], [1, 'claude']], 'the primary\'s end is paired with its start, not filed under the opinion')
 })

@@ -474,3 +474,34 @@ test('engine install: verified zip is unpacked with the OS tar, marker written, 
   assert.equal(await local.engineVariant(), 'cuda12')
   await local.dispose()
 })
+
+test('a local model this PC does not have the memory for is not ready, with the reason, like one not installed', async () => {
+  const specs = (ramGB) => async () => ({ ramGB, gpus: [], cpu: { cores: 8 }, diskFreeBytes: null })
+  for (const [ramGB, ready] of [[4, false], [32, true]]) {
+    const { engineDir, modelsDir, local } = localIn(tmp(), { specs: specs(ramGB) })
+    writeFileSync(join(engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'), '')
+    mkdirSync(join(engineDir, '.installed'))
+    writeFileSync(join(engineDir, '.installed', 'eng.json'), JSON.stringify({ sha256: sha('e') }))
+    writeFileSync(join(modelsDir, 'big.gguf'), 'big')
+    await local.status(); await local.settled()
+    const r = await local.readiness('big')
+    assert.equal(r.loggedIn, ready, `${ramGB} GB of RAM for a model that needs 12`)
+    if (!ready) assert.match(r.detail, /this PC cannot run big\.gguf: needs 12 GB RAM, this PC has 4 GB/)
+  }
+})
+
+test('a local agent carries the context window it will really run with, and the registry turns it into a size limit', async () => {
+  const { executorsFrom, CHARS_PER_TOKEN } = await import('../capabilities.js')
+  const { engineDir, modelsDir, local } = localIn(tmp(), { specs: async () => ({ ramGB: 32, gpus: [], cpu: { cores: 8 }, diskFreeBytes: null }) })
+  writeFileSync(join(engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'), '')
+  mkdirSync(join(engineDir, '.installed'))
+  writeFileSync(join(engineDir, '.installed', 'eng.json'), JSON.stringify({ sha256: sha('e') }))
+  writeFileSync(join(modelsDir, 'big.gguf'), 'big')
+  await local.status(); await local.settled()
+  const [agent] = await local.agents('p')
+  // The manifest asks for 8192, but nothing here starts a model with less than MIN_CTX (12288),
+  // and the model allows up to 40960: 12288 is what llama-server gets, so 12288 is what it holds.
+  assert.equal(agent.llm.contextSize, 12288)
+  const [exec] = executorsFrom({ agents: [{ ...agent, kind: 'local' }] })
+  assert.equal(exec.maxInputBytes, 12288 * CHARS_PER_TOKEN)
+})

@@ -45,6 +45,8 @@ const MESSAGE_ID = /^[\w.:-]{1,200}$/
 const AGENT_ID = /^[a-z][a-z0-9_-]{0,40}$/
 const PROVIDER = /^[\w.-]{1,64}$/
 const MODEL = /^[\w.:/+-]{1,128}$/
+// The run the answer came from, as the answer message carries it (index.js withRunMark).
+const RUN_ID = /^[\w-]{1,80}$/
 export const MAX_REASON = 2000
 
 /**
@@ -53,7 +55,9 @@ export const MAX_REASON = 2000
  * `sessionId` is the conversation, `messageId` the answer message, `verdict` like or dislike,
  * `reason` the one-line text (may be empty), `tag` what the verdict was about (optional, one of
  * TAGS), `suggestedAgent` the agent it should have been, and `provider` / `model` the answer's
- * model, which is how router.js attributes the verdict.
+ * model, which is how router.js attributes the verdict. `runId` is the run the answer came from,
+ * when the message says (index.js withRunMark): the one exact link from a message to its run,
+ * which index.js runOfVerdict credits the verdict to instead of guessing by time.
  * A `verdict` of `clear` is the tombstone: it needs only the two ids, and any reason, tag or
  * attribution in the body is ignored rather than stored on a row that has no verdict.
  */
@@ -80,6 +84,8 @@ export function validFeedback(body, { now = () => new Date().toISOString() } = {
   if (provider && !PROVIDER.test(provider)) throw new Error('provider: an agent or provider id')
   const model = typeof body.model === 'string' ? body.model.trim() : ''
   if (model && !MODEL.test(model)) throw new Error('model: a model id')
+  const runId = typeof body.runId === 'string' ? body.runId.trim() : ''
+  if (runId && !RUN_ID.test(runId)) throw new Error('runId: the id of the run that gave the answer')
   return {
     ts: now(),
     sessionId,
@@ -90,6 +96,7 @@ export function validFeedback(body, { now = () => new Date().toISOString() } = {
     ...(suggestedAgent ? { suggestedAgent } : {}),
     ...(provider ? { provider } : {}),
     ...(model ? { model } : {}),
+    ...(runId ? { runId } : {}),
   }
 }
 
@@ -137,6 +144,14 @@ export function createFeedback({ file, now = () => new Date().toISOString() }) {
       // Stable order by timestamp; a record with no readable ts keeps its file position.
       const at = (r) => { const t = Date.parse(r.ts); return Number.isNaN(t) ? 0 : t }
       return kept.map((r, i) => [r, i]).sort((a, b) => at(a[0]) - at(b[0]) || a[1] - b[1]).map(([r]) => r)
+    },
+    /**
+     * Every row of one session in file order, every form of every verdict and every tombstone.
+     * list() answers "what does the person think now"; this answers "when was each answer first
+     * judged", which list() cannot, because it keeps only the newest row per message.
+     */
+    async history(sessionId) {
+      return (await rows()).filter((r) => r && typeof r === 'object' && (!sessionId || r.sessionId === sessionId))
     },
   }
 }

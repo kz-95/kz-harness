@@ -154,7 +154,8 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     const omc = await readFile(join(home, '.claude', 'plugins', 'oh-my-claudecode', '.usage-cache-anthropic.json'), 'utf8').then(JSON.parse).catch(() => null)
     if (omc?.data && !omc.error && Date.now() - omc.timestamp < TTL) {
       const d = omc.data
-      return { windows: [{ name: '5h', minutes: 300, usedPercent: d.fiveHourPercent, resetsAt: iso(d.fiveHourResetsAt) }, { name: 'weekly', minutes: 10080, usedPercent: d.weeklyPercent, resetsAt: iso(d.weeklyResetsAt) }] }
+      // `via` names the source so the resource adapter can say how much to trust the figure.
+      return { windows: [{ name: '5h', minutes: 300, usedPercent: d.fiveHourPercent, resetsAt: iso(d.fiveHourResetsAt) }, { name: 'weekly', minutes: 10080, usedPercent: d.weeklyPercent, resetsAt: iso(d.weeklyResetsAt) }], via: 'omc-cache' }
     }
     const cred = await readFile(join(home, '.claude', '.credentials.json'), 'utf8').then(JSON.parse).catch(() => null)
     const o = cred?.claudeAiOauth
@@ -167,7 +168,7 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     })
     if (!r.ok) throw new Error(`Claude usage HTTP ${r.status}`)
     const j = await r.json()
-    return { windows: [['5h', j.five_hour, 300], ['weekly', j.seven_day, 10080]].filter(([, w]) => w).map(([name, w, minutes]) => ({ name, minutes, usedPercent: w.utilization, resetsAt: iso(w.resets_at) })) }
+    return { windows: [['5h', j.five_hour, 300], ['weekly', j.seven_day, 10080]].filter(([, w]) => w).map(([name, w, minutes]) => ({ name, minutes, usedPercent: w.utilization, resetsAt: iso(w.resets_at) })), via: 'oauth-usage' }
   })
 
   const codex = cached(async () => {
@@ -178,7 +179,7 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     // label, so a renamed window cannot silently switch the policy off.
     const win = (w, fallback) => w && { name: w.windowDurationMins === 300 ? '5h' : w.windowDurationMins === 10080 ? 'weekly' : fallback, minutes: w.windowDurationMins ?? null, usedPercent: w.usedPercent, resetsAt: iso(w.resetsAt) }
     const acct = r['account/read']?.account
-    return { windows: [win(rl.primary, 'primary'), win(rl.secondary, 'secondary')].filter(Boolean), email: acct?.email ?? null, plan: acct?.planType ?? rl.planType ?? null, limitReached: rl.rateLimitReachedType ?? null }
+    return { windows: [win(rl.primary, 'primary'), win(rl.secondary, 'secondary')].filter(Boolean), email: acct?.email ?? null, plan: acct?.planType ?? rl.planType ?? null, limitReached: rl.rateLimitReachedType ?? null, via: 'codex-app-server' }
   })
 
   const balances = new Map() // keyName -> cached fetcher
@@ -249,7 +250,9 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
       const base = { kind, provider: a.provider, keyProvider: keyProviderOf(a), canSignIn: canAuth(a.provider), limits, windows: [], balance: null, creditPercent: null, spentUsd: null, error: null, checkedAt }
       if (kind === 'subscription') {
         const q = a.provider === 'claude-code' ? cq : a.provider === 'codex' ? xq : null
-        Object.assign(base, { windows: q?.windows ?? [], error: q?.error ?? null, account: { label: a.provider === 'codex' ? 'ChatGPT' : 'Claude', email: a.provider === 'codex' ? q?.email ?? null : claudeEmail } })
+        // `via` and `plan` ride along for the resource adapters: where the figure came from, and
+        // the plan name when the provider reports one (Codex does, Claude does not).
+        Object.assign(base, { windows: q?.windows ?? [], error: q?.error ?? null, via: q?.via ?? null, plan: q?.plan ?? null, account: { label: a.provider === 'codex' ? 'ChatGPT' : 'Claude', email: a.provider === 'codex' ? q?.email ?? null : claudeEmail } })
         out[a.id] = { ...base, ...stateOf({ ...base, exhausted: exhaustedOf(a.id) }) }
         continue
       }

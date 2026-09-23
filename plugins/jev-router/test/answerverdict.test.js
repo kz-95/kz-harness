@@ -14,7 +14,7 @@ function loadPlugin() {
   return registration.factory((id) => { if (id === 'react') return React; throw new Error(`unexpected require: ${id}`) })
 }
 
-const { messageProvenance, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag } = loadPlugin().__test
+const { messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag } = loadPlugin().__test
 const marker = (steps) => `Some answer.\n\n[jev-agents]: kzh-agents-1-${Buffer.from(JSON.stringify(steps)).toString('base64url')}\n`
 
 test('answer verdict: a routed answer reports its agent and model from the chain marker', () => {
@@ -153,4 +153,32 @@ test('answer verdict: a chain model keeps only the model, not the effort', () =>
   assert.equal(modelId('deepseek-flash, high'), 'deepseek-flash')
   assert.equal(modelId('opus'), 'opus')
   assert.equal(modelId(undefined), '')
+})
+
+test('answer verdict: the run an answer came from rides every verdict, read off the answer itself', async () => {
+  // Without it the server can only guess the run by time: a first verdict on an older answer,
+  // given after a newer run in the session had ended, was credited to the newer run.
+  const { withRunMark } = await import('../index.js')
+  const { validFeedback } = await import('../feedback.js')
+  const text = withRunMark(`The answer.\n\n${marker([{ agent: 'deepseek', model: 'deepseek-flash', roles: ['work'], answered: true }]).trim()}`, 'run-older-1')
+  assert.equal(messageRunId(text), 'run-older-1', 'the client reads the mark route() writes')
+  assert.equal(messageRunId('A background result with no mark.'), '')
+  // A turn that reports two runs is judged on the last, as its provenance is.
+  assert.equal(messageRunId(withRunMark(withRunMark('two runs', 'first'), 'second')), 'second')
+  const body = feedbackBody({ sessionId: 's-1', messageId: 'm-1', verdict: 'dislike', reason: '', provider: 'deepseek', model: 'deepseek-flash', runId: messageRunId(text) })
+  assert.equal(body.runId, 'run-older-1')
+  assert.equal(validFeedback(body).runId, 'run-older-1', 'and the server stores it as sent')
+  assert.ok(!('runId' in feedbackBody({ sessionId: 's-1', messageId: 'm-1', verdict: null, runId: 'run-older-1' })), 'a clear needs no run')
+  assert.ok(!('runId' in feedbackBody({ sessionId: 's-1', messageId: 'm-1', verdict: 'like', runId: '' })), 'no mark, no field')
+})
+
+test('answer verdict: the reply route() hands back carries the run mark', () => {
+  // route() lives inside apply(), which needs the whole plugin runtime, so its return is read from
+  // the source: every routed reply must go through withRunMark, or the client has no run to send.
+  const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  const start = index.indexOf('async function route(')
+  const body = index.slice(start, index.indexOf('\n  async function ', start + 1))
+  const replies = body.match(/return [^\n]*formatReport\(result\)[^\n]*/g) ?? []
+  assert.ok(replies.length >= 1, 'route() returns the formatted report')
+  for (const r of replies) assert.match(r, /withRunMark\(formatReport\(result\), result\.runId\)/, r)
 })

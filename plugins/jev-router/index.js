@@ -23,11 +23,18 @@ import { JEV_PROVIDER, jevAdapter, line, nameOfAgent, queuedLine } from './adapt
 import { executorsFrom } from './capabilities.js'
 import { createDelivery } from './delivery.js'
 import { createFormatter } from './format.js'
-import { createFeedback, validFeedback } from './feedback.js'
+import { CLEAR, createFeedback, validFeedback } from './feedback.js'
 import { TERMINAL_STATES, createLanes, createTasks, laneKey, validJobId } from './tasks.js'
 import { SESSION_ID, exportSession, redactSecrets } from './export.js'
 import { KEY_NAME, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
 import { createUsage, detectLimit, longWindowPercent } from './usage.js'
+import { DOMAINS, resolvePolicy } from './routing-policy.js'
+import { answererUnconfigured, createCapabilityRegistry, evidenceFromFeedback, evidenceFromRun, loadPriors, subjectOf } from './profiles.js'
+import { snapshotResources } from './resources.js'
+import { governorSignals } from './governor.js'
+import { createTrainingStore, labelFromRun } from './training.js'
+import { createDomainRegistry } from './domains.js'
+import { createDecisionEngine } from './decision.js'
 import { LOCAL_PROVIDER, buildCatalog, createConnectivity, createLocalModels, detectSpecs, installLlmCommand, localAdapter, looksLikeQuestion, readManifest, removeLlmCommand } from './local.js'
 
 export const name = 'jev-router'
@@ -44,7 +51,15 @@ const Agent = Schema.object({
   id: Schema.string().pattern(/^[a-z][a-z0-9_-]*$/).required().description('Short id, also the manual override command name.'),
   provider: Schema.string().required().description('Subagent provider name, e.g. claude-code, codex, spawn.'),
   name: Schema.string().description('Shown in the model menu, the inspector and reports. Defaults to the id, title-cased.'),
-  description: Schema.string().required().description('Strengths shown to Jev when choosing. A prior, not a rule.'),
+  // What the agent IS, not what it is good at. Capability beliefs live as data in
+  // config/capability-priors.json and are measured from here on; a strengths sentence here would be
+  // a second, unmeasured belief system. When a run has a decision record, Jev reads the anonymous
+  // candidate table instead of this text, for the resource pick and for review and retry. Without
+  // one it reads this text: with routing.enabled false, on a run whose agent was picked by hand, and
+  // on a run that fell back because the decision engine failed. There, on the default text, Jev
+  // tells the agents apart mainly by how each is paid for. That is deliberate: those paths are not
+  // the adaptive router, and the old strengths prose contradicted the owner's priors.
+  description: Schema.string().required().description('What this agent is: which CLI or API it runs, and how it is paid for. Not what it is good at: capability beliefs live in config/capability-priors.json and are measured from real runs. When a run has a decision record, Jev reads the anonymous candidate table instead. Without one (routing.enabled false, an agent picked by hand, or a run that fell back because the decision engine failed) this is what Jev reads for the pick, the review and the retry, so on the default text it tells the agents apart mainly by how each is paid for; write your own here if you route that way.'),
   enabled: Schema.boolean().default(true),
   persona: Schema.string().description('Optional persona for providers that accept one (spawn).'),
   credentialRef: Schema.string().description('API key credential that must be set for this agent to run (BYOK agents).'),
@@ -72,21 +87,21 @@ export const Config = Schema.object({
       id: 'claude',
       name: 'Claude Code',
       provider: 'claude-code',
-      description: 'Claude Code: architecture, planning, large-context understanding, complex cross-file reasoning, ambiguous requirements.',
+      description: 'The Claude Code CLI (claude-code), signed in with its own login and paid for by your Claude subscription.',
       enabled: true,
     },
     {
       id: 'codex',
       name: 'Codex (GPT)',
       provider: 'codex',
-      description: 'OpenAI Codex: implementation, debugging, repository modification, targeted fixes, writing and running tests.',
+      description: 'The OpenAI Codex CLI (codex), signed in with its own login and paid for by your ChatGPT subscription.',
       enabled: true,
     },
     {
       id: 'deepseek',
       name: 'DeepSeek agent',
       provider: 'spawn',
-      description: 'DeepSeek (native harness agent): independent analysis, code review, second opinions, reasoning, broad investigation.',
+      description: 'The native harness agent (spawn) on the DeepSeek API, paid per token from the DEEPSEEK_API_KEY balance.',
       enabled: true,
       credentialRef: 'DEEPSEEK_API_KEY',
       llm: { provider: 'deepseek', model: 'deepseek-flash' },
@@ -163,6 +178,23 @@ export const Config = Schema.object({
     stallAfter: Schema.number().min(1).max(10).default(2)
       .description('Work attempts in a row that change no files before the run stops and asks a person, instead of retrying again.'),
   }).default({}).description('Cost policy: how far a subscription is spent on bulk work before the API takes over.'),
+  routing: Schema.object({
+    enabled: Schema.boolean().default(true).description('Adaptive routing: capability profiles, resource adapters and the learning routing domains. Off, the router asks Jev the way it always did.'),
+    learn: Schema.boolean().default(true).description('Record every routing decision, its verified outcome and the capability evidence a run or a verdict gives, and let a routing domain earn local authority. Off, nothing new is recorded and Jev keeps deciding: the capability evidence already on disk still informs routing, but it no longer grows.'),
+    disabledResources: Schema.array(String).default([]).description('Resource (agent) ids the router may never pick.'),
+    allowedResources: Schema.array(String).default([]).description('When set, the only resource ids the router may pick.'),
+    gates: Schema.dict(Schema.any()).description('Promotion, calibration and rollback thresholds per risk class (LOW, MEDIUM, HIGH). Omitted fields keep the defaults in routing-policy.js.'),
+    governor: Schema.dict(Schema.any()).description('Conservation curves per plan, reset weighting, staleness and the expected-cost weights.'),
+    capabilityTiers: Schema.dict(Schema.number().min(0).max(1)).description('Effective score at which a resource counts as standard, strong or frontier.'),
+    minimumReview: Schema.dict(Schema.number().min(0).max(1)).description('riskForReview and riskForFrontierReview: the risk at which the DETERMINISTIC FALLBACK asks for a review, or a frontier review, when neither Jev nor a trusted local classifier answers those judgments. Not a floor under their answers.'),
+    retrain: Schema.dict(Schema.any()).description('How often a routing domain retrains, and the training options.'),
+    drift: Schema.dict(Schema.number()).description('Drift and out-of-distribution thresholds.'),
+    priorsFile: Schema.string().description('Capability priors file, relative to the harness root. Default: config/capability-priors.json'),
+  }).default({}).description('The adaptive router: what each resource is good at, what it costs, and which routing domains have earned the right to decide without Jev.'),
+  resources: Schema.object({
+    plans: Schema.dict(Schema.string()).default({}).description('Agent id -> plan name (pro, max, plus, team). Sets the conservation curve for a provider that does not report its plan.'),
+    economics: Schema.dict(Schema.object({ marginalCost: Schema.union(['none', 'low', 'metered']) })).default({}).description('Agent id -> how a job on it is funded, when the default by provider is wrong.'),
+  }).default({}).description('Facts about each provider that its own API does not report.'),
   fallbackAgent: Schema.string().default('claude').description('Agent used when Jev is unavailable.'),
   credentialRef: Schema.string().default('TYPESAFE_API_KEY').description('Credential name for the TypeSafe API key (env, .credentials.yaml, or .env).'),
   jevModel: Schema.string().default('jev-1.13.0').description('TypeSafe model id, pinned so tuned thresholds keep their meaning.'),
@@ -179,7 +211,7 @@ export const Config = Schema.object({
       medium: Schema.number().min(0).max(1).default(0.7),
       high: Schema.number().min(0).max(1).default(0.85),
     }).description('Minimum review quality to accept, by routing risk (< 0.25, < 0.6, else).'),
-    secondOpinion: Schema.number().min(0).max(1).default(0.6),
+    secondOpinion: Schema.number().min(0).max(1).default(0.6).description('Second-opinion bar for a run with no routing decision (routing switched off, a forced agent): accepted changed code at or over it is reviewed first. A routed run follows its second-opinion decision instead.'),
     humanReview: Schema.number().min(0).max(1).default(0.7),
     needsTests: Schema.number().min(0).max(1).default(0.5),
     tool: Schema.number().min(0).max(1).default(0.5).description('Minimum "tool fits" probability to run a tool instead of an agent.'),
@@ -210,6 +242,214 @@ function textOf(blocks) {
 }
 
 /**
+ * The version an agent really runs, where one is known, for subjectOf and the evidence helpers.
+ * A local model's is the manifest SHA-256 of its weights file: an agent for it only exists once
+ * the installer has verified the file against that hash, so it names the exact bytes and
+ * profiles.js treats it as pinned. Nothing else reports a reliable version today (a CLI alias or
+ * an API id is a name its provider may repoint), so the rest is undefined and keyed by the
+ * unpinned model name. One function, passed to every reader and writer of profiles, so the
+ * evidence a run records and the profile a decision reads have the same key.
+ * @param {{ modelOf: (id: string) => { sha256?: string } | undefined }} local createLocalModels()
+ */
+export const localVersionOf = (local) => (agentDef, model) => (agentDef?.llm?.provider === LOCAL_PROVIDER ? local?.modelOf(agentDef.llm.model ?? model)?.sha256 : undefined)
+
+/**
+ * The capability evidence a run gives when it ends: what it did, and no human verdict. Nobody
+ * can judge an answer before it exists, and a verdict already in the session is about an earlier
+ * answer, so feedback is left out here and credited once, when it is given (creditVerdict).
+ * Handing the session's feedback in here as well would count one verdict twice.
+ * @param {object} record one history.jsonl row
+ * @param {object} deps   evidenceFromRun's, minus feedback
+ */
+export const runEvidence = (record, deps) => evidenceFromRun(record, { ...deps, feedback: [] })
+
+/**
+ * Credit one like, dislike or clear to the capability evidence, when it is given. A run's own
+ * evidence is recorded as it ends, before its answer can be judged, so this is the ONLY place a
+ * verdict becomes evidence. The run it is about is runOfVerdict's. A clear, or a newest form
+ * that credits nothing (a `too slow` tag, an agent that run did not use), retracts whatever the
+ * verdict had counted, the same "newest wins" rule feedback.js reads with.
+ *
+ * Old evidence is kept, rather than replaced or retracted, only when the verdict did not change:
+ * the same like or dislike with the same tag as the form before it (`previous`), which is also
+ * what the registry counts now (countsAs). Then either learning is off, which stops new credit
+ * and nothing here is new, or the rows came back empty only because the agent that gave the
+ * judged answer is no longer configured (answererUnconfigured), which says nothing about the
+ * verdict. Anything else the person did - a clear, a changed verdict or tag, a tag that is not
+ * about capability - is a withdrawal, and a withdrawal is not learning: it retracts with
+ * learning off too, and an unrelated agent (a reviewer) being removed never blocks it.
+ * @param {object} verdict   one feedback.js row, as stored
+ * @param {object[]} records history.jsonl rows (any sessions; only the verdict's is read)
+ * @param {{ capabilities: object, previous?: object|null, learn?: boolean } & object} deps the
+ *   registry, the form of this verdict before this one (none: it is new), whether learning is
+ *   on (default on), and evidenceFromFeedback's deps
+ * @returns {object[]} the rows recorded
+ */
+export function creditVerdict(verdict, records, { capabilities, previous = null, learn = true, ...deps }) {
+  const run = runOfVerdict(verdict, records, capabilities)
+  const cleared = verdict?.verdict === CLEAR
+  const rows = cleared || !run || !learn ? [] : evidenceFromFeedback(verdict, run, deps)
+  if (rows.length) {
+    capabilities.recordMany(rows)
+    return rows
+  }
+  const unchanged = !cleared && sameForm(previous, verdict) && !!capabilities.countsAs?.(verdict)
+  if (unchanged && (!learn || (!!run && answererUnconfigured(verdict, run, deps)))) return []
+  capabilities.retract(verdict)
+  return []
+}
+
+// Two forms of one verdict say the same thing: the same like or dislike, the same tag, about the
+// same answerer and the same run (a reason is free text and says nothing new about capability).
+// A missing attribution matches only a missing one. A run id matches unless both name one and they
+// differ: a form posted before the client sent run ids says nothing about which run it was, and
+// is found on the run it was credited to either way (runOfVerdict).
+const sameForm = (a, b) => !!a && !!b && a.verdict === b.verdict && (a.tag ?? '') === (b.tag ?? '')
+  && (a.provider ?? '') === (b.provider ?? '') && (a.model ?? '') === (b.model ?? '')
+  && (!a.runId || !b.runId || a.runId === b.runId)
+
+/**
+ * The row a verdict is stored as. One given while learning is off is marked: it was stored and
+ * nothing learnt from it, so a withdrawal made while learning is still off must not bring it in
+ * (onVerdict). A clear is the absence of a verdict and needs no mark.
+ * @param {object} record validFeedback's row
+ * @param {boolean} [learn]
+ */
+export const verdictRow = (record, learn = true) => (learn === false && record?.verdict !== CLEAR ? { ...record, learningOff: true } : record)
+
+/**
+ * The run a verdict is about. The run its answer came from, when the verdict says which
+ * (`runId`: the client reads it off the answer message, where route() writes it with
+ * withRunMark), exactly, whatever ran since; a runId that names no run of its session is about
+ * nothing here. Otherwise the one it was credited to before, when it was (a reason edited, a tag
+ * or a mind changed later is about the same answer, even after newer runs in the session), else
+ * the last run of its session that ended at or before the verdict was given. Callers pass the
+ * verdict as effectiveVerdicts() dates it - when the answer was FIRST judged - so an edit made
+ * after a newer run ended still lands on the answer that was judged. That last rule is a guess:
+ * without a runId, a first verdict on an older answer given after a newer run ended lands on the
+ * newer run.
+ */
+export function runOfVerdict(verdict, records, capabilities) {
+  const inSession = (records ?? []).filter((r) => r && r.sessionId === verdict?.sessionId)
+  if (typeof verdict?.runId === 'string' && verdict.runId) return inSession.find((r) => r.runId === verdict.runId) ?? null
+  const creditedTo = capabilities?.creditedRun?.(verdict)
+  let run = creditedTo ? inSession.find((r) => r.runId === creditedTo) : undefined
+  if (!run) {
+    const given = Date.parse(verdict?.ts)
+    // The newest run that had ended when the verdict was given; on a tie, the later written.
+    for (const r of inSession) { const t = Date.parse(r.ts); if (t <= given && !(Date.parse(run?.ts) > t)) run = r }
+  }
+  return run ?? null
+}
+
+// The run an answer came from, carried in the answer's own text the way router.js carries the
+// agent chain: a markdown link reference definition renders as nothing. The engine assigns the
+// message id after this side has returned the text, so the message is the only thing that can
+// hold the link; client.js reads it back (RUN_MARK) and posts it with a verdict as `runId`.
+// A blank line first: a definition cannot interrupt the paragraph a report may end on.
+export const RUN_MARK = /^\[jev-run\]:\s*kzh-run-1-([\w-]{1,80})\s*$/m
+export const withRunMark = (text, runId) => (typeof runId === 'string' && /^[\w-]{1,80}$/.test(runId) ? `${text}\n\n[jev-run]: kzh-run-1-${runId}` : text)
+
+/**
+ * One row per judged message: its NEWEST form (what the person thinks now), dated when the
+ * answer was FIRST judged (which answer it is about). feedback.jsonl is append-only, so a changed
+ * tag or an edited reason is a new row with a new time; dating it by that time moved it onto
+ * whichever run had ended most recently, which is not the answer the person was looking at.
+ * @param {object[]} rows feedback.js rows, any order
+ */
+export function effectiveVerdicts(rows) {
+  const by = new Map()
+  const loose = []
+  for (const f of rows ?? []) {
+    if (!f || typeof f !== 'object') continue
+    if (!f.sessionId || !f.messageId) { loose.push(f); continue }
+    const k = `${f.sessionId}\u0000${f.messageId}`
+    const cur = by.get(k)
+    if (!cur) { by.set(k, { row: f, first: f.ts }); continue }
+    if (Date.parse(f.ts) < Date.parse(cur.first)) cur.first = f.ts
+    if (!(Date.parse(cur.row.ts) > Date.parse(f.ts))) cur.row = f
+  }
+  return [...[...by.values()].map(({ row, first }) => ({ ...row, ts: first, ...(row.ts !== first ? { editedAt: row.ts } : {}) })), ...loose]
+}
+
+/**
+ * Everything a verdict changes, when it is given: the capability evidence of the run it is about,
+ * and that run's routing labels in the domains that read human feedback (task classification and
+ * skill selection). Both happen here and only here: a run's own evidence and labels are written
+ * as it ends, before anyone can judge its answer. With `learn` off it still runs, for what the
+ * person withdrew: a clear or a changed verdict takes back what the earlier form counted, and only
+ * new credit waits for learning to be on.
+ * @param {object} stored the feedback.js row just appended
+ * @param {{ feedbackRows: object[], records: object[], capabilities: object, training?: object, versionOf?: Function, agents?: object[], priors?: object, learn?: boolean }} deps
+ * @returns {Promise<{ run: object|null, evidence: object[], relabelled: string[] }>}
+ */
+export async function onVerdict(stored, { feedbackRows, records, capabilities, training, versionOf, agents, priors, learn = true }) {
+  const effective = effectiveVerdicts(feedbackRows)
+  const isThis = (f) => f?.sessionId === stored?.sessionId && f?.messageId === stored?.messageId
+  const verdict = effective.find(isThis) ?? stored
+  // The form this verdict had before this one: feedback.jsonl is append-only and this is called
+  // after `stored` was appended, so it is the last row of the pair and the one before it is that.
+  const previous = (feedbackRows ?? []).filter(isThis).at(-2) ?? null
+  const run = runOfVerdict(verdict, records, capabilities)
+  const evidence = creditVerdict(verdict, records, { capabilities, previous, learn, versionOf, agents, priors })
+  const relabelled = []
+  if (!run?.runId || !training) return { run, evidence, relabelled }
+  // With learning off nothing new is learnt, but a verdict the person cleared or changed is
+  // withdrawn: a human label it gave is recomputed without it. The same verdict again changes
+  // nothing, and a sample no person labelled has nothing of it to withdraw.
+  const withdrawn = verdict.verdict === CLEAR || !sameForm(previous, verdict)
+  if (!learn && !withdrawn) return { run, evidence, relabelled }
+  // With learning off the label is recomputed from the verdicts that were learnt from, which
+  // leaves out this one and every verdict given while learning was off: those were stored and
+  // never applied, and a withdrawal is not the moment to start applying them.
+  const feedback = learn ? effective : effective.filter((f) => !isThis(f) && !f.learningOff)
+  // Only the samples the run itself labels (the decision record lists them). One the engine left
+  // out on purpose - an off-vocabulary skill answer the run did not carry out, a judgment that
+  // could not change the run - says nothing a verdict about the run could confirm or refute.
+  const labels = Array.isArray(run.routing?.decision?.samples) ? new Set(run.routing.decision.samples.map((x) => x?.id)) : null
+  // The next run of the session bounds which verdicts are about this one (training.js feedbackFor).
+  const after = (records ?? []).filter((r) => r?.sessionId === run.sessionId && Date.parse(r.ts) > Date.parse(run.ts)).sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts))[0]
+  for (const domain of FEEDBACK_DOMAINS) {
+    for (const sample of await training.list({ domain })) {
+      if (sample.runId !== run.runId) continue
+      if (labels && !labels.has(sample.id)) continue
+      if (!learn && sample.outcome?.labelSource !== 'human') continue
+      const outcome = labelFromRun(domain, sample, run, { feedback, until: after?.ts })
+      if (!outcome) continue
+      const was = sample.outcome
+      if (was && was.labelSource === outcome.labelSource && was.label === outcome.label && was.negativeLabel === outcome.negativeLabel) continue
+      await training.resolveOutcome(sample.id, outcome)
+      relabelled.push(sample.id)
+    }
+  }
+  return { run, evidence, relabelled }
+}
+
+/**
+ * What POST /jev-router/feedback does with a valid verdict: store it, then apply it (onVerdict).
+ * The verdict itself is always stored (the routing prior reads it). Crediting it as evidence is
+ * learning, so new credit waits for learning to be on; a clear or a changed verdict still takes
+ * back what the earlier form counted, because a person withdrawing a verdict is not new learning.
+ * Skipping onVerdict altogether with learning off left a withdrawn like counting, then and after
+ * learning came back on, since nothing replays feedback.jsonl. A failure to apply it is logged
+ * and never loses the stored verdict.
+ * @param {object} record validFeedback's row
+ * @param {{ feedback: object, records: () => Promise<object[]>, agents: () => Promise<object[]>, learn: boolean, log?: (m: string) => void } & object} deps
+ *   `records` and `agents` are read after the append, so they are as fresh as the verdict
+ * @returns {Promise<object>} the stored row
+ */
+export async function acceptVerdict(record, { feedback, records, agents, log = () => {}, ...deps }) {
+  const stored = await feedback.append(verdictRow(record, deps.learn))
+  try {
+    await onVerdict(stored, { ...deps, feedbackRows: await feedback.history(stored.sessionId), records: await records(), agents: await agents() })
+  } catch (err) { log(`a verdict was stored but not credited: ${err.message}`) }
+  return stored
+}
+
+// The routing domains whose labels a person's verdict can change (training.js labelClassification).
+const FEEDBACK_DOMAINS = ['task_classification', 'skill_selection']
+
+/**
  * Run a configured tool in the workspace; its output is the attempt's answer.
  * The task text goes to stdin only, never into the environment or the command
  * line: cmd.exe expands %VAR% before parsing & | ", so free text there is
@@ -227,6 +467,84 @@ function runTool(cwd, timeoutMs) {
   }
 }
 
+/**
+ * Which resource ids the ranking routing domains have already seen, so a new one can narrow them
+ * (domains.js `new_resource`). The set lives in `file`, because an in-memory set seeded on the
+ * first call of a process swallowed exactly the ordinary case: add a provider to config, restart,
+ * and the new id is part of the seed, so nothing ever fired.
+ *
+ * Without the file (first start, or an install from before it existed) the set is rebuilt from
+ * what is on disk: the ids the stored ranking samples show were candidates, and every agent id
+ * history.jsonl names (the ones that ran, were picked, were out of allowance, near it or gated,
+ * and every candidate and exclusion in the run's decision record). That is every agent the
+ * decision engine ever saw. The one agent still unseen is one router.js removed before the engine
+ * was asked (a routing-policy exclusion) or that was never routed at all; such an agent is
+ * announced once on that first start, and narrows the ranking domains once. Empty there too
+ * means nothing was ever routed, so nothing has matured that a new resource could invalidate,
+ * and the current agents are simply recorded.
+ * @param {{ file: string, store?: { list: Function }, records?: () => Promise<object[]>, domains?: { noteEnvironmentChange: Function } | null }} p
+ */
+export function createResourceTracker({ file, store, records, domains }) {
+  let known = null
+  let queue = Promise.resolve()
+  const rankingDomains = Object.entries(DOMAINS).filter(([, d]) => d.kind === 'ranking').map(([id]) => id)
+  const seed = async () => {
+    try {
+      const ids = JSON.parse(await readFile(file, 'utf8'))
+      if (Array.isArray(ids)) return new Set(ids.filter((x) => typeof x === 'string'))
+    } catch { /* no file yet, or a damaged one: rebuild from the samples */ }
+    const ids = new Set()
+    const add = (id) => { if (typeof id === 'string' && id) ids.add(id) }
+    for (const domain of rankingDomains) {
+      for (const row of (await store?.list?.({ domain }).catch(() => [])) ?? []) {
+        for (const c of row?.input?.candidates ?? []) add(c?.id)
+      }
+    }
+    // Only when the samples show routing happened: with none, nothing has matured to protect.
+    if (ids.size) {
+      for (const r of (await records?.().catch(() => [])) ?? []) {
+        add(r?.routing?.primaryAgent)
+        for (const a of Array.isArray(r?.attempts) ? r.attempts : []) add(a?.agent)
+        for (const id of Array.isArray(r?.gated) ? r.gated : []) add(id)
+        for (const o of Array.isArray(r?.availability?.out) ? r.availability.out : []) add(o?.id)
+        for (const id of Array.isArray(r?.availability?.near) ? r.availability.near : []) add(id)
+        // The decision record names every agent the engine saw: the candidates, and the ones it
+        // ruled out (disabled, too small a context window, under the floor, gated, conserved).
+        for (const c of Array.isArray(r?.routing?.decision?.candidates) ? r.routing.decision.candidates : []) add(c?.id)
+        for (const e of Array.isArray(r?.routing?.decision?.excluded) ? r.routing.decision.excluded : []) add(e?.id)
+      }
+    }
+    return ids
+  }
+  const save = async () => {
+    await mkdir(dirname(file), { recursive: true })
+    const tmp = `${file}.tmp`
+    await writeFile(tmp, JSON.stringify([...known].sort()))
+    await rename(tmp, file)
+  }
+  return {
+    /** Record `agents`; returns the ids that were new to an existing set (and were announced). */
+    note(agents) {
+      const next = queue.then(async () => {
+        if (!domains) return []
+        const first = known === null
+        if (first) known = await seed()
+        const ids = (agents ?? []).map((a) => a?.id).filter((id) => typeof id === 'string')
+        const fresh = ids.filter((id) => !known.has(id))
+        const seeded = known.size > 0
+        for (const id of fresh) known.add(id)
+        if (fresh.length || first) await save()
+        if (!seeded || !fresh.length) return []
+        domains.noteEnvironmentChange({ kind: 'new_resource', detail: fresh.join(', ') })
+        return fresh
+      })
+      // One at a time, so two runs starting together cannot both announce the same id.
+      queue = next.catch(() => {})
+      return next
+    },
+  }
+}
+
 export function apply(ctx, config) {
   // A spawn agent without a pinned model inherits the parent's model, which is Jev itself.
   const unpinned = config.agents.filter((a) => a.provider === 'spawn' && !(a.llm?.provider && a.llm?.model))
@@ -235,6 +553,7 @@ export function apply(ctx, config) {
   const dataDir = dirname(config.historyFile)
   // Like/Dislike on a finished answer, next to history.jsonl, read back by the router below.
   const feedback = createFeedback({ file: join(dataDir, 'feedback.jsonl') })
+  let verdictQueue = Promise.resolve()
   // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
   const allRecords = async () => {
     const raw = await readFile(config.historyFile, 'utf8').catch(() => '')
@@ -256,6 +575,82 @@ export function apply(ctx, config) {
       await mkdir(dataDir, { recursive: true })
       await appendFile(config.historyFile, `${JSON.stringify(record)}\n`)
     },
+  }
+
+  // --- the adaptive router ------------------------------------------------
+  // Policy first: every threshold the router reasons with, config over the defaults. Then the
+  // capability registry (what each resource is good at, priors plus recorded evidence), the
+  // training store (every decision and what the run proved), the routing domains (who may decide
+  // what, and what they must prove first) and the decision engine that puts them together.
+  // A broken priors file is fatal on purpose: routing on a half-read set of capability numbers
+  // would be worse than not starting.
+  const policy = resolvePolicy(config.routing ?? {})
+  const priorsFile = join(harnessDir, policy.priorsFile ?? 'config/capability-priors.json')
+  let priors = { families: {}, models: {} }
+  try { priors = loadPriors(priorsFile) } catch (err) {
+    if (config.routing?.enabled !== false) throw new Error(`jev-router: capability priors not loaded from ${priorsFile}: ${err.message}`)
+  }
+  const capabilities = createCapabilityRegistry({ file: join(dataDir, 'capability-evidence.jsonl'), priors, policy })
+  try { capabilities.load() } catch (err) { process.stdout.write(`[jev] capability evidence not loaded: ${err.message}\n`) }
+  const training = createTrainingStore({ file: join(dataDir, 'routing-samples.jsonl') })
+  const domains = config.routing?.learn === false ? null : createDomainRegistry({
+    policy,
+    store: training,
+    artifactsDir: join(dataDir, 'classifiers'),
+    stateDir: join(dataDir, 'domains'),
+    log: (m) => process.stdout.write(`[jev] ${m}\n`),
+  })
+  domains?.load()
+  const decisions = createDecisionEngine({ policy, domains, profiles: capabilities, priors, store: training, economics: config.resources?.economics ?? {}, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
+  // Which agent ids the routing domains have already seen. A new one narrows the domains that
+  // rank resources, and nothing else: adding a coding model must not reset a mature task
+  // classifier. Persisted, because the ordinary way to add one is to edit config and restart.
+  const resourceTracker = createResourceTracker({ file: join(dataDir, 'known-resources.json'), store: training, records: allRecords, domains })
+  const noteResources = (agents) => resourceTracker.note(agents).catch((err) => process.stdout.write(`[jev] known resources not updated: ${err.message}\n`))
+
+  /**
+   * What a finished run taught: capability evidence per resource, and the label each routing
+   * decision of that run turned out to deserve. Both are append-only and neither can block the
+   * run, which has already finished by the time this is called.
+   */
+  async function learnFrom(record, samples) {
+    // Learning off means nothing new is recorded: capability evidence changes future routing just
+    // as a trained domain does, so recording it would keep the router learning by another door.
+    if (!record || config.routing?.learn === false) return
+    try {
+      const agents = await enabledAgents()
+      // No feedback here: a verdict is credited when it is given (creditVerdict, POST /feedback).
+      const rows = runEvidence(record, { versionOf, agents, priors })
+      if (rows.length) capabilities.recordMany(rows)
+    } catch (err) { process.stdout.write(`[jev] capability evidence not recorded: ${err.message}\n`) }
+    if (!domains) return
+    // The review's own decision is a routing decision too, and its sample id comes back on the
+    // assessment rather than from the decision engine. Without this the outcome domain would
+    // collect samples for ever and never see one of them verified, so it could never mature.
+    const all = [
+      ...(samples ?? []),
+      ...(record.assessments ?? []).map((a) => a.outcomeDomain?.sampleId).filter(Boolean).map((id) => ({ domain: 'outcome_disposition', id })),
+    ]
+    if (!all.length) return
+    try {
+      // No feedback here either: at the moment a run ends no verdict about its answer can exist.
+      // A verdict relabels this run's samples when it is given (onVerdict), by their runId.
+      for (const { domain, id } of all) {
+        const sample = await training.get(id)
+        if (!sample) continue
+        const outcome = labelFromRun(domain, sample, record)
+        if (outcome) await training.resolveOutcome(id, outcome)
+      }
+    } catch (err) { process.stdout.write(`[jev] routing outcomes not recorded: ${err.message}\n`) }
+  }
+
+  // Retraining is a background pass, not part of a run: a routing decision never waits for it.
+  let retraining = null
+  let lastRetrain = 0
+  const maybeRetrain = () => {
+    if (!domains || retraining || Date.now() - lastRetrain < 60_000) return
+    lastRetrain = Date.now()
+    retraining = domains.evaluateAll().catch((err) => process.stdout.write(`[jev] routing evaluation failed: ${err.message}\n`)).finally(() => { retraining = null })
   }
 
   // Setup-page state, layered over config: on/off switches and user-added
@@ -436,6 +831,10 @@ export function apply(ctx, config) {
     }]))
   }
 
+  // The outcome domain, for the review service: while it is immature Jev judges every result and
+  // teaches it; once it has earned authority the review is decided here without a Jev call.
+  const outcomeDomain = () => (config.routing?.enabled === false ? null : domains?.get('outcome_disposition') ?? null)
+
   // A Jev client on the active jev key; on 429/402 it moves to the next jev key and retries the call once.
   async function makeJev({ onTrace, runId, emit }) {
     await accounts.ready().catch(() => {})
@@ -503,6 +902,8 @@ export function apply(ctx, config) {
     return undefined
   }
   refreshModels()
+  // The one versionOf every profile reader and writer gets (localVersionOf).
+  const versionOf = localVersionOf(local)
 
   const hoursFromNow = (h) => new Date(Date.now() + h * 3600_000).toISOString()
   const keyOut = (provider, name) => ['stopped', 'exhausted'].includes(usage.last()?.keys?.[provider]?.find((k) => k.name === name)?.state)
@@ -618,7 +1019,11 @@ export function apply(ctx, config) {
         })
         try {
           const r = await sub.result
-          return { stopReason: r.stopReason, diagnostic: r.diagnostic, answerText: textOf(r.output), usage: r.usage }
+          // A local run names the weights it ran on, so its history record keeps that version
+          // however late it is read back (a verdict an hour on, a backfill), never the one
+          // installed by then; profiles.js does not ask versionOf about a past run.
+          const version = versionOf(agentDef, agentDef.llm?.model ?? null)
+          return { stopReason: r.stopReason, diagnostic: r.diagnostic, answerText: textOf(r.output), usage: r.usage, ...(version ? { modelVersion: version } : {}) }
         } finally {
           await sub.dispose().catch(() => {})
         }
@@ -628,6 +1033,22 @@ export function apply(ctx, config) {
       const seesImages = new Set()
       for (const a of agents) if (await agentSeesImages(a.id).catch(() => false)) seesImages.add(a.id)
 
+      // What each resource actually is right now, through its provider's own adapter: its limits
+      // in that provider's own terms, its economics, its hardware, how much to trust the figures.
+      await noteResources(agents)
+      const snapshots = config.routing?.enabled === false ? [] : snapshotResources({
+        agents,
+        usage: usage.last()?.out ?? {},
+        ready: await readiness(),
+        config,
+        specs: await specs().catch(() => null),
+        now: Date.now,
+        modelOf,
+        policy,
+        rates: pricingNow(config.pricing?.peak),
+      })
+      // The samples this run's decisions produced, so the outcome can label them afterwards.
+      let decisionSamples = []
       const result = await runRouted({
         task,
         cwd,
@@ -651,8 +1072,19 @@ export function apply(ctx, config) {
             tools: config.tools ?? [],
             chat: await chatPair(),
             seesImages: (id) => seesImages.has(id),
+            economics: config.resources?.economics ?? {},
           }),
           inputModalities: modalities ?? ['text'],
+          // The decision engine. Absent (routing switched off) the loop asks Jev directly, the
+          // way it did before any of this existed.
+          ...(config.routing?.enabled === false ? {} : {
+            decide: async (args) => {
+              const d = await decisions.decide({ ...args, versionOf, snapshots })
+              decisionSamples = d.samples ?? []
+              return d
+            },
+            outcomeDomain: outcomeDomain(),
+          }),
           execute,
           runTool: runTool(cwd, config.agentTimeoutMs),
           modelOf,
@@ -682,7 +1114,10 @@ export function apply(ctx, config) {
           },
         },
       })
-      return formatReport(result)
+      // What the run proved, recorded after the fact: capability evidence per resource, and the
+      // label each routing decision earned. Never on the run's critical path, and never fatal.
+      learnFrom(result, decisionSamples).then(maybeRetrain).catch(() => {})
+      return withRunMark(formatReport(result), result.runId)
     } catch (err) {
       onEvent({ type: 'error', at: Date.now(), message: err.message })
       throw err
@@ -1015,6 +1450,52 @@ export function apply(ctx, config) {
             } catch (err) { return send(err.status ?? 500, { error: err.message }) }
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/names') return send(200, await displayNames())
+          // The adaptive router's own state, for the Jev inspector: how far each routing domain
+          // has matured and what is blocking the next rung, what the registry currently believes
+          // each resource is good at and on what evidence, and what each provider's limits look
+          // like right now. Read only, and nothing here carries task text or a key.
+          if (req.method === 'GET' && url.pathname === '/jev-router/routing') {
+            const agents = await enabledAgents()
+            const snaps = snapshotResources({
+              agents, usage: usage.last()?.out ?? {}, ready: await readiness(), config,
+              specs: await specs().catch(() => null), modelOf, policy, rates: pricingNow(config.pricing?.peak),
+            })
+            const profiles = agents.map((a) => {
+              const subject = subjectOf(a, { modelOf, versionOf, priors })
+              const p = capabilities.profileOf(subject)
+              return {
+                id: a.id,
+                subject: { provider: subject.provider, family: subject.family, model: subject.model },
+                cold: p.cold,
+                samples: p.samples,
+                lastUpdate: p.lastUpdate,
+                // Only the dimensions something is actually known about: an unknown one is
+                // reported as unknown rather than as a number nobody stands behind.
+                dimensions: Object.fromEntries(Object.entries(p.dimensions ?? {}).filter(([, d]) => d.prior || d.samples > 0)),
+              }
+            })
+            return send(200, {
+              enabled: config.routing?.enabled !== false,
+              learning: !!domains,
+              domains: domains ? domains.states() : {},
+              policy: { capabilityTiers: policy.capabilityTiers, minimumReview: policy.minimumReview, gates: policy.gates, drift: policy.drift },
+              resources: snaps.map((r) => ({
+                id: r.resourceId, provider: r.provider, adapter: r.adapter, source: r.source, model: r.model,
+                plan: r.plan, limits: r.limits, availability: r.availability, economics: r.economics,
+                usageSource: r.usageSource, confidence: r.confidence, stale: r.stale, checkedAt: r.checkedAt,
+                governor: governorSignals({ snapshots: [r], policy }).get(r.resourceId) ?? null,
+              })),
+              profiles,
+              training: await training.stats().catch(() => null),
+            })
+          }
+          // Force an evaluation pass: train on what is there, measure it, and move any domain
+          // that has earned it. Normally this runs by itself after a run; this is for the setup
+          // page and for anyone who wants to see where a domain stands right now.
+          if (req.method === 'POST' && url.pathname === '/jev-router/routing/evaluate') {
+            if (!domains) return send(400, { error: 'routing learning is switched off' })
+            return send(200, { domains: await domains.evaluateAll() })
+          }
           // Background tasks: the task list column (queued / running / finished).
           if (req.method === 'GET' && url.pathname === '/jev-router/tasks') {
             await tasks.ready
@@ -1071,10 +1552,19 @@ export function apply(ctx, config) {
           // message, so a cleared verdict survives a reload. An unknown tag is rejected here with
           // a 400 by validFeedback, before it is stored. The GET is for the inspector and for a
           // page that reloads.
+          // The verdict also becomes capability evidence here, once, for the run it is about
+          // (creditVerdict): a run's own evidence was recorded when it ended, before anyone could
+          // judge it. One queue, so the evidence is recorded in the order feedback.jsonl is
+          // written and a quick like-then-dislike cannot land the other way round.
           if (req.method === 'POST' && url.pathname === '/jev-router/feedback') {
             let record
             try { record = validFeedback(JSON.parse(await readBody(req))) } catch (err) { return send(400, { error: err.message }) }
-            return send(200, { ok: true, record: await feedback.append(record) })
+            const job = verdictQueue.then(async () => acceptVerdict(record, {
+              feedback, records: allRecords, capabilities, training, versionOf, agents: enabledAgents, priors, learn: config.routing?.learn !== false,
+              log: (m) => process.stdout.write(`[jev] ${m}\n`),
+            }))
+            verdictQueue = job.catch(() => {})
+            return send(200, { ok: true, record: await job })
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/feedback') {
             const session = url.searchParams.get('session')
@@ -1202,7 +1692,7 @@ export function apply(ctx, config) {
           if (req.method === 'POST' && url.pathname === '/jev-router/custom') {
             const b = JSON.parse(await readBody(req))
             if (!/^[a-z][a-z0-9_-]{0,31}$/.test(b.id ?? '')) return send(400, { error: 'name: lowercase letters, digits, - or _, starting with a letter' })
-            if (!b.description) return send(400, { error: 'say what the agent is good at' })
+            if (!b.description) return send(400, { error: 'say what the agent is: which model or API it runs, and how it is paid for' })
             const provider = (await modelProviders()).find((p) => p.id === b.provider)
             if (!provider?.models.some((m) => m.id === b.model)) return send(400, { error: `${b.provider} / ${b.model} is not a model in Settings → Models` })
             await mutateSetup((s) => {

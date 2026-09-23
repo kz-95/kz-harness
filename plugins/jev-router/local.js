@@ -569,19 +569,33 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
 
   /** Router agents for installed models (manifest `agent`); none until the model is installed. */
   async function agents(persona) {
-    return (await installed()).filter((m) => m.agent).map((m) => ({
+    const models = (await installed()).filter((m) => m.agent)
+    return Promise.all(models.map(async (m) => ({
       id: m.agent.id, name: m.agent.name ?? (m.name ? `${m.name} (local)` : undefined), provider: 'spawn', description: m.agent.description, enabled: true,
       // `role` ('fast' | 'balanced' | 'best-quality') ranks the local models for the
       // local-low / local-high effort levels; size only breaks a tie.
-      role: m.role, size: m.size, llm: { provider: LOCAL_PROVIDER, model: m.id }, persona,
-    }))
+      // `contextSize` is the window llama-server will really be started with here (runDefaults),
+      // so the router's capability registry and the resource snapshot both know what this model
+      // can hold, and a request that does not fit is refused before any judgment.
+      role: m.role, size: m.size, llm: { provider: LOCAL_PROVIDER, model: m.id, contextSize: (await runDefaults(m)).ctx }, persona,
+    })))
   }
 
-  /** Router readiness for a local agent: no login, no quota; the engine must be installed. */
+  /**
+   * Router readiness for a local agent: no login, no quota; the engine must be installed, and this
+   * PC must be able to run the model. Insufficient hardware is a hard fact like a missing file: a
+   * model that needs more memory than the machine has cannot do any job, so it is not ready, and
+   * the router drops it before any judgment. The rule is the same one the model picker shows as
+   * "Won't fit" (rateModule), so setup and routing never disagree about what runs here.
+   */
   async function readiness(modelId) {
-    if (!(await engineInstalled())) return { installed: false, loggedIn: false, detail: 'llama.cpp engine not installed: type /install-llm' }
+    const variant = await engineVariant()
+    if (!variant) return { installed: false, loggedIn: false, detail: 'llama.cpp engine not installed: type /install-llm' }
     const m = (await installed()).find((x) => x.id === modelId)
     if (!m) return { installed: false, loggedIn: false, detail: `${mod(modelId)?.file ?? modelId} not installed: type /install-llm` }
+    const specs = await getSpecs().catch(() => null)
+    const fit = specs ? rateModule(m, specs, variant, { installed: true }) : null
+    if (fit?.fit === 'no') return { installed: true, loggedIn: false, detail: `this PC cannot run ${m.file}: ${fit.reason}` }
     return { installed: true, loggedIn: true, detail: `free, local: ${m.file}` }
   }
 
