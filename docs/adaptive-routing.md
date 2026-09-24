@@ -23,8 +23,22 @@ your request
 
 Each of those decisions belongs to a **routing domain**, and each domain answers its own question
 about who is allowed to make it: Jev, the local classifier, or a deterministic fallback.
-The domains mature separately, so task classification can be handled locally while resource
-selection is still asking Jev.
+The domains mature separately, so task classification can be handled locally while the
+execution strategy is still asking Jev.
+
+Three domains never ask Jev at all. Resource selection, conservation and frontier escalation are
+decided in **code**, and carry `authority: 'code'` rather than `jev` or `local`. They weigh
+capability against cost against scarcity, which is arithmetic over numbers, and a snap-judgment
+classifier cannot compare magnitudes; asking one to would be several judgments in a single
+question besides. `rankCandidates()` in `broker.js` does the ranking, and the two yes/no answers
+are read from the governor's pressure reading and the policy's cuts.
+
+A domain decided in code still has a ladder and still collects samples, because an outcome can
+contradict a rule as readily as it can contradict a judgment. What it does not collect is
+agreement: a run that goes as planned under `code` teaches the local classifier nothing, for the
+same reason it teaches it nothing under the classifier's own authority - a rule confirming itself
+is not evidence. So those domains train on rescues, negative outcomes and a person's `good pick`
+tag alone.
 
 | Domain | Decides | Risk class |
 | --- | --- | --- |
