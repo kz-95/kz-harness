@@ -204,6 +204,13 @@ Step 5 is tested too (`test/budgetpanel.test.js` runs the whole card), but nobod
 **An additional "Laya Auto" beside "Jev Auto", each with its own maturity ladder. Not a
 replacement.** Jev stays as the teacher and the quality bar.
 
+**Decided by the owner on 24 Sep 2026, and designed in [laya-auto.md](laya-auto.md):**
+Laya Auto is a model-picker row beside Jev Auto, and in it Laya alone decides, on this PC, with no Jev call, offline included.
+This overrides "shadow before authority" for the Laya Auto row only.
+In Jev Auto, Jev decides as today, and Laya answers the same questions in the background, recorded side by side, without ever slowing or breaking the run.
+Laya runs as the official `laya.serve` from NandhaKishorM/laya in a Python sidecar that KzH starts and stops, on the GPU where it can and the CPU otherwise, with uv from the installer fetching Python and torch once.
+Thresholds stay on each provider's record, and the arbiter, where one is needed, stays in code and dumb.
+
 ### Why it fits with almost no work
 
 `laya-serve` speaks the same `POST /v1/systemone` wire protocol as TypeSafe's hosted Jev API, with
