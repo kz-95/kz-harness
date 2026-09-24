@@ -92,6 +92,11 @@ window.__ModuleLoader__.load({
 .jevi dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px;margin:8px 0 0}
 .jevi dt{color:var(--dsw-alias-label-tertiary)}
 .jevi dd{margin:0;word-break:break-word;align-self:center}
+/* The resource budget table: the .limits row's type and colour, headings in the dt colour. */
+.jevi table.budget{border-collapse:collapse;margin:4px 0 0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary)}
+.jevi table.budget th,.jevi table.budget td{font:inherit;text-align:left;vertical-align:middle;padding:3px 12px 3px 0}
+.jevi table.budget thead th{color:var(--dsw-alias-label-tertiary)}
+.jevi table.budget td{font-variant-numeric:tabular-nums}
 .jevi ol.steps{margin:0;padding-left:18px}
 .jevi ol.steps li{margin:0 0 8px}
 .jevi details.q{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);border-radius:10px;padding:8px 10px;margin:0 0 6px}
@@ -1450,6 +1455,25 @@ window.__ModuleLoader__.load({
       LOCAL_ONLY: 'the local router decides normal cases with no Jev call',
       ROLLBACK: 'local authority suspended; Jev decides until it is earned back',
     }
+    // The same rungs for a domain a rule in code decides instead of Jev (`teacher: 'code'`).
+    const CODE_MATURITY_WORDS = {
+      JEV_PRIMARY: 'a rule in code decides; the local router is not trained yet',
+      SHADOW: 'a rule in code decides; the local router predicts alongside it and is being scored',
+      GUARDED_LOCAL: 'the local router decides when it is confident and the case is familiar; a rule in code decides the rest',
+      LOCAL_ONLY: 'the local router decides normal cases; a rule in code decides the rest',
+      ROLLBACK: 'local authority suspended; a rule in code decides until it is earned back',
+    }
+    /**
+     * What a domain's rung means for who decides. A domain whose local classifier never decides
+     * (`localDecides: false` in routing-policy.js, the resource ranking's case) still climbs the
+     * ladder, because its standing is measured, but the rung buys it nothing, so the words for
+     * the rung would promise an authority it never gets. A domain a rule in code decides
+     * (`teacher: 'code'`, the frontier review's case) asks Jev nothing, so the rungs Jev holds
+     * elsewhere are the rule's there.
+     */
+    const maturityWords = (d) => (d?.localDecides === false
+      ? `${d?.teacher === 'code' ? 'a rule in code decides' : 'Jev decides'} at every rung; the local router is recorded beside it for comparison and never decides`
+      : (d?.teacher === 'code' ? CODE_MATURITY_WORDS : MATURITY_WORDS)[d?.maturity] ?? '')
 
     /**
      * The Router view: how far each routing domain has matured, what is blocking the next step,
@@ -1468,7 +1492,7 @@ window.__ModuleLoader__.load({
           h('summary', null,
             h('div', null, h('b', null, id.replace(/_/g, ' ')), pill(MATURITY_TONE[d.maturity] ?? '', d.maturity.replace(/_/g, ' ').toLowerCase()), pill('', `${d.riskClass.toLowerCase()} risk`)),
             h('div', { className: 'ans' }, d.progress?.next ? `${done}/${gates.length} toward ${d.progress.next.replace(/_/g, ' ').toLowerCase()}` : 'fully matured')),
-          h('div', { className: 'muted', style: { margin: '6px 0' } }, MATURITY_WORDS[d.maturity] ?? ''),
+          h('div', { className: 'muted', style: { margin: '6px 0' } }, maturityWords(d)),
           h('div', { className: 'why' },
             `${d.samples?.verified ?? 0} verified samples`,
             d.samples?.outcomeBacked != null ? `, ${d.samples.outcomeBacked} proved by a run or a person` : '',
@@ -1510,7 +1534,7 @@ window.__ModuleLoader__.load({
       })
       return h('div', null,
         h('div', { className: 'head' },
-          h('div', { className: 'label', style: { margin: 0 } }, data.learning ? 'The router is learning from every routed task' : 'Learning is switched off: Jev decides and nothing is recorded'),
+          h('div', { className: 'label', style: { margin: 0 } }, data.learning ? 'The router is learning from every routed task' : 'Learning is switched off: Jev and the rules in code decide, and nothing is recorded'),
           h('button', { onClick: onRefresh, disabled: busy }, busy ? 'Reading…' : 'Refresh')),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'Routing domains'), ...domains),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'Resources, as the provider adapters report them'), h('ul', { className: 'plain' }, ...resources)),
@@ -3232,12 +3256,18 @@ window.__ModuleLoader__.load({
     const bytes = (b) => (b >= 1024 ** 3 ? `${(b / 1024 ** 3).toFixed(1)} GB` : `${Math.round(b / 1024 ** 2)} MB`)
     const ACTIVE_JOB = ['queued', 'downloading', 'extracting']
 
-    /** Local engine + module status, polled while shown (faster while something installs). */
+    /**
+     * Local engine + module status, polled while shown (faster while something installs). Only the
+     * newest load is applied: a poll that read the status before a save and answers after the save's
+     * own reload would put the old values back on the page until the next poll.
+     */
     function useLocal(active) {
       const [data, setData] = useState(null)
       const [error, setError] = useState('')
+      const seq = useRef(0)
       const load = useCallback(async () => {
-        try { setData(await api('/jev-router/local')); setError('') } catch (e) { setError(e.message) }
+        const n = ++seq.current
+        try { const d = await api('/jev-router/local'); if (n === seq.current) { setData(d); setError('') } } catch (e) { if (n === seq.current) setError(e.message) }
       }, [])
       const busy = !!data?.modules?.some((m) => ACTIVE_JOB.includes(m.job?.state) || m.state === 'verifying')
       useEffect(() => {
@@ -3377,19 +3407,245 @@ window.__ModuleLoader__.load({
       return null
     }
 
-    /** Settings → Jev setup: engine status, chat model, idle stop, GPU layers, installed modules. */
+    // ---- pure budget helpers: no React, no state. test/budgetpanel.test.js evaluates this block
+    // on its own (the runner cannot import a classic script), so nothing in it may reach outside it.
+
+    // local.js MIN_CTX. The page cannot import it, so it keeps a copy, and the test holds the two to
+    // the same number: a floor explained as 12k beside a model clamped somewhere else would mislead.
+    const MIN_CTX = 12288
+    /** A size in GB as the page prints it, '-' when there is none. */
+    const gbText = (x) => (typeof x === 'number' && Number.isFinite(x) ? `${x} GB` : '-')
+    /** A context size in tokens, as "16k" when it is a whole number of k. */
+    const ctxText = (n) => (Number.isInteger(n) && n > 0 && n % 1024 === 0 ? `${n / 1024}k` : String(n))
+    /**
+     * "32k to 21k". Both ends in one unit: a context the plugin config set to no whole number of k is
+     * the first one the budget tries, and then it and the one it came down to are given in tokens.
+     */
+    const reducedText = (from, to) => ([from, to].every((n) => n % 1024 === 0) ? `${ctxText(from)} to ${ctxText(to)}` : `${from} tokens to ${to} tokens`)
+    const threadsText = (n) => `${n} thread${n === 1 ? '' : 's'}`
+
+    /**
+     * The four limits, in the order the table lists them. `title` is the field's tooltip: what the
+     * limit holds and what blank means. VRAM, cores and tasks at once are real caps; RAM is not, and
+     * the words under the table say so (budgetNotes).
+     */
+    const BUDGET_ROWS = [
+      { key: 'maxVramGB', label: 'VRAM', id: 'jevi-lm-vram', unit: 'GB', title: 'GPU memory the local model may use, in GB. The layers that do not fit run from RAM. Blank: no limit.' },
+      { key: 'maxRamGB', label: 'RAM', id: 'jevi-lm-ram', unit: 'GB', title: 'Memory the local model may use, in GB. A soft limit: see below. Blank: no limit.' },
+      { key: 'maxCores', label: 'Cores', id: 'jevi-lm-cores', unit: '', title: 'Threads the local model may run on. Blank: a default that leaves the app at least a quarter of the machine.' },
+      { key: 'maxConcurrentTasks', label: 'Tasks at once', id: 'jevi-lm-tasks', unit: '', title: 'Agent runs at once across every workspace, foreground and background. A workspace still runs one at a time. Blank: no limit.' },
+    ]
+
+    /** The budget in words, "2 GB VRAM + 8 GB RAM", as local.js words it in a refusal; null when none is set. */
+    const budgetText = (s) => [s?.maxVramGB != null && `${s.maxVramGB} GB VRAM`, s?.maxRamGB != null && `${s.maxRamGB} GB RAM`].filter(Boolean).join(' + ') || null
+
+    const NO_FIGURE = { text: '-', note: null, title: null }
+    /**
+     * Tasks at once, now, from the response's `slots`: the runs holding a slot, counted by the lanes
+     * that hold the cap, so a foreground /auto, /<agent> or jev_route is in it as much as a background
+     * task. With a cap, the runs waiting only for a free slot are named beside it; a run waiting
+     * behind another in its own workspace is not, since a free slot would not start it. Lowering the
+     * cap stops nothing that runs, so the count can be over it, and the tooltip then says why. '-'
+     * only when the response carries no count, which is not the same as none running: a count of the
+     * background tasks alone would leave out the foreground runs, so the page never makes one up.
+     */
+    const tasksNow = (slots) => {
+      if (!Number.isInteger(slots?.held)) return { ...NO_FIGURE, title: 'How many run now is not reported to this page' }
+      const capped = slots.max != null
+      const waiting = capped && slots.waiting > 0 ? slots.waiting : 0
+      const over = capped && slots.held > slots.max ? ' That is more than the budget: lowering it stops nothing that already runs, and nothing new starts until fewer do.' : ''
+      const waits = !capped ? '' : waiting ? ` ${waiting} more ${waiting === 1 ? 'waits' : 'wait'} for a free slot.` : ' None waits for a free slot.'
+      return {
+        text: String(slots.held),
+        note: waiting ? `${waiting} waiting` : null,
+        title: `Agent runs holding a slot now, across every workspace: a foreground /auto, /<agent> or jev_route counts as much as a background task.${over}${waits}`,
+      }
+    }
+    /**
+     * The table's cells from GET /jev-router/local, one row per limit: the saved budget as its field
+     * shows it, what the loaded model uses now, and the most the next load could take.
+     *
+     * Now is the loaded model's own figure: VRAM from the engine's load report, and RAM from the
+     * watchdog's latest reading of the working set (taken only while a RAM budget is set), else from
+     * the load report. Each says which, since the two measure different things. The estimated peak is
+     * the largest figure among the installed models the budget lets load, because any of them may be
+     * the next one loaded; a model the budget refuses never loads, so it is no part of the peak. Only
+     * RAM is refused, so a VRAM peak can be over the VRAM budget where --fit does not hold it, and
+     * its tooltip says so rather than leave a figure over the budget in the budget's own row
+     * unexplained. Tasks at once is the runs holding a slot now (tasksNow).
+     */
+    const budgetCells = (status) => {
+      const s = status?.settings ?? {}
+      const e = status?.engine ?? {}
+      const b = status?.budget ?? {}
+      const loaded = e.running ? e.memory : null
+      const loadable = (status?.modules ?? []).filter((m) => m.kind === 'model' && m.state === 'installed' && m.memory && !m.overBudget)
+      const peak = (side) => {
+        const top = loadable.reduce((a, m) => (a && a.memory[side] >= m.memory[side] ? a : m), null)
+        if (!top) return { ...NO_FIGURE, title: 'No installed model the budget lets load' }
+        const over = side === 'vramGB' && s.maxVramGB != null && top.memory.vramGB > s.maxVramGB
+          ? ` That is more than the VRAM budget${b.vramNotApplied ? ', which is not applied: see below' : ''}.` : ''
+        return { text: gbText(top.memory[side]), note: top.memory.source, title: `${top.name} at ${ctxText(top.ctx)} context, the most any installed model the budget lets load would take.${over}` }
+      }
+      const report = "What the loaded model took, from the engine's own load report"
+      const cells = {
+        maxVramGB: { now: loaded ? { text: gbText(loaded.vramGB), note: 'load report', title: report } : NO_FIGURE, peak: peak('vramGB') },
+        maxRamGB: {
+          now: e.running && e.workingSetGB != null ? { text: gbText(e.workingSetGB), note: 'working set', title: "The loaded model's real memory use, read every 5 seconds while a RAM budget is set" }
+            : loaded ? { text: gbText(loaded.ramGB), note: 'load report', title: `${report}. Its real use is read only while a RAM budget is set.` } : NO_FIGURE,
+          peak: peak('ramGB'),
+        },
+        maxCores: {
+          now: e.running && e.threads ? { text: threadsText(e.threads), note: null, title: 'Threads the loaded model runs on' } : NO_FIGURE,
+          // A core budget above what this PC has gives it every processor there is, and no more.
+          peak: b.threads ? { text: threadsText(b.threads), note: s.maxCores == null ? 'default' : b.threads < s.maxCores ? 'all this PC has' : null, title: 'Threads the next load gets' } : NO_FIGURE,
+        },
+        maxConcurrentTasks: { now: tasksNow(status?.slots), peak: NO_FIGURE },
+      }
+      return BUDGET_ROWS.map((r) => ({ ...r, value: s[r.key] == null ? '' : String(s[r.key]), ...cells[r.key] }))
+    }
+
+    /**
+     * What a budget field's text asks the server to save: `{ patch }`, `{ error }` for text that is no
+     * number, or `{}` when there is nothing to send (never typed in, or the value already saved).
+     * Blank is no limit. A decimal comma reads as a point, but only with one or two digits after it,
+     * since three are a thousands separator (4,096 is not 4.096 GB). Text that is no number is refused
+     * here and never sent: JSON has no NaN, so it would reach the server as null and lift the limit,
+     * the opposite of what was typed. The bounds are left to the server, which keeps the one copy.
+     */
+    const budgetPatch = (key, text, saved) => {
+      if (text == null) return {}
+      const t = String(text).trim().replace(/^(\d+),(\d{1,2})$/, '$1.$2')
+      const value = t === '' ? null : Number(t)
+      if (value !== null && !Number.isFinite(value)) {
+        const row = BUDGET_ROWS.find((r) => r.key === key)
+        return { error: `${row.label}: a number${row.unit ? ` of ${row.unit}` : ''}, or blank for no limit` }
+      }
+      return value === (saved ?? null) ? {} : { patch: { [key]: value } }
+    }
+    /** A refusal from the server in the page's words: what the API calls null is a blank field here. */
+    const budgetError = (message) => String(message).replace(/, or null for no limit$/, ', or blank for no limit')
+
+    /**
+     * One installed model against the budget (`s`, the settings) and what the budget makes of the
+     * next load (`b`, status().budget): what it takes at the context it runs with, measured or
+     * estimated (always saying which), and whether it fits. `over` is the refusal a load would throw,
+     * word for word, a RAM watchdog unload included. With no budget set there is nothing to fit, and
+     * the line says nothing of it. `floor` warns of a context under MIN_CTX, which the plugin config
+     * can set and the page must not pass over in silence. `reduced` says when the RAM budget sized
+     * the context down to the one the line shows, from what to what (reducedText); a model refused
+     * even at the floor loads with none, and its refusal says so instead.
+     *
+     * Only RAM is ever refused. VRAM is held by --fit, and where --fit cannot hold it (layers pinned
+     * by hand, a GPU of unknown size) a model loads whatever its VRAM figure, and an estimate there
+     * assumes the budget holds. So "fits" is said only of a figure the VRAM budget really holds, and
+     * otherwise the line says why it is not.
+     */
+    const modelFit = (m, s, b) => {
+      if (!m?.memory) return null
+      const budget = budgetText(s)
+      const vram = s?.maxVramGB == null ? null
+        : b?.vramNotApplied ? 'VRAM budget not applied'
+          : m.memory.vramGB > s.maxVramGB ? `over your VRAM budget of ${gbText(s.maxVramGB)}` : null
+      const fits = !budget || m.overBudget ? '' : ` · ${vram ?? `fits your budget of ${budget}`}`
+      return {
+        line: `${ctxText(m.ctx)} context: ${gbText(m.memory.vramGB)} VRAM + ${gbText(m.memory.ramGB)} RAM (${m.memory.source})${fits}`,
+        over: m.overBudget ?? null,
+        floor: Number.isFinite(m.ctx) && m.ctx < MIN_CTX ? `${ctxText(m.ctx)} context is below the ${ctxText(MIN_CTX)} floor, so expect a context-exceeded error mid-chat: it comes from the context size, not from the model.` : null,
+        reduced: m.ctxReducedFrom && !m.overBudget ? `The budget reduced its context from ${reducedText(m.ctxReducedFrom, m.ctx)}, the largest that fits it.` : null,
+      }
+    }
+
+    /** A model as the pickers name it: one the budget refuses says so beside its name. */
+    const modelName = (m) => (m.overBudget ? `${m.name} (over budget)` : m.name)
+    /**
+     * The chat model select's options. The server answers with the chat model in effect, which is
+     * the stored choice only while the budget lets it load, so a model the budget refuses is named
+     * as over it and cannot be picked: picked, it would be saved, and the select would jump back to
+     * the model in effect with no word why. With none the budget lets load there is no chat model,
+     * and the select says so rather than show the first model as if it were the one in use.
+     */
+    const chatModelOptions = (models, chatModel) => [
+      ...(chatModel == null ? [{ value: '', label: 'None fits the budget', disabled: true }] : []),
+      ...models.map((m) => ({ value: m.id, label: modelName(m), disabled: !!m.overBudget })),
+    ]
+
+    /**
+     * The words under the table, which say what the budget can and cannot hold. RAM gets the honest
+     * version: nothing KzH can use stops a process's memory from growing (that takes a native Job
+     * Object), so it is kept by sizing a model's context down to fit it, by refusing a model over it
+     * even at the floor and by the watchdog, and the page must not imply a cap. The app window and its
+     * browser view are never capped, and no figure here includes them. The context floor is
+     * explained, because a floor that is only enforced costs whoever meets the error it prevents an
+     * hour of blaming the model.
+     */
+    const budgetNotes = (status) => [
+      { text: `RAM is a soft limit: nothing KzH can use stops a process's memory from growing. A model whose figure is over the RAM budget loads with a smaller context, down to the ${ctxText(MIN_CTX)} floor; one still over it there is refused before it loads, and a watchdog unloads a model whose real use stays over it for 30 seconds.`, warn: false },
+      { text: 'The app window and its browser view are never capped, since the app cannot run without them, and they are not in these figures: leave room for them when you set the RAM budget.', warn: false },
+      ...(status?.budget?.vramNotApplied ? [{ text: `VRAM budget not applied: ${status.budget.vramNotApplied}.`, warn: true }] : []),
+      { text: `The context floor is ${ctxText(MIN_CTX)} (${MIN_CTX} tokens): the system prompt and the tool list alone take about 8.6k tokens, and below roughly 12k a local model stops mid-chat with a context-exceeded error that looks like a fault in the model but is not one.`, warn: false },
+    ]
+    // ---- end pure budget helpers
+
+    /**
+     * The resource budget, inside the local models card: one row per limit, with the field that sets
+     * it, what the loaded model uses now and the most the next load could take (budgetCells), then
+     * what the budget can and cannot hold, in words (budgetNotes). A field saves when it loses focus,
+     * like the panel's other fields; `edits` holds what is being typed, over the saved value, until then.
+     * `errors` holds each field's refusal by key, shown in the table's order.
+     */
+    function ResourceBudget({ data, edits, errors, onEdit, onSave }) {
+      const figure = (c) => h('td', { title: c.title ?? undefined }, c.text, c.note ? h('span', { className: 'why' }, ` (${c.note})`) : null)
+      return h(React.Fragment, null,
+        h('div', { className: 'label', id: 'jevi-lm-budget-h', style: { margin: '12px 0 4px' } }, 'Resource budget'),
+        h('p', { className: 'why', style: { margin: '0 0 4px' } }, 'How much of this PC KzH may use. Leave a field blank for no limit.'),
+        h('table', { className: 'budget', 'aria-labelledby': 'jevi-lm-budget-h' },
+          h('thead', null, h('tr', null, h('td', null), h('th', { scope: 'col' }, 'Budget'), h('th', { scope: 'col' }, 'Now'), h('th', { scope: 'col' }, 'Estimated peak'))),
+          h('tbody', null, ...budgetCells(data).map((c) => h('tr', { key: c.key },
+            h('th', { scope: 'row' }, h('label', { htmlFor: c.id }, c.label)),
+            h('td', null,
+              h('input', { id: c.id, type: 'text', inputMode: c.unit ? 'decimal' : 'numeric', value: edits[c.key] ?? c.value, placeholder: 'no limit', title: c.title, style: { width: 64 }, onChange: (ev) => onEdit(c.key, ev.target.value), onBlur: () => onSave(c.key) }),
+              c.unit ? ` ${c.unit}` : null),
+            figure(c.now), figure(c.peak))))),
+        ...BUDGET_ROWS.filter((r) => errors[r.key]).map((r) => h('div', { key: `err-${r.key}`, className: 'err', role: 'alert' }, errors[r.key])),
+        ...budgetNotes(data).map((n, i) => h('div', { key: i, className: n.warn ? 'warnline' : 'why', style: { marginTop: 4 } }, n.text)))
+    }
+
+    /** Settings → Jev setup: engine status, chat model, idle stop, GPU layers, the resource budget, installed modules. */
     function LocalModelsCard({ ask }) {
       const { data, error, load } = useLocal(true)
       const [msg, setMsg] = useState('')
       const [idle, setIdle] = useState('')
       const [layers, setLayers] = useState('')
       const [startModel, setStartModel] = useState('')
+      // Budget fields being typed in, by key, until they save. Blank is a value here (no limit), so
+      // the fill-it-if-empty the idle and layers fields use would put the saved value back over a
+      // field just cleared at the next poll.
+      const [budget, setBudget] = useState({})
+      // Each field's refusal by key, so a save of one field never clears another's: a field still
+      // showing a value that was refused must go on saying it was not saved.
+      const [budgetMsg, setBudgetMsg] = useState({})
       useEffect(() => {
         if (!data) return
         setIdle((v) => v || String(data.settings.idleMinutes))
         setLayers((v) => v || String(data.settings.gpuLayers ?? 'auto'))
       }, [data])
       const run = async (fn) => { setMsg(''); try { await fn(); await load() } catch (e) { setMsg(e.message) } }
+      // Saved, reloaded, and only then the edit dropped, so the field goes from what was typed to
+      // what was saved and never shows the old value in between. A refused one keeps what was typed,
+      // with the reason under the table. The edit is dropped only if it is still the text that was
+      // saved: whatever was typed while the save was on its way is kept, and saved at the next blur.
+      const saveBudget = async (key) => {
+        const typed = budget[key]
+        if (typed === undefined) return
+        const { patch, error: bad } = budgetPatch(key, typed, data.settings[key])
+        setBudgetMsg((m) => ({ ...m, [key]: bad ?? '' }))
+        if (bad) return
+        if (patch) {
+          try { await post('/jev-router/local/settings', patch); await load() } catch (e) { setBudgetMsg((m) => ({ ...m, [key]: budgetError(e.message) })); return }
+        }
+        setBudget((b) => { if (b[key] !== typed) return b; const n = { ...b }; delete n[key]; return n })
+      }
       if (!data) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Local models'), h('div', { className: error ? 'err' : 'muted' }, error || 'Loading…'))
       const e = data.engine
       const models = data.modules.filter((m) => m.kind === 'model' && m.state === 'installed')
@@ -3409,7 +3665,7 @@ window.__ModuleLoader__.load({
         e.installed && models.length ? h('div', { className: 'limits', style: { marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
           h('label', { htmlFor: 'jevi-lm-chat' }, 'Chat model ',
             h('select', { id: 'jevi-lm-chat', value: data.settings.chatModel ?? '', onChange: (ev) => run(() => post('/jev-router/local/settings', { chatModel: ev.target.value })) },
-              ...models.map((m) => h('option', { key: m.id, value: m.id }, m.name)))),
+              ...chatModelOptions(models, data.settings.chatModel).map((o) => h('option', { key: o.value, value: o.value, disabled: o.disabled }, o.label)))),
           h('label', { htmlFor: 'jevi-lm-idle' }, 'Stop after idle (min) ',
             h('input', { id: 'jevi-lm-idle', type: 'number', min: 1, max: 240, value: idle, style: { width: 64 }, onChange: (ev) => setIdle(ev.target.value), onBlur: () => run(() => post('/jev-router/local/settings', { idleMinutes: Number(idle) })) })),
           h('label', { htmlFor: 'jevi-lm-ngl' }, 'GPU layers ',
@@ -3417,19 +3673,27 @@ window.__ModuleLoader__.load({
           e.running
             ? h('button', { className: 'btn', onClick: () => run(() => post('/jev-router/local/stop', {})) }, 'Stop')
             : h(React.Fragment, null,
-              h('select', { 'aria-label': 'Model to start', value: pick, onChange: (ev) => setStartModel(ev.target.value) }, ...models.map((m) => h('option', { key: m.id, value: m.id }, m.name))),
+              h('select', { 'aria-label': 'Model to start', value: pick, onChange: (ev) => setStartModel(ev.target.value) }, ...models.map((m) => h('option', { key: m.id, value: m.id }, modelName(m)))),
               h('button', { className: 'btn', onClick: () => run(() => post('/jev-router/local/start', { model: pick })) }, 'Start'))) : null,
         msg ? h('div', { className: 'err', role: 'alert' }, msg) : null,
         busyJobs.length ? h('div', { style: { marginTop: 8 } }, ...busyJobs.map((m) => h('div', { key: m.id }, h('b', null, m.name), m.state === 'verifying' ? h('div', { className: 'why' }, 'Checking SHA256…') : h(JobLine, { job: m.job })))) : null,
         rows.length ? h('ul', { className: 'plain', style: { marginTop: 8 } }, ...rows.map((r) => {
           const m = data.modules.find((x) => x.id === r.ids[0])
+          // What it takes at the context it runs with, under the budget as it stands, so a budget
+          // change shows its effect on each model at the next reload.
+          const fit = m?.kind === 'model' && m.state === 'installed' ? modelFit(m, data.settings, data.budget) : null
           return h('li', { key: r.id },
             h('div', { style: { minWidth: 0 } },
-              h('div', null, h('b', null, r.name), m?.state === 'corrupt' ? h('span', { className: 'pill bad' }, 'SHA256 mismatch') : h('span', { className: 'pill ok' }, 'installed'), m?.agent ? h('span', { className: 'pill' }, m.agent) : null),
+              h('div', null, h('b', null, r.name), m?.state === 'corrupt' ? h('span', { className: 'pill bad' }, 'SHA256 mismatch') : h('span', { className: 'pill ok' }, 'installed'), m?.agent ? h('span', { className: 'pill' }, m.agent) : null, fit?.over ? h('span', { className: 'pill bad' }, 'over budget') : null),
               h('div', { className: 'why' }, `${r.files.join(', ')} · ${bytes(r.size)}`),
+              fit ? h('div', { className: 'why' }, fit.line) : null,
+              fit?.reduced ? h('div', { className: 'why' }, fit.reduced) : null,
+              fit?.over ? h('div', { className: cx('why', 'err') }, fit.over) : null,
+              fit?.floor ? h('div', { className: 'warnline' }, fit.floor) : null,
               m?.badges ? h(Badges, { list: m.badges }) : null),
             h('button', { className: 'btn danger', 'aria-label': `Remove ${r.name}`, onClick: () => ask(removeConfirm([r], () => post('/jev-router/local/remove', { ids: r.ids }))) }, 'Remove'))
-        })) : h('div', { className: 'muted', style: { marginTop: 8 } }, 'Nothing installed yet. Install… suggests models that fit this PC.'))
+        })) : h('div', { className: 'muted', style: { marginTop: 8 } }, 'Nothing installed yet. Install… suggests models that fit this PC.'),
+        h(ResourceBudget, { data, edits: budget, errors: budgetMsg, onEdit: (k, v) => setBudget((b) => ({ ...b, [k]: v })), onSave: saveBudget }))
     }
 
     // ---------- icons (16px, currentColor) ----------
@@ -4275,7 +4539,8 @@ window.__ModuleLoader__.load({
       // cannot be imported by node. `taskLabels` is the copy the anti-drift test compares with
       // adapter.js TASK_LABELS on the server. The two start* schedulers are exposed with stubbable
       // DOM globals so a test can prove a pass lands on a timer while no frame is ever delivered.
-      __test: { Markdown, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs },
+      // ResourceBudget and LocalModelsCard are rendered with stand-in Reacts in test/budgetpanel.test.js.
+      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords },
       apply(ctx) {
         sessionsApi = ctx.sessions
         sidebarRight = ctx.sidebarRight

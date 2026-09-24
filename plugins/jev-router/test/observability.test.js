@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { line } from '../adapter.js'
+import { decidedBy, line } from '../adapter.js'
 
 const client = readFileSync(fileURLToPath(new URL('../client.js', import.meta.url)), 'utf8')
 
@@ -42,11 +42,27 @@ test('the routed line names the strategy and the reviewer, so the reasoning bloc
 
 test('the decision line says who decided and what it cost', () => {
   const allLocal = line({ type: 'decision', decision: { domains: { task_classification: { authority: 'local' }, resource_selection: { authority: 'local' } }, jevCalls: 0, candidates: [{}, {}] } })
-  assert.match(allLocal, /local router decided/)
+  assert.match(allLocal, /^the local router \(task classification, resource selection\) decided;/)
   assert.match(allLocal, /no Jev call/)
   const taught = line({ type: 'decision', decision: { domains: { task_classification: { authority: 'jev' } }, jevCalls: 2, candidates: [{}] } })
   assert.match(taught, /Jev decided/)
   assert.match(taught, /2 Jev calls/)
+  // A real adaptive run: rules in code rank the resources and answer the frontier review, so the
+  // line never credits Jev, or the local router, with the whole run.
+  const domains = {
+    task_classification: { authority: 'local' }, skill_selection: { authority: 'jev' }, resource_selection: { authority: 'code' },
+    execution_strategy: { authority: 'jev' }, second_opinion: { authority: 'jev' }, frontier_escalation: { authority: 'code' },
+  }
+  const real = line({ type: 'decision', decision: { domains, jevCalls: 1, candidates: [{}, {}, {}] } })
+  assert.equal(real, 'the local router (task classification), Jev and routing rules decided; 1 Jev call; 3 candidates considered')
+  assert.equal(decidedBy({ ...domains, task_classification: { authority: 'jev' } }), 'Jev and routing rules decided')
+  assert.equal(decidedBy({ resource_selection: { authority: 'code' } }), 'routing rules decided')
+  assert.equal(decidedBy({ task_classification: { authority: 'fallback' }, resource_selection: { authority: 'fallback' } }), 'safe fallback, nothing could decide')
+  assert.equal(decidedBy({ task_classification: { authority: 'fallback' }, resource_selection: { authority: 'code' } }), 'routing rules and the safe fallback (task classification) decided')
+  assert.equal(decidedBy({}), null, 'no per-domain report: the caller says Jev, as legacy named routing is')
+  // A heading with the per-domain list under it names the authorities only.
+  assert.equal(decidedBy(domains, { detail: false }), 'the local router, Jev and routing rules decided')
+  assert.equal(decidedBy({ task_classification: { authority: 'fallback' }, resource_selection: { authority: 'code' } }, { detail: false }), 'routing rules and the safe fallback decided')
 })
 
 test('the inspector reads the decision record, and reads it by the names the record uses', () => {

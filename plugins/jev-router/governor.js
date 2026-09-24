@@ -291,9 +291,10 @@ function hintOf(signal, profile, policy) {
 }
 
 /**
- * A conservation level and a one-line note per resource, as a seed for the routing prompt.
- * Never a rule: nothing here removes a resource from the pool. Given the signals Map it returns
- * a Map of hints by resourceId; given one signal it returns that resource's hint.
+ * A conservation level and a one-line note per resource. Never a rule: nothing here removes a
+ * resource from the pool. The decision engine's conservation limit reads the level (anything but
+ * `healthy` is a resource being used up) and decides there. Given the signals Map it returns a
+ * Map of hints by resourceId; given one signal it returns that resource's hint.
  * @param {Map<string, object>|object} signals  governorSignals output, or one of its values
  * @param {object} [profile]  task profile
  * @param {object} [policy]   resolvePolicy result

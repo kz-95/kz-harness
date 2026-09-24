@@ -4,9 +4,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { TypeSafeClient } from '@typesafe-ai/sdk'
+import { createJev } from '../jev.js'
 import { formatReport, runRouted } from '../router.js'
 
 const config = {
@@ -136,6 +138,50 @@ test('every agent at its limit: paused_limit with a harness handoff that stays',
   assert.match(note, /written by Kz-harness/)
   assert.match(note, /Task: fix/)
   assert.match(formatReport(r), /PAUSED: agents at their limits, handoff saved in \.kz-harness\/handoff\.md \(earliest reset \d\d:\d\d\)/)
+})
+
+test('a key the harness note would cut in two is masked in it, so the next run sends Jev no piece of it', async (t) => {
+  // The harness copies 2000 characters of the last answer and of the earlier note into its own.
+  // A key that straddled that cut left its first half in the note, too short for the scrubber to
+  // know it for a key, and the next run's routing call carries the note to Jev.
+  const answerKey = 'hf_Q8vLm2RtX4nWc7Pz1YkD9sGb3HjF6aKe' // at 1980 of the answer: the cut kept 'hf_' and 17 more
+  const noteKey = 'xoxb-KUz9-9nocsomoEDN65Ayn8wqv' // at 1986 of the earlier note: the cut kept 'xoxb-' and 9 more
+  const pieces = (text) => [answerKey, noteKey].filter((key) => Array.from({ length: key.length - 9 }, (_, i) => key.slice(i, i + 10)).some((p) => text.includes(p)))
+  const dir = repo()
+  mkdirSync(join(dir, '.kz-harness'))
+  const file = join(dir, '.kz-harness', 'handoff.md')
+  writeFileSync(file, `${'Earlier run: the lexer is done, the parser is half done.\n'.repeat(34).padEnd(1986)}${noteKey} posts the build status.\n`)
+  // An hour old, so the harness reads it as the earlier note and not as one the agent just wrote.
+  const hourAgo = new Date(Date.now() - 3_600_000)
+  utimesSync(file, hourAgo, hourAgo)
+  const answer = `${'I finished the parser and started on the printer.\n'.repeat(38).padEnd(1980)}${answerKey} is the token the upload used.`
+  const paused = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: {
+    jev: null, execute: async () => ({ ...limitHit, answerText: answer }), history: history(),
+    isLimitError: () => ({ hit: true, until }),
+    onLimit: async () => ({ rotated: false }),
+  } })
+  assert.equal(paused.finalStatus, 'paused_limit')
+  const note = readFileSync(file, 'utf8')
+  assert.match(note, /written by Kz-harness/)
+  assert.deepEqual(pieces(note), [], 'a piece of a key was written into the note')
+  assert.match(note, /started on the printer\.\n +hf_Q8v\.\.\.REDACTED is/, 'the answer is still in it, the key masked')
+  assert.match(note, /half done\.\n +xoxb-K\.\.\.REDAC/, 'and so is the earlier note')
+
+  // The next run reads the note, and its routing call carries the first 3000 characters of it.
+  const sent = []
+  const real = TypeSafeClient.prototype.systemOne
+  TypeSafeClient.prototype.systemOne = async ({ state, questions }) => {
+    sent.push(state)
+    const answers = Object.fromEntries(Object.entries(questions).map(([name, q]) => [name, q.type === 'choice'
+      ? { type: 'choice', choice: Object.keys(q.criteria)[0], confidence: 0.8, probabilities: {} }
+      : q.type === 'score' ? { type: 'score', score: 1, confidence: 0.8 } : { type: 'noul', noul: 0.9, confidence: 0.8 }]))
+    return { model: 'jev-test', usage: {}, answers }
+  }
+  t.after(() => { TypeSafeClient.prototype.systemOne = real })
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  await runRouted({ task: 'continue the fix', cwd: dir, config, signal, deps: { jev, execute: async () => fix(dir), history: history() } })
+  assert.match(sent[0].handoff, /hf_Q8v\.\.\.REDACTED/, 'the routing call carried the note')
+  for (const state of sent) assert.deepEqual(pieces(JSON.stringify(state)), [], 'a piece of a key rode out to Jev')
 })
 
 test('a new task that continues the earlier work gets the note; an unrelated one does not', async () => {

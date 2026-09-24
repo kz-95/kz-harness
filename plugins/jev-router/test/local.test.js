@@ -1,15 +1,18 @@
 // Local models and offline mode, with no network and no real llama-server:
 // offline routing rule, local agent eligibility, the connectivity cache,
-// llama-server arguments, verified resumable downloads, and the wire format.
+// llama-server arguments, verified resumable downloads, the wire format,
+// and the resource budget the engine is started and watched under.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { badgesOf, buildCatalog, estimateMemory, kvGbPerToken, readMemoryUsage, createConnectivity, createLocalModels, defaultsFor, detectSpecs, downloadVerified, installLlmCommand, llamaArgs, looksLikeQuestion, offlinePick, parseLlmArgs, pickEngineVariant, rateModule, readManifest, removeLlmCommand, specsLine, suggest, toWire, translate } from '../local.js'
+import { badgesOf, buildCatalog, contextSteps, defaultThreads, estimateMemory, parsePsRss, parseTasklistMemory, workingSetOf, kvGbPerToken, readMemoryUsage, createConnectivity, createLocalModels, defaultsFor, detectSpecs, downloadVerified, installLlmCommand, llamaArgs, localAdapter, looksLikeQuestion, offlinePick, parseLlmArgs, pickEngineVariant, rateModule, readManifest, removeLlmCommand, specsLine, suggest, toWire, translate } from '../local.js'
 import { fileURLToPath } from 'node:url'
+import { waitFor } from './wait-for.js'
 import { formatReport, runRouted } from '../router.js'
 import { kindOf, keyProviderOf } from '../accounts.js'
 import { jevAdapter } from '../adapter.js'
@@ -195,6 +198,14 @@ test('detectSpecs: nvidia-smi, Win32_VideoController fallback, RAM, CPU, free di
   const none = await detectSpecs({ dir: 'x', probe: { run: async () => null, os, statfs: async () => { throw new Error('no') } } })
   assert.deepEqual(none.gpus, [])
   assert.equal(none.diskFreeBytes, null)
+  // With no nvidia-smi, AdapterRAM is all there is, and it is a 32-bit field: every card of 4 GB or
+  // more reads 4293918720 bytes there. That figure is marked, since it is where the field stops and
+  // not what the card has; a smaller card reads its own size and is not.
+  const amd = await detectSpecs({ dir: 'x', probe: { run: async (cmd) => (cmd === 'powershell.exe' ? 'AMD Radeon RX 6600|4293918720\nAMD Radeon RX 550|2147483648\n' : null), os, statfs: async () => { throw new Error('no') } } })
+  assert.deepEqual(amd.gpus.map((g) => [g.name, g.vramGB, !!g.sizeCapped]), [['AMD Radeon RX 6600', 4293918720 / 1024 ** 3, true], ['AMD Radeon RX 550', 2, false]])
+  assert.equal(s.gpus.some((g) => g.sizeCapped), false, "nvidia-smi's size is the real one, whatever AdapterRAM says for the same card")
+  // And the line that describes this PC says the size is unknown rather than print the ceiling as one.
+  assert.equal(specsLine(amd), 'AMD Radeon RX 6600 (memory unknown, 4 GB or more) · 24 GB RAM · Core i5-11400H 12 threads')
 })
 
 test('engine build follows the hardware: CUDA 12/13 by driver, Vulkan for other GPUs, else CPU', () => {
@@ -277,6 +288,52 @@ test('suggestions: reliable (official-stable + verified) first, then fit, then q
   assert.deepEqual(t.picks, [])
   assert.match(t.none, /cloud agents/)
   assert.deepEqual(badgesOf(MANIFEST_MODULES[2]), ['Official', 'Stable', 'Verified'])
+})
+
+test('a GPU sized from the AdapterRAM ceiling is rated, suggested and described as of unknown size, never as a 4 GB card', () => {
+  const [, , big, small] = MANIFEST_MODULES
+  // Huge splits so far onto the CPU of a 4 GB card that it is slow there.
+  const huge = { ...big, id: 'huge', name: 'Huge', size: 9 * 1024 ** 3, recommendedVramGB: 11, minRamGB: 16, rank: 1 }
+  const on = (gpu) => ({ ...PC, cuda: null, gpus: [gpu] })
+  const four = on({ name: 'AMD Radeon RX 6500 XT', vendor: 'amd', vramGB: 4 })
+  // Every card of 4 GB or more reads 4293918720 bytes in AdapterRAM, so this one has at least that
+  // much and nobody can say how much more: it may be the 4 GB card above, or an 8 or 16 GB one.
+  const capped = on({ name: 'AMD Radeon RX 6600', vendor: 'amd', vramGB: 4293918720 / 1024 ** 3, sizeCapped: true })
+
+  // rateModule. On a real 4 GB card Big splits, at about 6 words/s.
+  assert.deepEqual(rateModule(big, four, 'vulkan'), { fit: 'split', label: 'Splits GPU + CPU (slower, ~6 words/s est.)', wordsPerSec: 6 })
+  // On the capped card it may split like that, or run fully on the GPU. Which is not known, so the
+  // rating says so and gives the speed of each, not one of them as if it were the answer.
+  assert.deepEqual(rateModule(big, capped, 'vulkan'), { fit: 'unknown', label: "Runs on the GPU as far as its memory allows (this GPU's memory is unknown, 4 GB or more: ~6 to ~20 words/s est.)", wordsPerSec: null, wordsPerSecRange: [6, 20] })
+  // What 4 GB is enough for runs fully on the GPU whatever more the card has, and is rated as before.
+  assert.deepEqual(rateModule(small, capped, 'vulkan'), rateModule(small, four, 'vulkan'))
+  assert.equal(rateModule(small, capped, 'vulkan').fit, 'gpu')
+  // The CPU build puts nothing on a GPU, so its size changes nothing.
+  assert.equal(rateModule(big, capped, 'cpu').fit, 'cpu')
+
+  // suggest. On the 4 GB card Huge is slow, so the lighter model comes first.
+  const rows = (pc) => [huge, small].map((m) => ({ m, installed: false, rating: rateModule(m, pc, 'vulkan') }))
+  const known = suggest(rows(four), four)
+  assert.deepEqual(known.picks.map((p) => p.id), ['small', 'huge'])
+  assert.match(known.picks[1].reason, /on your 4 GB GPU \+ 24 GB RAM \(Splits GPU \+ CPU, ~2 words\/s\)$/)
+  // On the capped card it is slow only if the card is 4 GB, which nothing says, so it is not ranked
+  // down on that guess, and the reason gives both speeds and says the size is not known.
+  const unknown = suggest(rows(capped), capped)
+  assert.deepEqual(unknown.picks.map((p) => p.id), ['huge', 'small'])
+  assert.equal(unknown.picks[0].reason, 'Huge: best quality that still runs on your GPU (memory unknown, 4 GB or more) + 24 GB RAM (Runs on the GPU as far as its memory allows, ~2 to ~11 words/s)')
+  for (const p of unknown.picks) assert.doesNotMatch(p.reason, /4 GB GPU/)
+  // What is slow even fully on the GPU is slow whatever the card's size, which is no guess, so it is
+  // ranked down as before, and the lighter model comes first. Giant is too big for any GPU to hold.
+  const giant = { ...big, id: 'giant', name: 'Giant', size: 48 * 1024 ** 3, recommendedVramGB: 50, minRamGB: undefined, rank: 1 }
+  const roomy = { ...capped, diskFreeBytes: 200 * 1024 ** 3 }
+  const slow = rateModule(giant, roomy, 'vulkan')
+  assert.deepEqual([slow.fit, slow.wordsPerSecRange], ['unknown', [1, 2]])
+  const slowRows = [giant, small].map((m) => ({ m, installed: false, rating: rateModule(m, roomy, 'vulkan') }))
+  assert.deepEqual(suggest(slowRows, roomy).picks.map((p) => p.id), ['small', 'giant'])
+
+  // specsLine.
+  assert.equal(specsLine(four), 'AMD Radeon RX 6500 XT 4 GB · 24 GB RAM · Core i5-11400H 6 cores · 52 GB free')
+  assert.equal(specsLine(capped), 'AMD Radeon RX 6600 (memory unknown, 4 GB or more) · 24 GB RAM · Core i5-11400H 6 cores · 52 GB free')
 })
 
 test('/install-llm and /remove-llm: argument parsing and the confirm step', async () => {
@@ -548,4 +605,662 @@ test('a local agent carries the context window it will really run with, and the 
   assert.equal(agent.llm.contextSize, 12288)
   const [exec] = executorsFrom({ agents: [{ ...agent, kind: 'local' }] })
   assert.equal(exec.maxInputBytes, 12288 * CHARS_PER_TOKEN)
+})
+
+// ---------- the resource budget ----------
+const BUDGET_FIELDS = ['maxVramGB', 'maxRamGB', 'maxCores', 'maxConcurrentTasks']
+const budgetOf = (s) => Object.fromEntries(BUDGET_FIELDS.map((k) => [k, s[k]]))
+
+test('the resource budget is kept with the local settings, every limit optional, and read back by the same GET', async () => {
+  const { local } = localIn(tmp())
+  // Unset is no limit, which is how KzH behaved before there was a budget.
+  assert.deepEqual(budgetOf((await local.status()).settings), { maxVramGB: null, maxRamGB: null, maxCores: null, maxConcurrentTasks: null })
+  const saved = await local.setSettings({ maxVramGB: 3, maxRamGB: 8.5, maxCores: 6, maxConcurrentTasks: 2 })
+  assert.deepEqual(budgetOf(saved), { maxVramGB: 3, maxRamGB: 8.5, maxCores: 6, maxConcurrentTasks: 2 })
+  assert.deepEqual(budgetOf((await local.status()).settings), budgetOf(saved), 'GET /jev-router/local serves status().settings')
+  // null lifts one limit and leaves the others as they were.
+  await local.setSettings({ maxRamGB: null })
+  assert.deepEqual(budgetOf((await local.status()).settings), { maxVramGB: 3, maxRamGB: null, maxCores: 6, maxConcurrentTasks: 2 })
+  for (const [patch, why] of [
+    [{ maxVramGB: 0 }, { message: 'max VRAM: GB above 0, at most 1024, or null for no limit' }],
+    [{ maxVramGB: '3' }, /max VRAM/],
+    [{ maxVramGB: 2000 }, /max VRAM/],
+    [{ maxRamGB: -1 }, { message: 'max RAM: GB above 0, at most 4096, or null for no limit' }],
+    [{ maxRamGB: Number.NaN }, /max RAM/],
+    [{ maxRamGB: 5000 }, /max RAM/],
+    [{ maxCores: 2.5 }, { message: 'max cores: whole number 1-256, or null for no limit' }],
+    [{ maxCores: 0 }, /max cores/],
+    [{ maxCores: 257 }, /max cores/],
+    [{ maxConcurrentTasks: 0 }, { message: 'max concurrent tasks: whole number 1-64, or null for no limit' }],
+    [{ maxConcurrentTasks: true }, /max concurrent tasks/],
+    [{ maxConcurrentTasks: 65 }, /max concurrent tasks/],
+  ]) await assert.rejects(local.setSettings(patch), why, JSON.stringify(patch))
+  // A refused patch saves nothing, not even the half of it that was valid.
+  await assert.rejects(local.setSettings({ maxCores: 4, maxConcurrentTasks: 'two' }), /max concurrent tasks/)
+  assert.equal((await local.status()).settings.maxCores, 6)
+  // Each upper bound is itself allowed.
+  assert.deepEqual(budgetOf(await local.setSettings({ maxVramGB: 1024, maxRamGB: 4096, maxCores: 256, maxConcurrentTasks: 64 })), { maxVramGB: 1024, maxRamGB: 4096, maxCores: 256, maxConcurrentTasks: 64 })
+  await local.dispose()
+})
+
+test('a saved settings change is handed on, so whatever follows the budget sees it; a refused one is not', async () => {
+  const seen = []
+  const { local } = localIn(tmp(), { onSettings: (s) => seen.push(budgetOf(s)) })
+  await local.setSettings({ maxConcurrentTasks: 3 })
+  await assert.rejects(local.setSettings({ maxConcurrentTasks: -3 }), /max concurrent tasks/)
+  await local.setSettings({ maxConcurrentTasks: null })
+  assert.deepEqual(seen.map((s) => s.maxConcurrentTasks), [3, null], 'once per saved change, with the settings as saved')
+  await local.dispose()
+  // A listener that fails is logged, and the change it was told of stays saved: it was saved first.
+  const logs = []
+  const { local: loud } = localIn(tmp(), { onSettings: () => { throw new Error('the lanes are gone') }, log: (t) => logs.push(t) })
+  assert.equal((await loud.setSettings({ maxCores: 2 })).maxCores, 2)
+  assert.equal((await loud.status()).settings.maxCores, 2)
+  assert.ok(logs.includes('local: settings change not handed on: the lanes are gone'), logs.join('\n'))
+  await loud.dispose()
+})
+
+/**
+ * A stand-in for llama-server: it records what it was started with and answers /health at once.
+ * Its pid, 2147483647, is one no process can have (a Windows process id is a multiple of 4, and
+ * Linux ids stop far below it), because the Windows stop path calls taskkill on the pid and must
+ * never reach a real process from a test. `report` gives the load report each start prints, as
+ * llama-server writes it on stderr before it answers /health, so start() reads it as from a real run.
+ */
+function fakeEngine({ report = () => [] } = {}) {
+  const started = []
+  const spawn = (cmd, args) => {
+    const child = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, pid: 2147483647 })
+    child.kill = () => { child.exitCode = 0; child.emit('exit', 0) }
+    started.push({ cmd, args, child, reported: false })
+    return child
+  }
+  const fetch = async () => {
+    const run = started.at(-1)
+    if (run && !run.reported) { run.reported = true; for (const l of report()) run.child.stderr.emit('data', `${l}\n`) }
+    return { ok: true }
+  }
+  return { started, spawn, fetch }
+}
+
+/** An engine build (the CUDA one unless said) and the `big` model in place, as a hand install leaves them, on the PC above. */
+async function installedIn(root, { engine = MANIFEST_MODULES[0], ...extra } = {}) {
+  const made = localIn(root, { specs: async () => PC, port: 0, ...extra })
+  writeFileSync(join(made.engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'), '')
+  mkdirSync(join(made.engineDir, '.installed'))
+  writeFileSync(join(made.engineDir, '.installed', `${engine.id}.json`), JSON.stringify({ sha256: engine.sha256 }))
+  writeFileSync(join(made.modelsDir, 'big.gguf'), 'big')
+  await made.local.installed()
+  await made.local.settled()
+  return made
+}
+const argOf = (args, flag) => (args.includes(flag) ? args[args.indexOf(flag) + 1] : undefined)
+const VULKAN = { id: 'eng-vk', kind: 'engine', variant: 'vulkan', name: 'vulkan engine', source: 'https://github.com/ggml-org/llama.cpp/releases/download/b1/v.zip', file: 'v.zip', size: 1, sha256: sha('vk') }
+
+test('llama-server always gets a thread count: the core budget when set, else a default that leaves the app room', async () => {
+  const eng = fakeEngine()
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch })
+  await local.start('big')
+  // The PC above has 6 physical cores. Left to itself llama.cpp takes all six and the PC crawls.
+  assert.equal(argOf(eng.started[0].args, '-t'), '4', '6 cores: 4 threads, 2 cores left for the app, the browser view and the agents')
+  await local.stop()
+  await local.setSettings({ maxCores: 3 })
+  await local.start('big')
+  assert.equal(argOf(eng.started[1].args, '-t'), '3', 'the core budget, when there is one')
+  await local.stop()
+  // A budget above what the machine has is a budget of the whole machine, never more threads than
+  // it has processors: oversubscribed, llama.cpp is exactly the crawl the thread cap is there to stop.
+  await local.setSettings({ maxCores: 64 })
+  await local.start('big')
+  assert.equal(argOf(eng.started[2].args, '-t'), '12', 'the PC above has 12 logical processors')
+  assert.equal((await local.status()).budget.threads, 12, 'and the page shows the count it will really get')
+  await local.dispose()
+})
+
+test('--fit-target keeps free what the GPU has beyond the VRAM budget, so the model stays under it', async () => {
+  const eng = fakeEngine()
+  const logs = []
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, log: (t) => logs.push(t) })
+  // What the budget makes of the next load, for the settings page, before anything is loaded.
+  assert.deepEqual((await local.status()).budget, { threads: 4, defaultThreads: 4, fitTargetMiB: 256, vramNotApplied: null })
+  await local.start('big')
+  assert.equal(argOf(eng.started[0].args, '--fit-target'), '256', 'no budget: the small margin llama.cpp always kept')
+  await local.stop()
+  // A 4 GB GPU and a 2.5 GB budget: 1.5 GB stays free, so whatever else holds GPU memory, the model gets 2.5 GB at most.
+  await local.setSettings({ maxVramGB: 2.5 })
+  assert.deepEqual((await local.status()).budget, { threads: 4, defaultThreads: 4, fitTargetMiB: 1536, vramNotApplied: null })
+  await local.start('big')
+  assert.equal(argOf(eng.started[1].args, '--fit-target'), '1536')
+  // Once loaded, the status says what the running engine was really started with.
+  const { engine } = await local.status()
+  assert.deepEqual([engine.threads, engine.fitTargetMiB], [4, 1536])
+  await local.stop()
+  // A budget bigger than the GPU changes nothing: the margin never drops below the usual one.
+  await local.setSettings({ maxVramGB: 16 })
+  await local.start('big')
+  assert.equal(argOf(eng.started[2].args, '--fit-target'), '256')
+  await local.dispose()
+
+  // A GPU of unknown size gives nothing to take the budget from, and the log says the budget was not applied.
+  const blind = fakeEngine()
+  const unknown = await installedIn(tmp(), { spawn: blind.spawn, fetch: blind.fetch, specs: async () => ({ ...PC, gpus: [] }), log: (t) => logs.push(t) })
+  await unknown.local.setSettings({ maxVramGB: 2.5 })
+  assert.equal((await unknown.local.status()).budget.vramNotApplied, "this PC's GPU memory is unknown")
+  await unknown.local.start('big')
+  assert.equal(argOf(blind.started[0].args, '--fit-target'), '256')
+  assert.ok(logs.some((l) => /VRAM budget of 2\.5 GB not applied: this PC's GPU memory is unknown/.test(l)), logs.join('\n'))
+  // Layers pinned in Settings are loaded as pinned, which --fit does not move, and the log says so.
+  await unknown.local.stop()
+  await unknown.local.setSettings({ gpuLayers: 20 })
+  await unknown.local.start('big')
+  assert.ok(logs.some((l) => /VRAM budget of 2\.5 GB not applied: GPU layers are pinned to 20/.test(l)), logs.join('\n'))
+  await unknown.local.dispose()
+
+  // An AMD card on the Vulkan build, sized from AdapterRAM, which stops at 4 GB: an 8 GB card reads
+  // as 4. Keeping free what that figure has beyond a 3 GB budget would keep 1 GB free on a card with
+  // 8, and let the model take 7. Its size is as unknown as no size at all, and treated the same.
+  const amd = fakeEngine()
+  const capped = await installedIn(tmp(), {
+    engine: VULKAN, modules: [...MANIFEST_MODULES, VULKAN], spawn: amd.spawn, fetch: amd.fetch, log: (t) => logs.push(t),
+    specs: async () => ({ ...PC, cuda: null, gpus: [{ name: 'AMD Radeon RX 6600', vendor: 'amd', vramGB: 4293918720 / 1024 ** 3, sizeCapped: true }] }),
+  })
+  assert.equal(await capped.local.engineVariant(), 'vulkan')
+  await capped.local.setSettings({ maxVramGB: 3 })
+  assert.equal((await capped.local.status()).budget.vramNotApplied, 'this GPU reports its memory through a 32-bit field that stops at 4 GB')
+  await capped.local.start('big')
+  assert.equal(argOf(amd.started[0].args, '--fit-target'), '256')
+  assert.ok(logs.some((l) => l === 'local: VRAM budget of 3 GB not applied: this GPU reports its memory through a 32-bit field that stops at 4 GB'), logs.join('\n'))
+  await capped.local.dispose()
+})
+
+test('the thread default leaves the app at least a quarter of the machine, and two cores from three cores up', () => {
+  for (const [cpu, want] of [
+    [{ cores: 6, threads: 12 }, 4],
+    [{ cores: 8, threads: 16 }, 6],
+    [{ cores: 10, threads: 20 }, 7],
+    [{ cores: 14, threads: 28 }, 10],
+    [{ cores: 16, threads: 32 }, 12],
+    [{ cores: 4, threads: 8 }, 2],
+    [{ cores: 3, threads: 6 }, 1],
+    [{ cores: 2, threads: 4 }, 1],
+    [{ cores: 1, threads: 1 }, 1],
+    // Physical cores are read on Windows only; elsewhere half the logical processors stand in.
+    [{ cores: null, threads: 12 }, 4],
+    [{ cores: null, threads: 1 }, 1],
+  ]) assert.equal(defaultThreads(cpu), want, JSON.stringify(cpu))
+  // And as a rule, on every size of machine: llama.cpp needs one thread, so a one-core machine is the one exception.
+  for (let n = 1; n <= 256; n++) {
+    const t = defaultThreads({ cores: n, threads: 2 * n })
+    assert.ok(t >= 1, `${n} cores: at least one thread`)
+    if (n >= 2) assert.ok(n - t >= n / 4, `${n} cores: ${t} threads leaves less than a quarter`)
+    if (n >= 3) assert.ok(n - t >= 2, `${n} cores: ${t} threads leaves fewer than two cores`)
+  }
+})
+
+test('a model whose memory figure is over the budget is refused before it loads, naming the figure, its source and the budget', async () => {
+  const eng = fakeEngine()
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch })
+  const big = async () => (await local.status()).modules.find((m) => m.id === 'big')
+  // Big at 12288 context on the 4 GB GPU above: about 4 GB of VRAM and 2.7 GB of RAM, estimated.
+  // 12288 is the floor, so there is no smaller context to size it to, and the refusal says so.
+  await local.setSettings({ maxRamGB: 2 })
+  const refused = 'Big needs about 2.7 GB of RAM even at the 12k context floor (estimated: 4 GB VRAM + 2.7 GB RAM), over the resource budget of 2 GB RAM. Raise the RAM budget or use a smaller model.'
+  await assert.rejects(local.start('big'), { message: refused })
+  assert.equal(eng.started.length, 0, 'refused before anything was started')
+  // The router hears the same answer before any judgment, rather than picking it and failing at the load.
+  assert.deepEqual(await local.readiness('big'), { installed: true, loggedIn: false, detail: refused })
+  // And the settings page gets it per model, beside the figure it came from.
+  assert.equal((await big()).overBudget, refused)
+
+  // A VRAM budget moves the layers it keeps off the GPU into RAM, and the figure follows them there.
+  await local.setSettings({ maxVramGB: 2, maxRamGB: 4 })
+  assert.deepEqual((({ vramGB, ramGB, source }) => ({ vramGB, ramGB, source }))((await big()).memory), { vramGB: 2, ramGB: 4.7, source: 'estimated' })
+  await assert.rejects(local.start('big'), { message: 'Big needs about 4.7 GB of RAM even at the 12k context floor (estimated: 2 GB VRAM + 4.7 GB RAM), over the resource budget of 2 GB VRAM + 4 GB RAM. Raise the RAM budget or use a smaller model.' })
+  await local.setSettings({ maxRamGB: 5 })
+  assert.equal((await big()).overBudget, null)
+  assert.equal((await local.readiness('big')).loggedIn, true)
+  await local.start('big')
+  assert.equal(eng.started.length, 1, 'inside the budget it loads')
+  // With no RAM budget there is nothing to refuse: VRAM is held by --fit, not by refusing.
+  await local.stop()
+  await local.setSettings({ maxVramGB: 1, maxRamGB: null })
+  assert.equal((await big()).overBudget, null)
+  await local.dispose()
+})
+
+test('a measured figure stands only for a run like the one it was measured on: the same GPU room and the same GPU layers', async () => {
+  // The load report each start prints, as llama-server writes it: one line per buffer, in MiB.
+  let report = []
+  const eng = fakeEngine({ report: () => report })
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch })
+  const big = async () => (await local.status()).modules.find((m) => m.id === 'big')
+  const figure = async () => (({ vramGB, ramGB, source }) => ({ vramGB, ramGB, source }))((await big()).memory)
+  const run = async (lines) => { report = lines; await local.start('big'); await local.stop() }
+
+  // A run with the whole 4 GB GPU to itself: 3.5 GB on the GPU, 3 GB in RAM. From then on that is
+  // the figure for this run, and a refusal says it was measured.
+  await run(['CUDA0 model buffer size = 3584.00 MiB', 'CPU model buffer size = 3072.00 MiB'])
+  assert.deepEqual(await figure(), { vramGB: 3.5, ramGB: 3, source: 'measured' })
+  await local.setSettings({ maxRamGB: 2.5 })
+  await assert.rejects(local.start('big'), { message: 'Big needs about 3 GB of RAM even at the 12k context floor (measured: 3.5 GB VRAM + 3 GB RAM), over the resource budget of 2.5 GB RAM. Raise the RAM budget or use a smaller model.' })
+  await local.setSettings({ maxRamGB: 4 })
+  assert.equal((await big()).overBudget, null)
+
+  // With no layers on the GPU all of it lands in RAM. What the GPU run left in RAM says nothing
+  // about that, and taking it for this run would let a 5.9 GB model through a 4 GB budget.
+  await local.setSettings({ gpuLayers: 0 })
+  assert.deepEqual(await figure(), { vramGB: 0, ramGB: 5.9, source: 'estimated' })
+  await assert.rejects(local.start('big'), { message: 'Big needs about 5.9 GB of RAM even at the 12k context floor (estimated: 0 GB VRAM + 5.9 GB RAM), over the resource budget of 4 GB RAM. Raise the RAM budget or use a smaller model.' })
+  // Nor for layers pinned by hand, which --fit does not place, so they split the model their own way.
+  await local.setSettings({ gpuLayers: 20 })
+  assert.equal((await figure()).source, 'estimated')
+
+  // A run held to a 2 GB VRAM budget leaves more in RAM, and under that budget its reading is refused.
+  await local.setSettings({ gpuLayers: null, maxRamGB: null, maxVramGB: 2 })
+  await run(['CUDA0 model buffer size = 1228.80 MiB', 'CPU model buffer size = 4812.80 MiB'])
+  await local.setSettings({ maxRamGB: 4 })
+  assert.deepEqual(await figure(), { vramGB: 1.2, ramGB: 4.7, source: 'measured' })
+  assert.match((await big()).overBudget, /needs about 4\.7 GB of RAM even at the 12k context floor \(measured: 1\.2 GB VRAM \+ 4\.7 GB RAM\)/)
+  // Lifting the VRAM budget gives it the GPU back. The tight run no longer describes the one it would
+  // get, and holding that reading against it would refuse it for good: a refused model never runs
+  // again to be measured.
+  await local.setSettings({ maxVramGB: null })
+  assert.deepEqual(await figure(), { vramGB: 4, ramGB: 2.7, source: 'estimated' })
+  assert.equal((await big()).overBudget, null)
+  await local.start('big')
+  assert.equal(eng.started.length, 3, 'it loads')
+  await local.dispose()
+})
+
+// A model whose manifest states its KV cost outright, 0.1 GB per 1k of context, and asks for 32k. On
+// the PC above each 1k step of context is a clean 0.1 GB, so the largest context that fits is plain to see.
+const WIDE = { id: 'wide', kind: 'model', name: 'Wide', source: 'https://huggingface.co/Org/Wide-GGUF/resolve/main/wide.gguf', file: 'wide.gguf', size: 2 * 1024 ** 3, sha256: sha('wide'), reliability: 'official-stable', verified: true, role: 'fast', rank: 2, kvGbPerToken: 0.1 / 1024, contextSize: 32768, agent: { id: 'wide-local', description: 'wide' } }
+/** installedIn, with Wide installed beside Big. */
+async function wideIn(root, extra = {}) {
+  const made = await installedIn(root, { modules: [...MANIFEST_MODULES, WIDE], ...extra })
+  writeFileSync(join(made.modelsDir, 'wide.gguf'), 'wide')
+  await made.local.installed()
+  await made.local.settled()
+  return made
+}
+
+test('the contexts a budget may size a model to: what it asks for, then each whole k below it, down to the floor and never under it', () => {
+  assert.deepEqual(contextSteps(16384), [16384, 15360, 14336, 13312, 12288])
+  // A context that is no whole number of k is tried as it is first, then the whole k below it.
+  assert.deepEqual(contextSteps(20000).slice(0, 3), [20000, 19456, 18432])
+  assert.equal(contextSteps(20000).at(-1), 12288)
+  assert.deepEqual(contextSteps(12288), [12288], 'at the floor there is nothing smaller to try')
+  // A context the plugin config set under the floor is left where it is: the budget never raises it.
+  assert.deepEqual(contextSteps(8192), [8192])
+})
+
+test('a RAM budget sizes the context to the largest that fits, and only a model over it even at the 12k floor is refused', async () => {
+  const eng = fakeEngine()
+  const logs = []
+  const { local } = await wideIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, log: (t) => logs.push(t) })
+  const wide = async () => (await local.status()).modules.find((m) => m.id === 'wide')
+  const figure = (m) => (({ vramGB, ramGB, source }) => ({ vramGB, ramGB, source }))(m.memory)
+  // No budget: the context it asks for, exactly as before there was a budget.
+  let m = await wide()
+  assert.deepEqual([m.ctx, m.ctxReducedFrom, figure(m)], [32768, null, { vramGB: 4, ramGB: 2.3, source: 'estimated' }])
+  await local.start('wide')
+  assert.equal(argOf(eng.started[0].args, '-c'), '32768')
+  await local.stop()
+
+  // At 32k Wide puts 2.3 GB into RAM, over a 1.25 GB budget. Each 1k less takes 0.1 GB off, so 21k
+  // (1.2 GB) is the largest context that fits, and 22k (1.3 GB) is not.
+  await local.setSettings({ maxRamGB: 1.25 })
+  m = await wide()
+  assert.deepEqual([m.ctx, m.ctxReducedFrom, figure(m), m.overBudget], [21504, 32768, { vramGB: 4, ramGB: 1.2, source: 'estimated' }, null])
+  assert.ok(estimateMemory(WIDE, { ctx: 22528, vramGB: 4 }).ramGB > 1.25, 'the next step up does not fit')
+  assert.equal((await local.readiness('wide')).loggedIn, true, 'sized down, it fits, so it is ready')
+  // What the page shows is what the load gets.
+  await local.start('wide')
+  assert.equal(argOf(eng.started[1].args, '-c'), '21504')
+  assert.equal((await local.status()).engine.ctx, 21504)
+  assert.ok(logs.includes('local: the resource budget reduced wide\'s context from 32768 to 21504, the largest that fits it'), logs.join('\n'))
+  await local.stop()
+  // The router and DSH are told the window it really runs with, so nothing sends it more than it holds.
+  assert.equal((await local.agents('p')).find((a) => a.id === 'wide-local').llm.contextSize, 21504)
+  assert.equal(local.contextOf('wide'), 21504)
+
+  // Where a VRAM budget applies it keeps layers off the GPU, and what they take lands in RAM, so the
+  // context is sized to the figure under both: at 2 GB of VRAM and 3.05 GB of RAM, 19k.
+  await local.setSettings({ maxVramGB: 2, maxRamGB: 3.05 })
+  m = await wide()
+  assert.deepEqual([m.ctx, m.ctxReducedFrom, figure(m)], [19456, 32768, { vramGB: 2, ramGB: 3, source: 'estimated' }])
+  // A VRAM budget alone refuses nothing, since --fit holds it, so it sizes nothing either.
+  await local.setSettings({ maxRamGB: null })
+  assert.deepEqual([(await wide()).ctx, (await wide()).ctxReducedFrom], [32768, null])
+
+  // Even at the 12k floor Wide puts 0.3 GB into RAM. Under a 0.2 GB budget nothing fits, and the
+  // refusal says it is the floor that does not fit, with the figure there.
+  await local.setSettings({ maxVramGB: null, maxRamGB: 0.2 })
+  const floor = 'Wide needs about 0.3 GB of RAM even at the 12k context floor (estimated: 4 GB VRAM + 0.3 GB RAM), over the resource budget of 0.2 GB RAM. Raise the RAM budget or use a smaller model.'
+  await assert.rejects(local.start('wide'), { message: floor })
+  assert.equal(eng.started.length, 2, 'refused before anything was started')
+  m = await wide()
+  assert.deepEqual([m.ctx, figure(m), m.overBudget], [12288, { vramGB: 4, ramGB: 0.3, source: 'estimated' }, floor])
+  assert.equal((await local.readiness('wide')).detail, floor)
+  await local.dispose()
+})
+
+test('a context sized by the budget is what a reading is kept under, and a reading over the budget there moves the next load down', async () => {
+  let report = []
+  const eng = fakeEngine({ report: () => report })
+  const { local } = await wideIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch })
+  const wide = async () => (await local.status()).modules.find((m) => m.id === 'wide')
+  await local.setSettings({ maxRamGB: 1.25 })
+  // Estimated at 1.2 GB, it really took 1.5 GB of RAM at 21k: kept against 21k, the context it ran with.
+  report = ['CUDA0 model buffer size = 3276.80 MiB', 'CPU model buffer size = 1536.00 MiB']
+  await local.start('wide')
+  await local.stop()
+  const kept = (await local.readSettings()).measured
+  assert.deepEqual(Object.keys(kept), ['wide@21504'])
+  assert.deepEqual([kept['wide@21504'].vramGB, kept['wide@21504'].ramGB], [3.2, 1.5])
+  // A reading stands for its own context only. At 21k it is over the budget, so 21k no longer fits,
+  // and the next load takes 20k, where nothing has been measured and the estimate stands in.
+  const m = await wide()
+  assert.deepEqual([m.ctx, m.ctxReducedFrom, m.memory.ramGB, m.memory.source], [20480, 32768, 1.1, 'estimated'])
+  await local.start('wide')
+  assert.equal(argOf(eng.started[1].args, '-c'), '20480')
+  await local.dispose()
+})
+
+test('while a model runs, DSH and the router are never told a window larger than the one llama-server was started with', async () => {
+  const eng = fakeEngine()
+  const { local } = await wideIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch })
+  const wide = async () => (await local.status()).modules.find((m) => m.id === 'wide')
+  const routerWindow = async () => (await local.agents('p')).find((a) => a.id === 'wide-local').llm.contextSize
+  const dshWindow = async () => (await localAdapter(local).resolveModel('local', 'wide')).context.contextWindow
+  // Sized to 21k by the budget, and started there.
+  await local.setSettings({ maxRamGB: 1.25 })
+  await local.start('wide')
+  assert.equal(argOf(eng.started[0].args, '-c'), '21504')
+  // The budget is lifted while it stays loaded. The next load would take 32k, and the page says so,
+  // but a loaded model is not restarted for it: asked again, it answers from the 21k it holds.
+  await local.setSettings({ maxRamGB: null })
+  assert.deepEqual([(await wide()).ctx, (await wide()).ctxReducedFrom], [32768, null])
+  await local.start('wide')
+  assert.equal(eng.started.length, 1, 'not restarted')
+  assert.equal(local.contextOf('wide'), 21504)
+  assert.equal(await dshWindow(), 21504)
+  assert.equal(await routerWindow(), 21504)
+  // Once it is unloaded, the next load is the window a request meets.
+  await local.stop()
+  assert.equal(local.contextOf('wide'), 32768)
+  assert.equal(await routerWindow(), 32768)
+
+  // The other way: loaded at 32k, then a budget that sizes the next load to 21k. DSH asks at each
+  // request, and while the 32k run is up it may fill 32k. The router keeps what it is told until the
+  // next change, and the model may be unloaded and loaded again at 21k before then, so it is told
+  // the smaller of the two, never a window the next load will not have.
+  await local.start('wide')
+  assert.equal(argOf(eng.started[1].args, '-c'), '32768')
+  await local.setSettings({ maxRamGB: 1.25 })
+  assert.equal(await routerWindow(), 21504)
+  assert.equal(local.contextOf('wide'), 32768)
+  await local.stop()
+  assert.equal(local.contextOf('wide'), 21504)
+  await local.start('wide')
+  assert.equal(argOf(eng.started[2].args, '-c'), '21504')
+  await local.dispose()
+})
+
+test('a model the watchdog unloaded is refused only at the context it was unloaded at and above: a smaller one that fits still loads', async () => {
+  const GIB = 1024 ** 3
+  let clock = 0
+  let rss = 2.3 * GIB
+  const eng = fakeEngine()
+  const changed = []
+  const { local } = await wideIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, now: () => clock, readWorkingSet: async () => rss, watchEveryMs: 3_600_000, onChange: (m) => changed.push(m.id) })
+  changed.length = 0 // the install's own verification is not what this test is about
+  const wide = async () => (await local.status()).modules.find((m) => m.id === 'wide')
+  const trip = async () => {
+    await local.checkMemory()
+    clock += 31_000
+    await local.checkMemory()
+    assert.equal((await local.status()).engine.running, false, 'unloaded by the watchdog')
+  }
+  // Loaded at 32k with no budget, then a 1.25 GB budget is set while it runs. Its 2.3 GB stays over
+  // it and the watchdog unloads it. That says 32k is too much, not that Wide is: at 21k its figure
+  // fits the budget, and it loads there.
+  await local.start('wide')
+  await local.setSettings({ maxRamGB: 1.25 })
+  await trip()
+  let m = await wide()
+  assert.deepEqual([m.ctx, m.ctxReducedFrom, m.overBudget], [21504, 32768, null])
+  assert.equal((await local.readiness('wide')).loggedIn, true)
+  // At 21k its real use is 1.5 GB, and the watchdog unloads it again. The estimate there still says
+  // 1.2 GB, but the run said otherwise, so 21k is not tried again: the next load steps down to 20k,
+  // where the figure fits and nothing has said it does not.
+  rss = 1.5 * GIB
+  await local.start('wide')
+  assert.equal(argOf(eng.started[1].args, '-c'), '21504')
+  await trip()
+  assert.ok(estimateMemory(WIDE, { ctx: 21504, vramGB: 4 }).ramGB <= 1.25, 'the figure at 21k fits: only the unload rules it out')
+  m = await wide()
+  assert.deepEqual([m.ctx, m.ctxReducedFrom, m.memory.ramGB, m.overBudget], [20480, 32768, 1.1, null])
+  await local.start('wide')
+  assert.equal(argOf(eng.started[2].args, '-c'), '20480')
+  await local.stop()
+  // A setting that changes nothing about its memory changes nothing here either.
+  await local.setSettings({ idleMinutes: 20 })
+  assert.equal((await wide()).ctx, 20480)
+  // A new RAM budget is a fresh start. Under 0.3 GB it loads at the 12k floor, and unloaded there it
+  // has nothing smaller left to load with: it is refused, with the watchdog's reason.
+  await local.setSettings({ maxRamGB: 0.3 })
+  assert.equal((await wide()).ctx, 12288)
+  await local.start('wide')
+  await trip()
+  const why = 'the RAM watchdog unloaded Wide: its working set stayed over the 0.3 GB RAM budget for 31 s (last reading 1.5 GB). Raise the RAM budget to load it again.'
+  assert.equal((await wide()).overBudget, why)
+  await assert.rejects(local.start('wide'), { message: why })
+  assert.deepEqual(changed, ['wide', 'wide', 'wide'], 'each unload told whoever follows the local models')
+  await local.dispose()
+})
+
+test('a context the plugin config set under the floor is not raised by the budget, and its refusal names that context', async () => {
+  const { local } = await installedIn(tmp(), { contextSize: 8192 })
+  await local.setSettings({ maxRamGB: 1 })
+  const big = (await local.status()).modules.find((m) => m.id === 'big')
+  assert.deepEqual([big.ctx, big.ctxReducedFrom], [8192, null])
+  assert.match(big.overBudget, /^Big needs about [\d.]+ GB of RAM at 8192 context \(estimated: /)
+  await local.dispose()
+})
+
+test('the chat model is one the budget lets load: titles and direct answers never go to a model it refuses', async () => {
+  const { local, modelsDir } = await installedIn(tmp())
+  writeFileSync(join(modelsDir, 'small.gguf'), 'small')
+  await local.installed(); await local.settled()
+  await local.setSettings({ chatModel: 'big' })
+  assert.equal(await local.chatModel(), 'big')
+  // On the PC above, Big needs about 2.7 GB of RAM and Small about 1.3.
+  await local.setSettings({ maxRamGB: 2 })
+  assert.equal(await local.chatModel(), 'small', 'the chosen one is over the budget, so the quickest one that fits')
+  assert.equal((await local.status()).settings.chatModel, 'small', 'and the page shows the one really answering')
+  await local.setSettings({ maxRamGB: 1 })
+  assert.equal(await local.chatModel(), null, 'none fits: no local chat model, so the next agent answers')
+  await local.setSettings({ maxRamGB: null })
+  assert.equal(await local.chatModel(), 'big', 'the choice stands again once it fits')
+  await local.dispose()
+})
+
+test('the RAM watchdog unloads a model whose working set stays over the budget for 30 seconds, says why, and keeps it unloaded', async () => {
+  const GIB = 1024 ** 3
+  let clock = 1_000_000
+  let rss = 3 * GIB
+  const reads = []
+  const logs = []
+  const changed = []
+  const eng = fakeEngine()
+  const { local } = await installedIn(tmp(), {
+    spawn: eng.spawn, fetch: eng.fetch, log: (t) => logs.push(t),
+    onChange: (m) => changed.push(m.id),
+    now: () => clock,
+    readWorkingSet: async (pid) => { reads.push(pid); return rss },
+    // No timer here: every reading below is taken by hand, on the test's own clock.
+    watchEveryMs: 3_600_000,
+  })
+  changed.length = 0 // the install's own verification is not what this test is about
+  const running = async () => (await local.status()).engine.running
+  await local.start('big')
+  await local.checkMemory()
+  assert.deepEqual(reads, [], 'no RAM budget, nothing to watch, nothing read')
+  await local.setSettings({ maxRamGB: 4 })
+  await local.checkMemory()
+  assert.deepEqual(reads, [2147483647], "llama-server's own process is the one read")
+  assert.equal((await local.status()).engine.workingSetGB, 3, 'the latest reading is on the status, for the page')
+
+  rss = 5 * GIB
+  await local.checkMemory() // over from here
+  clock += 25_000
+  await local.checkMemory()
+  assert.equal(await running(), true, '25 seconds over is not 30')
+  rss = 3.5 * GIB
+  clock += 5_000
+  await local.checkMemory() // back under: the count starts again
+  rss = 5 * GIB
+  clock += 5_000
+  await local.checkMemory()
+  clock += 29_000
+  await local.checkMemory()
+  assert.equal(await running(), true, 'the count started again when it dipped under')
+  assert.deepEqual(changed, [])
+  clock += 1_000
+  await local.checkMemory()
+  assert.equal(await running(), false, '30 seconds over the budget: unloaded')
+  assert.ok(logs.includes('local: unloaded big: its working set stayed over the 4 GB RAM budget for 30 s (last reading 5 GB)'), logs.join('\n'))
+  // The router caches readiness for minutes. Told at once, it stops offering the model now rather
+  // than sending it tasks that each fail at the load.
+  assert.deepEqual(changed, ['big'], 'whoever follows the local models hears of it, once')
+
+  // Big was unloaded at 12k, the context floor, so there is no smaller context to load it with, and
+  // loading it again would only end the same way: it is refused, with the reading, until the budget changes.
+  const why = 'the RAM watchdog unloaded Big: its working set stayed over the 4 GB RAM budget for 30 s (last reading 5 GB). Raise the RAM budget to load it again.'
+  await assert.rejects(local.start('big'), { message: why })
+  assert.equal((await local.readiness('big')).detail, why)
+  assert.equal((await local.status()).modules.find((m) => m.id === 'big').overBudget, why)
+  assert.equal(await local.chatModel(), null, 'nor is it the chat model any more')
+  await local.setSettings({ idleMinutes: 20 })
+  await assert.rejects(local.start('big'), { message: why }, 'a setting that changes nothing about its memory changes nothing here')
+  await local.setSettings({ maxRamGB: 6 })
+  await local.start('big')
+  assert.equal(await running(), true, 'a changed budget is a fresh start')
+
+  // A reading that cannot be taken says nothing either way, so it restarts the count rather than adding to it.
+  rss = 7 * GIB
+  await local.checkMemory()
+  rss = null
+  clock += 20_000
+  await local.checkMemory()
+  rss = 7 * GIB
+  clock += 20_000
+  await local.checkMemory()
+  assert.equal(await running(), true, 'forty seconds, but not thirty of them seen over')
+  await local.dispose()
+})
+
+test('a model the watchdog unloaded loads again once what decides its RAM changes, and not when the same value is saved again', async () => {
+  const GIB = 1024 ** 3
+  let clock = 0
+  const eng = fakeEngine()
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, now: () => clock, readWorkingSet: async () => 5 * GIB, watchEveryMs: 3_600_000 })
+  const running = async () => (await local.status()).engine.running
+  // Loads (so it was not refused), then stays over the 4 GB budget for 30 seconds.
+  const loadAndTrip = async () => {
+    await local.start('big')
+    await local.checkMemory()
+    clock += 30_000
+    await local.checkMemory()
+    assert.equal(await running(), false, 'unloaded by the watchdog')
+  }
+  const unloaded = /the RAM watchdog unloaded Big/
+  await local.setSettings({ maxRamGB: 4 })
+  await loadAndTrip()
+  // A settings form that posts the whole budget on every save sends the same values again.
+  await local.setSettings({ maxRamGB: 4, maxVramGB: null, gpuLayers: null })
+  await assert.rejects(local.start('big'), unloaded, 'the same values again change nothing about its memory')
+  // A different VRAM budget does: it moves some of the model between the GPU and RAM.
+  await local.setSettings({ maxVramGB: 3 })
+  await loadAndTrip()
+  await assert.rejects(local.start('big'), unloaded)
+  // So do different GPU layers.
+  await local.setSettings({ gpuLayers: 20 })
+  await local.start('big')
+  assert.equal(await running(), true)
+  await local.dispose()
+})
+
+test('the RAM watchdog takes one reading at a time, and a late one from an engine since replaced changes nothing', async () => {
+  const GIB = 1024 ** 3
+  let clock = 0
+  // Every reading waits for the test to answer it, as a slow tasklist would.
+  const answers = []
+  let taken = () => {}
+  const nextReading = () => new Promise((r) => { taken = r })
+  const eng = fakeEngine()
+  const { local } = await installedIn(tmp(), {
+    spawn: eng.spawn, fetch: eng.fetch, now: () => clock, watchEveryMs: 3_600_000,
+    readWorkingSet: () => new Promise((answer) => { answers.push(answer); taken() }),
+  })
+  await local.setSettings({ maxRamGB: 4 })
+  await local.start('big')
+  let reading = nextReading()
+  const first = local.checkMemory()
+  assert.equal(local.checkMemory(), first, 'a check while a reading is out joins it rather than taking a second')
+  await reading
+  answers[0](5 * GIB) // over the budget from here
+  await first
+  clock += 29_000
+  reading = nextReading()
+  const late = local.checkMemory()
+  await reading
+  // Before that reading comes back, the model is unloaded and loaded again: a new engine, a new count.
+  await local.stop()
+  await local.start('big')
+  clock += 2_000
+  answers[1](5 * GIB)
+  await late
+  assert.equal(answers.length, 2, 'one reading per check')
+  assert.equal((await local.status()).engine.running, true, "the old engine's thirty seconds do not unload the new one")
+  assert.equal((await local.readiness('big')).loggedIn, true, 'nor mark the model unloaded')
+  await local.dispose()
+})
+
+test('the working set is read per platform: tasklist on Windows, ps elsewhere, and no reading is null, never zero', async () => {
+  const asked = []
+  const answer = (out) => async (cmd, args) => { asked.push([cmd, ...args]); return out }
+  // tasklist writes the working set in KB with the locale's own thousands separator.
+  assert.equal(await workingSetOf(2140, { platform: 'win32', run: answer('"llama-server.exe","2140","Console","1","1,234,567 K"\r\n') }), 1234567 * 1024)
+  assert.deepEqual(asked[0], ['tasklist', '/FI', 'PID eq 2140', '/FO', 'CSV', '/NH'])
+  assert.equal(parseTasklistMemory('"llama-server.exe","2140","Console","1","1.234.567 K"'), 1234567 * 1024, 'a German separator')
+  assert.equal(parseTasklistMemory('"llama-server.exe","2140","Console","1","1 234 567 Ko"'), 1234567 * 1024, 'a French one, and its unit')
+  assert.equal(parseTasklistMemory('INFO: No tasks are running which match the specified criteria.\r\n'), null, 'the process has gone')
+  // ps reports RSS in KiB.
+  assert.equal(await workingSetOf(2140, { platform: 'linux', run: answer('  524288\n') }), 512 * 1024 ** 2)
+  assert.deepEqual(asked[1], ['ps', '-o', 'rss=', '-p', '2140'])
+  assert.equal(parsePsRss(''), null)
+  assert.equal(parsePsRss('RSS\n1024\n'), null, 'anything but the one number is no reading')
+  // The command failing (exec gives null) or no pid at all is no reading either.
+  assert.equal(await workingSetOf(2140, { platform: 'win32', run: async () => null }), null)
+  assert.equal(await workingSetOf(2140, { platform: 'darwin', run: async () => null }), null)
+  assert.equal(await workingSetOf(undefined, { run: answer('1') }), null)
+  assert.equal(asked.length, 2, 'nothing is run without a pid')
+})
+
+test('the RAM watchdog reads on its own once the model is loaded, and stops when the engine does', async () => {
+  let reads = 0
+  const eng = fakeEngine()
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, readWorkingSet: async () => { reads++; return 1024 }, watchEveryMs: 1 })
+  await local.setSettings({ maxRamGB: 8 })
+  await local.start('big')
+  // Waits for the first reading rather than for a length of time, so a loaded machine only makes it slower.
+  await waitFor('the watchdog took a reading by itself', () => reads, (n) => n > 0, { timeoutMs: 10_000 })
+  await local.stop()
+  await local.checkMemory() // lets a reading already in flight finish
+  const after = reads
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(reads, after, 'no reading once the engine is stopped')
+  await local.dispose()
 })

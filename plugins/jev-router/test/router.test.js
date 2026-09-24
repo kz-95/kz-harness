@@ -609,6 +609,203 @@ test('routing: an answer-only dislike cannot move the pick, a routing dislike do
   assert.equal(r3.attempts[0].agent, 'codex', 'the suggestion is ignored behind an answer-only tag')
 })
 
+// ---------- the feedback bias, matched by task type across sessions ----------
+// The wiring apply() gives the router, made by the same factory (createHistoryDeps): a real
+// history.jsonl holding the runs, the real feedback log beside it, whose reader returns every
+// session when it is given none, and runOfVerdict to find the run each verdict is about, whose
+// routing.taskType says what kind of work was judged. closeRoute routes debugging work.
+async function typedHistory(verdicts, runs, capabilities = null) {
+  const { createFeedback } = await import('../feedback.js')
+  const { createHistoryDeps } = await import('../index.js')
+  const dir = mkdtempSync(join(tmpdir(), 'jev-fb-'))
+  const historyFile = join(dir, 'history.jsonl')
+  writeFileSync(historyFile, runs.map((r) => `${JSON.stringify(r)}\n`).join(''))
+  const fb = createFeedback({ file: join(dir, 'feedback.jsonl') })
+  for (const v of verdicts) await fb.append(v)
+  return createHistoryDeps({ historyFile, feedback: fb, capabilities })
+}
+const typedRun = (runId, sessionId, taskType) => ({ ts: '2026-09-20T00:00:00.000Z', runId, sessionId, routing: { taskType, primaryAgent: 'claude' } })
+const r2 = (x) => Math.round(x * 100) / 100
+// The movement the prior applied to one agent's probability, or 0 when it applied none.
+const nudge = (r, id) => { const m = r.routing.feedback?.find((x) => x.agent === id && 'to' in x); return m ? m.to - m.from : 0 }
+
+test('feedback prior: a like on work of the same type moves the pick more than one on another type', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const runs = [typedRun('r-debug', 's', 'debugging'), typedRun('r-docs', 's', 'documentation')]
+  const likes = (runId) => [1, 2, 3].map((i) => fbRow({ messageId: `m${i}`, verdict: 'like', provider: 'claude', runId }))
+  const dir1 = repo()
+  const same = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: await typedHistory(likes('r-debug'), runs) } })
+  const dir2 = repo()
+  const other = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: await typedHistory(likes('r-docs'), runs) } })
+  assert.equal(same.attempts[0].agent, 'claude', 'three likes on debugging work raise claude over a close debugging pick')
+  assert.equal(other.attempts[0].agent, 'codex', 'three likes on documentation work do not')
+  assert.ok(nudge(same, 'claude') > nudge(other, 'claude'), `same type ${nudge(same, 'claude')} against another type ${nudge(other, 'claude')}`)
+  assert.ok(nudge(other, 'claude') > 0, 'a verdict on other work still counts, a little')
+})
+
+test('feedback prior: verdicts from another session now count, and their words stay out of this routing call', async () => {
+  let seen
+  const jev = { route: async (args) => { seen = args.trackRecord; return closeRoute() }, assess: async () => verdict('accept') }
+  const runs = [typedRun('r-past', 'past', 'debugging')]
+  const past = [1, 2, 3].map((i) => fbRow({ sessionId: 'past', messageId: `m${i}`, runId: 'r-past', reason: 'codex looped on the stack trace' }))
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: await typedHistory(past, runs) } })
+  assert.equal(r.attempts[0].agent, 'claude', 'three dislikes on debugging work in an earlier session cost codex this debugging call')
+  assert.equal(r.routing.feedbackFrom, 'codex')
+  // The typed reasons ride the routing call exactly as before: this session's only.
+  assert.equal(seen.codex.feedback, undefined, 'another session\'s reason did not ride this session\'s routing call')
+})
+
+test('feedback prior: a verdict with no runId is weighed by the run it was credited to, as its evidence was', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  // An earlier session's debugging run, then a documentation run, both ended before the verdicts.
+  const runs = [{ ...typedRun('r-debug', 'past', 'debugging'), ts: '2026-09-20T10:00:00.000Z' }, { ...typedRun('r-docs', 'past', 'documentation'), ts: '2026-09-20T10:10:00.000Z' }]
+  const past = [1, 2, 3].map((i) => fbRow({ ts: '2026-09-20T10:15:00.000Z', sessionId: 'past', messageId: `m${i}` }))
+  // The registry credited them to the debugging run (creditedRun), whatever ended since.
+  const credited = { creditedRun: (v) => (v.sessionId === 'past' ? 'r-debug' : null) }
+  const dir1 = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: await typedHistory(past, runs, credited) } })
+  assert.equal(r2(nudge(r, 'codex')), -0.15, 'three dislikes on debugging work, at full weight')
+  assert.equal(r.attempts[0].agent, 'claude')
+  const dir2 = repo()
+  const guessed = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: await typedHistory(past, runs) } })
+  assert.equal(r2(nudge(guessed, 'codex')), -0.04, 'with no credit to go by, the newest run before them is the documentation one')
+})
+
+test('feedback prior: an edited verdict with no runId is placed by when it was first given, as its evidence is', async () => {
+  const { effectiveVerdicts, runOfVerdict } = await import('../index.js')
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const runs = [{ ...typedRun('r-debug', 'past', 'debugging'), ts: '2026-09-20T10:00:00.000Z' }, { ...typedRun('r-docs', 'past', 'documentation'), ts: '2026-09-20T10:10:00.000Z' }]
+  // Three answers of the debugging run disliked at 10:05, each re-tagged at 10:15, after the
+  // documentation run ended, and never credited (learning was off).
+  const past = [1, 2, 3].flatMap((i) => [
+    fbRow({ ts: '2026-09-20T10:05:00.000Z', sessionId: 'past', messageId: `m${i}` }),
+    fbRow({ ts: '2026-09-20T10:15:00.000Z', sessionId: 'past', messageId: `m${i}`, tag: 'wrong agent' }),
+  ])
+  const typed = await typedHistory(past, runs)
+  const evidence = runOfVerdict(effectiveVerdicts(past)[0], runs, null)
+  assert.equal(evidence?.runId, 'r-debug', 'the evidence path reads the debugging run')
+  assert.equal(typed.runOfVerdict((await typed.feedback())[0], runs)?.runId, evidence.runId, 'and the router reads the same one')
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: typed } })
+  assert.equal(r2(nudge(r, 'codex')), -0.15, 'so the dislikes count as debugging work, fully')
+  assert.equal(r.attempts[0].agent, 'claude')
+})
+
+test('feedback prior: a suggested agent switches the pick only from this session, never from another', async () => {
+  const jev = { route: async () => routeResult({ primaryAgent: 'codex', agentConfidence: 0.8, agentProbabilities: { codex: 0.8, claude: 0.2 } }), assess: async () => verdict('accept') }
+  const runs = [typedRun('r-past', 'past', 'debugging'), typedRun('r-here', 's', 'debugging')]
+  const should = (sessionId, runId) => fbRow({ sessionId, messageId: 'm1', runId, reason: 'should have been claude', suggestedAgent: 'claude' })
+  const dir1 = repo()
+  const elsewhere = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: await typedHistory([should('past', 'r-past')], runs) } })
+  assert.equal(elsewhere.attempts[0].agent, 'codex', 'another session\'s newest correction does not switch this pick')
+  assert.equal(elsewhere.routing.feedback?.some((m) => m.suggested), false, 'and is not recorded as a suggestion')
+  assert.ok(nudge(elsewhere, 'codex') < 0, 'its dislike still counts as a vote on debugging work')
+  const dir2 = repo()
+  const here = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: await typedHistory([should('s', 'r-here')], runs) } })
+  assert.equal(here.attempts[0].agent, 'claude', 'the same correction in this session does')
+  assert.ok(here.routing.feedback.some((m) => m.agent === 'claude' && m.suggested))
+})
+
+test('feedback prior: no number of matching verdicts moves a probability past the cap', async () => {
+  const jev = { route: async () => routeResult({ primaryAgent: 'codex', agentConfidence: 0.8, agentProbabilities: { codex: 0.8, claude: 0.2 } }), assess: async () => verdict('accept') }
+  const runs = ['a', 'b', 'c'].map((s) => typedRun(`r-${s}`, s, 'debugging'))
+  const rows = []
+  for (let i = 0; i < 30; i++) {
+    const s = ['a', 'b', 'c'][i % 3]
+    rows.push(fbRow({ sessionId: s, messageId: `like${i}`, verdict: 'like', provider: 'claude', runId: `r-${s}` }))
+    rows.push(fbRow({ sessionId: s, messageId: `dislike${i}`, provider: 'codex', runId: `r-${s}` }))
+  }
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: await typedHistory(rows, runs) } })
+  assert.equal(r2(nudge(r, 'claude')), 0.15, 'claude is raised by exactly the cap')
+  assert.equal(r2(nudge(r, 'codex')), -0.15, 'codex is lowered by exactly the cap')
+  assert.equal(r.attempts[0].agent, 'codex', 'sixty matching verdicts still cannot overturn a confident pick')
+})
+
+test('feedback prior: a verdict with no run to match counts as it always did, fully in this session and not at all from another', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  // A runId naming no run, and no runId with no run of its session to fall back on.
+  const here = [1, 2, 3].map((i) => fbRow({ messageId: `m${i}`, ...(i === 1 ? { runId: 'gone' } : {}) }))
+  const dir1 = repo()
+  const kept = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: await typedHistory(here, []) } })
+  assert.equal(kept.attempts[0].agent, 'claude', 'three dislikes in this session still demote codex, run or no run')
+  const elsewhere = [1, 2, 3].map((i) => fbRow({ sessionId: 'past', messageId: `m${i}` }))
+  const dir2 = repo()
+  const ignored = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: await typedHistory(elsewhere, []) } })
+  assert.equal(ignored.attempts[0].agent, 'codex', 'another session\'s verdicts about no known work say nothing about this one')
+  assert.equal(ignored.routing.feedback, undefined)
+})
+
+test('feedbackPrior: a weighted vote moves the bias by its weight, and the cap holds at any weight', async () => {
+  const { feedbackPrior, verdictWeight } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }]
+  const runs = new Map([['r-debug', { routing: { taskType: 'debugging' } }], ['r-docs', { routing: { taskType: 'documentation' } }], ['r-manual', { routing: {} }]])
+  const weightOf = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: (v) => runs.get(v.runId) ?? null })
+  assert.equal(weightOf({ sessionId: 'x', runId: 'r-debug' }), 1, 'the same type counts fully, from any session')
+  assert.equal(weightOf({ sessionId: 's', runId: 'r-docs' }), 0.25, 'another type counts a little, even in this session')
+  assert.equal(weightOf({ sessionId: 's', runId: 'r-manual' }), 1, 'a run that never had a type is no match: this session counts as before')
+  assert.equal(weightOf({ sessionId: 'x', runId: 'r-none' }), 0, 'and another session is not read, as before')
+  assert.equal(verdictWeight({ sessionId: 's', runOf: (v) => runs.get(v.runId) })({ sessionId: 's', runId: 'r-docs' }), 1, 'no task type now: exactly the old prior')
+  const throwing = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: () => { throw new Error('history unreadable') } })
+  assert.deepEqual([throwing({ sessionId: 's' }), throwing({ sessionId: 'x' })], [1, 0], 'a reader that throws has found no run: the old prior, and nothing escapes')
+  assert.equal(verdictWeight({})({ sessionId: 'x' }), 1, 'no session: every row reads as this session\'s, as list() with no session returns them')
+  const like = (runId) => ({ sessionId: 's', verdict: 'like', provider: 'claude', runId })
+  assert.equal(feedbackPrior([like('r-debug')], agents, { weightOf }).agents.get('claude').bias, 0.05)
+  assert.equal(feedbackPrior([like('r-docs')], agents, { weightOf }).agents.get('claude').bias, 0.01)
+  assert.equal(feedbackPrior(Array.from({ length: 50 }, () => like('r-debug')), agents, { weightOf }).agents.get('claude').bias, 0.15)
+  assert.equal(feedbackPrior(Array.from({ length: 50 }, () => like('r-docs')), agents, { weightOf }).agents.get('claude').bias, 0.15, 'many small votes reach the cap and stop there')
+  assert.equal(feedbackPrior([like('r-debug')], agents).agents.get('claude').bias, 0.05, 'no weights: every vote counts fully, as before')
+})
+
+test('feedbackPrior: the window holds twenty verdicts\' worth of weight, so votes on other work cannot crowd out ones on this work', async () => {
+  const { feedbackPrior, verdictWeight } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }, { id: 'deepseek', provider: 'deepseek' }]
+  const runs = new Map([['r-here', { routing: { taskType: 'debugging' } }], ['r-docs', { routing: { taskType: 'documentation' } }]])
+  const weightOf = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: (v) => runs.get(v.runId) ?? null })
+  // This session's three dislikes of codex on debugging work, then twenty newer verdicts on
+  // documentation work from another session, a quarter each.
+  const here = [1, 2, 3].map((i) => ({ sessionId: 's', messageId: `h${i}`, verdict: 'dislike', provider: 'codex', runId: 'r-here' }))
+  const docs = (provider) => Array.from({ length: 20 }, (_, i) => ({ sessionId: 'other', messageId: `o${i}`, verdict: 'like', provider, runId: 'r-docs' }))
+  const crowded = feedbackPrior([...here, ...docs('deepseek')], agents, { weightOf })
+  assert.deepEqual([crowded.agents.get('codex')?.dislikes, crowded.agents.get('codex')?.bias], [3, -0.15], 'the dislikes on this work still count in full')
+  assert.equal(crowded.agents.get('deepseek').likes, 20, 'and the twenty on other work are read as well')
+  const outvoted = feedbackPrior([...here, ...docs('codex')], agents, { weightOf }).agents.get('codex')
+  assert.deepEqual([outvoted.likes, outvoted.dislikes], [20, 3], 'every verdict is read')
+  assert.equal(outvoted.bias, 0.04, 'twenty likes on other work weigh five, against three dislikes on this work')
+  // Rows at full weight fill the window exactly as before: twenty of them, the newest.
+  const full = Array.from({ length: 25 }, (_, i) => ({ sessionId: 's', messageId: `f${i}`, verdict: i < 5 ? 'like' : 'dislike', provider: 'codex', runId: 'r-here' }))
+  assert.deepEqual([feedbackPrior(full, agents, { weightOf }).agents.get('codex').likes, feedbackPrior(full, agents).agents.get('codex').dislikes], [0, 20])
+})
+
+test('feedbackPrior: a verdict that weighs nothing is not in the window at all, nor the newest verdict', async () => {
+  const { feedbackPrior, verdictWeight } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }, { id: 'deepseek', provider: 'deepseek' }]
+  const runs = new Map([['r-here', { routing: { taskType: 'debugging' } }]])
+  const weightOf = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: (v) => runs.get(v.runId) ?? null })
+  const here = [1, 2, 3].map((i) => ({ sessionId: 's', messageId: `h${i}`, verdict: 'dislike', provider: 'codex', runId: 'r-here' }))
+  // Twenty newer dislikes from another session about no run anyone knows, each naming deepseek.
+  const unplaced = Array.from({ length: 20 }, (_, i) => ({ sessionId: 'other', messageId: `o${i}`, verdict: 'dislike', provider: 'claude', suggestedAgent: 'deepseek' }))
+  assert.equal(weightOf(unplaced[0]), 0)
+  const p = feedbackPrior([...here, ...unplaced], agents, { weightOf })
+  assert.deepEqual([p.agents.get('codex')?.dislikes, p.agents.get('codex')?.bias], [3, -0.15], 'they crowd nothing out')
+  assert.equal(p.agents.has('claude'), false, 'they are not counted, even as whole verdicts')
+  assert.equal(p.agents.has('deepseek'), false, 'nor their suggestions')
+  assert.equal(p.suggestion, undefined, 'and the newest of them is not the newest verdict')
+})
+
+test('routing: twenty newer verdicts on other work from another session do not erase this session\'s on this work', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const cfg = { ...FB_CONFIG, agents: [...FB_CONFIG.agents, { id: 'deepseek', provider: 'deepseek', description: 'c', enabled: true }] }
+  const runs = [typedRun('r-here', 's', 'debugging'), typedRun('r-docs', 'other', 'documentation')]
+  const here = [1, 2, 3].map((i) => fbRow({ ts: '2026-09-21T00:00:00.000Z', messageId: `h${i}`, runId: 'r-here' }))
+  const docs = Array.from({ length: 20 }, (_, i) => fbRow({ ts: '2026-09-22T00:00:00.000Z', sessionId: 'other', messageId: `o${i}`, verdict: 'like', provider: 'deepseek', runId: 'r-docs' }))
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: cfg, signal, deps: { jev, execute: fixer(dir), history: await typedHistory([...here, ...docs], runs) } })
+  assert.equal(r2(nudge(r, 'codex')), -0.15, 'codex keeps the full demotion from three dislikes on debugging work')
+  assert.equal(r.attempts[0].agent, 'claude', 'so it still loses the close debugging call')
+})
+
 // ---------- hard facts, marginal cost, and the strategy's own steps ----------
 // Regressions for six defects: a provider NAME deciding a routing swap, admin exclusions that
 // only decision.js honoured, a filtered-out field swallowed into a fallback, a tool offered to

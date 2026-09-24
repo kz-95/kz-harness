@@ -5,9 +5,8 @@
 // Three judgment groups live here, each the teacher for one or more routing domains:
 //   task      what the request needs: type, complexity, risk, the capability dimensions it
 //             requires, skills, the minimum tier of model that could do it, verification
-//   resource  which anonymous candidate (RESOURCE_A, RESOURCE_B ...) should do the work and
-//             how (the execution strategy), judged from each candidate's machine-readable
-//             capability profile, scarcity and economics, never from a provider name
+//   resource  how the work should be organised (the execution strategy); which candidate does
+//             it is ranked in code (broker.js), and no candidate data rides the call
 //   outcome   what should happen after an attempt: the disposition, and the atomic yes/no
 //             judgments jev-review turns into a decision
 // `route()` batches whichever of the first two groups are still needed into one call, so a
@@ -117,13 +116,15 @@ export const DISPOSITION_CRITERIA = {
  */
 const scrub = (text) => (typeof text === 'string' ? redactSecrets(text) : text)
 /**
- * `scrub` every string inside a nested plain object or array. The track record is built from the
- * person's own feedback, including the free text they typed in the Why? box, so it is the one
- * payload on the routing call that can carry an arbitrary sentence. A key pasted into that box
- * must not ride out with it, and the README promises keys are masked in everything sent to Jev.
+ * `scrub` every string inside a nested plain object or array, object keys included. The track
+ * record is built from the person's own feedback, including the free text they typed in the Why?
+ * box, and the workspace facts are git's view of the files, so either can carry an arbitrary
+ * string. A key pasted into that box must not ride out with it, and the README promises keys are
+ * masked in everything sent to Jev. Keys too, because a map can be keyed by what was typed: the
+ * workspace counts its files by extension, and a file's extension is part of its name.
  */
 const scrubDeep = (v) => (Array.isArray(v) ? v.map(scrubDeep)
-  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scrubDeep(x)]))
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [scrub(k), scrubDeep(x)]))
     : scrub(v))
 
 function clip(text, max) {
@@ -132,8 +133,10 @@ function clip(text, max) {
   return s.length <= max ? s : `${s.slice(0, max)}\n...[truncated ${s.length - max} chars]`
 }
 
+// A description is the person's own words from config, and it goes out as the option Jev reads,
+// so it is scrubbed like any other text sent to Jev.
 function agentCriteria(agents) {
-  return Object.fromEntries(agents.map((a) => [a.id, { what: a.description }]))
+  return Object.fromEntries(agents.map((a) => [a.id, { what: scrub(a.description) }]))
 }
 
 // --- anonymity -------------------------------------------------------------------------------
@@ -261,14 +264,14 @@ export function anonymity(entries = []) {
 /** A tool step in the attempt log: router.js records it as `tool:<tool id>`. */
 const isToolAttempt = (agent) => typeof agent === 'string' && agent.startsWith('tool:')
 
-/** The names a configured agent goes by, for the masker: the same list the routing call uses. */
+/** The names a configured agent goes by, for the masker (features.js identityNames). */
 const namesOf = identityNames
 
 /**
  * Why an agent outside the work table is not a candidate for the work, in the words Jev reads.
  * The decision record says why for everything it excluded, and says whether that was a hard fact
- * or not: a weekly gate, the capability floor and conservation are policy and judgment, and a
- * resource kept out by them is kept for review on purpose. Telling Jev a judgment was a hard fact
+ * or not: a weekly gate, the capability floor and conservation are limits the policy sets, not
+ * facts about the resource, and a resource kept out by them is kept for review on purpose. Telling Jev a judgment was a hard fact
  * made the resource conserved for harder work look unfit to judge. An agent a current record does
  * not mention never reached the engine: the router offers it only what the executor registry says
  * can take this request. A record from before `excluded` was kept says nothing either way, and
@@ -309,8 +312,8 @@ function reviewTable(decision, agents, { modelOf, attempts = [] } = {}) {
   }
   const pool = agents?.length ? agents : [...byId.keys()].map((id) => ({ id }))
   const used = new Set([...byId.values()].map((c) => c.key))
-  // A review-only resource keeps the key the routing call gave it, so one resource reads as one
-  // key across the run's calls; only an agent the engine never keyed gets a fresh one.
+  // A review-only resource keeps the key the decision engine gave it, so one resource reads as
+  // one key across the run's calls; only an agent the engine never keyed gets a fresh one.
   const adopted = new Map()
   for (const [id, r] of reviewOnly) if (r.key && labelIndex(r.key) >= 0 && !used.has(r.key)) { used.add(r.key); adopted.set(id, r.key) }
   let next = Math.max(-1, ...[...used].map(labelIndex)) + 1
@@ -401,7 +404,7 @@ function numbersState(c) {
     reliability: c.reliability ? { score: r2(c.reliability.score), confidence: r2(c.reliability.confidence) } : null,
     verified_runs: c.evidenceSamples ?? 0,
     new_resource: !!c.cold,
-    // Only the decision record has it (the fit for THIS task); the routing call's table does not.
+    // Only the decision record has it (the fit for THIS task).
     ...(typeof c.fit === 'number' ? { task_fit: r2(c.fit) } : {}),
   }
 }
@@ -488,64 +491,65 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
      *   task      (default on)  what the request needs: type, complexity, risk, the requirement
      *                           dimensions, skills, minimum and preferred tier, verification,
      *                           capability category, tools
-     *   resource  (when `candidates` is given)  how the work should be organised across the
-     *                           anonymous candidates: the execution strategy. WHICH candidate does
-     *                           it is not asked, because that is a comparison of numbers
+     *   resource  (when `candidates` and `strategies` are given)  how the work should be
+     *                           organised: the execution strategy. WHICH candidate does it is not
+     *                           asked, because that is a comparison of numbers. The candidates
+     *                           decide which strategies the caller offers in `strategies`, and
+     *                           are not sent
      *   judgments (when `candidates` is given)  the second opinion: one yes/no judgment that
      *                           teaches a domain of its own. Conservation and the frontier review
      *                           were here too, and are rules in code now for the same reason
      *   agent     (legacy: `agents` without `candidates`)  the old named-agent choice
      *
      * `ask.task` false skips the task group when a local classifier already produced the
-     * profile; that profile then rides `state.task_profile` so the resource judgment can
+     * profile; that profile then rides `state.task_profile` so the strategy question can
      * read it. Every tool's parameter questions are asked speculatively in the same call.
      *
-     * `history`, `availability` and `trackRecord` arrive keyed by agent id. Only the legacy named
-     * question reads them that way. In a call with the anonymous table they are re-keyed through
-     * `identities` ([{ id, key, names }], from the decision engine), and without it they are left out.
+     * `history`, `availability` and `trackRecord` arrive keyed by agent id, and only the legacy
+     * named question reads them. A call about the anonymous candidates carries none of them: its
+     * questions read the task, not the resources, so there is nothing to re-key them for.
      */
-    async route({ task, context, agents = [], candidates, strategies, tools = [], history, availability, trackRecord, identities, handoff, capabilities, taskProfile, ask: want = {} }, signal) {
+    async route({ task, context, agents = [], candidates, strategies, tools = [], history, availability, trackRecord, handoff, capabilities, taskProfile, ask: want = {} }, signal) {
       const askTask = want.task !== false
       const askResource = !!candidates?.length && want.resource !== false
       // The judgment noul is its own group: it teaches a routing domain that matures on its own,
       // so it must be askable without the strategy choice and skippable when only the strategy is
       // still open.
       const askJudgments = !!candidates?.length && want.judgments !== false
-      const carriesTable = askResource || askJudgments
-      // The named-agent question never rides a call that carries the anonymous table: its
-      // options would print the very names the table exists to withhold.
-      const askAgent = !carriesTable && agents.length > 0 && want.agent !== false
-      const state = { task: scrub(task), workspace: context }
+      // The named-agent question never rides a call about the anonymous candidates: its options
+      // would print the very names the anonymity exists to withhold.
+      const askAgent = !(askResource || askJudgments) && agents.length > 0 && want.agent !== false
+      // The options are the strategies the caller says the pool can run (decision.js offers
+      // broker.js eligibleStrategies), and nothing else: the call carries nothing about the pool,
+      // so Jev cannot tell an option it can run from one it cannot. No list, no question. One
+      // eligible strategy is nothing to choose between, so the question needs two.
+      const strategyKeys = askResource ? (strategies ?? []).filter((s) => STRATEGIES[s]) : []
+      const askStrategy = strategyKeys.length > 1
+
+      // A call carries the state its questions read and nothing more: state no question reads
+      // costs tokens and loses accuracy on the state that is read, and each field of it is one
+      // more thing leaving the machine. Every question reads `task`. The task group judges it "in
+      // this workspace" and asks whether it continues `handoff`; the named-agent question reads
+      // `workspace` and the per-agent evidence; the strategy weighs the quality the task requires,
+      // which `task_profile` states when the task group is not asked beside it; the second opinion
+      // reads `task` alone. Nothing about the resources rides a call about them: the strategy
+      // question names no field of the candidate table, and every option it is offered is one the
+      // caller has already checked the pool can run.
+      const state = { task: scrub(task) }
+      // Git's view of the files (a file's name, its extension, the branch) and the project's own
+      // script and dependency names: whatever anyone typed into those goes out with them.
+      if ((askTask || askAgent) && context) state.workspace = scrubDeep(context)
+      // It quotes the earlier agent's answer, so it carries whatever that agent printed. clip()
+      // scrubs before it cuts; a caller must not cut before scrubbing, or a key split by its cut
+      // goes out in pieces (router.js scrubs the note before its own 3000 cut for that reason).
+      if (askTask && handoff) state.handoff = clip(handoff, 3000)
       if (askAgent) {
         // Legacy named routing: the question is asked over names, so its evidence is keyed by name.
-        state.recent_outcomes = history
+        state.recent_outcomes = scrubDeep(history)
         if (availability) state.agent_availability = availability
         if (trackRecord) state.agent_track_record = scrubDeep(trackRecord)
-      } else {
-        // `identities` ({ id, key, names }) is how an id becomes the key the table uses; only a key
-        // that is really in this call's table counts, so a resource the pool dropped reads as
-        // unnamed rather than as a key nothing describes. Without it (or in a call with no
-        // table, which asks nothing about resources) the per-agent maps have nothing they may be
-        // keyed by, so they are left out rather than sent under the real names.
-        const offered = new Set((candidates ?? []).map((c) => c.key))
-        const anon = carriesTable && identities?.length
-          ? anonymity(identities.map((e) => ({ ...e, key: offered.has(e.key) ? e.key : undefined })))
-          : null
-        if (Array.isArray(history)) {
-          state.recent_outcomes = history.map(({ first_agent: first, ...rest }) => {
-            const key = anon && first ? anon.keyOf(first) : undefined
-            return { ...(anon ? anon.maskFree(rest) : rest), ...(key ? { first_resource: key } : {}) }
-          })
-        }
-        // The per-candidate track record and availability used to ride this call under the same
-        // keys, for the resource question to read. That question is gone, and state no question
-        // reads costs tokens and loses accuracy on the rest of it, so they are not sent at all.
       }
-      if (handoff) state.handoff = clip(handoff, 3000)
-      // Only the call that asks the strategy question reads the table; a judgments-only call
-      // would be paying for a table nothing in it looks at.
-      if (askResource) state.candidates = candidateState(candidates)
-      if (!askTask && taskProfile) state.task_profile = scrubDeep(taskProfile)
+      if (askStrategy && !askTask && taskProfile) state.task_profile = scrubDeep(taskProfile)
       const questions = {}
       if (askAgent) {
         questions.agent = choice(
@@ -605,47 +609,50 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
           )
         }
         if (tools.length) {
+          // A tool's description and its parameter questions are config the person wrote, often
+          // about a script that calls an API, so they are scrubbed like the agents' descriptions.
+          // The option keys are not: they come back as the tool's arguments.
           questions.handler = choice(
             {
               question: 'Can a fixed tool fully handle `task`, or does it need an AI coding agent?',
               focus: 'Pick a tool only when it does exactly what `task` asks with no judgment, writing, or code changes. Anything else needs an agent.',
             },
-            { agent: { what: 'An AI coding agent is needed: the task involves reasoning, writing, or changing code' }, ...Object.fromEntries(tools.map((t) => [t.id, { what: t.description }])) },
+            { agent: { what: 'An AI coding agent is needed: the task involves reasoning, writing, or changing code' }, ...Object.fromEntries(tools.map((t) => [t.id, { what: scrub(t.description) }])) },
           )
           for (const t of tools) {
             // Atomic yes/no per tool (skill-suggestion cookbook); the handler choice alone is too broad.
             questions[`${t.id}.fits`] = noul({
               question: `Does the \`${t.id}\` tool do exactly what \`task\` asks, with nothing left for an AI agent?`,
-              focus: `The \`${t.id}\` tool: ${t.description}`,
+              focus: `The \`${t.id}\` tool: ${scrub(t.description)}`,
             })
             for (const [p, def] of Object.entries(t.params ?? {})) {
-              questions[`${t.id}.${p}`] = choice(def.question, Object.fromEntries(Object.entries(def.options).map(([k, v]) => [k, { what: v }])))
+              questions[`${t.id}.${p}`] = choice(scrubDeep(def.question), Object.fromEntries(Object.entries(def.options).map(([k, v]) => [k, { what: scrub(v) }])))
             }
           }
         }
       }
-      if (askResource) {
+      if (askStrategy) {
         // Which candidate does the work is not asked here. Ranking candidates means weighing
         // capability against cost against scarcity, all of them numbers, and comparing magnitudes
         // is the one thing a snap-judgment classifier cannot do: that decision is a rule in code
         // (broker.js rankCandidates). What is left for a judgment is the shape of the run, which
         // is a categorical choice over named strategies and nothing to do with arithmetic.
-        const strategyKeys = (strategies?.length ? strategies : Object.keys(STRATEGIES)).filter((s) => STRATEGIES[s])
-        if (strategyKeys.length > 1) {
-          questions.strategy = choice(
-            {
-              question: 'How should the work for `task` be organised across the candidates?',
-              focus: 'A direct strategy runs one candidate with the usual checks and review. The plan-then-execute and review strategies spend the strongest candidate only on planning or judging and a cheaper one on the bulk work. Prefer the least expensive strategy that still gives the required quality.',
-            },
-            Object.fromEntries(strategyKeys.map((s) => [s, { what: STRATEGIES[s] }])),
-          )
-        }
+        // The question reads only what rides the call: the task, and its profile when the task
+        // group is not asked beside it. It speaks of no candidates, because none are sent.
+        questions.strategy = choice(
+          {
+            question: 'How should the work for `task` be organised?',
+            focus: 'Every option is one the resources available for this task can run. A direct strategy runs one resource with the usual checks and review. The plan-then-execute and review strategies spend the strongest available resource only on planning or judging and a cheaper one on the bulk work. '
+              + (state.task_profile ? 'Prefer the least expensive strategy that still gives the quality `task_profile` says `task` requires.' : 'Prefer the least expensive strategy that still gives the quality `task` requires.'),
+          },
+          Object.fromEntries(strategyKeys.map((s) => [s, { what: STRATEGIES[s] }])),
+        )
       }
       if (askJudgments) {
         // Only the judgments a decision reads. Every question costs tokens and latency on every
         // routed run, so one whose answer nothing acts on is not asked: "is the cheapest enough"
-        // is what the conservation question already decides, and a consistency-review answer had
-        // no step that would carry it out.
+        // is what the ranking already decides in code, and a consistency-review answer had no
+        // step that would carry it out.
         // Conservation and the frontier review are not here either: both weighed a candidate's
         // scarcity or the task's risk against a threshold, which is arithmetic, and both are
         // decided in code now (decision.js). What is left is one judgment about the task itself.
@@ -742,7 +749,7 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
       // machine-readable candidate data the resource pick was, never over prose descriptions:
       // a description is a capability claim, and it would outvote the owner's priors and the
       // measured evidence on every review and every retry. `modelOf` (agent -> the model it runs)
-      // is how the masker learns a CLI agent's model id, as the routing call's does.
+      // is how the masker learns a CLI agent's model id.
       const table = reviewTable(routing?.decision, agents, { modelOf, attempts })
       const anon = table?.anon
       // jev-review hands over `{ results, regressed, fixed, failing }`; a bare array is accepted
@@ -765,12 +772,16 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
           ...(anon ? { resource: isToolAttempt(a.agent) ? a.agent : anon.keyOf(a.agent) ?? UNNAMED } : { agent: a.agent }),
           role: a.role,
           status: a.stopReason,
-          diagnostic: anon ? anon.maskFree(scrubDeep(a.diagnostic)) : scrub(a.diagnostic),
+          // An executor's error quotes what it was sent, a key included, and it can arrive as an
+          // object as well as a string, with or without a table to mask it against.
+          diagnostic: anon ? anon.maskFree(scrubDeep(a.diagnostic)) : scrubDeep(a.diagnostic),
           ...(i === attempts.length - 1 ? { answer: clip(a.answerText, 2500) } : {}),
-          changed_files: a.changedFiles,
+          // File names are scrubbed here and in the diff's file list for the same reason as in the
+          // routing call's workspace facts: a name is whatever the agent or the person typed.
+          changed_files: scrubDeep(a.changedFiles),
         })),
         verification: Array.isArray(checks) ? scrubbedResults : { ...checks, results: scrubbedResults },
-        diff: { stat: diff.stat, excerpt: clip(diff.patch, 6000) },
+        diff: { stat: scrub(diff.stat), excerpt: clip(diff.patch, 6000) },
       }
       if (table) state.candidates = candidateState(table.rows)
       const options = table ? Object.fromEntries(table.rows.map((r) => [r.key, { what: candidateLine(r) }])) : agentCriteria(agents)

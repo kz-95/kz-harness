@@ -1,5 +1,6 @@
 // Non-blocking orchestration: routed tasks run as DSH background jobs, one at a
-// time per workspace (a lane), while the chat stays free.
+// time per workspace (a lane), while the chat stays free. The resource budget can
+// also cap how many run at once across every workspace.
 //
 // One task is one record. The task list and the chat both read that record, so the
 // row and the delivered message can never disagree, and a result stays unread until
@@ -44,44 +45,102 @@ const terminalOf = (status) => {
 }
 
 /**
+ * What a task that has to wait is told, by what it waits for (acquire's `onWait`): another task in
+ * its own workspace, or a free slot under the resource budget's cap on tasks at once. The first is
+ * what a queued event with no text has always read as.
+ */
+export const WAITING = {
+  workspace: 'Waiting: another task is running in this workspace',
+  cap: 'Waiting for a free slot: the resource budget caps how many tasks run at once',
+}
+
+/**
  * One lane per workspace: a holder and a reorderable waiting line.
  * acquire() resolves with release() when it is this id's turn; an abort while waiting rejects.
+ *
+ * `max` caps how many lanes may hold at once across every workspace (the resource budget's tasks
+ * at once); null, the default, is no cap. A workspace still runs one task at a time whatever the
+ * cap. When a slot frees, the workspace whose waiting task arrived first gets it, so a busy
+ * workspace cannot keep a quiet one waiting; within a workspace its own line's order decides.
+ *
+ * The cap counts every run that holds a lane, a foreground /auto, /<agent> or jev_route as much as
+ * a background task: each runs an agent's processes, which is what overloads the PC. None is
+ * exempt, so each is told when it has to wait: acquire's `onWait` hears why ('workspace' or 'cap',
+ * see WAITING) as the run joins the line, and not at all when it starts at once.
  */
-export function createLanes() {
-  const lanes = new Map() // key -> { holder: id | null, waiting: [{ id, go }] }
+export function createLanes({ max = null } = {}) {
+  const lanes = new Map() // key -> { holder: id | null, waiting: [{ id, n, go }] }
+  let limit = max ?? Infinity
+  let holding = 0 // lanes with a holder, across every workspace
+  let arrivals = 0 // numbers every waiter in arrival order, across workspaces
   const get = (k) => { if (!lanes.has(k)) lanes.set(k, { holder: null, waiting: [] }); return lanes.get(k) }
-  const next = (k) => {
-    const l = lanes.get(k)
-    if (!l || l.holder) return
-    if (!l.waiting.length) { lanes.delete(k); return }
-    const w = l.waiting.shift()
-    l.holder = w.id
-    w.go()
+  const firstArrival = (l) => Math.min(...l.waiting.map((w) => w.n))
+  // Why a run joining lane `k` now would wait, or null when it would start at once. A lane with
+  // waiters and no holder is one whose waiters are held back by the cap: next() lets anyone in the
+  // moment both its workspace and a slot are free.
+  const waitsFor = (k) => (lanes.get(k)?.holder ? 'workspace' : lanes.get(k)?.waiting.length || holding >= limit ? 'cap' : null)
+  // Hand out every slot the cap allows: a lane nobody holds, with somebody waiting, lets the head
+  // of its line in. With no cap that is every such lane, which is what this did before there was one.
+  const next = () => {
+    while (holding < limit) {
+      let pick = null
+      for (const l of lanes.values()) if (!l.holder && l.waiting.length && (!pick || firstArrival(l) < firstArrival(pick))) pick = l
+      if (!pick) break
+      const w = pick.waiting.shift()
+      pick.holder = w.id
+      holding++
+      w.go()
+    }
+    for (const [k, l] of lanes) if (!l.holder && !l.waiting.length) lanes.delete(k)
   }
   return {
-    acquire(k, id, signal) {
+    acquire(k, id, signal, { onWait } = {}) {
       return new Promise((res, rej) => {
         if (signal?.aborted) return rej(signal.reason ?? new DOMException('Stopped', 'AbortError'))
+        // Told before it joins the line: a listener that throws then fails this call and leaves
+        // nothing in the line, where a waiter nobody holds a promise for would take the lane for good.
+        const why = waitsFor(k)
+        if (why) onWait?.(why)
         const l = get(k)
         const onAbort = () => {
           const i = l.waiting.indexOf(w)
-          if (i >= 0) { l.waiting.splice(i, 1); next(k); rej(signal.reason ?? new DOMException('Stopped', 'AbortError')) }
+          if (i >= 0) { l.waiting.splice(i, 1); next(); rej(signal.reason ?? new DOMException('Stopped', 'AbortError')) }
         }
         const w = {
           id,
+          n: arrivals++,
           go: () => {
             signal?.removeEventListener('abort', onAbort)
             let released = false
-            res(() => { if (released) return; released = true; l.holder = null; next(k) })
+            res(() => { if (released) return; released = true; l.holder = null; holding--; next() })
           },
         }
         signal?.addEventListener('abort', onAbort, { once: true })
         l.waiting.push(w)
-        next(k)
+        next()
       })
     },
     busy: (k) => !!lanes.get(k)?.holder,
-    /** 0 = running, 2 = first behind the running one ("2nd in line"), -1 = not in this lane. */
+    /** Whether a task joining lane `k` now would wait: its workspace is taken, or the cap is. */
+    waits: (k) => !!waitsFor(k),
+    /** A new cap (null: none). Raising it lets waiting work in at once; lowering it stops nothing that runs. */
+    setMax(n) { limit = n ?? Infinity; next() },
+    /**
+     * The cap as it stands now, counted where it is held: `held` is every run holding a slot, a
+     * foreground run as much as a background task, since each holds its workspace's lane; `waiting`
+     * is the runs kept waiting only by the cap, the first in each line whose workspace nobody holds
+     * (position 1); `max` is the cap, null for none. A run behind another in its own workspace is not
+     * waiting for a slot, since a free one would not start it, and with no cap nothing is.
+     */
+    slots() {
+      let waiting = 0
+      for (const l of lanes.values()) if (!l.holder && l.waiting.length) waiting++
+      return { held: holding, waiting, max: limit === Infinity ? null : limit }
+    },
+    /**
+     * 0 = running, 2 = first behind the running one ("2nd in line"), 1 = first in line with nothing
+     * running in this workspace (waiting for a slot under the cap), -1 = not in this lane.
+     */
     position(k, id) {
       const l = lanes.get(k)
       if (!l) return -1
@@ -436,6 +495,16 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
 
   return {
     ready,
+    /**
+     * Resolves once every write asked for so far has landed or failed and been logged, a progress
+     * write still waiting to be coalesced included (it is written now rather than in half a
+     * second). This is how to know the file holds the latest state: polling the file races the
+     * writer, and on Windows a reader holding the file open is exactly what makes its rename fail.
+     */
+    flushed() {
+      if (soon) { clearTimeout(soon); soon = null; persist() }
+      return writing
+    },
     enqueue,
     applyEvent,
     get: (jobId) => { const t = find(jobId); return t ? view(t) : null },

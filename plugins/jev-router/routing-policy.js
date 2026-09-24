@@ -16,15 +16,30 @@
 export const MATURITY = Object.freeze(['JEV_PRIMARY', 'SHADOW', 'GUARDED_LOCAL', 'LOCAL_ONLY', 'ROLLBACK'])
 export const RISK_CLASSES = Object.freeze(['LOW', 'MEDIUM', 'HIGH'])
 
-/** The routing domains, each maturing on its own. `kind` says what its local classifier predicts. */
+/**
+ * The routing domains, each maturing on its own. `kind` says what its local classifier predicts.
+ * Quota conservation is not one: whether the most capable resource leaves the work pool is a hard
+ * limit in decision.js, read off the governor's level, and there is nothing in it to learn.
+ *
+ * `localDecides: false` says the domain's local classifier never decides, at any rung: it still
+ * climbs the ladder and its answer is recorded beside the one that decided, for comparison, but
+ * the rung buys it nothing. Resource selection is the one, by the owner's decision: it has no
+ * teacher, so its classifier learns only from the runs that contradict the ranking, and one that
+ * matured on a diet of failures must not overrule arithmetic that is right (decision.js takes the
+ * pick from rankCandidates() at every rung). The controller and the Router tab both read it here.
+ *
+ * `teacher: 'code'` says a rule in code is the domain's authority and no teacher is ever asked:
+ * each of these is a comparison of numbers, which a snap-judgment classifier cannot make. The
+ * rule decides wherever the local classifier does not, so the rungs where Jev would decide
+ * elsewhere are the rule's here. Without it the teacher is Jev.
+ */
 export const DOMAINS = Object.freeze({
   task_classification: { risk: 'LOW', kind: 'multiclass', label: 'task classification' },
   skill_selection: { risk: 'LOW', kind: 'multiclass', label: 'skill selection' },
-  resource_selection: { risk: 'MEDIUM', kind: 'ranking', label: 'resource selection' },
-  conservation: { risk: 'MEDIUM', kind: 'multiclass', label: 'quota conservation' },
+  resource_selection: { risk: 'MEDIUM', kind: 'ranking', label: 'resource selection', localDecides: false, teacher: 'code' },
   execution_strategy: { risk: 'MEDIUM', kind: 'multiclass', label: 'execution strategy' },
   second_opinion: { risk: 'MEDIUM', kind: 'multiclass', label: 'second opinion' },
-  frontier_escalation: { risk: 'HIGH', kind: 'multiclass', label: 'frontier escalation' },
+  frontier_escalation: { risk: 'HIGH', kind: 'multiclass', label: 'frontier escalation', teacher: 'code' },
   outcome_disposition: { risk: 'HIGH', kind: 'multiclass', label: 'outcome disposition' },
 })
 
@@ -238,9 +253,10 @@ export const ROUTING_DEFAULTS = Object.freeze({
     unknownScore: 0.5,
   }),
   governor: Object.freeze({
-    // Where conservation starts and where it becomes aggressive, as a share of a limit used.
-    // Plan-specific curves are seeds, not rules: Jev and later the local classifier learn when to
-    // spend. Keys are plan names as the provider adapter reports them, lower case.
+    // Where conservation starts and where it becomes aggressive, as a share of a limit used. The
+    // ranking prices the scarcity this curve gives (broker.js), and from `startAt` on the
+    // conservation limit in decision.js keeps easy work off the most capable resource. Keys are
+    // plan names as the provider adapter reports them, lower case.
     conservation: {
       default: { startAt: 0.6, aggressiveAt: 0.85 },
       plans: {
@@ -290,11 +306,12 @@ export const ROUTING_DEFAULTS = Object.freeze({
   // Minimum review policy: the risk cuts of the DETERMINISTIC FALLBACKS, used only when neither
   // Jev nor a trusted local classifier answers: for the second-opinion (riskForReview) and
   // frontier-escalation (riskForFrontierReview) judgments, risk at or above the cut then counts as
-  // yes. The same cuts steer the other fallbacks of decision.js: riskForReview decides when the
-  // fallback resource pick prefers the strongest candidate and when the fallback conservation
-  // answer may say yes, and riskForFrontierReview when the fallback strategy is a cheap execute
-  // with a frontier review. They are not a floor under any answer - a Jev "no" at any risk stands
-  // (decision.js judgment()).
+  // yes. The same cuts are read elsewhere in decision.js: riskForFrontierReview decides when the
+  // fallback strategy is a cheap execute with a frontier review, and riskForReview is where the
+  // conservation limit stops, because work at or above it is not easy enough to move off the most
+  // capable resource. The resource pick reads neither: the ranking below makes it at any risk.
+  // They are not a floor under any answer - a Jev "no" at any risk stands (decision.js
+  // judgment()).
   minimumReview: Object.freeze({ riskForReview: 0.6, riskForFrontierReview: 0.8 }),
   // The resource ranking (broker.js rankCandidates), which is the authority on which candidate
   // does the work. Unitless weights over one score per candidate: what the extra capability is
@@ -308,13 +325,11 @@ export const ROUTING_DEFAULTS = Object.freeze({
     capabilityWeight: 2.0, costWeight: 0.6, scarcityWeight: 0.8,
     evidenceRuns: 5, evidenceFloor: 0.5, temperature: 0.25,
   }),
-  // The two judgments answered in code rather than asked of a snap classifier, because both are
-  // comparisons of numbers. Conservation reads the governor's own pressure level for the scarce
-  // resource and asks only whether this task is easy enough to spend it elsewhere; the frontier
-  // review reads the task's risk against the minimumReview cuts above. Both answer with a
-  // probability, so the judgment carries a confidence the way one from anywhere else does.
+  // The judgment answered in code rather than asked of a snap classifier, because it is a
+  // comparison of numbers: the frontier review reads the task's risk against the minimumReview
+  // cuts above. It answers with a probability, so the judgment carries a confidence the way one
+  // from anywhere else does.
   codeJudgments: Object.freeze({
-    conserve: Object.freeze({ high: { easy: 0.9, hard: 0.3 }, increasing: { easy: 0.7, hard: 0.2 }, otherwise: 0.1 }),
     frontierReview: Object.freeze({ risky: 0.9, frontierWork: 0.7, otherwise: 0.15 }),
   }),
   // Where the machine-readable capability priors live, relative to the harness root.
@@ -382,6 +397,16 @@ export function resolvePolicy(overrides = {}) {
   for (const [id, d] of Object.entries(p.domains)) {
     if (!RISK_CLASSES.includes(d.risk)) throw new Error(`routing policy: domain ${id}: risk must be ${RISK_CLASSES.join(', ')}`)
     if (!['multiclass', 'ranking'].includes(d.kind)) throw new Error(`routing policy: domain ${id}: kind must be multiclass or ranking`)
+    if (d.localDecides !== undefined && typeof d.localDecides !== 'boolean') throw new Error(`routing policy: domain ${id}: localDecides must be true or false`)
+    // A policy may take a classifier's authority away, never give back one the code withholds:
+    // decision.js takes such a pick from its rule whatever this says, so switching it on would
+    // only make the Router tab promise an authority nothing gives it.
+    if (DOMAINS[id]?.localDecides === false && d.localDecides !== false) throw new Error(`routing policy: domain ${id}: localDecides cannot be switched on; its local classifier never decides`)
+    // Who teaches a domain is fixed by the code that asks: decision.js opens no Jev question for a
+    // domain a rule decides and asks nobody else for one Jev teaches, so a policy saying otherwise
+    // would only make the Router tab and the controller disagree with what happens.
+    if (d.teacher !== undefined && !['jev', 'code'].includes(d.teacher)) throw new Error(`routing policy: domain ${id}: teacher must be jev or code`)
+    if (DOMAINS[id] && (d.teacher ?? 'jev') !== (DOMAINS[id].teacher ?? 'jev')) throw new Error(`routing policy: domain ${id}: teacher cannot be changed; it is ${DOMAINS[id].teacher ?? 'jev'}`)
   }
   for (const rc of RISK_CLASSES) {
     const g = p.gates[rc]

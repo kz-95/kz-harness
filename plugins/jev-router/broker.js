@@ -21,12 +21,6 @@ const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x))
 const fitOf = (c) => num(c.fit, 0.5)
 const costOf = (c) => num(c.expectedCost?.total, 0.5)
 
-/** Strategies that make sense as an opening move; the rest are transitions the review reaches. */
-export const OPENING_STRATEGIES = Object.freeze([
-  'CHEAP_DIRECT', 'STANDARD_DIRECT', 'PREMIUM_DIRECT', 'LOCAL_FIRST',
-  'CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE', 'CHEAP_EXECUTE_FRONTIER_REVIEW', 'PARALLEL_SECOND_OPINION',
-])
-
 /** Strongest candidate: highest tier, then best fit, then cheaper. `except` ids are skipped. */
 export function strongestOf(candidates, { except = [] } = {}) {
   return [...candidates].filter((c) => !except.includes(c.id))

@@ -130,6 +130,42 @@ test('the policy carries no threshold that nothing reads', async () => {
   assert.equal('lowConfidence' in resolvePolicy(), false)
 })
 
+test('conservation is a hard limit in the decision engine, not a routing domain with cuts of its own', async () => {
+  const { DOMAINS, resolvePolicy } = await import('../routing-policy.js')
+  // A domain is something a classifier learns to decide. Conservation reads the governor's level
+  // for the most capable resource and moves the work in code (decision.js), so it has no ladder,
+  // no training lane and no probability cuts to tune.
+  const policy = resolvePolicy()
+  assert.equal('conservation' in DOMAINS, false)
+  assert.equal('conservation' in policy.domains, false)
+  assert.deepEqual(Object.keys(policy.codeJudgments), ['frontierReview'], 'the frontier review is the one judgment left answered in code')
+})
+
+test('the resource ranking\'s local classifier never decides, and no policy can say it does', async () => {
+  const { DOMAINS, resolvePolicy } = await import('../routing-policy.js')
+  // The owner's decision: the ranking makes the pick at every rung (decision.js). The domain
+  // carries it, so the controller and the Router tab read the same thing.
+  assert.equal(DOMAINS.resource_selection.localDecides, false)
+  assert.deepEqual(Object.keys(DOMAINS).filter((id) => DOMAINS[id].localDecides === false), ['resource_selection'], 'the one domain it holds for')
+  // decision.js takes that pick from the ranking whatever the policy says, so a policy that
+  // switched the classifier back on would only make the Router tab promise what nothing does.
+  assert.throws(() => resolvePolicy({ domains: { resource_selection: { localDecides: true } } }), /routing policy: domain resource_selection: localDecides/)
+  assert.throws(() => resolvePolicy({ domains: { task_classification: { localDecides: 'no' } } }), /routing policy: domain task_classification: localDecides must be true or false/)
+  // Taking a domain's local authority away is a choice the policy may make.
+  assert.equal(resolvePolicy({ domains: { task_classification: { localDecides: false } } }).domains.task_classification.localDecides, false)
+})
+
+test('the domains a rule in code decides are the ones decision.js asks Jev nothing for, and no policy moves them', async () => {
+  const { DOMAINS, resolvePolicy } = await import('../routing-policy.js')
+  // The resource ranking and the frontier review are comparisons of numbers: a rule decides each,
+  // and the Router tab says so at the rungs where it would otherwise say Jev decides.
+  assert.deepEqual(Object.keys(DOMAINS).filter((id) => DOMAINS[id].teacher === 'code'), ['resource_selection', 'frontier_escalation'])
+  assert.throws(() => resolvePolicy({ domains: { frontier_escalation: { teacher: 'jev' } } }), /routing policy: domain frontier_escalation: teacher cannot be changed/)
+  assert.throws(() => resolvePolicy({ domains: { second_opinion: { teacher: 'code' } } }), /routing policy: domain second_opinion: teacher cannot be changed/)
+  assert.throws(() => resolvePolicy({ domains: { task_classification: { teacher: 'someone' } } }), /routing policy: domain task_classification: teacher must be jev or code/)
+  assert.equal(resolvePolicy().domains.frontier_escalation.teacher, 'code')
+})
+
 test('the subscription-to-metered crossover falls where the policy comment says', async () => {
   const { resolvePolicy } = await import('../routing-policy.js')
   const { CURVE_KNEES, conservationCurve, expectedJobCost } = await import('../governor.js')
@@ -202,9 +238,10 @@ test('the minimum review thresholds are described as the fallback they are, not 
   assert.doesNotMatch(note, /always gets an independent review/)
   assert.match(note, /FALLBACK/)
   assert.match(note, /not a floor/)
-  // An operator who edits these keys also moves the fallback resource pick, the fallback
-  // conservation answer and the fallback strategy, so the note says so.
-  assert.match(note, /resource pick/)
+  // An operator who edits these keys also moves the conservation limit and the fallback strategy,
+  // so the note says so. It must not send them to a fallback resource pick: there is none, the
+  // ranking makes the pick at every risk (decision.js), and nothing there reads these cuts.
   assert.match(note, /conservation/)
   assert.match(note, /strategy/)
+  assert.doesNotMatch(note, /fallback resource pick/)
 })

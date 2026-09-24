@@ -11,12 +11,13 @@ unless it says otherwise. Where something is unverified it says so.
 ## State
 
 ```
-branch        main                         49aa6cb, pushed; adaptive routing merged and fixed
+branch        main                         977e39e, pushed; adaptive routing merged, unchanged by the branch below
+              fix/roadmap-open-items       pushed, NOT merged into main; the second pass of 24 Sep
               fix/routing-self-labelling   merged into main, pushed, safe to delete
               feat/routing-stability-local-context   parked by the owner, not merged
 remote        origin github.com/kz-95/kz-harness, PUBLIC
-tests         722 tests, 722 pass, 0 fail  (npm --prefix plugins/jev-router test)
-app           NOT rebuilt since the merge; the running app is on older plugin code
+tests         820 tests, 819 pass, 0 fail, 1 skipped on fix/roadmap-open-items  (npm --prefix plugins/jev-router test)
+app           NOT rebuilt; the running app is on older plugin code than either branch
 ```
 
 Git authorship is the GitHub noreply alias on every commit. All five were rewritten on 22 Sep
@@ -30,13 +31,46 @@ everything, because the API wants the engine's per-process token. If cordis ever
 INACTIVE the app still boots and looks normal, so that 404 is the only cheap sign every KzH
 feature is silently gone.
 
-## Where this was left, 24 Sep: read this first
+## Where this was left, 24 Sep (second pass): read this first
 
-The adaptive router is **merged into `main` and pushed**. It was reviewed before merging, two
-blockers were found and fixed, and the suite is green. It has still **never run in the app**, so
-everything under "Built but NOT observed" continues to apply to it.
+The adaptive router was merged into `main` on 24 Sep (the first pass, below).
+The second pass is branch `fix/roadmap-open-items`: pushed, not merged, and `main` is unchanged by it.
+It closes roadmap §0 items 1 to 3, builds the resource budget (roadmap §1 build steps 1 to 6), deletes conservation as a domain (roadmap §4), carries out two owner decisions, and matches feedback to the task type.
+None of it has run in the app: the router has still never been watched, and the budget page has never been seen, so both belong under "Built but NOT observed".
 
-What the design review found, and what was done about it:
+What the second pass did:
+
+1. **What goes to Jev is scrubbed before it is cut** (roadmap §0 item 1).
+   `jev.js` `route()` scrubs the task, the workspace facts and the handoff note, and every other free-text channel of the route and review calls is scrubbed.
+   Every router-side cut on the way to Jev now scrubs first: the handoff note before its 3000 cut (`router.js`), an executor's thrown error before its 300 cut (`describeError`), check output before its tail is taken (`workspace.js` `runChecks`), and a harness-written note's answer and earlier-note excerpts before their 2000 cuts (`harnessHandoff`).
+   The one exception left is a configured tool's output (`index.js` `runTool`), an owner decision below.
+   Each routing call carries only the state its questions read: the task call the task, the workspace facts and the handoff note; the strategy call the task and `task_profile`; a judgments-only call the task alone.
+   No adaptive routing call carries the candidate table, the history, the availability or the track record; the candidate table rides only the review call.
+2. **Conservation is a hard limit, and the resource ranking is never outranked** (roadmap §4, and an owner decision).
+   The `conservation` domain is gone: it has no state, classifier or new samples, old ones on disk are ignored, and so is `codeJudgments.conserve`; the limit lives in `decision.js` beside the weekly gate and the capability floor.
+   `resource_selection` has `localDecides: false`, which `resolvePolicy` refuses to switch on, and `decision.js` takes the pick from `rankCandidates()` at every rung.
+   `routing-policy.js` `DOMAINS` gained `teacher: 'code'` on resource selection and frontier escalation, and the domain controller holds such a domain to code authority.
+3. **Training samples capped** (roadmap §0 item 2).
+   `routing-samples.jsonl` is capped per domain at `samplesCap(policy)`, 10000 with the shipped gates, and compacted by an atomic rewrite that keeps running totals of what the cap let go of in a `dropped` row; the domains count new evidence on `samples.seen`.
+   A split with no holdout share no longer leaves a one-row holdout slice (`domains.js` `splitRows`).
+4. **The resource budget** (roadmap §0 item 3, §1 build steps 1 to 6), below.
+   It includes a local model's context sized down to the RAM budget, the **Tasks at once** count of runs holding a slot, and the install picker's `unknown` rating for a GPU whose size is capped at 4 GB by `AdapterRAM`.
+5. **Feedback matched by task type.**
+   The feedback bias reads verdicts from every session and every workspace, each weighted 1 for the same task type and 0.25 for any other; [`adaptive-routing.md`](adaptive-routing.md) has the rules.
+   The POST route's handling is `index.js` `createFeedbackRoute` and the router's history deps are `createHistoryDeps`, and both are tested.
+6. **Who decided, in words, and dead code.**
+   A `teacher: 'code'` domain says a rule in code decides at its rung, and a domain whose classifier never decides says so at every rung (`client.js` `maturityWords`).
+   The reasoning line names every authority that decided a domain and which domains the local router decided (`adapter.js` `decidedBy`), and the report header names the same authorities without the domain lists, so a typical adaptive run reads `Jev and routing rules decided` rather than crediting Jev with the pick.
+   The `identities` mapping, `decide()`'s `everyAgent`, the `OPENING_STRATEGIES` fallback, `fallbackYes` and `scarceTop` are gone.
+
+What is next, in order:
+
+1. Everything under "For the desktop agent" below, starting with getting the branch into the app and watching one routed run.
+2. Providerise `jev.js` (roadmap §2 step 1), then Laya (roadmap §2 steps 2 to 4).
+
+### The first pass, for context
+
+The adaptive router was reviewed before it was merged, and two blockers were found and fixed:
 
 1. **The router trained on its own picks.** Once a domain reached local authority, `pickOf`
    returned the local classifier's own answer and an accepted run filed it as `teacher_confirmed`.
@@ -44,60 +78,57 @@ What the design review found, and what was done about it:
    `training.js` now drops the agreeing label under local authority; evidence that contradicts the
    pick still trains it. A bare thumbs-up also counted as a full-weight human routing label and fed
    promotion, so only the explicit `good pick` tag counts now. Commit `5d7b9f4`.
-2. **Three questions asked Jev to compare numbers.** The `resource` choice handed it capability
-   scores, scarcity, expected cost, reliability and latency and asked which candidate wins;
-   `conserve` and `frontierReview` had the same shape. That is several judgments in one question
-   over magnitudes a snap-judgment classifier cannot compare (QUICKREF rules 2 and 4).
-   `rankCandidates()` in `broker.js` now does it in code under a new `code` authority, and the two
-   yes/no answers come from the governor and the policy. `questions.strategy` stayed: a choice
-   between named shapes is a judgment. Commit `a0528db`.
+2. **Three questions asked Jev to compare numbers.**
+   The `resource` choice handed it capability scores, scarcity, expected cost, reliability and latency and asked which candidate wins; `conserve` and `frontierReview` had the same shape.
+   That is several judgments in one question over magnitudes a snap-judgment classifier cannot compare (QUICKREF rules 2 and 4).
+   `rankCandidates()` in `broker.js` now does it in code under a new `code` authority.
+   The frontier review became a rule in code, and conservation, in the second pass, a hard limit rather than a judgment.
+   `questions.strategy` stayed: a choice between named shapes is a judgment.
+   Commit `a0528db`.
 
-Consequences worth knowing before reading the code:
+The two consequences that pass left open are closed by the second pass: `resource_selection`, which has no Jev teacher, is decided by the ranking in code at every rung and its local classifier never decides, and the comment above the ranking in `decision.js` says so; and conservation, left with nothing to do, is a plain limit rather than a domain.
+The first pass also gave local models a memory answer (`8539b9f`), `estimateMemory()` before a run and `readMemoryUsage()` after it, which became the first piece of the resource budget below.
 
-- `resource_selection` has **no Jev teacher any more**. It trains only on rescues, negatives and a
-  person's `good pick` tag, so it matures slowly or not at all. The optimistic comment at
-  `decision.js:169` has not been rewritten to say so. Decide which you want, and write it down.
-- **Conservation was left with nothing to do** once the ranker prices scarcity itself, so its
-  action was redefined: it now removes the most capable resource from the WORK pool whether or not
-  the ranking picked it, keeping it available to review. A reviewer's verdict on that was to delete
-  the domain outright and keep the removal as a plain pool filter beside the other hard limits.
-  That is still open, and it is the largest single deletion available here.
+### The resource budget, built
 
-Local models gained a memory answer (`8539b9f`). `estimateMemory()` gives the rough figure before
-anything runs, being the weights, the KV cache for that context and the compute scratch, split the
-way the layers will load. `readMemoryUsage()` reads the engine's own load report afterwards, which
-names the device holding each buffer, so the split is read rather than guessed. A reading is stored
-against the model **and** the context size it was measured at, because a reading for one context
-says nothing about another. This is the first piece of the resource budget below.
+Agreed scope, now built: **one budget page, all consumers**, being max VRAM, max RAM, max cores and max concurrent tasks.
+Roadmap §1 has the design and says where the build differs from it, and the README's local models section has the page as a person sees it.
 
-What to do next, in order:
+The API behind the page:
 
-1. **Rebuild the exe and watch a routed run in the app.** The running copy is on older plugin code.
-   This is still the one thing the router has never had.
-2. **Scrub the handoff before it goes to Jev** (`jev.js:544`). The task text is scrubbed, the
-   earlier agent's output is only clipped, and the workspace text is not scrubbed either. A
-   one-line fix, on the owner's own stated privacy terms.
-3. **Cap `routing-samples.jsonl`.** Eight rows per routed run, no cap, no rotation, parsed whole at
-   startup and mirrored in memory. A `slice(-N)` on load covers it.
-4. **Set a thread cap.** `llamaArgs` accepts `threads` and nothing sets it, so llama.cpp takes every
-   core and the rest of the machine crawls.
-5. Then the resource budget, the conservation deletion, and the open work below.
+- `GET /jev-router/local` returns `{ ...status(), online, slots }` (`index.js` `localStatus`).
+  `slots` is `{ held, waiting, max }` from `tasks.js` `createLanes().slots()`: `held` is the agent runs holding a slot under `maxConcurrentTasks` across every workspace, a foreground `/auto`, `/<agent>` or `jev_route` run counting the same as a background task; `waiting` is the runs kept out by the cap alone, the first in line in a workspace where nothing runs, and nothing with no cap; `max` is null with no cap.
+  `status().settings` holds `maxVramGB` (GB of 1024^3 bytes, above 0 and at most 1024, or null for no limit), `maxRamGB` (above 0 and at most 4096, or null), `maxCores` (whole number 1-256, or null), `maxConcurrentTasks` (whole number 1-64, or null), and `measured`, keyed `'<modelId>@<ctx>'`, each reading `{ vramGB, ramGB, totalGB, gpuFraction, roomGB, gpuLayers, at }`.
+  `settings.chatModel` is the chat model in effect: the stored choice if the budget lets it load, else the quickest installed model that fits, else null.
+  `status().budget` is `{ threads, defaultThreads, fitTargetMiB, vramNotApplied }`: the `-t` the next load gets, what an unset core limit means, the MiB kept free per GPU, and why the VRAM budget cannot be held (`GPU layers are pinned to N, which --fit does not move`, `this GPU reports its memory through a 32-bit field that stops at 4 GB`, or `this PC's GPU memory is unknown`), else null.
+  `status().engine` adds `threads`, `fitTargetMiB` and `workingSetGB`, the watchdog's latest reading in GB, only while a RAM budget is set.
+  Each `status().modules[]` entry has `ctx`, the context the next load gets, sized to the RAM budget; `ctxReducedFrom`, the context it would have had without the budget, or null; `memory` at that context (`{ vramGB, ramGB, totalGB, gpuFraction, source }`, `source` being `estimated` or `measured`, plus `roomGB`, `gpuLayers` and `at` when measured); and `overBudget`, the refusal text or null.
+- `POST /jev-router/local/settings` takes a patch with any of the four fields: a field left out keeps its value, and null lifts the limit.
+  It answers 200 `{ ok: true }`, or 400 `{ error }` with exactly one of `max VRAM: GB above 0, at most 1024, or null for no limit`, `max RAM: GB above 0, at most 4096, or null for no limit`, `max cores: whole number 1-256, or null for no limit` or `max concurrent tasks: whole number 1-64, or null for no limit`.
+  A refused patch saves nothing.
 
-### The resource budget, agreed and part-built
+The budget's refusal, which is `start()`'s error, the router's readiness detail and a module's `overBudget` alike, reads `<Name> needs about <ramGB> GB of RAM even at the 12k context floor (<estimated|measured>: <vramGB> GB VRAM + <ramGB> GB RAM), over the resource budget of [<maxVramGB> GB VRAM + ]<maxRamGB> GB RAM. Raise the RAM budget or use a smaller model.`
+It reads `at <ctx> context` in place of `even at the 12k context floor` only for a model whose context starts under the floor (set so by the plugin config or the manifest's `maxContext`), since the budget sizes every other context down before it refuses.
+After a watchdog unload at the 12k floor it reads `the RAM watchdog unloaded <Name>: its working set stayed over the <maxRamGB> GB RAM budget for <s> s (last reading <GB> GB). Raise the RAM budget to load it again.`
+`detectSpecs` marks a GPU sized from `Win32_VideoController.AdapterRAM` at 4293918720 bytes or more with `sizeCapped: true`, and its real size is treated as unknown for the VRAM budget and in the install picker.
 
-Agreed scope: **one budget page, all consumers**, being max VRAM, max RAM, max cores and max
-concurrent tasks, with the local model sizing itself to fit, refusing to start when it cannot, and
-the task queue respecting the concurrency cap. The estimate and the measured readback are done; the
-budget itself, the computed `--fit-target` and `-t`, refuse-to-load, the watchdog and the settings
-UI are not.
+How the context is sized (`local.js` `planFor`): the largest of `contextSteps(ctx)`, from the context the model would start with down to 12288 in whole k, whose figure fits the RAM budget, a VRAM budget counting through the GPU room it leaves.
+The chosen context is the `-c` that `start()` passes, what `status()` reports and what a measured reading is stored under.
+`contextOf(id)` is the running engine's `-c` while it runs that model, else the context `planFor` last chose, else the manifest default, and `agents()` reports `llm.contextSize` as the smaller of the planned and the running context.
+`index.js` `onSettings` calls `refreshLocal()`, so the router's local agents pick up the budget-sized window after any settings save.
+A loaded model is not restarted when the budget changes; its window follows only after it unloads.
+The watchdog records an unload as `{ why, ctx }`, the next load is sized below that context, and only an unload at the 12k floor leaves the model refused, until `maxRamGB`, `maxVramGB` or `gpuLayers` changes.
 
-Honest limits, so nobody promises more than this can do. VRAM is a real cap, because `--fit-target`
-already controls exactly that and only needs computing from the budget rather than hardcoding
-256 MiB. Cores is real, via `-t`. Concurrency is real, via the queue. **RAM is not a hard cap**:
-Windows needs a native Job Object for that and none is being added, so what it does instead is size
-the context to fit, refuse a model whose estimate exceeds the budget, and unload from a watchdog
-when the real working set runs over. The Electron shell and the browser view are counted but never
-capped, because they have to run.
+Honest limits, so nobody promises more than this can do.
+VRAM is a real cap where `--fit` can hold it: `--fit-target` keeps free everything the GPU has beyond the budget, but not with GPU layers pinned by hand, or on a GPU whose size is unknown or capped at 4 GB by `AdapterRAM`, and then the page says `VRAM budget not applied`.
+Cores is real, via `-t`.
+Concurrency is real, via the cap on the lanes in `tasks.js`, and it counts foreground runs as well as background tasks.
+**RAM is not a hard cap**: Windows needs a native Job Object for that and none is being added, so the RAM budget sizes the context down until the figure fits, refuses a model whose figure is over it even at the 12k floor, and has a watchdog unload a model whose real working set stays over it for 30 s.
+The Electron shell and the browser view are never capped and are not in the figures, because they have to run.
+
+Two things worth knowing before touching the page.
+The card's status poll applies only its newest response (`client.js` `useLocal`), so a slow poll can no longer undo a save on screen.
+`test/budgetpanel.test.js` runs the whole `LocalModelsCard` with a stand-in React that keeps state, over a real `createLocalModels` behind stubbed routes (`card()`, `statefulReact()`), a pattern other card tests can reuse.
 
 ### Laya, discussed and not started
 
@@ -127,43 +158,64 @@ answers** stays in code and stays dumb. Highest maturity wins, ties go to the ch
 anything rolled back is out, and nobody mature means Jev. A learned arbiter would have less
 evidence than the classifiers it arbitrates, and would make a bad pick unattributable.
 
-### Still open from the merge review, none of it blocking
+### From the merge review: all closed on 24 Sep
 
-- `state.candidates` still ships the full numeric table for `questions.strategy`, which names none
-  of its fields. The same cut that removed `candidate_track_record` stopped one field short.
-- `decision.js:647` pushes a conservation sample for labelling even when conservation changed
-  nothing, which the comment three lines above warns against. Masked today only because `confirms()`
-  drops the positive label under `code`.
-- A mature local classifier still outranks the `code` ranking for `resource_selection`, on a label
-  diet made entirely of failures.
-- Dead after the change: `fallbackYes` and `scarceTop` in `decision.js`.
-- `history` and `first_resource` still ride a judgments-only call that reads only `task`.
-- The flaky acceptance test `five tasks in one workspace, every state, then a restart` passes
-  standalone in 0.14 s and has failed under full-suite load at 2 s. Not hardened.
+The six items still open from the merge review are closed by the second pass, so nobody re-opens them.
+`state.candidates` no longer rides the strategy call, because no routing call carries candidate data.
+No conservation sample exists to push for labelling.
+A mature local classifier cannot outrank the `code` ranking (`localDecides: false`).
+`fallbackYes` and `scarceTop` are gone from `decision.js`.
+`history` and `first_resource` ride no judgments-only call.
+The acceptance test `five tasks in one workspace, every state, then a restart` awaits `tasks.flushed()` and runs on an injected clock, where it used to poll the file for up to 2 s and failed under full-suite load.
+
+## For the desktop agent
+
+These need the Windows machine, the running app or the owner, and could not be done in the cloud session that built `fix/roadmap-open-items`.
+
+1. **Get the branch into the app and watch one routed run** (roadmap §0 item 4).
+   Where: `C:\Harness` on the branch (or on `main` once it is merged), then start KzH fresh, since a `client.js` change needs an app START; the branch changes no `app/` code, so the exe needs rebuilding (`npm run package`, app stopped first) only if `app/` has changed since.
+   Route one project task under **Jev Auto** and open the Jev inspector.
+   Done when: the **Router** tab lists all seven domains with real sample counts; frontier escalation's words name a rule in code at its rung (`a rule in code decides; the local router is not trained yet` at JEV_PRIMARY), and resource selection reads `a rule in code decides at every rung; the local router is recorded beside it for comparison and never decides`; the run's reasoning block carries the decision line (`adapter.js` `decidedBy`), on a cold router `Jev and routing rules decided; 2 Jev calls; 3 candidates considered` (the task call, then the strategy and second-opinion call), or `the local router (task classification, skill selection), Jev and routing rules decided; 1 Jev call; ...` once both task domains answer locally, and the report header uses the short form, `AUTO (Jev and routing rules decided)` or `AUTO (the local router, Jev and routing rules decided)`; and the **Decisions** tab shows each `RESOURCE_x` key with its agent id next to it.
+2. **Look at the Resource budget table** (Settings → Jev setup → Local models, with at least one local model installed).
+   Check: the four rows (VRAM, RAM, Cores, Tasks at once) with their Budget, Now and Estimated peak cells; a field saves when it loses focus; blank is no limit; `4,5` is read as 4.5 and `4,096` is refused; a refused field keeps its own error line under the table; an over-budget model shows the `over budget` pill and the refusal word for word; the chat model select shows `None fits the budget` when nothing fits; a model the RAM budget sized down shows `The budget reduced its context from <X> to <Y>, the largest that fits it.`; the soft-RAM note and the 12k context warning read as the README says; and the Tasks at once Now cell shows the runs holding a slot (`0` when nothing runs), with `N waiting` beside it when a cap is set and runs wait, and `-` only when the response carries no count.
+   Look at it at the app's normal width and at a narrow one.
+   Done when every item reads as described and nothing clips or overlaps at either width.
+3. **Right-panel guide icons**: the seven KzH rows showing the generic cube (see "Open work an agent can do").
+   Done when each of the seven rows shows its own icon in the running app.
+4. **Installer fixes**, each needing the Windows machine to test.
+   `scripts/Install-Harness.ps1:60` treats any `cordis.patch.yml` containing "jev-router" as configured, so a privacy setting added later never lands on a re-run.
+   `scripts/Set-TypeSafeKey.ps1:7` writes a second, persistent HKCU copy of `TYPESAFE_API_KEY`, which `Start-KzH.ps1:21` reads back.
+   `C:\HarnessProjects` is hardcoded at `app/main.js:536`, `Start-KzH.ps1:6` and `scripts/Install-Harness.ps1:74`.
+   Done when a re-run adds a missing setting, the key lives only in `~/.kzh/.env`, and the projects folder follows `-Workspace`.
+5. **Providerise `jev.js`** (roadmap §2 step 1), then Laya (roadmap §2 steps 2 to 4).
+   Not started.
+   Step 1 is a pure refactor that needs no app; Laya's steps need the machine to install and shadow it.
+6. **Exercise the gemma transfer against a real local model** (`plugins/jev-router/format.js`).
+   Done when one finished background result is posted in the running app with a local chat model installed.
+7. **The `Use it here` kill path.**
+   Done when, on the real machine, a click is seen to stop an orphaned engine on port 3080 and to refuse anything whose command line is not the engine.
+8. **Owner decision: a configured tool's output is cut before it is scrubbed.**
+   `index.js` `runTool` keeps the last 8000 characters as the answer and the last 500 as the diagnostic, so a key straddling the cut reaches the review call as a fragment; scrubbing first changes what the person is shown and what history stores.
+   Options: scrub the tool answer everywhere, or keep a scrubbed copy for Jev.
+   Done when the owner has chosen and the choice is in roadmap §5.
+9. **Owner decision: whether Jev is offered the whole capability vocabulary.**
+   Jev is offered only the capabilities some agent in the pool can carry out (the "Still open" bullet under the 23 Sep fix rounds); offering the whole vocabulary so code can refuse is a design choice.
+   Done when the owner has chosen and the choice is in roadmap §5.
 
 ## Open, and needing the OWNER, not an agent
 
-1. **Feedback privacy.** Up to three recent reason STRINGS ride the routing call to TypeSafe,
-   inside the per-agent track record, in both modes. With `routing.enabled: false` they go in
-   the legacy named call (`agent_track_record`). Under adaptive routing, the default,
-   `decision.js` now passes the id-to-key mapping, so they go in the resource call as
-   `candidate_track_record`, re-keyed to `RESOURCE_x` and with agent ids, display names,
-   providers, model ids (short ones such as `o3` included) and vendor words masked.
-   Each string is the chosen tag, when there is one, followed by the reason the person typed.
-   In both modes key-shaped secrets and `Bearer` tokens in it are redacted by the same scrubber the Markdown export uses.
-   In adaptive mode everything else goes out as typed, and in legacy mode no names are masked.
-   Keep, counts-and-tags-only, or local-only.
-   Worth knowing before deciding: the bias that actually moves a pick is computed locally by
-   `router.js` `feedbackPrior` from `feedback.jsonl` and applied to the resource pick's
-   probabilities in the `router.js` block that opens with the comment `// The feedback prior, applied.`
-   Under adaptive routing those probabilities come from the `resource_selection` domain: they are Jev's while that domain has Jev decide, the local classifier's when it answers for itself at a local rung, and the deterministic fallback's (all weight on one resource) when Jev is not configured, fails or has no answer.
-   With `routing.enabled: false` they are Jev's.
-   So the strings only flavour the single call they ride on.
-   Nothing accumulates on the far side for your benefit.
-   Defaults are easy; the choice is not an engineering one.
-2. **The `Use it here` holder test** is narrow but not ownership-proof: it can stop a manually
-   started copy of the pinned engine on 3080, though it needs an explicit click and refuses
-   anything whose command line is not our engine.
+1. **The `Use it here` holder test** is narrow but not ownership-proof: it can stop a manually started copy of the pinned engine on 3080, though it needs an explicit click and refuses anything whose command line is not our engine.
+2. **A configured tool's output is cut before it is scrubbed**, and **whether Jev is offered the whole capability vocabulary**: items 8 and 9 of "For the desktop agent".
+
+### Decided by the owner, 24 Sep 2026
+
+- **Feedback privacy: keep as now.**
+  Now means this, checked against `jev.js` `route()`: the typed reasons ride only the legacy named call (`routing.enabled: false`), inside `agent_track_record`, with key-shaped secrets and `Bearer` tokens scrubbed and names not masked.
+  Each is the chosen tag, when there is one, followed by the reason the person typed, up to three per agent, from this session only.
+  Under adaptive routing, the default, no routing call carries any track record, availability or history, so the reasons do not leave the machine at all.
+  The bias that moves a pick is computed locally either way (`router.js` `feedbackPrior`, applied in the block that opens with the comment `// The feedback prior, applied.`), to the ranking's probabilities under adaptive routing and to Jev's with `routing.enabled: false`.
+- **A mature local classifier may not outrank the `code` ranking.**
+  The resource ranking decides at every rung (`localDecides: false` in `routing-policy.js` `DOMAINS`), and no policy can switch that on.
 
 ## From the pre-publication audit, 22 Sep
 
@@ -199,24 +251,20 @@ independently re-derived.
 
 ## Open work an agent can do
 
-- **Task-type matching for feedback**, the next real lever. Whether the feedback loop improves
-  routing accuracy is UNMEASURABLE until real verdicts accumulate, and there is no task-type
-  matching yet, so "similar work" currently means "same session" (`deps.history.feedback` is
-  called with a `sessionId`). Recording task features at routing time and matching on them is the
-  change. It touches the same function as the privacy question above, so settle that first.
 - **Exercise the gemma transfer against a real local model** (`plugins/jev-router/format.js`).
   No real local call has ever been made, only fake streams.
   One finished background result posted in the running app, with a local chat model installed, would settle it.
+  It needs the machine: item 6 of "For the desktop agent".
 - **Right-panel guide icons.** KzH registers seven guide rows in `plugins/jev-router/client.js` (Browser, Terminal, Background tasks, Subagents, Usage, Session overview, Jev inspector) and passes no icon for any of them, so all seven show the same generic cube.
   Only Workspace files, the engine's own row, has a real folder icon, so something already makes that one different.
   Find what, then give KzH's seven rows relevant icons.
-- **Watch the adaptive router in the running app**, which is the one thing it has never had. Start
-  KzH, open the Jev inspector, and check three things: the **Router** tab lists all eight domains
-  with real sample counts, a routed run's reasoning block carries the `Jev decided; N Jev calls;
-  M candidates considered` line, and the Decisions tab shows the candidate table as the router
-  saw it, each `RESOURCE_x` key with its agent id next to it (the person sees the mapping; Jev
-  does not). Everything else about it is already exercised by
-  `node scripts/kzh-routing-demo.mjs --learn 60`, which needs no engine and no network.
+- **Watch the adaptive router in the running app**, which is the one thing it has never had.
+  Start KzH, open the Jev inspector, and check four things: the **Router** tab lists all seven domains with real sample counts; the two domains a rule in code decides say so at their rung; a routed run's reasoning block carries the decision line, on a cold router `Jev and routing rules decided; 2 Jev calls; 3 candidates considered`; and the Decisions tab shows the candidate table as the router saw it, each `RESOURCE_x` key with its agent id next to it (the person sees the mapping; Jev does not).
+  Item 1 of "For the desktop agent" has the exact words to look for.
+  Everything else about it is already exercised by `node scripts/kzh-routing-demo.mjs --learn 60`, which needs no engine and no network.
+- **Two small edges in the budget-sized context**, neither urgent.
+  A measured reading over the RAM budget moves the next load down 1k without a watchdog unload, and the router keeps the old, larger window until its next refresh; the watchdog normally catches the same overload.
+  `index.js` `refreshLocal` joins a refresh already in flight (`refreshing ??=`), which may have read the settings before a save that lands during it; this predates the branch, applies to `onChange` too, and the window is small.
 - **Benchmark evidence has no source yet.** `profiles.js` aggregates three kinds of evidence -
   declared priors, published benchmarks and this harness's own verified runs - and only the first
   and third ever arrive. Nothing writes a `benchmark` row or a `benchmark_prior`; the source is
@@ -231,11 +279,7 @@ independently re-derived.
   that reproduced every defect with a probe, and every fix proven by a test that fails against
   the old code.
   Closed, so nobody re-opens them:
-  - Routing: every router swap (capability, tie-break, weekly gate, feedback, retry, `LOCAL_FIRST`
-    hand-over) goes only to an agent that can do the job, and none brings back an agent a hard
-    fact excluded; a capability outranks conservation and the gate, and the gate yields visibly
-    (`gateYielded`) only when nothing ungated can do it; `gateOverride` reaches the engine in a
-    wired install, and a gated resource the override does not keep is recorded as past its gate.
+  - Routing: every router swap (capability, tie-break, weekly gate, feedback, retry, `LOCAL_FIRST` hand-over) goes only to an agent that can do the job, and none brings back an agent a hard fact excluded; a capability outranks the conservation limit and the gate, and the gate yields visibly (`gateYielded`) only when nothing ungated can do it; `gateOverride` reaches the engine in a wired install, and a gated resource the override does not keep is recorded as past its gate.
   - Every move the router makes is recorded in `routing.moves` with its own target, and the report
     and the inspector name each one, the tie-break included.
   - A review the plan promised goes to the reviewer it named, whatever asked for it.
@@ -246,14 +290,13 @@ independently re-derived.
     otherwise reads as unknown.
     It refuses policy values its arithmetic cannot use, and conservation acts only on a resource
     that is actually being used up.
-  - Masking: short model ids, a vendor word with a version, and a point release after any name are
-    masked; model aliases are not names; the routing call and the review call mask the same names
-    (`features.js` `identityNames`: id, display name, providers, model ids), including the model a
-    CLI agent really runs; no field is a hiding place from the masker.
+  - Masking: short model ids, a vendor word with a version, and a point release after any name are masked; model aliases are not names; no field is a hiding place from the masker.
+    The review call masks the names `features.js` `identityNames` gives (id, display name, providers, model ids), including the model a CLI agent really runs.
+    Since the second pass the adaptive routing calls carry no identity channel at all, so beyond the key scrub of their free text (task, workspace, handoff) there is nothing in them to mask.
   - The review call says truthfully why each resource is outside the work table and carries the
     numbers of one kept for review.
-  - Labels: a planned forced review is not a rescue; a strategy, conservation, second-opinion or
-    frontier answer is labelled by a run only where it could change that run.
+  - Labels: a planned forced review is not a rescue; a strategy, second-opinion or frontier answer is labelled by a run only where it could change that run.
+    Conservation, a limit since the second pass, is never labelled.
   - Verdicts: the client sends the run id every routed answer carries, so a verdict lands on its
     own run; a verdict credits capability evidence once, relabels its run's routing samples, keeps
     what it counted only when re-posted unchanged, and is withdrawn by a clear or a change even with
@@ -282,9 +325,9 @@ independently re-derived.
     that newer run.
   - Executors: only local runs return `modelVersion`; a cloud or subscription executor that can
     report the model it served should return it from `execute`, and `router.js` will record it.
-  - The `POST /jev-router/feedback` line itself is untested: `acceptVerdict` and `onVerdict` are
-    tested end to end with a real registry, training store and feedback log, but nothing drives
-    `apply()`, so the one line that calls `acceptVerdict` from the route is covered by reading only.
+  - The `POST /jev-router/feedback` handling is `index.js` `createFeedbackRoute` now, tested end to end in `profiles.test.js`: a verdict is stored, credited and relabelled; a bad body is a 400; learning off is honoured; posts are applied in stored order; and the next verdict is taken after a store failure.
+    The history deps `apply()` gives the router are `createHistoryDeps`, which is tested too.
+    Still untested, because they need the plugin runtime: the deps object `apply()` passes to `createFeedbackRoute` (`records: allRecords`, `agents: enabledAgents`, `learn: () => config.routing?.learn !== false`, `log` and the rest) and the one-line `send(status, body)` branch.
 
 Closed on the way past, so nobody re-opens them: the `README.md` dangling "described below" is gone
 (it reads "the list below" and resolves), and the one machine-specific path in the repo, a Windows
@@ -309,6 +352,9 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
   the usual reason that a `client.js` change needs an app START. Reference:
   [`adaptive-routing.md`](adaptive-routing.md); what it still does not do is the last section of
   that file, not repeated here.
+- **Everything the second pass built** (24 Sep, `fix/roadmap-open-items`, not merged).
+  The scrub-before-cut rule, the conservation limit, the samples cap, feedback matched by task type and the Router tab's words for code-decided domains are covered by tests only.
+  The resource budget is too: the `local`, `tasks` and `budgetpanel` test files drive the settings, the refusal, the watchdog on its own clock, the thread and `--fit-target` arithmetic, the lanes' cap and the whole settings card, but no real llama-server has been started under a budget, no working set has been read on Windows, and nobody has looked at the page.
 - **Live provider quota through the new adapters.** `snapshotResources` reads the same
   `usage.js` numbers the Usage tab has always shown, so the inputs are real, but the normalised
   snapshot (`kind`, `scope`, `rolling`, `resetsAt`, `source`, `confidence`, `fieldSources`) has

@@ -3,6 +3,7 @@
 import { execFile, spawn } from 'node:child_process'
 import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
 import { dirname, extname, join, resolve } from 'node:path'
+import { redactSecrets } from './export.js'
 
 /** Kill a child and everything it started. On Windows a shell child's grandchildren (npm, node) survive a plain kill. */
 export function killTree(child) {
@@ -142,7 +143,10 @@ export async function runChecks(cwd, { scripts, timeoutMs, outputChars, signal }
   const results = []
   for (const name of available) {
     const r = await run('npm', ['run', '-s', name], { cwd, shell: process.platform === 'win32', timeoutMs, signal })
-    results.push({ name, passed: r.code === 0, exitCode: r.code, durationMs: r.durationMs, output: tail(r.output.trim(), outputChars) })
+    // A test or a build prints whatever the run had in its environment, and the review sends the
+    // output to Jev. It is scrubbed before the tail is taken: a key the cut starts inside loses the
+    // prefix the scrubber knows it by, and the rest of it would go out as ordinary text.
+    results.push({ name, passed: r.code === 0, exitCode: r.code, durationMs: r.durationMs, output: tail(redactSecrets(r.output.trim()), outputChars) })
   }
   return results
 }

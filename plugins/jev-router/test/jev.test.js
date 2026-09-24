@@ -109,13 +109,6 @@ const TABLE = [
   { key: 'RESOURCE_A', tier: 'frontier', source: 'subscription', capabilities: { coding: { score: 0.9, confidence: 0.8, samples: 4 } }, scarcity: 0.4, marginalCost: 'low', expectedCost: { total: 0.3, class: 'low' }, latency: 'slow', availability: 'ok', evidenceSamples: 4 },
   { key: 'RESOURCE_B', tier: 'strong', source: 'subscription', capabilities: { coding: { score: 0.8, confidence: 0.8, samples: 9 } }, scarcity: 0.7, marginalCost: 'low', expectedCost: { total: 0.4, class: 'low' }, latency: 'slow', availability: 'near', evidenceSamples: 9 },
 ]
-// What the decision engine knows and the table does not show: which key is which agent.
-const IDS = [
-  { id: 'claude', key: 'RESOURCE_A', names: ['Claude Code', 'claude-code', 'claude-opus-5'] },
-  { id: 'codex', key: 'RESOURCE_B', names: ['Codex (GPT)', 'codex', 'gpt-5.6'] },
-  // Configured, but not in this call's table (a hard fact dropped it): it has no key here.
-  { id: 'deepseek', key: 'RESOURCE_C', names: ['DeepSeek agent', 'spawn', 'deepseek', 'deepseek-flash'] },
-]
 const HISTORY = [{ task_type: 'implementation', first_agent: 'claude', attempts: 1, outcome: 'accepted' }, { task_type: 'debugging', first_agent: 'deepseek', attempts: 2, outcome: 'needs_human' }]
 const AVAILABILITY = { claude: 'ok', codex: 'near limit', deepseek: 'ok' }
 const TRACK = {
@@ -130,39 +123,44 @@ test('a routing call with the anonymous table names no agent in any field, and s
   // table, so the names lined up with the keys trivially. The per-candidate track record and
   // availability have since gone entirely: the resource question that read them is decided in
   // code now, and state no question reads costs tokens and accuracy on the state that is read.
+  // The history re-keyed to the table went the same way once the table itself stopped riding the
+  // strategy call: a key nothing in the call describes tells the teacher nothing.
   const { sent, restore } = captureCalls()
   t.after(restore)
   const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
   await jev.route({
     task: 'make the failing test pass', context: { branch: 'main' },
-    candidates: TABLE, history: HISTORY, availability: AVAILABILITY, trackRecord: TRACK, identities: IDS,
-    taskProfile: { complexity: 0.5, risk: 0.3 }, ask: { task: false, resource: true, judgments: true },
+    candidates: TABLE, history: HISTORY, availability: AVAILABILITY, trackRecord: TRACK,
+    strategies: ['CHEAP_DIRECT', 'STANDARD_DIRECT'], taskProfile: { complexity: 0.5, risk: 0.3 }, ask: { task: false, resource: true, judgments: true },
   })
   assert.equal(sent.length, 1)
-  assert.deepEqual(leaks(sent[0]), [], 'a real name rode out next to the anonymous table')
+  assert.deepEqual(leaks(sent[0]), [], 'a real name rode out in a call about the anonymous candidates')
   const s = sent[0].state
-  // The information stays; only the name goes.
-  assert.equal(s.recent_outcomes[0].first_resource, 'RESOURCE_A', 'the history row is re-keyed to the table key')
-  assert.equal(s.recent_outcomes[1].first_resource, undefined, 'a resource outside the table gets no key nothing describes')
-  assert.equal(s.recent_outcomes[1].outcome, 'needs_human', 'and the rest of the row survives')
+  assert.equal(s.recent_outcomes, undefined, 'no question reads the history, so it is not sent')
+  assert.equal(s.candidates, undefined, 'nor the table it was keyed to')
   assert.equal(s.candidate_track_record, undefined, 'no question reads it, so it is not sent')
   assert.equal(s.candidate_availability, undefined)
   assert.equal(s.agent_track_record, undefined)
   assert.equal(s.agent_availability, undefined)
 })
 
-test('without the id-to-key mapping, the per-agent channels are dropped rather than sent under the names', async (t) => {
+test('a call that does not ask the named question carries no per-agent channel, and the id-to-key mapping changes nothing', async (t) => {
+  // The per-agent channels once rode the anonymous calls re-keyed through the decision engine's
+  // id-to-key mapping. No question in those calls reads them, so they are not sent at all, and the
+  // mapping has nothing left to re-key: a call made with it must be the call made without it.
   const { sent, restore } = captureCalls()
   t.after(restore)
   const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
-  await jev.route({ task: 'fix it', context: {}, candidates: TABLE, history: HISTORY, availability: AVAILABILITY, trackRecord: TRACK, ask: { task: false, resource: true } })
+  const strategyCall = { task: 'fix it', context: {}, candidates: TABLE, strategies: ['CHEAP_DIRECT', 'STANDARD_DIRECT'], history: HISTORY, availability: AVAILABILITY, trackRecord: TRACK, ask: { task: false, resource: true } }
+  await jev.route(strategyCall)
   // The decision engine's task-only call carries no table and asks nothing about resources.
   await jev.route({ task: 'fix it', context: {}, history: HISTORY, availability: AVAILABILITY, trackRecord: TRACK, ask: { task: true } })
   assert.equal(sent.length, 2)
   for (const call of sent) {
     assert.deepEqual(leaks(call), [])
     assert.equal(call.state.candidate_track_record, undefined)
-    assert.equal(call.state.recent_outcomes[0].task_type, 'implementation', 'the history row stays, minus who ran it')
+    // Only the named question reads the history, and neither of these calls asks it.
+    assert.equal(call.state.recent_outcomes, undefined, 'the history rode a call that does not read it')
   }
 })
 
@@ -263,55 +261,52 @@ test('the review call accepts the check shape jev-review really sends', async (t
 
 // A local agent as config.example.json has it: the provider and the cost tier are generic words.
 const LOCAL_AGENT = { id: 'qwen-local', name: 'Qwen local', provider: 'spawn', kind: 'local', llm: { provider: 'local', model: 'qwen2.5-coder:7b' } }
-// A caller that passes every string it has, generic ones included. The masker must refuse those.
-const LOCAL_IDS = [{ id: 'qwen-local', key: 'RESOURCE_A', names: ['Qwen local', 'local', 'spawn', 'free-local', 'qwen2.5-coder:7b'] }]
-const LOCAL_TABLE = [{ key: 'RESOURCE_A', tier: 'standard', source: 'local', capabilities: { coding: { score: 0.5, confidence: 0.5, samples: 2 } }, scarcity: 0, marginalCost: 'free', expectedCost: { total: 0, class: 'free' }, latency: 'fast', availability: 'ok', evidenceSamples: 2 }]
-const localTrack = () => ({
-  'qwen-local': {
-    cost_tier: 'free-local', availability: 'ok',
-    here_by_task_type: { review: { attempts: 3, accepted_rate: 0.67 }, implementation: { attempts: 1, accepted_rate: null, note: 'too few attempts to judge' } },
-    overall: { attempts: 4, accepted_rate: 0.5 },
-    feedback: { likes: 1, dislikes: 0, suggested: 0, recent_reasons: ['qwen2.5-coder:7b did the review fine, local is fast'] },
-  },
-})
 
-test('a local agent is re-keyed in the history like any other, and its generic words survive', async (t) => {
+test('a local agent is re-keyed in the review call like any other, and its generic words survive', async (t) => {
   // The masker treated every configured string as a name and rewrote every string and object key
   // it carried, so with a name of 'local' a categorical fact went out as 'free-[resource]', and a
-  // task type that is also an agent id became a key. The history row is the channel that still
-  // rides this call, so it is the one that proves a generic word is not a name.
+  // task type that is also an agent id became a key. The routing calls no longer carry anything
+  // per resource, so the review call's attempts are the channel that proves a generic word is not
+  // a name: the agent's own names ('spawn' and 'local' among them) are what the masker is handed.
   const { sent, restore } = captureCalls()
   t.after(restore)
   const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
-  await jev.route({
-    task: 'review the parser', context: {}, candidates: LOCAL_TABLE, identities: LOCAL_IDS,
-    history: [{ task_type: 'review', first_agent: 'qwen-local', attempts: 1, outcome: 'accepted' }],
-    availability: { 'qwen-local': 'ok' }, trackRecord: localTrack(),
-    taskProfile: { complexity: 0.2, risk: 0.1 }, ask: { task: false, resource: true, judgments: false },
-  })
-  const s = sent[0].state
-  assert.deepEqual(s.recent_outcomes[0], { task_type: 'review', attempts: 1, outcome: 'accepted', first_resource: 'RESOURCE_A' }, 'the task type stays a task type and only the runner becomes a key')
-  assert.equal(s.candidate_track_record, undefined)
-  assert.equal(s.candidate_availability, undefined)
-  assert.ok(!JSON.stringify(s).toLowerCase().includes('qwen'), 'and the specific names are gone')
+  const input = assessInput({ taskType: 'review', decision: DECISION })
+  input.agents = [...REVIEW_AGENTS, LOCAL_AGENT]
+  input.attempts = [
+    { agent: 'qwen-local', role: 'primary', stopReason: 'error', diagnostic: 'qwen2.5-coder:7b via spawn: the local model on the free-local tier ran out of context', answerText: '', changedFiles: [] },
+    input.attempts[1],
+  ]
+  await jev.assess(input)
+  const { attempts } = sent[0].state
+  const key = attempts[0].resource
+  assert.match(key, /^RESOURCE_[A-Z]$/)
+  assert.equal(attempts[0].diagnostic, `${key} via spawn: the local model on the free-local tier ran out of context`, 'the generic words stay and only the model id becomes the key')
+  assert.ok(!JSON.stringify(sent[0]).toLowerCase().includes('qwen'), 'and the specific names are gone')
 })
 
 test('with two local agents a shared generic word is still not a name, and a task-type id is re-keyed only where it is an id', async (t) => {
-  // An agent whose id is a task-type word: its record is re-keyed by id (the map's keys ARE ids),
-  // but the word itself is never masked in a task-type key, a history row or a sentence.
+  // An agent whose id is a task-type word: where it ran an attempt it reads as its key, but the
+  // word itself is never masked where it is a category or in a sentence. Both are in the
+  // diagnostic, which the masker walks: `routing.task_type` is copied as it is, so a check on it
+  // would pass whatever the masker did.
   const { sent, restore } = captureCalls()
   t.after(restore)
   const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
-  const table = [LOCAL_TABLE[0], { ...LOCAL_TABLE[0], key: 'RESOURCE_B' }]
-  const track = { ...localTrack(), review: { cost_tier: 'free-local', here_by_task_type: { review: { attempts: 5, accepted_rate: 0.8 } }, overall: { attempts: 5, accepted_rate: 0.8 }, feedback: { likes: 0, dislikes: 1, suggested: 0, recent_reasons: ['the review agent missed a bug in review'] } } }
-  await jev.route({
-    task: 'review the parser', context: {}, candidates: table,
-    identities: [...LOCAL_IDS, { id: 'review', key: 'RESOURCE_B', names: ['review', 'local', 'free-local', 'rv'] }],
-    history: [{ task_type: 'review', first_agent: 'review', attempts: 1, outcome: 'accepted' }, { task_type: 'debugging', first_agent: 'qwen-local', attempts: 2, outcome: 'failed' }],
-    trackRecord: track, taskProfile: { complexity: 0.2, risk: 0.1 }, ask: { task: false, resource: true, judgments: false },
-  })
-  const s = sent[0].state
-  assert.deepEqual(s.recent_outcomes.map((h) => [h.task_type, h.first_resource]), [['review', 'RESOURCE_B'], ['debugging', 'RESOURCE_A']], 'an id that is also a task-type word is re-keyed where it is the runner and left alone where it is the type')
+  const reviewer = { id: 'review', name: 'rv', provider: 'spawn', kind: 'local', llm: { provider: 'local', model: 'rv-7b' } }
+  const input = assessInput({ taskType: 'review', decision: DECISION })
+  input.agents = [...REVIEW_AGENTS, LOCAL_AGENT, reviewer]
+  input.attempts = [
+    { agent: 'review', role: 'primary', stopReason: 'completed', diagnostic: { message: 'the review agent missed a bug in review', category: 'review' }, answerText: 'looks fine', changedFiles: [] },
+    { agent: 'qwen-local', role: 'retry', stopReason: 'completed', diagnostic: 'picked over the other local, free-local agent', answerText: 'found the bug', changedFiles: ['a.js'] },
+  ]
+  await jev.assess(input)
+  const { attempts } = sent[0].state
+  assert.ok(attempts.every((a) => /^RESOURCE_[A-Z]$/.test(a.resource)), 'the id is re-keyed where it is the runner')
+  assert.notEqual(attempts[0].resource, attempts[1].resource)
+  assert.equal(attempts[0].diagnostic.category, 'review', 'and left alone where it is a category')
+  assert.equal(attempts[0].diagnostic.message, 'the review agent missed a bug in review', 'and in a sentence')
+  assert.equal(attempts[1].diagnostic, 'picked over the other local, free-local agent', 'a generic word two local agents share is no name')
   assert.deepEqual(leaks(sent[0]), [])
 })
 
@@ -418,6 +413,21 @@ test('the review call masks the model a CLI agent really runs, as the routing ca
   assert.deepEqual(leaks(sent[0]), [])
 })
 
+test('the review call masks a provider word that names one agent, while a generic one stays a word', async (t) => {
+  // A gateway nobody else uses names that one agent as surely as its id does. 'spawn' is how many
+  // agents run, so it names none of them and must stay readable wherever it appears.
+  const { sent, restore } = captureCalls()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  const input = assessInput({ decision: DECISION })
+  input.agents = [...REVIEW_AGENTS, { id: 'gw', provider: 'spawn', llm: { provider: 'openrouter', model: 'router-large-2' }, description: 'e' }]
+  input.attempts = [{ ...input.attempts[0], diagnostic: 'openrouter returned 502 while spawn waited' }, ...input.attempts.slice(1)]
+  await jev.assess(input)
+  const diagnostic = sent[0].state.attempts[0].diagnostic
+  assert.match(diagnostic, /^(RESOURCE_[A-Z]|\[resource\]) returned 502 while spawn waited$/)
+  assert.ok(!/openrouter/i.test(JSON.stringify(sent[0])), 'the provider word rode out in the review call')
+})
+
 test('the model an attempt recorded is masked even when the caller passes no modelOf', async (t) => {
   // router.js stores `model` (and the served `modelVersion`) on every attempt: that alone is
   // enough to mask the model of every agent that ran.
@@ -519,10 +529,221 @@ test('the routing call asks no question whose answer nothing reads, and none tha
   const { sent, restore } = captureCalls()
   t.after(restore)
   const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
-  const r = await jev.route({ task: 'fix it', context: {}, candidates: TABLE, identities: IDS, ask: { task: true, resource: true, judgments: true } })
+  const r = await jev.route({ task: 'fix it', context: {}, candidates: TABLE, strategies: ['CHEAP_DIRECT', 'STANDARD_DIRECT', 'PREMIUM_PLAN_CHEAP_EXECUTE'], ask: { task: true, resource: true, judgments: true } })
   const asked = Object.keys(sent[0].questions)
   for (const q of ['cheapSufficient', 'consistencyReview', 'resource', 'conserve', 'frontierReview']) assert.ok(!asked.includes(q), `${q} is still asked`)
   for (const q of ['secondOpinion', 'strategy', 'taskType', 'needsTests']) assert.ok(asked.includes(q), `${q} is no longer asked`)
   assert.ok(!('cheapSufficient' in r))
   assert.deepEqual(r.profile.verification, [], 'needsTests at 0.3 asks for no checks, and nothing else rides verification')
+})
+
+// ---------------------------------------------------------------- a key in every channel
+
+// One key per channel, each in the shape its issuer really uses, so a failure names the channel
+// it leaked through.
+const PLANTED = {
+  handoff: `sk-proj-${'Pq3x'.repeat(12)}`, // an OpenAI project key the earlier agent printed
+  workspace: `ghp_${'a1B2'.repeat(9)}`, // a GitHub token that ended up in an untracked file's name
+  history: `hf_${'Xy7k'.repeat(9)}`, // a Hugging Face token in a history row
+  agent: `sk-ant-api03-${'k9Lm'.repeat(10)}`, // an Anthropic key pasted into an agent's description
+  tool: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJyZWxlYXNlIn0', // a bearer token in a tool's description
+  diagnostic: 'AKIAIOSFODNN7EXAMPLE', // an AWS key id an executor's error quoted
+  changedFiles: `xoxb-2400-1180-${'Zq9s'.repeat(4)}`, // a Slack token in a changed file's name
+  diffStat: `AIzaSy${'D4e5'.repeat(8)}`, // a Google key in the file list of the diff
+}
+const leaked = (call) => Object.entries(PLANTED).filter(([, key]) => JSON.stringify(call).includes(key)).map(([channel]) => channel)
+
+test('a key an agent printed or a file name carries never reaches the routing call, in any channel', async (t) => {
+  // The task text was scrubbed and the handoff was scrubbed by clip(), but the workspace facts went
+  // out as gathered, and so did the history rows and every description in the questions.
+  const { sent, restore } = captureCalls()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  const input = {
+    task: 'finish the release script',
+    // gatherContext lists the untracked file by name, and counts it under its extension.
+    context: { branch: 'main', uncommittedFiles: ['src/release.js', `notes/token.${PLANTED.workspace}`], fileTypes: { '.js': 1, [`.${PLANTED.workspace}`]: 1 }, scripts: ['test'] },
+    handoff: `Step 2 of 3 done. I ran export OPENAI_API_KEY=${PLANTED.handoff} and the dry run passed.`,
+    history: [{ task_type: 'implementation', first_agent: 'claude', attempts: 1, outcome: `failed: 401 for ${PLANTED.history}` }],
+    tools: [{
+      id: 'release',
+      description: `Posts the release notes: curl -H "Authorization: Bearer ${PLANTED.tool}" https://hooks.example.com/release`,
+      params: { channel: { question: `Which channel should the notes go to? The hook sends Authorization: Bearer ${PLANTED.tool}`, options: { stable: 'The stable channel', beta: `The beta channel, same Bearer ${PLANTED.tool}` } } },
+    }],
+  }
+  // The named call reads the workspace, the history and each agent's own description.
+  await jev.route({ ...input, agents: [{ id: 'claude', description: `Claude Code on the team key ${PLANTED.agent}` }] })
+  // The decision engine's task call reads the workspace and the handoff.
+  await jev.route({ ...input, ask: { task: true, resource: false, judgments: false } })
+
+  assert.equal(sent.length, 2)
+  for (const call of sent) assert.deepEqual(leaked(call), [], 'a key rode out in the routing call')
+  // Only the secret goes: the rest of every channel is the routing judgment's evidence.
+  const [named, taskCall] = sent
+  for (const { state } of sent) {
+    assert.deepEqual(state.workspace.uncommittedFiles, ['src/release.js', 'notes/token.ghp_a1...REDACTED'])
+    assert.deepEqual(state.workspace.fileTypes, { '.js': 1, '.ghp_a1...REDACTED': 1 }, 'an extension is a file name too')
+    assert.match(state.handoff, /^Step 2 of 3 done\. I ran export OPENAI_API_KEY=sk-pro\.\.\.REDACTED and the dry run passed\.$/)
+  }
+  assert.equal(named.state.recent_outcomes[0].outcome, 'failed: 401 for hf_Xy7...REDACTED')
+  assert.equal(named.questions.agent.criteria.claude.what, 'Claude Code on the team key sk-ant...REDACTED')
+  for (const { questions } of sent) {
+    assert.match(questions.handler.criteria.release.what, /Authorization: Bearer \.\.\.REDACTED" https:\/\/hooks\.example\.com\/release$/)
+    assert.match(questions['release.fits'].instructions.focus, /Bearer \.\.\.REDACTED/)
+    assert.match(questions['release.channel'].instructions, /Bearer \.\.\.REDACTED$/)
+    assert.equal(questions['release.channel'].criteria.beta.what, 'The beta channel, same Bearer ...REDACTED')
+  }
+  assert.ok(taskCall.questions.continueHandoff, 'the task call reads the handoff it carries')
+})
+
+test('a key an executor quoted or a file name carries never reaches the review call, with or without the anonymous table', async (t) => {
+  // The answer, the diff excerpt and the check output were scrubbed. The diff's file list and each
+  // attempt's changed files were not, and neither was a diagnostic that arrived as an object when
+  // the review had no decision record to mask it with.
+  const { sent, restore } = captureCalls()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  const input = (routing) => ({
+    ...assessInput(routing),
+    attempts: [
+      { agent: 'deepseek', role: 'primary', stopReason: 'error', diagnostic: { message: `aws s3 cp refused: InvalidAccessKeyId ${PLANTED.diagnostic}`, category: 'failed' }, answerText: '', changedFiles: [] },
+      { agent: 'claude', role: 'retry', stopReason: 'completed', answerText: 'wired the notifier', changedFiles: ['src/notify.js', `slack/${PLANTED.changedFiles}.json`] },
+    ],
+    diff: { stat: ` src/notify.js | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)\nnew untracked: config/${PLANTED.diffStat}.json`, patch: '+notify()' },
+    agents: REVIEW_AGENTS.map((a) => (a.id === 'codex' ? { ...a, description: `${a.description}; on the team key ${PLANTED.agent}` } : a)),
+  })
+  // No decision record (a forced agent, or a run whose engine fell back): the named options.
+  await jev.assess(input({}))
+  await jev.assess(input({ decision: DECISION }))
+
+  assert.equal(sent.length, 2)
+  for (const call of sent) assert.deepEqual(leaked(call), [], 'a key rode out in the review call')
+  const [named, anonymous] = sent
+  assert.deepEqual(named.state.attempts[0].diagnostic, { message: 'aws s3 cp refused: InvalidAccessKeyId AKIAIO...REDACTED', category: 'failed' })
+  assert.match(named.questions.reviewAgent.criteria.codex.what, /^OpenAI Codex: implementation, debugging, writing and running tests; on the team key sk-ant\.\.\.REDACTED$/)
+  for (const { state } of sent) {
+    assert.deepEqual(state.attempts[1].changed_files, ['src/notify.js', 'slack/xoxb-2...REDACTED.json'])
+    assert.equal(state.diff.stat, ' src/notify.js | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)\nnew untracked: config/AIzaSy...REDACTED.json')
+  }
+  assert.equal(anonymous.state.attempts[0].diagnostic.message, 'aws s3 cp refused: InvalidAccessKeyId AKIAIO...REDACTED', 'the anonymous path scrubbed it already, and still does')
+})
+
+// ---------------------------------------------------------------- what each call carries
+
+// Everything a routing call can be handed. Each call shape must carry only the state its own
+// questions read, so a shape that carries more than that shows up as an extra key.
+const EVERYTHING = {
+  task: 'make the failing test pass',
+  context: { branch: 'main', uncommittedFiles: ['a.js'], scripts: ['test'] },
+  handoff: 'Step 1 of 2 done: the parser is fixed, the printer is next.',
+  history: HISTORY, availability: AVAILABILITY, trackRecord: TRACK, candidates: TABLE,
+  strategies: ['CHEAP_DIRECT', 'STANDARD_DIRECT', 'PREMIUM_PLAN_CHEAP_EXECUTE'],
+  taskProfile: { complexity: 0.5, risk: 0.3, needsSecondOpinion: 0.4 },
+}
+const stateKeys = (call) => Object.keys(call.state).filter((k) => call.state[k] !== undefined).sort()
+
+test('the task call carries the task, its workspace and its handoff, and nothing about other tasks or resources', async (t) => {
+  // The task group judges `task` "in this workspace" and asks whether it continues `handoff`. No
+  // question in it reads the earlier tasks' outcomes, a track record or an availability map.
+  const { sent, restore } = captureCalls()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  // The decision engine's task call: no candidate table.
+  await jev.route({ ...EVERYTHING, candidates: undefined, ask: { task: true, resource: false, judgments: false } })
+  assert.deepEqual(stateKeys(sent[0]), ['handoff', 'task', 'workspace'])
+  assert.ok(sent[0].questions.taskType && sent[0].questions.continueHandoff)
+})
+
+test('the strategy call carries the task and its profile, and neither the candidate table nor the history', async (t) => {
+  // The strategy question reads `task` and weighs the required quality, which is what the task
+  // profile states. It names no field of the candidate table, and what the table decides about the
+  // strategy is decided before the call: every option it is offered is one the pool allows.
+  const { sent, restore } = captureCalls()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  await jev.route({ ...EVERYTHING, ask: { task: false, resource: true, judgments: false } })
+  const [call] = sent
+  assert.deepEqual(Object.keys(call.questions), ['strategy'])
+  assert.equal(call.state.candidates, undefined, 'the numeric table rode a call whose question reads none of it')
+  assert.deepEqual(stateKeys(call), ['task', 'task_profile'])
+  assert.deepEqual(Object.keys(call.questions.strategy.criteria), EVERYTHING.strategies, 'the options are the strategies the pool allows')
+  assertReadsOnlyWhatRides(call)
+  // A cold router batches the second opinion into the same call: it carries what the two read.
+  await jev.route({ ...EVERYTHING, ask: { task: false, resource: true, judgments: true } })
+  assert.deepEqual(Object.keys(sent[1].questions).sort(), ['secondOpinion', 'strategy'])
+  assert.deepEqual(stateKeys(sent[1]), ['task', 'task_profile'])
+  assert.deepEqual(leaks(sent[1]), [])
+  // Asked beside the task group, the call has no profile yet, so the question must not quote one.
+  await jev.route({ ...EVERYTHING, ask: { task: true, resource: true, judgments: false } })
+  assert.equal(sent[2].state.task_profile, undefined)
+  assertReadsOnlyWhatRides(sent[2])
+})
+
+/**
+ * The strategy question reads only what its call carries: every field it quotes rides the call,
+ * and it speaks of no candidates, because the call carries none. A question about facts it is not
+ * given is answered from nothing, and reads as though they were there.
+ */
+function assertReadsOnlyWhatRides(call) {
+  const { question, focus } = call.questions.strategy.instructions
+  for (const [, field] of `${question} ${focus}`.matchAll(/`(\w+)`/g)) assert.ok(field in call.state, `the strategy question quotes \`${field}\`, which this call does not carry`)
+  assert.ok(!/candidate/i.test(`${question} ${focus}`), `the strategy question speaks of candidates the call does not carry: ${question} ${focus}`)
+}
+
+test('a strategy call offers only the strategies the caller says the pool can run', async (t) => {
+  // The call carries nothing about the pool, so Jev cannot tell an option the pool can run from
+  // one it cannot. Without the caller's list every strategy was offered, planning on the
+  // strongest resource included, to a pool of one local model.
+  const { sent, restore } = captureCalls()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  const onlyLocal = [{ key: 'RESOURCE_A', tier: 'standard', source: 'local' }]
+  await jev.route({ task: 'fix a typo', candidates: onlyLocal, ask: { task: false, resource: true, judgments: true } })
+  assert.deepEqual(Object.keys(sent[0].questions), ['secondOpinion'], 'no strategy question without the strategies it may offer')
+  await assert.rejects(jev.route({ task: 'fix a typo', candidates: onlyLocal, ask: { task: false, resource: true, judgments: false } }), /nothing to ask/)
+  // The list the caller passes is the whole of what is offered, less anything that is no strategy.
+  await jev.route({ task: 'fix a typo', candidates: onlyLocal, strategies: ['LOCAL_FIRST', 'STANDARD_DIRECT', 'NOT_A_STRATEGY'], ask: { task: false, resource: true, judgments: false } })
+  assert.deepEqual(Object.keys(sent[1].questions.strategy.criteria), ['LOCAL_FIRST', 'STANDARD_DIRECT'])
+})
+
+test('the judgments-only call carries the task alone', async (t) => {
+  // The second opinion reads `task` and nothing else: no workspace, no handoff, no profile, and no
+  // history keyed to a table the call does not carry.
+  const { sent, restore } = captureCalls()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  await jev.route({ ...EVERYTHING, ask: { task: false, resource: false, judgments: true } })
+  assert.deepEqual(Object.keys(sent[0].questions), ['secondOpinion'])
+  assert.deepEqual(stateKeys(sent[0]), ['task'])
+  // One eligible strategy is nothing to choose between, so a resource call asks no strategy
+  // question, and what is left of it is a judgments-only call.
+  await jev.route({ ...EVERYTHING, strategies: ['STANDARD_DIRECT'], ask: { task: false, resource: true, judgments: true } })
+  assert.deepEqual(Object.keys(sent[1].questions), ['secondOpinion'])
+  assert.deepEqual(stateKeys(sent[1]), ['task'])
+})
+
+test('the review call still carries its own full table: the reviewer and fixer picks are made over it', async (t) => {
+  // The strategy call no longer carries a table. The review call's questions choose between the
+  // candidates by their data, so its table must not have lost a field on the way.
+  const { sent, restore } = captureCalls()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  await jev.assess(assessInput({ decision: DECISION }))
+  // As it leaves the machine: the SDK sends JSON, so an undefined field is no field.
+  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].state.candidates)), [
+    {
+      key: 'RESOURCE_A', tier: 'frontier',
+      capabilities: { coding: { score: 0.9, confidence: 0.8, samples: 4 }, reliability: { score: 0.85, confidence: 0.6, samples: 4 } },
+      source: 'subscription', scarcity: 0.4, reset_in_minutes: null, marginal_cost: 'low', expected_cost: { total: 0.3, class: 'low' },
+      latency: 'slow', availability: 'ok', reliability: { score: 0.85, confidence: 0.6 }, verified_runs: 4, new_resource: false, task_fit: 0.88,
+    },
+    {
+      key: 'RESOURCE_C', tier: 'strong',
+      capabilities: { coding: { score: 0.75, confidence: 0.7, samples: 12 } },
+      source: 'api', scarcity: 0, reset_in_minutes: null, marginal_cost: 'metered', expected_cost: { total: 0.2, class: 'low' },
+      latency: 'medium', availability: 'ok', reliability: null, verified_runs: 12, new_resource: false, task_fit: 0.7,
+    },
+    { key: 'RESOURCE_D', candidate_for_work: false, kept_out_by: 'unrecorded' },
+  ])
+  assert.ok(Object.keys(sent[0].questions.reviewAgent.criteria).every((k) => sent[0].state.candidates.some((c) => c.key === k)), 'every option is a row of it')
 })

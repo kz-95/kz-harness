@@ -171,10 +171,40 @@ function* textBlock(text, index = 0) {
   yield { type: 'block-end', index, block: { type: 'text', text } }
 }
 
+const AUTHORITY_ORDER = ['local', 'jev', 'code']
+const joinAnd = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`)
+/**
+ * Who decided a routed run, in words, from its per-domain report: every authority that answered
+ * a domain, named once, in a fixed order. The local router names what it decided, because that is
+ * the part that changes as the router learns. `code` is the rules that rank the resources and
+ * answer the frontier review, which decide part of every adaptive run, so a run Jev taught the
+ * rest of reads "Jev and routing rules decided" rather than crediting Jev with the pick.
+ * @param {object} [domains]  routing.decision.domains
+ * @param {{ detail?: boolean }} [opts]  false leaves out which domains the local router and the
+ *   fallback answered, for a heading with the per-domain list right under it
+ * @returns {string|null} null when there is no per-domain report (legacy named routing)
+ */
+export function decidedBy(domains, { detail = true } = {}) {
+  const by = new Map()
+  for (const [id, d] of Object.entries(domains ?? {})) {
+    if (!d?.authority || d.authority === 'none') continue
+    by.set(d.authority, [...(by.get(d.authority) ?? []), id.replace(/_/g, ' ')])
+  }
+  if (!by.size) return null
+  // Nothing could decide anything: the deterministic stand-in answered every domain.
+  if ([...by.keys()].every((a) => a === 'fallback')) return 'safe fallback, nothing could decide'
+  const which = (a) => (detail ? ` (${by.get(a).join(', ')})` : '')
+  const names = AUTHORITY_ORDER.filter((a) => by.has(a)).map((a) => (a === 'local' ? `the local router${which(a)}` : a === 'jev' ? 'Jev' : 'routing rules'))
+  if (by.has('fallback')) names.push(`the safe fallback${which('fallback')}`)
+  return `${joinAnd(names)} decided`
+}
+
 /** One line per router event, for the live reasoning block and the app log. */
 export function line(e) {
   switch (e.type) {
-    case 'queued': return 'Waiting: another task is running in this workspace'
+    // What it waits for, when the lanes said (tasks.js WAITING): the cap on tasks at once is not
+    // another task in this workspace.
+    case 'queued': return e.text ?? 'Waiting: another task is running in this workspace'
     case 'loading': return e.text
     case 'start': return `Task received${e.forceAgent ? ` (forced: ${e.forceAgent})` : ''}`
     case 'jev': return `Jev ${e.trace.phase}: ${e.trace.questions.filter((q) => q.used).length}/${e.trace.questions.length} questions in ${e.trace.ms} ms`
@@ -187,10 +217,8 @@ export function line(e) {
     // Who decided, at what maturity, and how the candidates compared. One line: the inspector's
     // Decisions tab carries the full table.
     case 'decision': {
-      const by = Object.entries(e.decision?.domains ?? {}).filter(([, d]) => d.authority && d.authority !== 'none')
-      const local = by.filter(([, d]) => d.authority === 'local').map(([id]) => id.replace(/_/g, ' '))
       const calls = e.decision?.jevCalls ?? 0
-      const who = local.length ? `local router decided ${local.join(', ')}` : 'Jev decided'
+      const who = decidedBy(e.decision?.domains) ?? 'Jev decided'
       const seen = e.decision?.candidates?.length ?? 0
       return `${who}; ${calls ? `${calls} Jev call${calls === 1 ? '' : 's'}` : 'no Jev call'}; ${seen} candidate${seen === 1 ? '' : 's'} considered`
     }

@@ -206,7 +206,7 @@ test('OOD: an unseen category and an out-of-range numeric are flagged, hashed te
 test('OOD: an indecisive prediction is high entropy and low margin', () => {
   // Two classes on top of each other: nothing separates them, so the artifact must say so.
   const samples = Array.from({ length: 40 }, (_, i) => ({ features: { numeric: { x: 1 } }, label: i % 2 ? 'yes' : 'no' }))
-  const artifact = trainMulticlass({ samples, domain: 'conservation', now: clock })
+  const artifact = trainMulticlass({ samples, domain: 'second_opinion', now: clock })
   const p = predict(artifact, { numeric: { x: 1 } })
   assert.ok(p.ood.reasons.includes('high_entropy'), p.ood.reasons.join(','))
   assert.ok(p.ood.reasons.includes('low_margin'), p.ood.reasons.join(','))
@@ -341,7 +341,7 @@ test('training options: the policy defaults are recorded, balance can be switche
 })
 
 test('degenerate inputs stay honest: one class, one candidate, an unusable group', () => {
-  const single = trainMulticlass({ samples: Array.from({ length: 8 }, (_, i) => ({ features: { numeric: { x: i } }, label: 'only' })), domain: 'conservation', now: clock })
+  const single = trainMulticlass({ samples: Array.from({ length: 8 }, (_, i) => ({ features: { numeric: { x: i } }, label: 'only' })), domain: 'second_opinion', now: clock })
   assert.deepEqual(single.classes, ['only'])
   assert.deepEqual(single.weights[0].filter((w) => w !== 0), [], 'one class leaves nothing to learn, so no weight moves')
   const p = predict(single, { numeric: { x: 3 } })
@@ -400,7 +400,7 @@ test('a constant column and an absent sample list do not break the arithmetic', 
   // `k` never varies, so its standard deviation is 0: the scale must not be a division by it.
   const artifact = trainMulticlass({
     samples: Array.from({ length: 10 }, (_, i) => ({ features: { numeric: { x: i % 2, k: 5 } }, label: i % 2 ? 'yes' : 'no' })),
-    domain: 'conservation',
+    domain: 'second_opinion',
     now: clock,
   })
   assert.equal(artifact.standardization.std[0], 0, 'the constant column has no spread')

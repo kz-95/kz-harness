@@ -9,9 +9,11 @@ import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { createReview } from '../jev-review/index.js'
 import { kindOf, marginalCostOf } from './accounts.js'
+import { decidedBy } from './adapter.js'
 import { CHARS_PER_TOKEN, eligible, rank } from './capabilities.js'
 import { NO_CANDIDATES, contextEstimate } from './decision.js'
 import { effortFamily, toAgentEffort } from './effort.js'
+import { redactSecrets } from './export.js'
 import { tagIsAnswerOnly } from './feedback.js'
 import { offlinePick } from './local.js'
 import { assertWorkspace, changedSince, compareChecks, ensureHandoffIgnored, gatherContext, runChecks, snapshot } from './workspace.js'
@@ -28,8 +30,10 @@ const PEERS = { claude: 'codex', codex: 'claude' }
 const JUDGMENT_ROLES = ['review']
 
 function describeError(err) {
-  // Class name + message only; SDK errors never include the API key.
-  return `${err?.constructor?.name ?? 'Error'}: ${err?.message ?? String(err)}`.slice(0, 300)
+  // Class name + message only; SDK errors never include the API key. An executor's error can
+  // quote what it was sent, and this becomes an attempt's diagnostic, which the review sends to
+  // Jev, so it is scrubbed before it is cut: a key the cut split would go out as a plain word.
+  return redactSecrets(`${err?.constructor?.name ?? 'Error'}: ${err?.message ?? String(err)}`).slice(0, 300)
 }
 
 // The model an executor says it actually served, when it says so. `model` on an attempt is what
@@ -74,13 +78,21 @@ const STALL_AFTER = 2
 // and the routing prompt weighs accepted rate first, so noise wins picks.
 const MIN_RATE_SAMPLES = 3
 
-// Feedback priors: how many recent Like/Dislike verdicts the routing prior weighs, and the
-// most a run of them may move an agent's probability. A verdict is explicit, so it counts more
-// than one quiet run, but a click is still one data point: the bias is ramped over three
-// verdicts and capped, so one cannot swing a pick and ten cannot make an agent unoverridable.
+// Feedback priors: how many recent Like/Dislike verdicts the routing prior weighs (by weight, so
+// a verdict on other work takes only its share of a place), and the most a run of them may move
+// an agent's probability. A verdict is explicit, so it counts more than one quiet run, but a
+// click is still one data point: the bias is ramped over three verdicts and capped, so one
+// cannot swing a pick and ten cannot make an agent unoverridable.
 const FEEDBACK_WINDOW = 20
 const FEEDBACK_WEIGHT = 0.15
 const FEEDBACK_RAMP = 3
+// A verdict about another kind of work still says something about an agent, but far less than one
+// about the kind of work being routed now, so it counts this share of a matching one. It is the
+// share the capability evidence gives an unrelated task type by default (routing-policy.js
+// evidence.similarity.other), copied rather than read: this does not tell a related type (which
+// that evidence counts at a half) from an unrelated one, and an install that overrides the
+// evidence similarity does not move it.
+const FEEDBACK_OTHER_TYPE = 0.25
 
 const TIER = { local: 'free-local', api: 'api', subscription: 'subscription' }
 // The same tiers by what a job costs at the margin, for an operator's `resources.economics` override.
@@ -230,9 +242,49 @@ export function trackRecord(records, cwd, agents, { availability = {}, pricing =
 }
 
 /**
+ * How much one verdict counts toward the feedback bias of the task being routed now, by how well
+ * the work it judged matches this task. The work it judged is the run it is about (`runOf`, which
+ * index.js answers with runOfVerdict: the runId the client sends, else the same fallback the
+ * capability evidence is credited by), and that run's routing.taskType says what kind of work it
+ * was. A verdict about the same kind of work counts fully, from any session; one about another
+ * kind counts FEEDBACK_OTHER_TYPE of that, from this session too. A verdict whose kind of work
+ * cannot be told - no run found, a run that never had a task type (a manual pick), or no task
+ * type for the task at hand - counts exactly as every verdict did before there was a match: fully
+ * when it is from this session and not at all when it is from another, since nothing then says
+ * it was about similar work.
+ * @param {object} p
+ * @param {string} [p.taskType]  what routing said the task at hand is
+ * @param {string} [p.sessionId] this run's session; without one every row reads as this session's,
+ *   as feedback.js list() returns every session when it is asked for none
+ * @param {(verdict: object) => object|null} [p.runOf] the run a verdict is about
+ * @returns {(verdict: object) => number} the verdict's weight, 0..1
+ */
+export function verdictWeight({ taskType, sessionId, runOf } = {}) {
+  const judged = (v) => {
+    // A reader that fails has found no run, which is a verdict it cannot place and nothing worse.
+    try { return runOf?.(v)?.routing?.taskType } catch { return undefined }
+  }
+  return (v) => {
+    const type = taskType ? judged(v) : undefined
+    if (type) return type === taskType ? 1 : FEEDBACK_OTHER_TYPE
+    return !sessionId || v?.sessionId === sessionId ? 1 : 0
+  }
+}
+
+/**
  * The routing prior from recent feedback.jsonl rows: per agent, the Like/Dislike counts, the
  * reasons the person gave, and a bounded bias for Jev's probabilities. It extends the same
  * deps.history path trackRecord uses, one file over, so there is one priors mechanism, not two.
+ *
+ * `weightOf` says how much each row counts (verdictWeight); without it every row counts fully.
+ * The window is `n` verdicts' worth of weight, newest first: at full weight that is the newest
+ * `n` rows, as it always was, and a verdict on other work takes only its share of a place, so a
+ * run of them cannot push out the verdicts that bear on this task. A row that weighs nothing is
+ * left out before the window is counted, so it can neither crowd out one that bears on this task
+ * nor be the newest verdict. The counts stay whole verdicts; the bias is taken over the weights,
+ * and since the weighted likes less the weighted dislikes can never exceed their sum, it stays
+ * inside FEEDBACK_WEIGHT however many rows there are and whatever they weigh, the same bound a
+ * whole vote has always had.
  *
  * Which agent a verdict is about comes from `provider` (and `model`): the engine's message id
  * is never known on this side, so `messageId` is only the client's key and this file's upsert
@@ -247,8 +299,22 @@ export function trackRecord(records, cwd, agents, { availability = {}, pricing =
  * but it never reaches `likes` / `dislikes`, so the bias it feeds is untouched, and it cannot
  * raise a `suggestion` either, because that would promote an agent through the answer door.
  */
-export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } = {}) {
-  const recent = (records ?? []).slice(-n)
+export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf, weightOf = () => 1 } = {}) {
+  // Newest first until the window holds n verdicts' worth of weight, so a long log is only
+  // weighed as far back as it counts. Filled by weight, not by rows: counted by rows, twenty
+  // quarter-weight verdicts on other work from other sessions took every place and pushed out
+  // this session's verdicts on this very work.
+  const rows = records ?? []
+  const recent = []
+  const weight = new Map()
+  let filled = 0
+  for (let i = rows.length - 1; i >= 0 && filled < n; i--) {
+    const w = weightOf(rows[i])
+    if (!(w > 0)) continue
+    recent.unshift(rows[i])
+    weight.set(rows[i], w)
+    filled += w
+  }
   const modelOfAgent = (a) => a.llm?.model ?? modelOf?.(a) ?? ''
   const agentOf = (r) => {
     if (!r?.provider) return undefined
@@ -261,7 +327,7 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } 
   const tally = new Map()
   const bump = (id, fn) => {
     if (!id || !agents.some((a) => a.id === id)) return
-    const t = tally.get(id) ?? { likes: 0, dislikes: 0, suggested: 0, reasons: [] }
+    const t = tally.get(id) ?? { likes: 0, dislikes: 0, suggested: 0, reasons: [], up: 0, down: 0 }
     fn(t)
     tally.set(id, t)
   }
@@ -278,8 +344,8 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } 
     const counts = !tagIsAnswerOnly(r.tag)
     bump(agentOf(r), (t) => {
       if (counts) {
-        if (r.verdict === 'dislike') t.dislikes++
-        else t.likes++
+        if (r.verdict === 'dislike') { t.dislikes++; t.down += weight.get(r) }
+        else { t.likes++; t.up += weight.get(r) }
       }
       const text = note(r)
       if (text) t.reasons.push(text)
@@ -295,7 +361,7 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } 
       dislikes: t.dislikes,
       suggested: t.suggested,
       reasons: t.reasons.slice(-3),
-      bias: votes ? r2(FEEDBACK_WEIGHT * (t.likes - t.dislikes) / Math.max(FEEDBACK_RAMP, votes)) : 0,
+      bias: votes ? r2(FEEDBACK_WEIGHT * (t.up - t.down) / Math.max(FEEDBACK_RAMP, t.up + t.down)) : 0,
     })
   }
   const latest = recent.at(-1)
@@ -365,10 +431,14 @@ function reviewPrompt(task, cwd, diff) {
   ].join('\n')
 }
 
-/** Handoff note written by the harness from evidence when the limited agent left none. */
+/**
+ * Handoff note written by the harness from evidence when the limited agent left none. The next
+ * run's routing call carries it to Jev, so each excerpt is scrubbed before it is cut: a key the
+ * cut split would stay in the note as a piece too short for any scrubber to know it for a key.
+ */
 function harnessHandoff({ task, attempts, diff, checks, previous }) {
   const failing = checks.filter((c) => !c.passed)
-  const lastAnswer = attempts.findLast((a) => a.answerText)?.answerText ?? ''
+  const lastAnswer = redactSecrets(attempts.findLast((a) => a.answerText)?.answerText ?? '')
   return [
     '# Handoff (written by Kz-harness from evidence; the agent hit its usage limit before updating this note)',
     '',
@@ -390,7 +460,7 @@ function harnessHandoff({ task, attempts, diff, checks, previous }) {
     '',
     '## How to verify',
     checks.length ? `Run the project checks: ${checks.map((c) => c.name).join(', ')}.` : 'No project checks configured; verify the task by hand.',
-    previous ? `\n## Earlier note\n${previous.slice(0, 2000)}` : '',
+    previous ? `\n## Earlier note\n${redactSecrets(previous).slice(0, 2000)}` : '',
   ].join('\n')
 }
 
@@ -528,6 +598,11 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // Read before the capability filter, because the note is part of what an agent must hold.
   const handoffFile = join(cwd, HANDOFF)
   const priorHandoff = await readFile(handoffFile, 'utf8').catch(() => null)
+  // The part of the note Jev reads. It quotes whatever the earlier agent printed, so it is
+  // scrubbed before it is cut: a key the cut splits keeps neither the prefix nor the length the
+  // scrubber knows it by, and jev.js, which scrubs again, would see only an ordinary word. The
+  // context estimate below reads the raw note, so what an agent must hold is measured as it is.
+  const handoffForJev = priorHandoff ? redactSecrets(priorHandoff).slice(0, 3000) : undefined
   // How much this request needs an agent to hold, in the units decision.js estimates with: the
   // context window is a hard fact the registry applies (capabilities.js maxInputBytes), so the
   // same check covers online, offline and local-only runs, and every capability-checked move.
@@ -601,13 +676,19 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   const history = await deps.history.recent(cwd, 10)
   // Agents billed by time of day (DeepSeek): Jev sees which are on their cheap rate right now.
   const pricing = pricingNow(config.pricing?.peak)
-  const agentRecord = deps.history.records ? trackRecord(await deps.history.records().catch(() => []), cwd, agents, { availability, pricing, economics: config.resources?.economics }) : undefined
+  const records = deps.history.records ? await deps.history.records().catch(() => []) : null
+  const agentRecord = records ? trackRecord(records, cwd, agents, { availability, pricing, economics: config.resources?.economics }) : undefined
   // Feedback priors: the person's Like/Dislike on earlier answers, read through the same
-  // deps.history path history.jsonl uses. The reasons ride each agent's track record into the
-  // routing prompt, and the bounded bias is applied to Jev's own probabilities once it answers.
+  // deps.history path history.jsonl uses, every session at once. This session's verdicts alone
+  // (the filter feedback.js list() applies for one session) make the counts and reasons that ride
+  // each agent's track record into the routing prompt, and the correction a suggestedAgent makes,
+  // exactly as when nothing else was read: another session's typed words never reach this
+  // session's routing call. The bounded bias applied to Jev's own probabilities once it answers
+  // is weighed over every session's verdicts, by how well the work each judged matches this task.
   // No feedback, an unreadable file, or a verdict naming no agent leaves all of this empty.
-  const feedbackRows = deps.history.feedback ? await deps.history.feedback(sessionId).catch(() => []) : []
-  const priors = feedbackPrior(feedbackRows, agents, { modelOf: deps.modelOf })
+  const everyVerdict = (deps.history.feedback ? await deps.history.feedback().catch(() => []) : null) ?? []
+  const sessionVerdicts = sessionId ? everyVerdict.filter((r) => r?.sessionId === sessionId) : everyVerdict
+  const priors = feedbackPrior(sessionVerdicts, agents, { modelOf: deps.modelOf })
   if (agentRecord) {
     for (const [id, f] of priors.agents) {
       if (agentRecord[id]) agentRecord[id] = { ...agentRecord[id], feedback: { likes: f.likes, dislikes: f.dislikes, suggested: f.suggested, recent_reasons: f.reasons } }
@@ -642,8 +723,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       const d = await deps.decide({
         task, context, history, tools, answerOnly, runId,
         capableFor: executors.length ? (capability) => new Set(rank(eligible(executors, { ...need, capability })).filter((e) => e.kind === 'agent').map((e) => e.id)) : undefined,
-        everyAgent: config.agents,
-        handoff: priorHandoff ? priorHandoff.slice(0, 3000) : undefined,
+        handoff: handoffForJev,
         agents: [...pickPool, ...gatedPool],
         gated: gatedIds,
         modelOf: deps.modelOf,
@@ -669,7 +749,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     routing = { mode: 'fallback', primaryAgent: pick, reason: deps.jevUnavailableReason, ...(pick !== config.fallbackAgent ? movedTo('capability', config.fallbackAgent, pick) : {}) }
   } else {
     try {
-      routing = { mode: localOnly ? 'local' : 'jev', ...(await deps.jev.route({ task, context, agents: pickPool, tools, history, availability, trackRecord: agentRecord, ...(capabilitySet ? { capabilities: capabilitySet } : {}), ...(priorHandoff ? { handoff: priorHandoff.slice(0, 3000) } : {}) }, signal)) }
+      routing = { mode: localOnly ? 'local' : 'jev', ...(await deps.jev.route({ task, context, agents: pickPool, tools, history, availability, trackRecord: agentRecord, ...(capabilitySet ? { capabilities: capabilitySet } : {}), ...(handoffForJev ? { handoff: handoffForJev } : {}) }, signal)) }
     } catch (err) {
       if (signal.aborted) throw err
       const pick = fallbackPick()
@@ -712,26 +792,26 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // permission system.
   const capableSet = capableNowIds.size ? capableNowIds : capableIds
   // What the decision engine excluded as a FACT (a context window too small, a resource the
-  // governor reads as unusable, a capability it lacks) rather than as a judgment (the floor, the
+  // governor reads as unusable, a capability it lacks) rather than as policy (the floor, the
   // gate, conservation). Those bind every move the router makes of its own - swap, retry, review,
   // hand-over - exactly like the facts the router filters itself.
   const hardOut = new Set((routing.decision?.excluded ?? []).filter((e) => e?.hard).map((e) => e.id))
   // Whether an agent can do what this run needs. An agent the registry does not know is not
   // filtered out: an unwired registry must never silently empty the pool.
   function canDo(id) { return !hardOut.has(id) && (!executors.some((e) => e.id === id && e.kind === 'agent') || capableSet.has(id)) }
-  // Conservation (decision.js) moved the work off the most capable resource on purpose. It is a
-  // judgment, not a router gate, so that resource is still in pickPool, and every swap below would
-  // otherwise be free to hand the work straight back. None of them may; it stays available to
-  // review. The capability swap alone may still land there when nothing else can do the job,
-  // because a capability is a hard fact and conservation is not.
+  // Conservation (decision.js) moved the work off the most capable resource on purpose. It is the
+  // decision engine's limit, not a router gate, so that resource is still in pickPool, and every
+  // swap below would otherwise be free to hand the work straight back. None of them may; it stays
+  // available to review. The capability swap alone may still land there when nothing else can do
+  // the job, because a capability is a hard fact and conservation is not.
   const conservedFrom = routing.conservedFrom ?? null
   if (!forceAgent && executors.some((e) => e.id === routing.primaryAgent && e.kind === 'agent') && !capableSet.has(routing.primaryAgent)) {
     // Only an agent that can do what was named may take the work: the very set the pick was just
     // measured against, never the looser one (which let the swap "move" the work onto another
     // agent that cannot do it either). A capability is a hard fact, so it outranks conservation
-    // (a judgment) and the weekly gate (a cost rule): first an agent neither applies to, then the
-    // conserved one, and only when nothing ungated can do it at all, a gated one - the gate
-    // yields, and the record says so.
+    // (a spending limit) and the weekly gate (a cost rule): first an agent neither applies to,
+    // then the conserved one, and only when nothing ungated can do it at all, a gated one - the
+    // gate yields, and the record says so.
     const fitSet = (capableNowIds.size ? capableNow : capable).filter((e) => e.kind === 'agent' && byId.has(e.id) && !hardOut.has(e.id))
     const inPool = fitSet.filter((e) => pickPool.some((a) => a.id === e.id))
     const swap = inPool.find((e) => e.id !== conservedFrom) ?? inPool[0] ?? fitSet.find((e) => gated(e.id))
@@ -795,17 +875,28 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
 
   // The feedback prior, applied. The bounded bias from recent Likes and Dislikes moves an
   // agent's probability, and the top pick is re-read from the adjusted numbers, so a demoted
-  // agent loses a close call while a confident pick survives. The person's newest correction (a
-  // suggestedAgent) is stronger and switches the pick outright, but only to an agent this run
-  // could really have used: enabled, in the capability pool, and not past its weekly gate.
+  // agent loses a close call while a confident pick survives. The bias is weighed here rather
+  // than before routing because only now is the task type known: a verdict about the same kind of
+  // work counts fully from any session, one about other work a little (verdictWeight). The
+  // person's newest correction in this session (a suggestedAgent) is stronger and switches the
+  // pick outright, but only to an agent this run could really have used: enabled, in the
+  // capability pool, and not past its weekly gate.
   // Manual overrides and non-Jev routes never reach here, so those are untouched.
-  // Only vote rows are in `priors.agents` with a non-zero bias: an answer-only tag contributed no
+  // Only vote rows are in `weighed.agents` with a non-zero bias: an answer-only tag contributed no
   // vote (see feedbackPrior), so nothing here can move a pick because of one. Its words already
   // reached the routing prompt through the track record above, which is all it is meant to do.
-  if (!forceAgent && routing.mode === 'jev' && priors.agents.size) {
+  // runOfVerdict reads only the verdict's own session, so the history is split by session once
+  // rather than filtered whole for every verdict weighed: a verdict that weighs nothing never
+  // fills the window, so the scan can walk the whole feedback log.
+  const bySession = records && deps.history.runOfVerdict ? Map.groupBy(records, (r) => r?.sessionId) : null
+  const runOf = bySession ? (v) => deps.history.runOfVerdict(v, bySession.get(v?.sessionId) ?? []) : undefined
+  const weighed = !forceAgent && routing.mode === 'jev'
+    ? feedbackPrior(everyVerdict, agents, { modelOf: deps.modelOf, weightOf: verdictWeight({ taskType: routing.taskType, sessionId, runOf }) })
+    : null
+  if (weighed && (weighed.agents.size || priors.suggestion)) {
     const probs = { ...(routing.agentProbabilities ?? {}) }
     const moved = []
-    for (const [id, f] of priors.agents) {
+    for (const [id, f] of weighed.agents) {
       if (!f.bias || !pickPool.some((a) => a.id === id && !gated(a.id))) continue
       const before = probs[id] ?? 0
       probs[id] = Math.max(0, Math.min(1, before + f.bias))
@@ -1299,16 +1390,6 @@ export function moveLine(m, R = {}) {
 const STRIP_LABEL = 'jev-agents'
 const STRIP_PREFIX = 'kzh-agents-1-'
 
-/** Who made the routing decision across its domains: jev, local, mixed, fallback, or none. */
-export function decisionAuthority(R) {
-  const list = Object.values(R?.decision?.domains ?? {}).map((d) => d.authority).filter((a) => a && a !== 'none')
-  if (!list.length) return R?.mode === 'jev' || R?.mode === 'local' ? 'jev' : 'none'
-  const set = new Set(list)
-  if (set.size === 1) return list[0]
-  if (set.has('fallback') && !set.has('jev') && !set.has('local') && !set.has('code')) return 'fallback'
-  return 'mixed'
-}
-
 // Whose words you are reading: the last attempt that produced an answer, never a parallel
 // second opinion - that one is its own step in the chain, not the answer - unless nothing else
 // answered at all. The report carries excerpts, the live record carries the full text; either
@@ -1336,9 +1417,13 @@ export function answeredSteps(r) {
   // One chain, in the order the work actually moved: router, then whoever worked, then
   // whoever judged. Agents used to be joined with a middot, which read as an unordered list
   // and hid the handover.
-  const who = decisionAuthority(r.routing)
+  // The router's step names who decided, as the report's heading does (adapter.js decidedBy):
+  // Jev whenever it answered a domain, or when there is no per-domain report (legacy named
+  // routing); else the local router; else the rules in code alone.
+  const auths = new Set(Object.values(r.routing?.decision?.domains ?? {}).map((d) => d?.authority))
+  const byJev = !r.routing?.decision || auths.has('jev')
   const router = r.routing?.mode === 'jev' || r.routing?.mode === 'local'
-    ? [who === 'local' ? { agent: 'Local router', model: '', roles: [] } : { agent: 'Jev', model: r.routing.model ?? '', roles: [] }]
+    ? [byJev ? { agent: 'Jev', model: r.routing.model ?? '', roles: [] } : { agent: auths.has('local') ? 'Local router' : 'Routing rules', model: '', roles: [] }]
     : []
   return [...router, ...steps]
 }
@@ -1355,8 +1440,10 @@ export function answeredBy(r) {
 export function formatReport(r) {
   const R = r.routing
   const lines = []
-  const who = decisionAuthority(R)
-  const decided = who === 'local' ? 'local router decided' : who === 'code' ? 'routing rules decided' : who === 'mixed' ? 'Jev and the local router decided' : who === 'fallback' ? 'safe fallback, nothing could decide' : 'Jev decided'
+  // Every authority that decided a domain, the rules that rank the resources included; a run
+  // with no per-domain report (legacy named routing) was Jev's. The heading names them only: the
+  // "Decided by" line under it says which domain each one answered.
+  const decided = decidedBy(R.decision?.domains, { detail: false }) ?? 'Jev decided'
   const modeLabel = { jev: `AUTO (${decided})`, manual: `MANUAL /${R.primaryAgent}`, fallback: 'AUTO, JEV UNAVAILABLE: routing fallback activated', offline: 'OFFLINE: local models only', local: `AUTO (${decided}), LOCAL MODELS ONLY` }[R.mode]
   lines.push(`**Jev router** · ${modeLabel}${R.mode !== 'offline' && r.offline ? ' · OFFLINE: local models only' : ''}`)
   if (R.mode === 'fallback') lines.push(`Fallback reason: ${R.reason}. Default agent: ${R.primaryAgent}`)

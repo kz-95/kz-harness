@@ -24,7 +24,7 @@ import { executorsFrom } from './capabilities.js'
 import { createDelivery } from './delivery.js'
 import { createFormatter } from './format.js'
 import { CLEAR, createFeedback, validFeedback } from './feedback.js'
-import { TERMINAL_STATES, createLanes, createTasks, laneKey, validJobId } from './tasks.js'
+import { TERMINAL_STATES, WAITING, createLanes, createTasks, laneKey, validJobId } from './tasks.js'
 import { SESSION_ID, exportSession, redactSecrets } from './export.js'
 import { KEY_NAME, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
 import { createUsage, detectLimit, longWindowPercent } from './usage.js'
@@ -115,7 +115,7 @@ export const Config = Schema.object({
   }).default({}).description('Real model the Jev Auto model hands session titles, conversation compaction and direct answers to. Unset, these follow this machine: the installed local chat model when there is one, then the first enabled agent that pins llm.provider and llm.model. Set both to pin one.'),
   local: Schema.object({
     port: Schema.natural().default(8081).description('First 127.0.0.1 port for llama-server; the next ones are tried when it is taken.'),
-    contextSize: Schema.natural().min(2048).description('Context tokens for every local model; unset = the model\'s manifest value (16,384), 12,288 on PCs with under 12 GB RAM.'),
+    contextSize: Schema.natural().min(2048).description('Context tokens every local model starts with; unset = the model\'s manifest value (16,384), 12,288 on PCs with under 12 GB RAM. A RAM budget may size it down, to 12,288 at least.'),
   }).description('Local models (llama.cpp llama-server under <harness>/engine/llama, GGUF files under <harness>/models).'),
   format: Schema.object({
     enabled: Schema.boolean().default(true).description('Rewrite a finished background result into readable prose with the installed local chat model before it is posted. Off, the report is posted exactly as the agent wrote it.'),
@@ -446,6 +446,80 @@ export async function acceptVerdict(record, { feedback, records, agents, log = (
   return stored
 }
 
+/**
+ * POST /jev-router/feedback without the HTTP: the request body's text in, the status and the JSON
+ * to answer with out. A body that is not JSON, or not a verdict validFeedback accepts, is a 400
+ * that stores nothing, so an unknown tag is refused before it could be read as routing rights. A
+ * valid one is stored and applied by acceptVerdict, one verdict at a time: the evidence is
+ * recorded in the order feedback.jsonl is written, so a quick like-then-dislike cannot land the
+ * other way round. apply() makes one for the plugin's life, which is what makes it one queue. A
+ * store that fails throws, and the route answers that as it answers any other failure.
+ * @param {{ learn: () => boolean } & object} deps acceptVerdict's, with `learn` read as each
+ *   verdict arrives, so a verdict is marked by the setting it was given under
+ * @returns {(raw: string) => Promise<{ status: number, body: object }>}
+ */
+export function createFeedbackRoute({ learn, ...deps }) {
+  let queue = Promise.resolve()
+  return async (raw) => {
+    let record
+    try { record = validFeedback(JSON.parse(raw)) } catch (err) { return { status: 400, body: { error: err.message } } }
+    const on = learn()
+    const job = queue.then(() => acceptVerdict(record, { ...deps, learn: on }))
+    queue = job.catch(() => {})
+    return { status: 200, body: { ok: true, record: await job } }
+  }
+}
+
+/**
+ * What the router reads its priors from (runRouted's deps.history): history.jsonl and the feedback
+ * log beside it. A function of its own, which apply() makes once, so the wiring the feedback prior
+ * depends on - the run a verdict is about, placed with the capability registry's credit - is
+ * tested without the plugin runtime.
+ * @param {object} p
+ * @param {string} p.historyFile  history.jsonl
+ * @param {object} p.feedback     feedback.js's store for the log beside it
+ * @param {object} [p.capabilities] the capability registry, whose creditedRun places a verdict
+ */
+export function createHistoryDeps({ historyFile, feedback, capabilities }) {
+  const dataDir = dirname(historyFile)
+  // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
+  const allRecords = async () => {
+    const raw = await readFile(historyFile, 'utf8').catch(() => '')
+    return raw.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  }
+  return {
+    async recent(cwd, n) {
+      return (await allRecords()).filter((r) => r.workspace === cwd).slice(-n)
+        .map((r) => ({ task_type: r.routing?.taskType, first_agent: r.routing?.primaryAgent, attempts: r.attempts?.length, outcome: r.finalStatus }))
+    },
+    // Full rows for trackRecord: what each agent costs, how it has done here, and whether it is
+    // on its cheap rate right now. Without this the router silently skips all of that and Jev
+    // picks with no cost or history prior at all.
+    records: allRecords,
+    // The same priors path as history.jsonl, one file over: the router reads it to demote an
+    // agent whose picks were disliked and promote one whose picks were liked. The rows are
+    // list()'s, dated by their newest form, which is the order the router's window reads them
+    // in; a row whose answer was first judged earlier also carries that time as `judgedAt`
+    // (effectiveVerdicts), which is what places it on a run below.
+    async feedback(sessionId) {
+      const [rows, forms] = await Promise.all([feedback.list(sessionId), feedback.history(sessionId)])
+      const key = (f) => `${f.sessionId}\u0000${f.messageId}`
+      const judged = new Map(effectiveVerdicts(forms).map((f) => [key(f), f.ts]))
+      return rows.map((r) => { const at = judged.get(key(r)); return at && at !== r.ts ? { ...r, judgedAt: at } : r })
+    },
+    // The run a verdict is about, which the router's feedback prior reads the task type off: the
+    // same run its capability evidence is credited to, so both read a verdict as one answer.
+    // Placed, as the evidence is, by when the answer was first judged: dated by its latest edit,
+    // a verdict with no runId that was never credited (learning off, a tag that credits
+    // nothing) and was edited after a newer run ended was read as being about that newer run.
+    runOfVerdict: (verdict, records) => runOfVerdict(verdict?.judgedAt ? { ...verdict, ts: verdict.judgedAt } : verdict, records, capabilities),
+    async append(record) {
+      await mkdir(dataDir, { recursive: true })
+      await appendFile(historyFile, `${JSON.stringify(record)}\n`)
+    },
+  }
+}
+
 // The routing domains whose labels a person's verdict can change (training.js labelClassification).
 const FEEDBACK_DOMAINS = ['task_classification', 'skill_selection']
 
@@ -553,29 +627,6 @@ export function apply(ctx, config) {
   const dataDir = dirname(config.historyFile)
   // Like/Dislike on a finished answer, next to history.jsonl, read back by the router below.
   const feedback = createFeedback({ file: join(dataDir, 'feedback.jsonl') })
-  let verdictQueue = Promise.resolve()
-  // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
-  const allRecords = async () => {
-    const raw = await readFile(config.historyFile, 'utf8').catch(() => '')
-    return raw.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
-  }
-  const history = {
-    async recent(cwd, n) {
-      return (await allRecords()).filter((r) => r.workspace === cwd).slice(-n)
-        .map((r) => ({ task_type: r.routing?.taskType, first_agent: r.routing?.primaryAgent, attempts: r.attempts?.length, outcome: r.finalStatus }))
-    },
-    // Full rows for trackRecord: what each agent costs, how it has done here, and whether it is
-    // on its cheap rate right now. Without this the router silently skips all of that and Jev
-    // picks with no cost or history prior at all.
-    records: allRecords,
-    // The same priors path as history.jsonl, one file over: the router reads it to demote an
-    // agent whose picks were disliked and promote one whose picks were liked.
-    feedback: (sessionId) => feedback.list(sessionId),
-    async append(record) {
-      await mkdir(dataDir, { recursive: true })
-      await appendFile(config.historyFile, `${JSON.stringify(record)}\n`)
-    },
-  }
 
   // --- the adaptive router ------------------------------------------------
   // Policy first: every threshold the router reasons with, config over the defaults. Then the
@@ -592,7 +643,11 @@ export function apply(ctx, config) {
   }
   const capabilities = createCapabilityRegistry({ file: join(dataDir, 'capability-evidence.jsonl'), priors, policy })
   try { capabilities.load() } catch (err) { process.stdout.write(`[jev] capability evidence not loaded: ${err.message}\n`) }
-  const training = createTrainingStore({ file: join(dataDir, 'routing-samples.jsonl') })
+  // What the router reads its priors from: history.jsonl, the feedback log beside it, and the run
+  // each verdict is about, placed with this registry's credit (createHistoryDeps).
+  const history = createHistoryDeps({ historyFile: config.historyFile, feedback, capabilities })
+  const allRecords = history.records
+  const training = createTrainingStore({ file: join(dataDir, 'routing-samples.jsonl'), policy, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
   const domains = config.routing?.learn === false ? null : createDomainRegistry({
     policy,
     store: training,
@@ -610,8 +665,9 @@ export function apply(ctx, config) {
 
   /**
    * What a finished run taught: capability evidence per resource, and the label each routing
-   * decision of that run turned out to deserve. Both are append-only and neither can block the
-   * run, which has already finished by the time this is called.
+   * decision of that run turned out to deserve. Capability evidence is append-only, and the
+   * routing samples are appended and compacted under their cap (training.js); neither can block
+   * the run, which has already finished by the time this is called.
    */
   async function learnFrom(record, samples) {
     // Learning off means nothing new is recorded: capability evidence changes future routing just
@@ -766,6 +822,12 @@ export function apply(ctx, config) {
     specs,
     log: (t) => process.stdout.write(`[jev] ${t}\n`),
     onChange: () => { refreshLocal(); resolveAux() },
+    // The resource budget reaches what follows it: readiness, since a local model over the budget is
+    // not ready, the lanes' cap on tasks at once, the chat model, which is the quickest local model
+    // the budget lets load, and the local agents' context windows, which the budget sizes. `lanes`
+    // is declared further down; this runs only on a saved settings change, and no request can make
+    // one before apply() has returned.
+    onSettings: (s) => { readyGen++; readyCache = null; lanes.setMax(s.maxConcurrentTasks); resolveAux(); refreshLocal() },
   })
   ctx.effect(() => () => { local.dispose() })
   refreshLocal()
@@ -904,6 +966,13 @@ export function apply(ctx, config) {
   refreshModels()
   // The one versionOf every profile reader and writer gets (localVersionOf).
   const versionOf = localVersionOf(local)
+  // What POST /jev-router/feedback does (createFeedbackRoute), made once so every verdict the
+  // plugin is given goes through its one queue.
+  const postFeedback = createFeedbackRoute({
+    feedback, records: allRecords, capabilities, training, versionOf, agents: enabledAgents, priors,
+    learn: () => config.routing?.learn !== false,
+    log: (m) => process.stdout.write(`[jev] ${m}\n`),
+  })
 
   const hoursFromNow = (h) => new Date(Date.now() + h * 3600_000).toISOString()
   const keyOut = (provider, name) => ['stopped', 'exhausted'].includes(usage.last()?.keys?.[provider]?.find((k) => k.name === name)?.state)
@@ -971,8 +1040,10 @@ export function apply(ctx, config) {
     // so that case still refuses outright rather than waiting.
     if (active.has(key)) throw new Error('already routing a task in this workspace; wait for it to finish (a nested agent must do its task directly, not call jev_route)')
     // One queue per workspace for every caller. Background tasks and slash commands
-    // used to hold two independent mutexes, which let both run in one working tree.
-    const release = laneHeld ? () => {} : await lanes.acquire(key, `route-${randomUUID()}`, signal)
+    // used to hold two independent mutexes, which let both run in one working tree. The budget's
+    // cap on tasks at once counts this run too, so when it has to wait it says so, in its live lines
+    // and the log, rather than sitting silent until a task in another workspace ends.
+    const release = laneHeld ? () => {} : await lanes.acquire(key, `route-${randomUUID()}`, signal, { onWait: (why) => { emit?.({ type: 'queued', text: WAITING[why] }); process.stdout.write(`[jev] ${WAITING[why]}\n`) } })
     active.add(key)
     const sessionId = sessionIdOf(agent) ?? cwd
     const entry = logRun(sessionId, task)
@@ -1133,6 +1204,8 @@ export function apply(ctx, config) {
   // at a time per workspace (a lane) so two agents never edit the same folder.
   // The result is posted into the chat on the session's next turn.
   const lanes = createLanes()
+  // The budget's cap on tasks at once, across every workspace. Changes arrive through onSettings.
+  local.readSettings().then((s) => lanes.setMax(s.maxConcurrentTasks), () => {})
 
   // The delivery path lives in its own module so it can be tested (test/delivery.test.js): it is
   // the path a person's result travels, and inside this closure it had no test at all. It needs
@@ -1159,9 +1232,8 @@ export function apply(ctx, config) {
     run: (t, { signal, emit, onEntry }) => {
       // Read before the first emit: `t.agent` becomes the agent the router picked.
       const forceAgent = t.agent ?? undefined
-      // Only say "waiting" when something is actually ahead of it.
-      if (lanes.busy(laneKey(t.workspace))) emit({ type: 'queued' })
-      return lanes.acquire(laneKey(t.workspace), t.jobId, signal).then(async (release) => {
+      // Only say "waiting" when it will wait, and what for: its workspace, or the cap on tasks at once.
+      return lanes.acquire(laneKey(t.workspace), t.jobId, signal, { onWait: (why) => emit({ type: 'queued', text: WAITING[why] }) }).then(async (release) => {
         try {
           return await route({ task: t.task, agent: t.owner, forceAgent, effort: t.effort ?? undefined, mode: t.mode ?? 'auto', laneHeld: true, modalities: t.modalities ?? ['text'], signal, emit, onEntry })
         } finally { release() }
@@ -1198,7 +1270,8 @@ export function apply(ctx, config) {
       // Counted, not read from the lane: the job joins the lane a tick after enqueue returns.
       const key = laneKey(cwd)
       const ahead = tasks.list().filter((x) => x.jobId !== t.jobId && laneKey(x.workspace) === key && !TERMINAL_STATES.includes(x.state)).length
-      return queuedLine({ jobId: t.jobId, agent: t.agent, position: ahead ? ahead + 1 : 0, workspace: cwd })
+      // Nothing ahead in this workspace can still mean waiting: the cap on tasks at once may be full.
+      return queuedLine({ jobId: t.jobId, agent: t.agent, position: ahead ? ahead + 1 : lanes.waits(key) ? 1 : 0, workspace: cwd })
     },
   }
 
@@ -1555,16 +1628,11 @@ export function apply(ctx, config) {
           // The verdict also becomes capability evidence here, once, for the run it is about
           // (creditVerdict): a run's own evidence was recorded when it ended, before anyone could
           // judge it. One queue, so the evidence is recorded in the order feedback.jsonl is
-          // written and a quick like-then-dislike cannot land the other way round.
+          // written and a quick like-then-dislike cannot land the other way round. All of that
+          // is postFeedback's (createFeedbackRoute), so the route is tested without a server.
           if (req.method === 'POST' && url.pathname === '/jev-router/feedback') {
-            let record
-            try { record = validFeedback(JSON.parse(await readBody(req))) } catch (err) { return send(400, { error: err.message }) }
-            const job = verdictQueue.then(async () => acceptVerdict(record, {
-              feedback, records: allRecords, capabilities, training, versionOf, agents: enabledAgents, priors, learn: config.routing?.learn !== false,
-              log: (m) => process.stdout.write(`[jev] ${m}\n`),
-            }))
-            verdictQueue = job.catch(() => {})
-            return send(200, { ok: true, record: await job })
+            const { status, body } = await postFeedback(await readBody(req))
+            return send(status, body)
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/feedback') {
             const session = url.searchParams.get('session')
@@ -1673,7 +1741,7 @@ export function apply(ctx, config) {
           }
           // Local models: status for the Settings card, the picker's catalog, installs and removals (manifest ids only).
           if (req.method === 'GET' && url.pathname === '/jev-router/local') {
-            return send(200, { ...(await local.status()), online: connectivity.last()?.online ?? null })
+            return send(200, await localStatus({ local, lanes, online: connectivity.last()?.online ?? null }))
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/local/catalog') return send(200, await catalog())
           if (req.method === 'POST' && url.pathname.startsWith('/jev-router/local/')) {
@@ -1742,6 +1810,14 @@ export async function workspaceDir(cwd, projectPaths) {
   if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new Error('that folder does not exist')
   return dir
 }
+
+/**
+ * GET /jev-router/local: the local models' status, whether this PC is online, and `slots`, how many
+ * runs hold a slot under the budget's cap on tasks at once and how many wait for one (lanes.slots()).
+ * The count comes from the lanes because that is where the cap is held: a count of background tasks
+ * would leave out the foreground /auto, /<agent> and jev_route runs the cap counts as well.
+ */
+export const localStatus = async ({ local, lanes, online }) => ({ ...(await local.status()), online, slots: lanes.slots() })
 
 /** One line for Jev and the log: windows, balance or spend. */
 function summaryOf(q) {

@@ -47,13 +47,17 @@ export function readManifest(path) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/** What llama.cpp's --fit keeps free on each GPU when no VRAM budget says otherwise, in MiB. */
+export const FIT_TARGET_MIB = 256
+
 /**
  * llama-server arguments. `gpuLayers` 'auto' lets the server fit layers into
  * free VRAM (--fit, on by default), keeping `fitTargetMiB` free; a number pins
  * it. One slot, so the whole context serves the one request. Log level 4 so
- * the "offloaded N/M layers to GPU" line can be read.
+ * the "offloaded N/M layers to GPU" line can be read. `threads` becomes -t;
+ * start() always sets it, from the core budget or defaultThreads().
  */
-export function llamaArgs({ modelPath, alias, port, ctx, gpuLayers = 'auto', fitTargetMiB = 256, thinking = false, threads }) {
+export function llamaArgs({ modelPath, alias, port, ctx, gpuLayers = 'auto', fitTargetMiB = FIT_TARGET_MIB, thinking = false, threads }) {
   return [
     '-m', modelPath,
     '--alias', alias,
@@ -293,6 +297,15 @@ const exec = (cmd, args) => new Promise((done) => {
   setTimeout(() => { c.kill(); done(null) }, 10_000).unref?.()
 })
 const vendorOf = (name) => (/nvidia|geforce|rtx|quadro/i.test(name) ? 'nvidia' : /amd|radeon/i.test(name) ? 'amd' : /intel/i.test(name) ? 'intel' : 'other')
+/**
+ * What Win32_VideoController.AdapterRAM reads for every card of 4 GB or more. The field is 32 bits
+ * wide and stops here, so a card at this figure has at least this much and nobody can say how much
+ * more: an 8 GB card and a 4 GB one read the same.
+ */
+const ADAPTER_RAM_CEILING = 4293918720
+/** A GPU sized from that ceiling in words: its size is not known, only that it is at least the ceiling. */
+const CAPPED_GB = Math.round(ADAPTER_RAM_CEILING / GB)
+const CAPPED_SIZE = `memory unknown, ${CAPPED_GB} GB or more`
 
 /**
  * What this PC has: GPUs (VRAM, NVIDIA driver and its CUDA version), RAM, CPU,
@@ -317,7 +330,9 @@ export async function detectSpecs({ dir, probe = {} } = {}) {
     for (const l of (cim ?? '').split('\n').map((x) => x.trim()).filter(Boolean)) {
       const [name, v] = l.split('|')
       if (name === 'CORES') { if (Number(v)) probe.cores = Number(v); continue }
-      if (!gpus.some((g) => g.name === name)) gpus.push({ name, vendor: vendorOf(name), vramGB: vendorOf(name) === 'intel' ? 0 : Number(v) / GB || 0 })
+      // A size at the ceiling is marked, so nothing works out a VRAM budget from a size the card may
+      // well not have (the budget's --fit-target). nvidia-smi's own size wins for a card it lists.
+      if (!gpus.some((g) => g.name === name)) gpus.push({ name, vendor: vendorOf(name), vramGB: vendorOf(name) === 'intel' ? 0 : Number(v) / GB || 0, ...(Number(v) >= ADAPTER_RAM_CEILING && { sizeCapped: true }) })
     }
   }
   const cpuList = osx.cpus()
@@ -336,10 +351,15 @@ export async function detectSpecs({ dir, probe = {} } = {}) {
   }
 }
 
-/** "RTX 3050 Laptop 4 GB · 24 GB RAM · i5-11400H 6 cores · 52 GB free" */
+/**
+ * "RTX 3050 Laptop 4 GB · 24 GB RAM · i5-11400H 6 cores · 52 GB free". A GPU sized from AdapterRAM's
+ * ceiling says its size is unknown, "Radeon RX 6600 (memory unknown, 4 GB or more)", rather than print
+ * the ceiling as if it were the size.
+ */
 export function specsLine(s) {
   const g = s.gpus.find((x) => x.vendor === 'nvidia') ?? s.gpus.find((x) => x.vramGB > 0) ?? s.gpus[0]
-  const gpu = g ? `${g.name.replace(/^NVIDIA\s+|GeForce\s+/gi, '').replace(/\s+GPU$/i, '')}${g.vramGB ? ` ${Math.round(g.vramGB)} GB` : ''}` : 'no GPU'
+  const vram = g?.sizeCapped ? ` (${CAPPED_SIZE})` : g?.vramGB ? ` ${Math.round(g.vramGB)} GB` : ''
+  const gpu = g ? `${g.name.replace(/^NVIDIA\s+|GeForce\s+/gi, '').replace(/\s+GPU$/i, '')}${vram}` : 'no GPU'
   const cpu = s.cpu.name.replace(/\(R\)|\(TM\)|CPU|@.*$|\d+th Gen|Intel|AMD/gi, '').replace(/\s+/g, ' ').trim()
   return [gpu, `${Math.round(s.ramGB)} GB RAM`, `${cpu} ${s.cpu.cores ?? s.cpu.threads} ${s.cpu.cores ? 'cores' : 'threads'}`, s.diskFreeBytes != null ? `${Math.round(s.diskFreeBytes / GB)} GB free` : null].filter(Boolean).join(' · ')
 }
@@ -360,12 +380,20 @@ export function pickEngineVariant(specs, modules) {
 const GPU_GBPS = 150
 const CPU_GBPS = 25
 const RESERVE_GB = 0.8 // desktop + CUDA context
+/** The GPUs an engine build can put layers on: NVIDIA's for a CUDA build, any but Intel's for Vulkan, none for the CPU build. */
+const gpusFor = (specs, variant) => (variant === 'cpu' ? [] : specs.gpus.filter((g) => (variant.startsWith('cuda') ? g.vendor === 'nvidia' : g.vendor !== 'intel')))
 /** GPU memory the engine can use for model layers on this PC. */
-export const usableVramGB = (specs, variant) => (variant === 'cpu' ? 0 : Math.max(0, ...specs.gpus.filter((g) => (variant.startsWith('cuda') ? g.vendor === 'nvidia' : g.vendor !== 'intel')).map((g) => g.vramGB)))
+export const usableVramGB = (specs, variant) => Math.max(0, ...gpusFor(specs, variant).map((g) => g.vramGB))
 
 /**
- * How a module would run here: gpu | split | cpu | no (won't fit, with reason).
+ * How a module would run here: gpu | split | cpu | unknown | no (won't fit, with reason).
  * Estimate: tokens/s from the bytes read per token over GPU and CPU memory bandwidth.
+ *
+ * A GPU sized from AdapterRAM's ceiling (detectSpecs) has at least the ceiling and nobody can say how
+ * much more, so it is not read as a 4 GB card. What the ceiling holds runs fully on it whatever its
+ * size, and is rated 'gpu' as before. Anything bigger may split or may run fully on it, which is not
+ * known: it is rated 'unknown', with no single speed (`wordsPerSec` null) but the two ends it lies
+ * between (`wordsPerSecRange`): split as on a card of the ceiling's size, and fully on the GPU.
  */
 export function rateModule(m, specs, variant, { installed = false } = {}) {
   const need = m.size * 1.1
@@ -380,13 +408,18 @@ export function rateModule(m, specs, variant, { installed = false } = {}) {
     const tps = GPU_GBPS / weights
     return { fit: 'gpu', label: 'Runs fully on GPU (fast)', wordsPerSec: words(tps) }
   }
-  const frac = Math.min(1, Math.max(0, (vram - RESERVE_GB - 0.25) / weights))
-  if (vram > 0 && vram >= (m.minVramGB ?? 0) && frac > 0.1) {
-    const tps = 1 / ((frac * weights) / GPU_GBPS + ((1 - frac) * weights) / CPU_GBPS)
-    return { fit: 'split', label: `Splits GPU + CPU (slower, ~${words(tps)} words/s est.)`, wordsPerSec: words(tps) }
-  }
-  const tps = CPU_GBPS / weights
-  return { fit: 'cpu', label: `CPU only (slow, ~${words(tps)} words/s est.)`, wordsPerSec: words(tps) }
+  const below = (() => {
+    const frac = Math.min(1, Math.max(0, (vram - RESERVE_GB - 0.25) / weights))
+    if (vram > 0 && vram >= (m.minVramGB ?? 0) && frac > 0.1) {
+      const tps = 1 / ((frac * weights) / GPU_GBPS + ((1 - frac) * weights) / CPU_GBPS)
+      return { fit: 'split', label: `Splits GPU + CPU (slower, ~${words(tps)} words/s est.)`, wordsPerSec: words(tps) }
+    }
+    const tps = CPU_GBPS / weights
+    return { fit: 'cpu', label: `CPU only (slow, ~${words(tps)} words/s est.)`, wordsPerSec: words(tps) }
+  })()
+  if (!gpusFor(specs, variant).some((g) => g.sizeCapped)) return below
+  const range = [below.wordsPerSec, words(GPU_GBPS / weights)]
+  return { fit: 'unknown', label: `Runs on the GPU as far as its memory allows (this GPU's memory is unknown, ${CAPPED_GB} GB or more: ~${range[0]} to ~${range[1]} words/s est.)`, wordsPerSec: null, wordsPerSecRange: range }
 }
 
 /** Compute buffers and the scratch llama.cpp keeps beside the weights, whatever the context. */
@@ -419,7 +452,8 @@ export function kvGbPerToken(m) {
  *
  * Every number is an estimate until the model has actually run once. `source` says which it is,
  * so nothing shows a guess and a measurement in the same shape; `measured` is what a test run
- * recorded for this model at this context size, and it wins outright when it is there.
+ * recorded for this model at this context size, on a run with this GPU room (the caller passes no
+ * other), and it wins outright when it is there.
  *
  * @param {object} m         manifest model entry
  * @param {object} p
@@ -492,6 +526,18 @@ export const defaultsFor = (m, specs, variant) => ({
   gpuLayers: variant === 'cpu' ? 0 : m.gpuLayers ?? 'auto',
 })
 
+/**
+ * The contexts the resource budget may start a model with, largest first: `ctx`, the one it would
+ * start with anyway, then each whole k (1024 tokens) below it, the unit the page prints a context in,
+ * down to MIN_CTX. Never below the floor, and never above `ctx`: a context the plugin config set
+ * under the floor is left as it is, since the budget only ever takes context away.
+ */
+export function contextSteps(ctx) {
+  const steps = [ctx]
+  for (let c = Math.ceil(ctx / 1024) * 1024 - 1024; c >= MIN_CTX; c -= 1024) steps.push(c)
+  return steps
+}
+
 /** "Official · Stable · Verified (…)" */
 export const badgesOf = (m) => [
   m.reliability?.startsWith('official') ? 'Official' : 'Community',
@@ -499,11 +545,15 @@ export const badgesOf = (m) => [
   m.verified ? `Verified${m.verifiedOn ? ` (${m.verifiedOn.split(',')[0]})` : ''}` : 'Not tested yet',
 ]
 
-const TIER = { gpu: 2, split: 2, cpu: 1, ok: 0, no: -1 }
+const TIER = { gpu: 2, split: 2, unknown: 2, cpu: 1, ok: 0, no: -1 }
 /**
  * Suggest 1-2 models for this PC. Reliability first (official-stable and verified
  * only), then fit (runs at a usable speed), then quality (manifest rank), then
  * Hugging Face downloads as a tie-breaker. Every other module says why it is not suggested.
+ *
+ * A model rated 'unknown' (a GPU sized from AdapterRAM's ceiling) is ranked down as slow only
+ * if it is slow even fully on the GPU: that it would be slow on a card of the ceiling's size is a
+ * guess at the size, and taking it would rank a bigger card as a 4 GB one.
  * @param {{m: object, rating: object, installed: boolean, downloads?: number}[]} rows
  */
 export function suggest(rows, specs) {
@@ -516,16 +566,18 @@ export function suggest(rows, specs) {
     else if (r.rating.fit === 'no') why[r.m.id] = r.rating.reason
     else ok.push(r)
   }
-  const usable = (r) => TIER[r.rating.fit] + (r.rating.fit === 'split' && r.rating.wordsPerSec < 3 ? -1 : 0)
+  const best = (rating) => rating.wordsPerSecRange?.[1] ?? rating.wordsPerSec
+  const usable = (r) => TIER[r.rating.fit] + ((r.rating.fit === 'split' || r.rating.fit === 'unknown') && best(r.rating) < 3 ? -1 : 0)
   ok.sort((a, b) => usable(b) - usable(a) || (a.m.rank ?? 99) - (b.m.rank ?? 99) || (b.downloads ?? 0) - (a.downloads ?? 0))
   const g = specs.gpus.find((x) => x.vramGB > 0)
-  const pc = `${g ? `${Math.round(g.vramGB)} GB GPU + ` : ''}${Math.round(specs.ramGB)} GB RAM`
+  const pc = `${g ? (g.sizeCapped ? `GPU (${CAPPED_SIZE}) + ` : `${Math.round(g.vramGB)} GB GPU + `) : ''}${Math.round(specs.ramGB)} GB RAM`
+  const speed = (rating) => (rating.wordsPerSecRange ? `~${rating.wordsPerSecRange[0]} to ~${rating.wordsPerSecRange[1]}` : `~${rating.wordsPerSec}`)
   const vision = (r) => rows.find((x) => x.m.kind === 'vision' && x.m.for === r.m.id && !x.installed)
   const picks = ok.slice(0, 2).map((r, i) => ({
     id: r.m.id,
     reason: (r.m.role === 'best-quality' || (i === 0 && r.m.rank === 1)
-      ? `${r.m.name}: best quality that still runs on your ${pc} (${r.rating.label.replace(/ \(.*/, '')}, ~${r.rating.wordsPerSec} words/s)`
-      : `${r.m.name}: lighter and faster (${r.rating.label.replace(/ \(.*/, '')}, ~${r.rating.wordsPerSec} words/s)`)
+      ? `${r.m.name}: best quality that still runs on your ${pc} (${r.rating.label.replace(/ \(.*/, '')}, ${speed(r.rating)} words/s)`
+      : `${r.m.name}: lighter and faster (${r.rating.label.replace(/ \(.*/, '')}, ${speed(r.rating)} words/s)`)
       + (vision(r) ? '; add the vision add-on to read images offline' : ''),
   }))
   for (const r of ok.slice(2)) why[r.m.id] = 'fits, but the suggested ones are better here'
@@ -550,6 +602,123 @@ export function parseLlmArgs(raw, ids) {
   return { ids: all ? [...ids] : [...new Set(picked.filter((w) => ids.includes(w)))], unknown: picked.filter((w) => !ids.includes(w)), all, confirm, empty: rest.length === 0 }
 }
 
+// ---------- the resource budget ----------
+
+/**
+ * The resource budget: how much of this PC KzH may use. Every limit is optional, and null, the
+ * default, means no limit, which is how KzH behaved before there was a budget. Sizes are in GB of
+ * 1024^3 bytes, the unit every figure in this file uses.
+ *
+ * VRAM, cores and tasks at once are real caps. RAM is not: without a native Job Object nothing can
+ * stop a process growing, so the RAM budget refuses a model whose figure is over it and unloads one
+ * whose working set stays over it. The page that sets these has to say so.
+ */
+const BUDGET = {
+  maxVramGB: { ok: (v) => Number.isFinite(v) && v > 0 && v <= 1024, why: 'max VRAM: GB above 0, at most 1024, or null for no limit' },
+  maxRamGB: { ok: (v) => Number.isFinite(v) && v > 0 && v <= 4096, why: 'max RAM: GB above 0, at most 4096, or null for no limit' },
+  maxCores: { ok: (v) => Number.isInteger(v) && v >= 1 && v <= 256, why: 'max cores: whole number 1-256, or null for no limit' },
+  maxConcurrentTasks: { ok: (v) => Number.isInteger(v) && v >= 1 && v <= 64, why: 'max concurrent tasks: whole number 1-64, or null for no limit' },
+}
+
+/**
+ * Threads for llama-server when the budget sets no core limit.
+ *
+ * llama.cpp's own default is every physical core, and generating is held back by memory bandwidth
+ * long before arithmetic, so the last cores add little speed while taking the whole machine: the
+ * app, its browser view and the agents' processes then crawl. This leaves them at least a quarter
+ * of the machine, and at least two cores from three cores up (rounding the model's share down is
+ * what keeps the quarter: 10 cores give it 7, not 8). A machine of one or two cores still gives it
+ * one thread, since llama.cpp cannot run on none. When the physical count is unknown (it is read on
+ * Windows only), half the logical processors stands in for it, since nearly every x86 CPU runs two
+ * threads a core; erring low is the safe side of this setting.
+ *
+ * @param {{ cores?: number|null, threads: number }} cpu  detectSpecs().cpu
+ */
+export function defaultThreads({ cores, threads }) {
+  const n = cores || Math.max(1, Math.floor(threads / 2))
+  return Math.max(1, Math.min(n - 2, Math.floor((n * 3) / 4)))
+}
+
+/**
+ * The --fit-target for a VRAM budget, in MiB.
+ *
+ * llama.cpp's --fit places layers until each GPU still has this much free, counted against what is
+ * free as the model loads. Keeping free everything the GPU has beyond the budget therefore holds the
+ * model to the budget whatever else is using the GPU: it gets the budget less what the desktop and
+ * other programs hold, never more. Counting from a reading of free VRAM instead would hand it the
+ * whole budget, but that reading is taken before the load and goes stale, and a stale one lets the
+ * model over. A budget the GPU cannot reach leaves the usual margin. The margin is per GPU, so this
+ * is exact with one GPU, and two could each take up to the budget.
+ *
+ * @param {object} p
+ * @param {number|null} p.maxVramGB  the budget, or null for none
+ * @param {number} p.gpuTotalGB      the GPU's size, 0 when it is not known
+ */
+export function fitTargetMiB({ maxVramGB, gpuTotalGB }) {
+  if (maxVramGB == null || !(gpuTotalGB > 0)) return FIT_TARGET_MIB
+  return Math.max(FIT_TARGET_MIB, Math.ceil((gpuTotalGB - maxVramGB) * 1024))
+}
+
+/**
+ * Why the budget refuses a model's memory figure, or null when it fits.
+ *
+ * The figure is for the run this start would get (planFor): estimated for the GPU room the VRAM
+ * budget leaves it, or measured on a run with that same room and the same GPU layers. So its VRAM
+ * side is already held to the VRAM budget, by --fit, which moves the layers that do not fit onto
+ * the CPU, and VRAM is never refused on its own account. (Where --fit cannot hold it, with layers
+ * pinned by hand or a GPU of unknown size, start() logs that the VRAM budget is not applied.) What
+ * the budget can honestly refuse is what lands in RAM, the figure's RAM side. That covers the two
+ * budgets together as well: what stays on the GPU is at most the VRAM budget, so a figure over both
+ * added up always puts more than the RAM budget into RAM. With no RAM budget nothing is refused.
+ *
+ * planFor sizes the context down to the floor before it asks, so a refusal at MIN_CTX says that
+ * not even the floor fits. One at any other context is at a context the plugin config set under it.
+ *
+ * @param {{ vramGB: number, ramGB: number, source: string }} memory  estimateMemory()'s figure
+ * @param {{ maxVramGB?: number|null, maxRamGB?: number|null }} budget
+ * @param {{ name: string, ctx: number }} about  the model and context, for the message
+ */
+function overBudget(memory, { maxVramGB = null, maxRamGB = null }, { name, ctx }) {
+  if (!overRam(memory, maxRamGB)) return null
+  const budget = [maxVramGB != null && `${maxVramGB} GB VRAM`, `${maxRamGB} GB RAM`].filter(Boolean).join(' + ')
+  const at = ctx === MIN_CTX ? `even at the ${MIN_CTX / 1024}k context floor` : `at ${ctx} context`
+  return `${name} needs about ${memory.ramGB} GB of RAM ${at} (${memory.source}: ${memory.vramGB} GB VRAM + ${memory.ramGB} GB RAM), over the resource budget of ${budget}. Raise the RAM budget or use a smaller model.`
+}
+
+/** Whether a memory figure puts more into RAM than the RAM budget allows; never with no RAM budget. */
+const overRam = (memory, maxRamGB) => maxRamGB != null && !!memory && memory.ramGB > maxRamGB
+
+/** How long the working set must stay over the RAM budget before the watchdog unloads the model. */
+const WATCH_GRACE_MS = 30_000
+
+/**
+ * A process's working set in bytes, as this OS reports it: tasklist on Windows, whose "Mem Usage"
+ * column is the working set, and ps everywhere else, whose RSS is the same thing. null when it
+ * cannot be read, a process that has gone included. `run` is injectable for tests.
+ */
+export async function workingSetOf(pid, { run = exec, platform = process.platform } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null
+  if (platform === 'win32') return parseTasklistMemory(await run('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH']))
+  return parsePsRss(await run('ps', ['-o', 'rss=', '-p', String(pid)]))
+}
+
+/**
+ * `tasklist /FO CSV /NH` -> bytes. The last field is the working set in KB, written with the
+ * locale's thousands separator ("1,234,567 K", "1.234.567 K", "1 234 567 Ko"), so every non-digit
+ * goes. No quoted row is tasklist saying no such process is running.
+ */
+export function parseTasklistMemory(out) {
+  const row = String(out ?? '').split(/\r?\n/).find((l) => l.startsWith('"'))
+  const kb = row?.trim().replace(/^"|"$/g, '').split('","').at(-1).replace(/\D/g, '')
+  return kb ? Number(kb) * 1024 : null
+}
+
+/** `ps -o rss= -p <pid>` -> bytes. ps reports RSS in KiB; anything but one number is no reading. */
+export function parsePsRss(out) {
+  const kib = /^\s*(\d+)\s*$/.exec(String(out ?? ''))?.[1]
+  return kib ? Number(kib) * 1024 : null
+}
+
 // ---------- the engine ----------
 
 const TAR = process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar'
@@ -569,29 +738,53 @@ function unzip(zip, dir, spawn) {
  * @param {object[]} p.modules   readManifest() result
  * @param {string} p.engineDir   folder for llama-server.exe and its DLLs
  * @param {string} p.modelsDir   folder for *.gguf
- * @param {string} p.settingsFile  UI settings (chat model, idle minutes, GPU layers)
+ * @param {string} p.settingsFile  UI settings (chat model, idle minutes, GPU layers, the resource budget)
  * @param {number} [p.port]      first port to try (next ones if taken)
- * @param {number} [p.contextSize]  overrides every model's context size
+ * @param {number} [p.contextSize]  the context every model starts with, in place of its manifest's (a RAM budget may size it down, to MIN_CTX at least)
  * @param {() => Promise<object>} [p.specs]  detectSpecs() for this PC (cached by the caller)
  * @param {(m: object) => void} [p.onChange]  a module was installed, removed or verified
+ * @param {(s: object) => void} [p.onSettings]  the settings were changed and saved; called with them
+ * @param {(pid: number) => Promise<number|null>} [p.readWorkingSet]  the RAM watchdog's reading, in bytes (tests)
+ * @param {() => number} [p.now]  the RAM watchdog's clock (tests)
+ * @param {number} [p.watchEveryMs]  how often the RAM watchdog reads, while a RAM budget is set
  */
-export function createLocalModels({ modules, engineDir, modelsDir, settingsFile, port: basePort = 8081, contextSize, specs: getSpecs = async () => null, spawn = nodeSpawn, fetch = globalThis.fetch, log = () => {}, onChange = () => {} }) {
+export function createLocalModels({ modules, engineDir, modelsDir, settingsFile, port: basePort = 8081, contextSize, specs: getSpecs = async () => null, spawn = nodeSpawn, fetch = globalThis.fetch, log = () => {}, onChange = () => {}, onSettings = () => {}, readWorkingSet = workingSetOf, now = Date.now, watchEveryMs = 5000 }) {
   const exe = join(engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server')
   const engines = modules.filter((m) => m.kind === 'engine')
   const models = modules.filter((m) => m.kind === 'model')
   const mod = (id) => modules.find((m) => m.id === id)
-  let engine = null // { child, modelId, port, key, ready, startedAt, gpuLayers, tail }
+  let engine = null // { child, modelId, port, key, ready, startedAt, gpuLayers, tail, threads, fitTargetMiB, workingSetGB, overSince }
   let busy = 0
   let idleTimer = null
+  let watchTimer = null
+  let watching = null // the watchdog reading in flight, so a slow tasklist never stacks up a second one
+  // Models the RAM watchdog unloaded: why, and the context it was running with. Loading one again at
+  // that context or a larger one would only end the same way, so until a setting that decides how
+  // much of it lands in RAM changes, planFor sizes it below that context, and refuses it only when
+  // there is no smaller one left (it was unloaded at the floor).
+  const tripped = new Map()
+  const RAM_DECIDERS = ['maxRamGB', 'maxVramGB', 'gpuLayers']
+  // The context each model was last planned with (planFor), for contextOf(), which has to answer at
+  // once: the window DSH and the formatter fill must be the one llama-server is started with.
+  const planned = new Map()
+  // The context llama-server was started with, while it runs `id`. A loaded model is not restarted
+  // when the budget changes, so until it is unloaded this, not the next load's plan, is its window.
+  const runningCtx = (id) => (engine?.modelId === id ? engine.ctx : null)
   let lock = Promise.resolve()
   let installing = Promise.resolve()
   const jobs = new Map() // module id -> { state: queued | downloading | extracting | done | failed, received, total, bytesPerSec, error }
 
-  const DEFAULTS = { chatModel: null, idleMinutes: 10, gpuLayers: null, keepWarm: false, loadAtStart: null, measured: {} }
+  const DEFAULTS = { chatModel: null, idleMinutes: 10, gpuLayers: null, keepWarm: false, loadAtStart: null, measured: {}, ...Object.fromEntries(Object.keys(BUDGET).map((k) => [k, null])) }
   const loadMs = new Map() // model id -> last load time, for the "~8 s" estimate
   const readSettings = async () => ({ ...DEFAULTS, ...JSON.parse(await readFile(settingsFile, 'utf8').catch(() => '{}')) })
   async function setSettings(patch) {
-    const s = { ...(await readSettings()) }
+    const was = await readSettings()
+    const s = { ...was }
+    for (const [k, rule] of Object.entries(BUDGET)) {
+      if (patch[k] === undefined) continue
+      if (!(patch[k] === null || rule.ok(patch[k]))) throw new Error(rule.why)
+      s[k] = patch[k]
+    }
     if (patch.idleMinutes !== undefined) {
       if (!(Number.isInteger(patch.idleMinutes) && patch.idleMinutes >= 1 && patch.idleMinutes <= 240)) throw new Error('idle minutes: whole number 1-240')
       s.idleMinutes = patch.idleMinutes
@@ -613,6 +806,12 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       s.chatModel = patch.chatModel
     }
     await save(s)
+    // Changed, not merely sent: a settings form that posts the whole budget on every save sends the
+    // same RAM budget again, and that must not load a tripped model straight back into the same overload.
+    if (RAM_DECIDERS.some((k) => s[k] !== was[k])) tripped.clear()
+    // Whatever follows the budget (the task queue's cap, the router's readiness) hears of the change
+    // here, the one place settings are written. A listener that fails must not undo a saved change.
+    try { onSettings(s) } catch (err) { log(`local: settings change not handed on: ${err.message}`) }
     return s
   }
 
@@ -624,8 +823,10 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
 
   /**
    * Keep what a real load took, under the model and the context size it was measured at, so the
-   * estimate is only ever shown for a pairing nothing has measured yet. A later reading replaces
-   * an earlier one: the newest run is the one that describes this machine as it is now.
+   * estimate is only ever shown for a pairing nothing has measured yet. The reading carries the GPU
+   * room and layers of its run (`roomGB`, `gpuLayers`), and stands only for a run like it
+   * (measuredFor). A later reading replaces an earlier one: the newest run is the one that describes
+   * this machine as it is now.
    */
   async function recordMemory(modelId, ctx, memory) {
     const s = await readSettings()
@@ -633,8 +834,19 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     await save(s)
   }
 
-  /** What a run recorded for this model at this context size, or null if none has. */
-  const measuredFor = (s, modelId, ctx) => s.measured?.[`${modelId}@${ctx}`] ?? null
+  /**
+   * What a run recorded for this model at this context size, or null if none has, or if that run
+   * was not like this one: another GPU room (`roomGB`, what planFor gives it) or other GPU layers
+   * split the model another way. A GPU run's RAM side says nothing about a CPU run, which puts all
+   * of it in RAM, and a run held to a tight VRAM budget overstates RAM once the budget is lifted;
+   * taken as they are, the first lets an oversized model through and the second refuses a model
+   * for good, since a refused model never runs again to be measured. Such a run stays on file and
+   * the estimate for this one stands in. A reading from before the room was recorded has none.
+   */
+  const measuredFor = (s, modelId, ctx, { roomGB, gpuLayers }) => {
+    const got = s.measured?.[`${modelId}@${ctx}`]
+    return got && got.roomGB === roomGB && got.gpuLayers === gpuLayers ? got : null
+  }
 
   // Install markers. Engine: <engineDir>/.installed/<id>.json once its zip was verified and unpacked.
   // Model/vision: <modelsDir>/.verified/<file>.json with the file's size, mtime and hash, so a 5 GB file is hashed once.
@@ -683,14 +895,19 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   /** Router agents for installed models (manifest `agent`); none until the model is installed. */
   async function agents(persona) {
     const models = (await installed()).filter((m) => m.agent)
+    const s = await readSettings()
     return Promise.all(models.map(async (m) => ({
       id: m.agent.id, name: m.agent.name ?? (m.name ? `${m.name} (local)` : undefined), provider: 'spawn', description: m.agent.description, enabled: true,
       // `role` ('fast' | 'balanced' | 'best-quality') ranks the local models for the
       // local-low / local-high effort levels; size only breaks a tie.
-      // `contextSize` is the window llama-server will really be started with here (runDefaults),
-      // so the router's capability registry and the resource snapshot both know what this model
-      // can hold, and a request that does not fit is refused before any judgment.
-      role: m.role, size: m.size, llm: { provider: LOCAL_PROVIDER, model: m.id, contextSize: (await runDefaults(m)).ctx }, persona,
+      // `contextSize` is the window llama-server will really be started with here (planFor, which
+      // sizes it to the resource budget), so the router's capability registry and the resource
+      // snapshot both know what this model can hold, and a request that does not fit is refused
+      // before any judgment. While the model runs, a request meets the window it was started with,
+      // and the router keeps this until it is told again, by which time the model may have been
+      // loaded afresh with the planned one: so it gets the smaller of the two, never more than
+      // either run holds.
+      role: m.role, size: m.size, llm: { provider: LOCAL_PROVIDER, model: m.id, contextSize: Math.min((await planFor(m, s)).ctx, runningCtx(m.id) ?? Infinity) }, persona,
     })))
   }
 
@@ -709,6 +926,10 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const specs = await getSpecs().catch(() => null)
     const fit = specs ? rateModule(m, specs, variant, { installed: true }) : null
     if (fit?.fit === 'no') return { installed: true, loggedIn: false, detail: `this PC cannot run ${m.file}: ${fit.reason}` }
+    // Over the resource budget is as hard a fact as too little memory: start() would refuse it, so
+    // the router must not pick it and then fail the task at the load.
+    const { refusal } = await planFor(m, await readSettings())
+    if (refusal) return { installed: true, loggedIn: false, detail: refusal }
     return { installed: true, loggedIn: true, detail: `free, local: ${m.file}` }
   }
 
@@ -719,17 +940,87 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    * instead of to the `fast` role that exists for exactly this job (Gemma 4 E4B, ~47 tokens/s).
    * A direct answer is a short one, so speed is what a local chat model is for; the stored
    * choice still wins over both.
+   *
+   * Either way only among the models the resource budget lets load, a watchdog unload included.
+   * Titles, compaction and direct answers go to the local chat model first, and a refused one
+   * would fail each of them at the load rather than leave them to the next agent.
    */
   async function chatModel() {
     if (!(await engineInstalled())) return null
-    const have = await installed()
-    const { chatModel: want } = await readSettings()
-    return have.find((m) => m.id === want)?.id ?? quickestLocal(have)?.id ?? null
+    const s = await readSettings()
+    const fits = []
+    for (const m of await installed()) if (!(await planFor(m, s)).refusal) fits.push(m)
+    return fits.find((m) => m.id === s.chatModel)?.id ?? quickestLocal(fits)?.id ?? null
   }
 
   async function runDefaults(m) {
     const d = defaultsFor(m, await getSpecs().catch(() => null), await engineVariant())
     return { ctx: Math.min(contextSize ?? d.ctx, m.maxContext ?? Infinity), gpuLayers: d.gpuLayers }
+  }
+
+  /**
+   * What the budget makes of a start: the thread count, the --fit-target, and, when the VRAM budget
+   * cannot be held by --fit, why not, so the log can say so instead of implying a cap that is not
+   * there. Layers pinned in Settings are loaded as pinned and --fit does not move them; a CPU run
+   * (no layers, or the CPU build) uses no VRAM, so any budget holds. A GPU sized from AdapterRAM's
+   * ceiling (detectSpecs) has no known size either: a margin worked out from 4 GB on an 8 GB card
+   * would let the model take about twice the budget.
+   *
+   * A core budget is a cap, not a request: above the machine's logical processors it would have
+   * llama.cpp run more threads than there are, oversubscribed, which is the crawl -t is there to stop.
+   */
+  function limitsFor(s, specs, variant, gpuLayers) {
+    const cpu = specs?.cpu ?? { cores: null, threads: cpus().length }
+    const auto = defaultThreads(cpu)
+    const machine = cpu.threads || cpus().length || Infinity
+    const gpus = specs && variant ? gpusFor(specs, variant) : []
+    const sizeCapped = gpus.some((g) => g.sizeCapped)
+    const gpuTotalGB = sizeCapped ? 0 : Math.max(0, ...gpus.map((g) => g.vramGB))
+    let unapplied = null
+    if (s.maxVramGB != null && variant !== 'cpu' && gpuLayers !== 0) {
+      if (typeof gpuLayers === 'number') unapplied = `GPU layers are pinned to ${gpuLayers}, which --fit does not move`
+      else if (sizeCapped) unapplied = 'this GPU reports its memory through a 32-bit field that stops at 4 GB'
+      else if (!(gpuTotalGB > 0)) unapplied = "this PC's GPU memory is unknown"
+    }
+    return { threads: s.maxCores == null ? auto : Math.min(s.maxCores, machine), defaultThreads: auto, fitTargetMiB: fitTargetMiB({ maxVramGB: s.maxVramGB, gpuTotalGB }), unapplied }
+  }
+
+  /**
+   * How a model would start here under these settings: its context, its GPU layers, the GPU room it
+   * would have, what it would take (measured if a run like this one has reported it, estimated until
+   * then), and the budget's refusal, if any. The GPU room is what the start would really give it:
+   * none on a CPU run, otherwise the GPU's usable memory held to the VRAM budget. start(),
+   * readiness(), chatModel(), agents() and status() all read this, so the load, the router and the
+   * settings page cannot disagree about what fits.
+   *
+   * The context is sized to the RAM budget: the largest of contextSteps(), from the one it would
+   * start with (runDefaults) down to MIN_CTX, whose figure the budget holds. Each context is judged
+   * by its own figure, measured there or estimated there, since a reading at one context says
+   * nothing about another. The VRAM budget comes into it where it applies, through the room: the
+   * layers it keeps off the GPU land in RAM, and the figure with them. On its own it sizes nothing,
+   * since --fit holds it and nothing is refused on its account, and with no RAM budget the context is
+   * the one it would start with. Only a model over the budget even at the floor is refused, with its
+   * figure there. `reducedFrom` is the context it would have started with, when the budget took some away.
+   *
+   * A model the RAM watchdog unloaded is sized below the context it was unloaded at: its real use
+   * there was over the budget, whatever the figure says, and says nothing about a smaller context.
+   * Only one unloaded at the smallest context it can have is refused on the watchdog's account.
+   */
+  async function planFor(m, s) {
+    const specs = await getSpecs().catch(() => null)
+    const variant = (await engineVariant()) ?? 'cpu'
+    const d = await runDefaults(m)
+    const gpuLayers = s.gpuLayers ?? d.gpuLayers
+    const room = !specs || gpuLayers === 0 ? 0 : Math.min(usableVramGB(specs, variant), s.maxVramGB ?? Infinity)
+    const figureAt = (ctx) => estimateMemory(m, { ctx, vramGB: room, measured: measuredFor(s, m.id, ctx, { roomGB: room, gpuLayers }) })
+    const all = contextSteps(d.ctx)
+    const unloaded = tripped.get(m.id)
+    const steps = unloaded ? all.filter((c) => c < unloaded.ctx) : all
+    const ctx = steps.find((c) => !overRam(figureAt(c), s.maxRamGB)) ?? steps.at(-1) ?? all.at(-1)
+    const memory = figureAt(ctx)
+    planned.set(m.id, ctx)
+    const refusal = unloaded && !steps.length ? `the RAM watchdog unloaded ${m.name ?? m.id}: ${unloaded.why}. Raise the RAM budget to load it again.` : overBudget(memory, s, { name: m.name ?? m.id, ctx })
+    return { ctx, reducedFrom: ctx < d.ctx ? d.ctx : null, gpuLayers, room, specs, variant, memory, refusal }
   }
 
   function kill(child) {
@@ -742,9 +1033,42 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
 
   async function stop() {
     clearTimeout(idleTimer)
+    clearInterval(watchTimer)
     const e = engine
     engine = null
     if (e) { kill(e.child); log(`local: engine stopped (${e.modelId})`) }
+  }
+
+  /**
+   * One reading of the RAM watchdog. RAM cannot be capped, so while a RAM budget is set the engine's
+   * real working set is read every few seconds, and a model that stays over the budget for
+   * WATCH_GRACE_MS is unloaded, even mid-answer: the budget is there to keep the PC usable. Only
+   * readings that all say "over" count, so a reading that cannot be taken restarts the count rather
+   * than adding to it; not knowing is no evidence the model is over. The interval takes a reading
+   * every `watchEveryMs`; tests take them by hand, on their own clock.
+   */
+  function checkMemory() {
+    watching ??= (async () => {
+      const e = engine
+      if (!e?.loaded) return
+      const { maxRamGB } = await readSettings()
+      if (maxRamGB == null) { e.overSince = null; e.workingSetGB = null; return }
+      const bytes = await readWorkingSet(e.child.pid).catch(() => null)
+      if (engine !== e) return
+      e.workingSetGB = bytes == null ? null : r1(bytes / GB)
+      if (bytes == null || bytes <= maxRamGB * GB) { e.overSince = null; return }
+      e.overSince ??= now()
+      const forMs = now() - e.overSince
+      if (forMs < WATCH_GRACE_MS) return
+      const why = `its working set stayed over the ${maxRamGB} GB RAM budget for ${Math.round(forMs / 1000)} s (last reading ${e.workingSetGB} GB)`
+      tripped.set(e.modelId, { why, ctx: e.ctx })
+      log(`local: unloaded ${e.modelId}: ${why}`)
+      await stop()
+      // The router caches readiness for minutes and the chat model with it. Told now, it stops
+      // offering this model at once, instead of sending it tasks that each fail at the load.
+      onChange(mod(e.modelId))
+    })().finally(() => { watching = null })
+    return watching
   }
 
   async function start(modelId) {
@@ -752,18 +1076,24 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     if (!m) throw new Error(`local model ${modelId} is not installed (type /install-llm)`)
     if (!(await engineInstalled())) throw new Error('llama.cpp engine not installed (type /install-llm)')
     const s = await readSettings()
+    // Refused before anything is spawned: RAM cannot be capped once the model is loading, so a
+    // model the budget cannot hold is not started at all.
+    const plan = await planFor(m, s)
+    if (plan.refusal) throw new Error(plan.refusal)
     const port = await freePort(basePort)
     const key = randomBytes(24).toString('hex')
-    const d = await runDefaults(m)
-    const gpuLayers = s.gpuLayers ?? d.gpuLayers
+    const { ctx, gpuLayers } = plan
+    const limits = limitsFor(s, plan.specs, plan.variant, gpuLayers)
+    if (limits.unapplied) log(`local: VRAM budget of ${s.maxVramGB} GB not applied: ${limits.unapplied}`)
+    if (plan.reducedFrom) log(`local: the resource budget reduced ${m.id}'s context from ${plan.reducedFrom} to ${ctx}, the largest that fits it`)
     const vision = await visionFor(m.id)
     const args = [
-      ...llamaArgs({ modelPath: join(modelsDir, m.file), alias: m.id, port, ctx: d.ctx, gpuLayers, thinking: !!m.thinking }),
+      ...llamaArgs({ modelPath: join(modelsDir, m.file), alias: m.id, port, ctx, gpuLayers, fitTargetMiB: limits.fitTargetMiB, threads: limits.threads, thinking: !!m.thinking }),
       // The vision projector stays on the CPU so the GPU keeps the text model's layers.
       ...(vision ? ['--mmproj', join(modelsDir, vision.file), '--no-mmproj-offload'] : ['--no-mmproj']),
     ]
     const child = spawn(exe, args, { cwd: engineDir, env: { ...process.env, LLAMA_API_KEY: key }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    const e = { child, modelId: m.id, port, key, ctx: d.ctx, vision: !!vision, startedAt: Date.now(), gpuLayers: null, tail: [], memoryLines: [], memory: null }
+    const e = { child, modelId: m.id, port, key, ctx, vision: !!vision, startedAt: Date.now(), gpuLayers: null, threads: limits.threads, fitTargetMiB: limits.fitTargetMiB, tail: [], memoryLines: [], memory: null }
     const onLine = (chunk) => {
       for (const l of String(chunk).split('\n')) {
         const off = /offloaded (\d+)\/(\d+) layers to GPU/.exec(l)
@@ -779,7 +1109,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const exited = new Promise((r) => child.once('exit', r)).then((code) => { if (engine === e) engine = null; return code })
     child.once('error', (err) => { e.tail.push(err.message); if (engine === e) engine = null })
     engine = e
-    log(`local: engine starting ${m.id} on 127.0.0.1:${port} (ctx ${d.ctx}, GPU layers ${gpuLayers}${vision ? ', vision' : ''})`)
+    log(`local: engine starting ${m.id} on 127.0.0.1:${port} (ctx ${ctx}, GPU layers ${gpuLayers}, ${limits.threads} threads, ${limits.fitTargetMiB} MiB kept free on the GPU${vision ? ', vision' : ''})`)
     e.ready = (async () => {
       const deadline = Date.now() + 5 * 60_000
       while (Date.now() < deadline) {
@@ -788,11 +1118,17 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
         if (ok) {
           e.loaded = true
           loadMs.set(m.id, Date.now() - e.startedAt)
-          // What it really took, at this context size, on this machine. Recorded against both, so
-          // a reading is never shown for a context it was not measured at.
+          // What it really took, at this context size, on this machine. Recorded against both, and
+          // with the GPU room and layers it ran with, so a reading is never shown for a context it
+          // was not measured at, nor taken for a run that splits the model another way.
           e.memory = readMemoryUsage(e.memoryLines)
-          if (e.memory) { await recordMemory(m.id, d.ctx, e.memory); log(`local: ${m.id} took ${e.memory.vramGB} GB VRAM + ${e.memory.ramGB} GB RAM at ctx ${d.ctx}`) }
+          if (e.memory) { await recordMemory(m.id, ctx, { ...e.memory, roomGB: plan.room, gpuLayers }); log(`local: ${m.id} took ${e.memory.vramGB} GB VRAM + ${e.memory.ramGB} GB RAM at ctx ${ctx}`) }
           log(`local: engine ready: ${m.id}, ${e.gpuLayers ? `${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : 'GPU layers unknown'}`)
+          // Watched from here on, not while loading: the budget is about the model as it runs, and a
+          // model too big to load under it was refused before it started.
+          clearInterval(watchTimer)
+          watchTimer = setInterval(() => { checkMemory().catch((err) => log(`local: RAM watchdog: ${err.message}`)) }, watchEveryMs)
+          watchTimer.unref?.()
           return
         }
         await Promise.race([sleep(500), exited])
@@ -955,27 +1291,34 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const s = await readSettings()
     const states = await Promise.all(modules.map(stateOf))
     const ready = engine ? await Promise.race([engine.ready.then(() => true, () => false), sleep(0).then(() => false)]) : false
-    // The context each model would really start with here, and the GPU room it would have, so the
-    // memory figures below describe the run this PC would actually get rather than a default one.
-    const specs = await getSpecs().catch(() => null)
-    const vramGB = specs ? usableVramGB(specs, await engineVariant() ?? 'cpu') : 0
-    const ctxs = new Map(await Promise.all(modules.map(async (m) => [m.id, m.kind === 'model' ? (await runDefaults(m)).ctx : null])))
+    // The run each model would really get here: the context it would start with and the GPU room
+    // the budget leaves it, so the memory figures below describe that run rather than a default one.
+    const plans = new Map(await Promise.all(modules.filter((m) => m.kind === 'model').map(async (m) => [m.id, await planFor(m, s)])))
+    const variant = (await engineVariant()) ?? 'cpu'
+    const limits = limitsFor(s, await getSpecs().catch(() => null), variant, s.gpuLayers ?? (variant === 'cpu' ? 0 : 'auto'))
     return {
-      engine: { installed: await engineInstalled(), variant: await engineVariant(), running: !!engine, ready, model: engine?.modelId ?? null, vision: !!engine?.vision, port: engine?.port ?? null, ctx: engine?.ctx ?? null, gpuLayers: engine?.gpuLayers ?? null, memory: engine?.memory ?? null, startedAt: engine?.startedAt ?? null, busy },
+      engine: { installed: await engineInstalled(), variant: await engineVariant(), running: !!engine, ready, model: engine?.modelId ?? null, vision: !!engine?.vision, port: engine?.port ?? null, ctx: engine?.ctx ?? null, gpuLayers: engine?.gpuLayers ?? null, threads: engine?.threads ?? null, fitTargetMiB: engine?.fitTargetMiB ?? null, memory: engine?.memory ?? null, workingSetGB: engine?.workingSetGB ?? null, startedAt: engine?.startedAt ?? null, busy },
       settings: { ...s, chatModel: await chatModel() },
+      // What the budget makes of the next load: the thread count (and the default an unset core
+      // limit means), the VRAM kept free, and why the VRAM budget cannot be held when it cannot.
+      budget: { threads: limits.threads, defaultThreads: limits.defaultThreads, fitTargetMiB: limits.fitTargetMiB, vramNotApplied: limits.unapplied },
       modules: modules.map((m, i) => ({
         id: m.id, kind: m.kind, variant: m.variant, for: m.for, name: m.name, file: m.file, size: m.size, license: m.license, notes: m.notes, source: m.source,
         agent: m.agent?.id ?? null, state: states[i], job: jobs.get(m.id) ?? null, badges: badgesOf(m),
         // What it would take here at the context it would run with, measured if a run has ever
         // reported it and a rough estimate until then. The caller shows which, never both.
-        memory: m.kind === 'model' ? estimateMemory(m, { ctx: ctxs.get(m.id), vramGB, measured: measuredFor(s, m.id, ctxs.get(m.id)) }) : null,
-        ctx: ctxs.get(m.id),
+        memory: plans.get(m.id)?.memory ?? null,
+        ctx: plans.get(m.id)?.ctx ?? null,
+        // The context it would have started with, when the budget sized it down to `ctx`; else null.
+        ctxReducedFrom: plans.get(m.id)?.reducedFrom ?? null,
+        // The budget's refusal, word for word what start() would throw, or null when it fits.
+        overBudget: plans.get(m.id)?.refusal ?? null,
       })),
     }
   }
 
   return {
-    readiness, installed, agents, chatModel, stream, acquire, status, install, plan, remove, setSettings, settled, engineVariant, visionFor, readSettings,
+    readiness, installed, agents, chatModel, stream, acquire, status, install, plan, remove, setSettings, settled, engineVariant, visionFor, readSettings, checkMemory,
     /** True when `modelId` is loaded and answering (no cold start). */
     isLoaded: (modelId) => !!engine?.loaded && engine.modelId === modelId,
     /** Expected load time: the last one measured this session, else ~8 s. */
@@ -983,7 +1326,12 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     start: async (id) => { const c = await acquire(id); c.release() },
     stop: async () => { if (busy > 0) throw new Error('a local model is answering right now'); await stop() },
     dispose: async () => { process.off('exit', onExit); await stop() },
-    contextOf: (id) => { const m = mod(id); return m ? Math.min(contextSize ?? Math.max(MIN_CTX, m.contextSize ?? 16384), m.maxContext ?? Infinity) : contextSize ?? 16384 },
+    /**
+     * The context window a request to `id` meets: the one llama-server was started with while it runs
+     * `id`, else the one it was last planned with (planFor), which the next load gets, else what its
+     * manifest asks for.
+     */
+    contextOf: (id) => { const m = mod(id); return runningCtx(id) ?? planned.get(id) ?? (m ? Math.min(contextSize ?? Math.max(MIN_CTX, m.contextSize ?? 16384), m.maxContext ?? Infinity) : contextSize ?? 16384) },
     modelOf: mod,
     modules,
   }

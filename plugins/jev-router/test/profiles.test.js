@@ -3,7 +3,7 @@
 // up as a declining trend, and a run record turns into evidence rows with none of its text.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { appendFileSync, existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1085,4 +1085,127 @@ test('the feedback route with learning off stores the verdict and still applies 
   const again = createCapabilityRegistry({ file, priors, policy, now: () => NOW })
   again.load()
   assert.equal(humanOf(again, claudeSubject()).length, 0, 'after a restart too')
+})
+
+// ---------- POST /jev-router/feedback, the route itself ----------
+// apply() needs the whole plugin runtime, so the route's handling is a function of its own
+// (createFeedbackRoute) that apply() serves the route with. These drive it with the request body
+// as text, over a real feedback log, capability registry and training store, wired as apply() does.
+async function routeHarness({ slowLike = false, failOnce = false } = {}) {
+  const { createFeedbackRoute } = await import('../index.js')
+  const { createFeedback } = await import('../feedback.js')
+  const { createTrainingStore, labelFromRun } = await import('../training.js')
+  const file = tmp()
+  const reg = createCapabilityRegistry({ file, priors, policy, now: () => NOW })
+  const fb = createFeedback({ file: join(dirname(file), 'feedback.jsonl') })
+  const training = createTrainingStore({ file: join(dirname(file), 'routing-samples.jsonl') })
+  const r1 = run({ runId: 'run-1', ts: T0 })
+  // The run's task-classification sample, labelled from the run alone, as it is when a run ends.
+  const sample = await training.append({ domain: 'task_classification', runId: 'run-1', input: { features: { numeric: { x: 1 }, categorical: {} } }, teacher: { label: 'implementation', probabilities: { implementation: 0.9 }, confidence: 0.9, model: 'jev-1' }, local: null, authority: 'jev' })
+  await training.resolveOutcome(sample.id, labelFromRun('task_classification', await training.get(sample.id), r1))
+  let learn = true
+  // A like that takes a while to reach the disk, so a verdict posted after it could overtake it.
+  // Or one whose first write fails (a full disk, say), and every write after it succeeds.
+  let failed = false
+  const log = slowLike ? { ...fb, append: async (r) => { if (r.verdict === 'like') await new Promise((ok) => setTimeout(ok, 50)); return fb.append(r) } }
+    : failOnce ? { ...fb, append: async (r) => { if (!failed) { failed = true; throw new Error('ENOSPC: no space left on device') } return fb.append(r) } }
+      : fb
+  const post = createFeedbackRoute({ feedback: log, records: async () => [r1], capabilities: reg, training, agents: async () => agents, priors, learn: () => learn })
+  const body = (over) => JSON.stringify({ sessionId: 'sess-1', messageId: 'm1', provider: 'claude', runId: 'run-1', ...over })
+  const labelSource = async () => (await training.get(sample.id)).outcome.labelSource
+  return { reg, fb, training, sample, post, body, labelSource, setLearn: (on) => { learn = on } }
+}
+
+test('POST /jev-router/feedback: a verdict is stored, credited to its run and relabels it, and the reply is the stored row', async () => {
+  const h = await routeHarness()
+  const res = await h.post(h.body({ verdict: 'dislike', tag: 'misread my question', reason: 'I asked for a plan' }))
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.deepEqual(await h.fb.list('sess-1'), [res.body.record], 'stored, and the reply carries exactly what was stored')
+  assert.equal(res.body.record.runId, 'run-1')
+  const label = (await h.training.get(h.sample.id)).outcome
+  assert.deepEqual([label.label, label.negativeLabel, label.labelSource], [null, 'implementation', 'human'], 'the run\'s routing sample now carries the person\'s label')
+  assert.ok(humanOf(h.reg, claudeSubject()).length > 0, 'and the verdict is capability evidence')
+  assert.ok(humanOf(h.reg, claudeSubject()).every((x) => x.runId === 'run-1' && x.score === 0), 'a dislike, about run 1')
+})
+
+test('POST /jev-router/feedback: a bad body is a 400 with the reason, and changes nothing', async () => {
+  const h = await routeHarness()
+  for (const [raw, reason] of [
+    ['{not json', /JSON/],
+    ['[]', /expected an object/],
+    [h.body({ verdict: 'meh' }), /verdict: like, dislike, or clear/],
+    [h.body({ verdict: 'dislike', tag: 'wrong model' }), /tag: one of/],
+    [h.body({ verdict: 'like', runId: 'run 1' }), /runId/],
+    [h.body({ verdict: 'like', sessionId: '' }), /sessionId/],
+  ]) {
+    const res = await h.post(raw)
+    assert.equal(res.status, 400, raw)
+    assert.match(res.body.error, reason)
+  }
+  assert.deepEqual(await h.fb.history(), [], 'nothing was stored')
+  assert.equal(humanOf(h.reg, claudeSubject()).length, 0, 'nothing was credited')
+  assert.equal(await h.labelSource(), 'teacher_confirmed', 'nothing was relabelled')
+  assert.equal((await h.post(h.body({ verdict: 'like' }))).status, 200, 'and the route still takes a good one after them')
+})
+
+test('POST /jev-router/feedback with learning off: stored and marked, nothing learnt, and a clear still withdraws', async () => {
+  const h = await routeHarness()
+  assert.equal((await h.post(h.body({ verdict: 'like' }))).status, 200)
+  const counted = humanOf(h.reg, claudeSubject()).length
+  assert.ok(counted > 0, 'the setting: with learning on the like counted')
+  h.setLearn(false)
+  const off = await h.post(h.body({ messageId: 'm2', verdict: 'dislike', tag: 'misread my question' }))
+  assert.equal(off.status, 200)
+  assert.equal(off.body.record.learningOff, true, 'stored, and marked as given while learning was off')
+  assert.equal(humanOf(h.reg, claudeSubject()).length, counted, 'no new evidence')
+  assert.equal(await h.labelSource(), 'teacher_confirmed', 'and no new label')
+  assert.equal((await h.post(h.body({ verdict: 'clear' }))).status, 200)
+  assert.equal(humanOf(h.reg, claudeSubject()).length, 0, 'the like withdrawn with learning off no longer counts')
+  assert.deepEqual((await h.fb.list('sess-1')).map((r) => r.messageId), ['m2'], 'the log reads back what the person thinks now')
+})
+
+test('POST /jev-router/feedback: verdicts posted together are applied in the order they are stored', async () => {
+  const h = await routeHarness({ slowLike: true })
+  // A quick like then dislike on one answer, the second posted before the first has answered,
+  // and the like slow to store: only the one queue keeps the dislike from landing first.
+  const [a, b] = await Promise.all([h.post(h.body({ verdict: 'like' })), h.post(h.body({ verdict: 'dislike' }))])
+  assert.deepEqual([a.status, b.status], [200, 200])
+  assert.deepEqual((await h.fb.history('sess-1')).map((r) => r.verdict), ['like', 'dislike'], 'stored in the order given')
+  const scores = humanOf(h.reg, claudeSubject()).map((x) => x.score)
+  assert.ok(scores.length > 0 && scores.every((s) => s === 0), `what counts is the dislike, the newest: ${scores}`)
+})
+
+test('POST /jev-router/feedback: a verdict that could not be stored fails alone, and the next one is taken', async () => {
+  const h = await routeHarness({ failOnce: true })
+  // The route throws, and the HTTP handler answers that as it answers any other failure.
+  await assert.rejects(h.post(h.body({ verdict: 'like' })), /ENOSPC/)
+  assert.deepEqual(await h.fb.history(), [], 'nothing was stored')
+  assert.equal(humanOf(h.reg, claudeSubject()).length, 0, 'and nothing credited')
+  // One failed write must not become the queue: every verdict after it would fail too.
+  const next = await h.post(h.body({ verdict: 'dislike' }))
+  assert.equal(next.status, 200)
+  assert.deepEqual((await h.fb.list('sess-1')).map((r) => r.verdict), ['dislike'], 'the next verdict is stored')
+  assert.ok(humanOf(h.reg, claudeSubject()).length > 0, 'and applied')
+})
+
+// ---------- the history deps apply() gives the router ----------
+// createHistoryDeps is what apply() hands runRouted as deps.history. Its runOfVerdict is the one
+// place the registry's credit (creditedRun) reaches the router's feedback prior, so it is driven
+// here over the same registry the route credits verdicts in.
+test('createHistoryDeps: a verdict with no runId is placed on the run the route credited it to, whatever ended since', async () => {
+  const { createHistoryDeps } = await import('../index.js')
+  const h = await routeHarness()
+  // The first form names its run, so the route credits it to run 1.
+  const first = await h.post(h.body({ verdict: 'dislike' }))
+  assert.equal(first.status, 200)
+  // A newer run of the session, of another kind, ended before a later form that names no run.
+  const historyFile = join(dirname(tmp()), 'history.jsonl')
+  const runs = [run({ runId: 'run-1', ts: T0 }), run({ runId: 'run-2', ts: daysAgo(-1), routing: { taskType: 'documentation', primaryAgent: 'claude' } })]
+  writeFileSync(historyFile, runs.map((r) => `${JSON.stringify(r)}\n`).join(''))
+  const later = { ...first.body.record, runId: undefined, ts: daysAgo(-2) }
+  const deps = createHistoryDeps({ historyFile, feedback: h.fb, capabilities: h.reg })
+  assert.equal(deps.runOfVerdict(later, await deps.records())?.runId, 'run-1', 'the run its evidence is on')
+  const blind = createHistoryDeps({ historyFile, feedback: h.fb })
+  assert.equal(blind.runOfVerdict(later, await blind.records())?.runId, 'run-2', 'without the registry it would be read as the newer run')
 })
