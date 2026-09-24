@@ -11,12 +11,12 @@ unless it says otherwise. Where something is unverified it says so.
 ## State
 
 ```
-branch        main                         (primary; chore/initial-setup points at the same commit)
-              feat/adaptive-routing        adaptive routing, one commit on main e56bca7, 23 Sep, not merged
+branch        main                         49aa6cb, pushed; adaptive routing merged and fixed
+              fix/routing-self-labelling   merged into main, pushed, safe to delete
+              feat/routing-stability-local-context   parked by the owner, not merged
 remote        origin github.com/kz-95/kz-harness, PUBLIC
-tests         716 tests, 715 pass, 0 fail, 1 skipped  (npm --prefix plugins/jev-router test)
-              the one skip is Windows-only (engine zip unpack) and skips on Linux by design
-app           exe rebuilt 21 Sep 22:16, engine on 127.0.0.1:3080
+tests         722 tests, 722 pass, 0 fail  (npm --prefix plugins/jev-router test)
+app           NOT rebuilt since the merge; the running app is on older plugin code
 ```
 
 Git authorship is the GitHub noreply alias on every commit. All five were rewritten on 22 Sep
@@ -30,55 +30,116 @@ everything, because the API wants the engine's per-process token. If cordis ever
 INACTIVE the app still boots and looks normal, so that 404 is the only cheap sign every KzH
 feature is silently gone.
 
-## Where this was left, 23 Sep: read this first
+## Where this was left, 24 Sep: read this first
 
-The adaptive router is finished on `feat/adaptive-routing`, as one commit on top of `main` (`e56bca7`).
-It is not merged, and it has never run in the app: everything below "Built but NOT observed" still applies to it.
-Work continues on the owner's PC from here, not in the cloud session that built it.
+The adaptive router is **merged into `main` and pushed**. It was reviewed before merging, two
+blockers were found and fixed, and the suite is green. It has still **never run in the app**, so
+everything under "Built but NOT observed" continues to apply to it.
 
-That cloud session could not push.
-The Claude GitHub App had read access only to `kz-95/kz-harness`, so every `git push` and every GitHub API write returned 403.
-The branch therefore travelled as a git bundle, `adaptive-routing.bundle`, with `adaptive-routing.patch` holding the same commit as a patch.
-If the branch is already on GitHub (the app was given write access and a later push worked), fetch it from `origin` instead and skip the bundle.
+What the design review found, and what was done about it:
 
-Picking it up, in PowerShell from the repo root:
+1. **The router trained on its own picks.** Once a domain reached local authority, `pickOf`
+   returned the local classifier's own answer and an accepted run filed it as `teacher_confirmed`.
+   The classifier confirmed itself, and the label named a teacher nobody asked. `confirms()` in
+   `training.js` now drops the agreeing label under local authority; evidence that contradicts the
+   pick still trains it. A bare thumbs-up also counted as a full-weight human routing label and fed
+   promotion, so only the explicit `good pick` tag counts now. Commit `5d7b9f4`.
+2. **Three questions asked Jev to compare numbers.** The `resource` choice handed it capability
+   scores, scarcity, expected cost, reliability and latency and asked which candidate wins;
+   `conserve` and `frontierReview` had the same shape. That is several judgments in one question
+   over magnitudes a snap-judgment classifier cannot compare (QUICKREF rules 2 and 4).
+   `rankCandidates()` in `broker.js` now does it in code under a new `code` authority, and the two
+   yes/no answers come from the governor and the policy. `questions.strategy` stayed: a choice
+   between named shapes is a judgment. Commit `a0528db`.
 
-```
-git fetch origin main
-git fetch <folder>\adaptive-routing.bundle feat/adaptive-routing:feat/adaptive-routing
-git checkout feat/adaptive-routing
-cd plugins\jev-router; npm test; cd ..\..
-node scripts\kzh-routing-demo.mjs --learn 60
-git push -u origin feat/adaptive-routing
-```
+Consequences worth knowing before reading the code:
 
-The bundle needs `e56bca7` already in the clone, which is what the first line makes sure of.
-If a local `feat/adaptive-routing` exists from an earlier bundle, switch off it and delete it first (`git checkout main`, then `git branch -D feat/adaptive-routing`): the commit was replaced, not added to, and git refuses to delete or fetch into the branch that is checked out.
-`git am adaptive-routing.patch` on a branch made from `origin/main` gives the same tree when the bundle will not load.
-`npm test` must show `# fail 0` in the summary block it prints last; the one Windows-only test (engine zip unpack) is skipped on Linux and runs on Windows, so the skipped count there is 0.
-`plugins/jev-review` no longer depends on `@deepseek-ai/schemastery`; a copy left in its `node_modules` is harmless, and `npm install` there prunes it.
+- `resource_selection` has **no Jev teacher any more**. It trains only on rescues, negatives and a
+  person's `good pick` tag, so it matures slowly or not at all. The optimistic comment at
+  `decision.js:169` has not been rewritten to say so. Decide which you want, and write it down.
+- **Conservation was left with nothing to do** once the ranker prices scarcity itself, so its
+  action was redefined: it now removes the most capable resource from the WORK pool whether or not
+  the ranking picked it, keeping it available to review. A reviewer's verdict on that was to delete
+  the domain outright and keep the removal as a plain pool filter beside the other hard limits.
+  That is still open, and it is the largest single deletion available here.
 
-What a first start on this PC changes, so nothing in it is a surprise:
-
-- `client.js` changed, so it takes an app START, not a page reload (see the gotchas below).
-- Every routing domain starts at `JEV_PRIMARY`, so Jev still makes every routing decision.
-  A domain decides anything alone only after hundreds to thousands of verified samples (`shadowSamples` 250, `guardedSamples` 750 and `localOnlySamples` 1500 for a LOW-risk domain, double and four times that for MEDIUM and HIGH).
-- A routed run makes two Jev calls where the named-agent route made one: the task profile first, then the anonymous resource table and the judgments, because the second needs the first.
-  That is the price of the candidate table carrying capability numbers; it drops to one call, then none, as the domains mature.
-- New files appear under `~/.kzh/jev-router/` as runs happen: `routing-samples.jsonl`, `capability-evidence.jsonl`, `classifiers/`, `domains/` and `known-resources.json`.
-  Nothing existing is rewritten: `history.jsonl` and `feedback.jsonl` gain new fields on new rows only.
-- Verdicts given before this branch are not replayed as capability evidence; the routing prior still reads them as before.
-- To go back to the old behaviour without changing branch, set `routing.enabled: false` on the jev-router row of `~/.kzh/profiles/web/cordis.patch.yml`, the live copy the engine reads: Jev then routes over named agents as it did on `main`.
-  `config/cordis.patch.yml` is only the installer's template, and the installer does not rewrite a live file that already has a jev-router row, so changing the template alone changes nothing on this PC.
-  A patch replaces the row's whole `config`, so add `routing:` next to the fields already there rather than a row holding only it.
+Local models gained a memory answer (`8539b9f`). `estimateMemory()` gives the rough figure before
+anything runs, being the weights, the KV cache for that context and the compute scratch, split the
+way the layers will load. `readMemoryUsage()` reads the engine's own load report afterwards, which
+names the device holding each buffer, so the split is read rather than guessed. A reading is stored
+against the model **and** the context size it was measured at, because a reading for one context
+says nothing about another. This is the first piece of the resource budget below.
 
 What to do next, in order:
 
-1. **Watch it in the running app**, the one thing it has never had.
-   The checklist is the "Watch the adaptive router" item under "Open work" below, plus two new things: a routed run's view names every move the router made (`routing.moves`), and a Like on a routed answer stores a `runId` in `feedback.jsonl`.
-2. **Settle the feedback-privacy question** (the owner item below).
-3. **Open a pull request** from `feat/adaptive-routing` to `main` once it has been watched, and merge only when you decide to.
-4. Then the open work below, and the three items still open after the fix rounds.
+1. **Rebuild the exe and watch a routed run in the app.** The running copy is on older plugin code.
+   This is still the one thing the router has never had.
+2. **Scrub the handoff before it goes to Jev** (`jev.js:544`). The task text is scrubbed, the
+   earlier agent's output is only clipped, and the workspace text is not scrubbed either. A
+   one-line fix, on the owner's own stated privacy terms.
+3. **Cap `routing-samples.jsonl`.** Eight rows per routed run, no cap, no rotation, parsed whole at
+   startup and mirrored in memory. A `slice(-N)` on load covers it.
+4. **Set a thread cap.** `llamaArgs` accepts `threads` and nothing sets it, so llama.cpp takes every
+   core and the rest of the machine crawls.
+5. Then the resource budget, the conservation deletion, and the open work below.
+
+### The resource budget, agreed and part-built
+
+Agreed scope: **one budget page, all consumers**, being max VRAM, max RAM, max cores and max
+concurrent tasks, with the local model sizing itself to fit, refusing to start when it cannot, and
+the task queue respecting the concurrency cap. The estimate and the measured readback are done; the
+budget itself, the computed `--fit-target` and `-t`, refuse-to-load, the watchdog and the settings
+UI are not.
+
+Honest limits, so nobody promises more than this can do. VRAM is a real cap, because `--fit-target`
+already controls exactly that and only needs computing from the budget rather than hardcoding
+256 MiB. Cores is real, via `-t`. Concurrency is real, via the queue. **RAM is not a hard cap**:
+Windows needs a native Job Object for that and none is being added, so what it does instead is size
+the context to fit, refuse a model whose estimate exceeds the budget, and unload from a watchdog
+when the real working set runs over. The Electron shell and the browser view are counted but never
+capped, because they have to run.
+
+### Laya, discussed and not started
+
+`laya-serve` speaks the same `POST /v1/systemone` protocol as Jev, with the same `choice`, `score`
+and `noul` answers, so a second decision provider is a `baseUrl`, not a rewrite. The owner's intent
+is **an additional Laya Auto beside Jev Auto, each with its own maturity ladder**, not a
+replacement.
+
+Read the numbers before betting on it. Laya's base checkpoints score **0.362** and **0.342** on its
+own typed-decisions benchmark, against **0.318** random and **0.461** majority-class, so zero-shot
+it is worse than always guessing the commonest answer; the **0.766** that beats Jev's **0.727**
+belongs to a fine-tuned checkpoint. It ships over-confident, mean ECE **0.466** until temperatures
+are refitted, and the multilingual checkpoint ships with none fitted at all. Open bug #156 has
+`noul` following its option labels instead of the input. All of these figures come from Laya's own
+README, which states plainly that the Jev column is third-party published and was never measured
+there.
+
+So thresholds must live **on the provider record**, never shared with Jev's, and the first step is
+providerising `jev.js` so endpoint, key, model and thresholds stop being constants. That step is
+worth doing whether or not Laya ever ships, because it is what makes any second provider possible,
+including a BYOK one. Then shadow mode, which costs nothing, and a decision taken from the
+agreement data rather than from anybody's README. `routing-samples.jsonl` is already the shape of a
+fine-tuning set, which is the only reason the fine-tune step is interesting at all.
+
+One rule if this is built: when several sources can answer a domain, the rule choosing **who
+answers** stays in code and stays dumb. Highest maturity wins, ties go to the cheaper source,
+anything rolled back is out, and nobody mature means Jev. A learned arbiter would have less
+evidence than the classifiers it arbitrates, and would make a bad pick unattributable.
+
+### Still open from the merge review, none of it blocking
+
+- `state.candidates` still ships the full numeric table for `questions.strategy`, which names none
+  of its fields. The same cut that removed `candidate_track_record` stopped one field short.
+- `decision.js:647` pushes a conservation sample for labelling even when conservation changed
+  nothing, which the comment three lines above warns against. Masked today only because `confirms()`
+  drops the positive label under `code`.
+- A mature local classifier still outranks the `code` ranking for `resource_selection`, on a label
+  diet made entirely of failures.
+- Dead after the change: `fallbackYes` and `scarceTop` in `decision.js`.
+- `history` and `first_resource` still ride a judgments-only call that reads only `task`.
+- The flaky acceptance test `five tasks in one workspace, every state, then a restart` passes
+  standalone in 0.14 s and has failed under full-suite load at 2 s. Not hardened.
 
 ## Open, and needing the OWNER, not an agent
 
