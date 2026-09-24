@@ -1,5 +1,20 @@
 # Jev Auto UX and General Routing Design
 
+> **Superseded in part, 24 Sep 2026.** The UX half of this document - the foreground and
+> background split, delivery and at-most-once, task states, the result head, the effort ladder and
+> the transcript controls - still matches the code and is still worth building against.
+>
+> The **General Capability Routing** half does not. The Jev questions for the executor pick, the
+> seven-step cost-policy ordering and the preferred model set were superseded by `53d90e1` and
+> `a0528db`. Resource selection, conservation and frontier escalation are now decided in code, and
+> candidates reach the decision layer anonymised as `RESOURCE_A`/`RESOURCE_B` with no provider or
+> model named anywhere in the routing path - so a named preferred-model list is not a detail that
+> drifted, it is the opposite of the design.
+>
+> Build the routing half against [adaptive-routing.md](../../adaptive-routing.md) and
+> [roadmap.md](../../roadmap.md) instead. This file is kept as a record of intent.
+
+
 Date: 2026-09-21
 Status: Awaiting user review
 Workspace: `C:\Harness`

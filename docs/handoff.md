@@ -180,16 +180,14 @@ These were raised and NOT fixed. None blocks publishing; all are real.
   environment, which `Start-KzH.ps1:21` reads back and which outranks `~/.kzh/.env`. The README
   says keys live in exactly one place, and its removal instructions only cover `.env`. A second
   copy nobody is told to rotate.
-- **Real wallet thresholds are published**: `255 soft / 240 hard` appear in this file and in
-  `progress/progress.html`. The shipped defaults are 10 and 5.
-- **`progress/progress.html` is drifting from the tree**: it still names `chore/initial-setup` and
-  commit `2aeae40`, says a push is blocked because there is no remote, hardcodes the test count,
-  and its result-card and Overview rows now contradict the README and this file.
-- **README start time** says 10 to 20 seconds; `app/main.js:49` measures about 40, plus an engine
-  download on a first run.
-- **README says nothing hardcodes a machine**, but `C:\HarnessProjects` appears at
-  `app/main.js:536`, `Start-KzH.ps1:6` and `scripts/Install-Harness.ps1:74`, and
-  `scripts/Install-Harness.ps1:75` creates that folder when it is missing.
+- **Real wallet thresholds are published**: `255 soft / 240 hard` appear in this file. The
+  shipped defaults are 10 and 5.
+- ~~README start time~~ and ~~README says nothing hardcodes a machine~~ were both fixed in the
+  README on 24 Sep: it now says about 40 seconds and longer on a first run, and it names
+  `C:\HarnessProjects` as the one built-in path with `-Workspace` as the override. The code still
+  hardcodes it at `app/main.js:536`, `Start-KzH.ps1:6` and `scripts/Install-Harness.ps1:74`; the
+  prose was made honest rather than the code made general, which is the cheaper of the two and
+  should be revisited if anyone ever ships this to someone else's PC.
 - **`scripts/Install-Harness.ps1:60`** treats any `cordis.patch.yml` containing "jev-router" as
   configured, so a privacy setting added later never lands on a re-run, while the README says
   re-running does whatever is missing.
@@ -212,7 +210,6 @@ independently re-derived.
 - **Right-panel guide icons.** KzH registers seven guide rows in `plugins/jev-router/client.js` (Browser, Terminal, Background tasks, Subagents, Usage, Session overview, Jev inspector) and passes no icon for any of them, so all seven show the same generic cube.
   Only Workspace files, the engine's own row, has a real folder icon, so something already makes that one different.
   Find what, then give KzH's seven rows relevant icons.
-- **Stale line references in `progress/progress.html`**, if you touch it.
 - **Watch the adaptive router in the running app**, which is the one thing it has never had. Start
   KzH, open the Jev inspector, and check three things: the **Router** tab lists all eight domains
   with real sample counts, a routed run's reasoning block carries the `Jev decided; N Jev calls;
