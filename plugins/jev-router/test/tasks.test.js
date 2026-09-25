@@ -935,3 +935,27 @@ test('background enqueue: every field the adapter passes reaches tasks.enqueue',
     assert.ok(forwarded.includes(f), `${f} never reaches the task record`)
   }
 })
+
+test('a task keeps who decides it: on the record, in the list, on disk, through a restart, and in its result', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kz-tasks-'))
+  const file = join(dir, 'tasks.jsonl')
+  const ran = []
+  const { tasks } = harness({ file, run: async (t) => { ran.push(t.decider); return 'the report' } })
+  const laya = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'fix the parser', decider: 'laya' })
+  const jev = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/other', task: 'fix the lexer' })
+  assert.equal(tasks.get(laya.jobId).decider, 'laya', 'the list shows who decides it')
+  assert.equal(tasks.get(jev.jobId).decider, 'jev', 'a task queued with no decider is Jev\'s, as every task was')
+  for (let i = 0; i < 20; i++) await tick()
+  assert.deepEqual(ran.sort(), ['jev', 'laya'], 'run() is handed it, so route() asks that one when the task runs')
+  const result = tasks.results('s1').find((r) => r.jobId === laya.jobId)
+  assert.equal(result.decider, 'laya', 'and so is the result the chat posts')
+  await tasks.flushed()
+  const onDisk = readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  assert.deepEqual(onDisk.map((r) => [r.jobId, r.decider]).sort(), [[laya.jobId, 'laya'], [jev.jobId, 'jev']].sort())
+  // A restart reads it back; a row an older build wrote without one is Jev's.
+  writeFileSync(file, `${readFileSync(file, 'utf8')}${JSON.stringify({ jobId: 'jev-99', sessionId: 's1', workspace: 'C:/old', task: 'old one', state: 'completed', deliveryState: 'delivered' })}\n`)
+  const again = harness({ file, run: async () => 'never' })
+  await again.tasks.ready
+  assert.equal(again.tasks.get(laya.jobId).decider, 'laya')
+  assert.equal(again.tasks.get('jev-99').decider, 'jev')
+})

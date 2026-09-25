@@ -15,6 +15,7 @@ branch        main                         977e39e, pushed; adaptive routing mer
               fix/roadmap-open-items       pushed, NOT merged into main; the second pass of 24 Sep
               fix/routing-self-labelling   merged into main, pushed, safe to delete
               feat/routing-stability-local-context   parked by the owner, not merged
+              feat/laya-auto               Laya Auto, built group by group (docs/laya-auto.md 11); G1 to G8 integrated, G9 (the cloud end-to-end test and the desktop helpers) next
 remote        origin github.com/kz-95/kz-harness, PUBLIC
 tests         820 tests, 819 pass, 0 fail, 1 skipped on fix/roadmap-open-items  (npm --prefix plugins/jev-router test)
 app           NOT rebuilt; the running app is on older plugin code than either branch
@@ -66,7 +67,7 @@ What the second pass did:
 What is next, in order:
 
 1. Everything under "For the desktop agent" below, starting with getting the branch into the app and watching one routed run.
-2. Providerise `jev.js` (roadmap §2 step 1), then Laya (roadmap §2 steps 2 to 4).
+2. Laya: the providerised `jev.js` and Laya Auto are built on `feat/laya-auto` (see "Laya: built on `feat/laya-auto`, not yet observed"); what is left is its cloud end-to-end test (G9) and the owner's desktop checklist.
 
 ### The first pass, for context
 
@@ -130,8 +131,14 @@ Two things worth knowing before touching the page.
 The card's status poll applies only its newest response (`client.js` `useLocal`), so a slow poll can no longer undo a save on screen.
 `test/budgetpanel.test.js` runs the whole `LocalModelsCard` with a stand-in React that keeps state, over a real `createLocalModels` behind stubbed routes (`card()`, `statefulReact()`), a pattern other card tests can reuse.
 
-### Laya, discussed and not started
+### Laya: built on `feat/laya-auto`, not yet observed
 
+The design the owner decided on 24 Sep is [`laya-auto.md`](laya-auto.md), and branch `feat/laya-auto` builds it group by group (its section 11).
+With G8 integrated, the plugin wires all of it (`index.js`): both provider records built once, Laya's sidecar with its install recovery and orphan sweep run first in `apply()`, the Laya client every Laya call goes through, the shadow of Jev Auto, the RAM residency shared with llama, one run id per run across `usage.jsonl`, `history.jsonl`, the samples, the shadow rows, the inspector and Stop, the Laya Auto row and `/laya` with the refusals of 3.5, Laya's own sample store and verdict relabelling, and the Laya routes of 8.4.
+Whole runs are tested in `plugins/jev-router/test/laya-integration.test.js` against a fake `laya.serve` supervised by the real sidecar; the store and authority rules are in [`adaptive-routing.md`](adaptive-routing.md), "A second decider: Laya".
+Nothing of it has run in the app or against real Laya weights. G9 adds the cloud test against the real `laya.serve` on a random-weight checkpoint; after that the owner runs the desktop checklist, `laya-auto.md` 9.5.
+
+What follows is the reasoning from before the design, kept for why it is shaped this way.
 `laya-serve` speaks the same `POST /v1/systemone` protocol as Jev, with the same `choice`, `score`
 and `noul` answers, so a second decision provider is a `baseUrl`, not a rewrite. The owner's intent
 is **an additional Laya Auto beside Jev Auto, each with its own maturity ladder**, not a
@@ -187,9 +194,9 @@ These need the Windows machine, the running app or the owner, and could not be d
    `scripts/Set-TypeSafeKey.ps1:7` writes a second, persistent HKCU copy of `TYPESAFE_API_KEY`, which `Start-KzH.ps1:21` reads back.
    `C:\HarnessProjects` is hardcoded at `app/main.js:536`, `Start-KzH.ps1:6` and `scripts/Install-Harness.ps1:74`.
    Done when a re-run adds a missing setting, the key lives only in `~/.kzh/.env`, and the projects folder follows `-Workspace`.
-5. **Providerise `jev.js`** (roadmap §2 step 1), then Laya (roadmap §2 steps 2 to 4).
-   Not started.
-   Step 1 is a pure refactor that needs no app; Laya's steps need the machine to install and shadow it.
+5. **Jev and Laya together, on the desktop** (roadmap §2; built on `feat/laya-auto`, see "Laya: built on `feat/laya-auto`, not yet observed" above).
+   The providerised `jev.js` and all of Laya are built and tested in the cloud; Laya needs this machine to install, run on the GPU and shadow real Jev Auto runs.
+   Done when the owner has worked through `docs/laya-auto.md` 9.5 and brought back its one export file.
 6. **Exercise the gemma transfer against a real local model** (`plugins/jev-router/format.js`).
    Done when one finished background result is posted in the running app with a local chat model installed.
 7. **The `Use it here` kill path.**
@@ -340,6 +347,10 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
 
 ## Built but NOT observed, do not claim these as working
 
+- **Laya Auto and the Laya comparison in Jev Auto** (`feat/laya-auto`). Tested against a fake
+  `laya.serve` only: no real Laya weights have answered a KzH question, no GPU has run it, no
+  Windows process handling has been seen, and nobody has looked at the Laya card or the inspector's
+  Laya column. The desktop checklist is `laya-auto.md` 9.5.
 - **The whole adaptive router** (22 Sep, `feat/adaptive-routing`, audited and fixed 23 Sep). It is
   covered by its own test files (`adaptive`, `classifier`, `decision`, `domains`, `governor`,
   `jev`, `observability`, `policy`, `profiles`, `resources`, `training` under

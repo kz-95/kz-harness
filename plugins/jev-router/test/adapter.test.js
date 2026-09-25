@@ -1,7 +1,7 @@
 // The Jev Auto model must route what the person typed, never injected context.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { jevAdapter } from '../adapter.js'
+import { decidedBy, jevAdapter, line, queuedLine, resultSection } from '../adapter.js'
 
 test('routes the typed message, not a later plugin reminder', async () => {
   let routed
@@ -605,4 +605,171 @@ test('a classifier that reports nothing about work still answers normally', asyn
     orchestrator: { results: () => [], live: () => 0, enqueue: () => { throw new Error('must not be called') } },
   })
   assert.match(await run(a, 'hello'), /An answer\./)
+})
+
+// ---------- Laya Auto: who decides, in every line the adapter writes (docs/laya-auto.md 3) ----------
+const LAYA_RECORD = async () => (await import('../providers.js')).resolveProviders({}, { policy: (await import('../routing-policy.js')).resolvePolicy() })
+
+test('every row says who decides it, and an unknown id is Jev Auto', async () => {
+  const { rowOf } = await import('../adapter.js')
+  assert.equal(typeof rowOf, 'function', 'adapter.js exports rowOf')
+  assert.deepEqual(rowOf('laya-auto'), { mode: 'auto', decider: 'laya' })
+  assert.deepEqual(rowOf('jev-auto'), { mode: 'auto', decider: 'jev' })
+  assert.deepEqual(rowOf('jev-online'), { mode: 'online', decider: 'jev' })
+  assert.deepEqual(rowOf('jev-local'), { mode: 'local', decider: 'jev' })
+  assert.deepEqual(rowOf('jev-offline'), { mode: 'offline', decider: 'jev' })
+  assert.deepEqual(rowOf('agent-claude'), { mode: 'auto', decider: 'jev' }, 'a picked agent is reviewed by Jev, as before')
+  assert.deepEqual(rowOf(undefined), { mode: 'auto', decider: 'jev' })
+})
+
+test('the group is named for the app, and its id stays jev', async () => {
+  const a = jevAdapter({ ctx: chat([]), route: async () => '', auxModel: aux })
+  assert.deepEqual(a.providerInfo('jev'), { id: 'jev', name: 'Kz-harness' })
+})
+
+test('the routed line names who decided: (laya), (laya, local), and Jev\'s reads as before', () => {
+  const routed = (routing, extra = {}) => line({ type: 'routed', routing: { primaryAgent: 'claude', ...routing }, plan: { strategy: 'STANDARD_DIRECT' }, ...extra })
+  assert.equal(routed({ mode: 'jev', decider: 'laya' }), 'Routed to claude (laya)')
+  assert.equal(routed({ mode: 'local', decider: 'laya' }), 'Routed to claude (laya, local)')
+  assert.equal(routed({ mode: 'manual', decider: 'laya' }), 'Routed to claude (laya, manual)')
+  assert.equal(routed({ mode: 'jev', decider: 'jev' }), 'Routed to claude (jev)')
+  assert.equal(routed({ mode: 'local' }), 'Routed to claude (local)', 'a record from before `decider` was kept')
+  // In Jev Auto, once per run at the routed event, what the shadow does with this run's questions.
+  assert.equal(routed({ mode: 'jev', decider: 'jev' }, { shadow: 'answering' }), 'Routed to claude (jev)\nLaya is answering the same questions in the background; compare them in Jev → Decisions')
+  assert.equal(routed({ mode: 'jev', decider: 'jev' }, { shadow: 'not_running' }), 'Routed to claude (jev)\nLaya is not running, so this run is not compared')
+})
+
+test('decidedBy names Laya in its place among the authorities, and the decision line counts Laya\'s calls', () => {
+  const domains = { task_classification: { authority: 'laya' }, skill_selection: { authority: 'laya' }, resource_selection: { authority: 'code' } }
+  assert.equal(decidedBy(domains), 'Laya and routing rules decided')
+  const fell = { ...domains, execution_strategy: { authority: 'fallback' } }
+  assert.equal(decidedBy(fell), 'Laya, routing rules and the safe fallback (execution strategy) decided')
+  assert.equal(decidedBy(fell, { detail: false }), 'Laya, routing rules and the safe fallback decided')
+  const decision = (jevCalls) => line({ type: 'decision', decision: { domains, jevCalls, decider: 'laya', candidates: [{}, {}, {}] } })
+  assert.equal(decision(2), 'Laya and routing rules decided; 2 Laya calls; 3 candidates considered')
+  assert.equal(decision(1), 'Laya and routing rules decided; 1 Laya call; 3 candidates considered')
+  assert.equal(decision(0), 'Laya and routing rules decided; no Laya call; 3 candidates considered')
+  assert.equal(line({ type: 'decision', decision: { jevCalls: 0, candidates: [] } }), 'Jev decided; no Jev call; 0 candidates considered', 'with no decider named, Jev, as before')
+})
+
+test('a Laya call reads as Laya: the device, the wait, answers too flat to use, and evidence cut at the context limit', () => {
+  const q = (name, over = {}) => ({ name, type: 'score', used: true, ...over })
+  const questions = [q('taskType', { type: 'choice' }), q('risk', { informative: false }), q('req.planning', { informative: false }), q('humanReview', { type: 'noul', informative: false }), q('secondOpinion', { type: 'noul', informative: false }), q('weather.units', { type: 'choice', used: false, informative: false })]
+  const trace = { phase: 'route', ms: 950, provider: 'laya', model: 'laya-english/0.3.20@1a2b3c4', questions, meta: { device: 'cuda', waitedMs: 4200, requests: 2, atContextLimit: 0 } }
+  assert.equal(line({ type: 'jev', trace }), [
+    'Laya route: 5/6 questions in 950 ms on the GPU (waited 4200 ms for an earlier Laya answer)',
+    // A flat yes/no the rules do not fill (humanReview) is kept as answered, and an unused
+    // speculative question is not said at all.
+    'Laya route: 3 answers too flat to use (risk, req.planning, secondOpinion); the routing rules filled them',
+  ].join('\n'))
+  const review = { phase: 'review', ms: 9000, provider: 'laya', questions: [q('addressed', { type: 'noul' })], meta: { device: 'cpu', waitedMs: 0, requests: 4, atContextLimit: 1 } }
+  assert.equal(line({ type: 'jev', trace: review }), 'Laya review: 1/1 questions in 9000 ms on the CPU\nLaya review: 1 of 4 requests reached the 512-token limit, so part of the evidence was cut')
+  // Jev's line is today's: no device, no marks.
+  assert.equal(line({ type: 'jev', trace: { phase: 'route', ms: 120, provider: 'jev', questions: [q('a'), q('b', { used: false })] } }), 'Jev route: 1/2 questions in 120 ms')
+})
+
+test('a call that did not answer is a line of its own: who, which call, how long, and why', () => {
+  // What createJev hands onError, as the event carries it.
+  const failed = (provider, phase, ms, message) => ({ type: 'decider-error', at: 1, error: { phase, callId: 'c1', provider, ms, error: { class: 'Error', code: 'LAYA_TIMEOUT', status: null, message } } })
+  assert.equal(line(failed('laya', 'route', 42000, 'timed out (20 questions on the CPU)')), 'Laya route failed after 42000 ms: timed out (20 questions on the CPU); routing rules decide those domains')
+  assert.equal(line(failed('laya', 'review', 40000, 'timed out after 40 s')), 'Laya review failed after 40000 ms: timed out after 40 s')
+  assert.equal(line(failed('jev', 'route', 900, '503 Service Unavailable')), 'Jev route failed after 900 ms: 503 Service Unavailable')
+})
+
+test('a queued task Laya decides says Laya picks, with the reason it was queued as a task', () => {
+  const base = { jobId: 'jev-4', position: 0, workspace: 'C:\\work\\Harness' }
+  assert.equal(queuedLine(base), 'Queued → Jev picks as **jev-4** (starting now in Harness). Keep chatting: the result posts here when done.')
+  assert.equal(queuedLine({ ...base, decider: 'laya' }), 'Queued → Laya picks as **jev-4** (starting now in Harness). Keep chatting: the result posts here when done.')
+  const why = 'Laya could not sort this message (timed out after 8 s); treating it as a task.'
+  assert.equal(queuedLine({ ...base, decider: 'laya', why }), `Queued → Laya picks as **jev-4** (starting now in Harness). Keep chatting: the result posts here when done. ${why}`)
+  assert.equal(queuedLine({ ...base, agent: 'codex', decider: 'laya' }), 'Queued → codex as **jev-4** (starting now in Harness). Keep chatting: the result posts here when done.', 'a forced agent is named as before')
+  assert.match(resultSection({ ...READY_RESULT, agent: null, model: null, decider: 'laya' }), /^Agent: Laya picks$/m, 'a result nobody was picked for yet says who would have')
+  assert.match(resultSection({ ...READY_RESULT, agent: null, model: null }), /^Agent: Jev picks$/m)
+})
+
+test('a Laya Auto message is sorted by Laya and read against Laya\'s bars, where Jev\'s would answer it', async () => {
+  const { jev, laya } = await LAYA_RECORD()
+  const sorted = []
+  const make = (thresholds, cls, orchestrator) => jevAdapter({
+    ctx: chat(OK_TEXT), auxModel: aux, orchestrator,
+    route: async ({ decider, emit }) => { emit({ type: 'final', status: 'accepted' }); return `routed by ${decider}` },
+    classify: async (task, mode, decider) => { sorted.push([mode, decider]); return { ...cls, thresholds } },
+  })
+  // A question at 0.7 clears Jev's 0.6 and not Laya's 0.8, so Laya Auto runs it as a task.
+  const unsure = { kind: 'question', confidence: 0.7 }
+  assert.match(await runAs(make(jev.thresholds, unsure), 'jev-auto', 'what is this?'), /^An answer\./)
+  assert.equal(await runAs(make(laya.thresholds, unsure), 'laya-auto', 'what is this?'), 'routed by laya')
+  assert.deepEqual(sorted, [['auto', 'jev'], ['auto', 'laya']], 'each row\'s decider sorts its message')
+  // "Also do the work" at 0.75 clears Jev's 0.7 and not Laya's 0.8.
+  const both = { kind: 'question', confidence: 0.95, alsoWork: 0.75 }
+  const queued = []
+  const orchestrator = { results: () => [], live: () => 0, enqueue: (fields, extra) => { queued.push(extra); return 'queued' } }
+  await runAs(make(jev.thresholds, both, orchestrator), 'jev-auto', 'how does it work, and fix it?')
+  await runAs(make(laya.thresholds, both, orchestrator), 'laya-auto', 'how does it work, and fix it?')
+  assert.deepEqual(queued, [{ decider: 'jev' }], 'only Jev\'s bar queued the work')
+  // Laya's reason for the stronger model is Laya's.
+  const deep = await runAs(make(laya.thresholds, { kind: 'question', confidence: 0.95, depth: 'deep' }), 'laya-auto', 'why does this deadlock?')
+  assert.match(deep, /Laya judged this worth the stronger model, so Answered by: x\/y/)
+})
+
+test('a Laya Auto task is routed and queued as Laya\'s, and a Jev row\'s as Jev\'s', async () => {
+  const routed = []
+  const queued = []
+  const a = jevAdapter({
+    ctx: chat([]), auxModel: aux, agents: async () => AGENTS,
+    route: async ({ decider, mode, emit }) => { routed.push([decider, mode]); emit({ type: 'final', status: 'accepted' }); return 'ok' },
+    classify: async () => ({ kind: 'task' }),
+  })
+  for (const id of ['laya-auto', 'jev-auto', 'jev-offline']) await runAs(a, id, 'fix the parser')
+  assert.deepEqual(routed, [['laya', 'auto'], ['jev', 'auto'], ['jev', 'offline']])
+  const b = jevAdapter({
+    ctx: chat([]), auxModel: aux, agents: async () => AGENTS, route: async () => 'unused', classify: async () => ({ kind: 'task' }),
+    orchestrator: { results: () => [], live: () => 0, enqueue: (fields, extra) => { queued.push({ task: fields.task, ...extra }); return 'queued' } },
+  })
+  await runAs(b, 'laya-auto', 'fix the parser')
+  await runAs(b, 'jev-auto', 'fix the parser')
+  assert.deepEqual(queued, [{ task: 'fix the parser', decider: 'laya', why: null }, { task: 'fix the parser', decider: 'jev', why: null }])
+  assert.equal(await runAs(b, 'laya-auto', ''), 'Type a task and Laya will route it.')
+})
+
+test('nothing Laya Auto shows names Jev: the near-tie line and the Auto effort say who they are', async () => {
+  const tie = (decider) => line({ type: 'tiebreak', from: 'deepseek', to: 'claude', confidence: 0.41, margin: 0.1, ...(decider ? { decider } : {}) })
+  assert.equal(tie('laya'), 'The routing rules could not tell deepseek from claude (confidence 41%): claude takes the work as the standing policy')
+  assert.equal(tie('jev'), 'Jev could not tell deepseek from claude (confidence 41%): claude takes the work as the standing policy')
+  assert.equal(tie(), tie('jev'), 'as it always read')
+  const a = jevAdapter({ ctx: chat([]), route: async () => '', auxModel: aux, layaRow: async () => ({ state: 'failed' }) })
+  const auto = (row) => row.reasoning.efforts.find((e) => e.id === 'auto').description
+  const [jevRow, layaRow] = await a.listModels('jev')
+  assert.equal(auto(layaRow), 'Laya picks by task (Settings default applies)')
+  assert.equal(auto(jevRow), 'Jev picks by task (Settings default applies)')
+  assert.deepEqual(layaRow.reasoning.efforts.map((e) => e.id), jevRow.reasoning.efforts.map((e) => e.id), 'the same ladder')
+})
+
+test('a Laya call never sent because it would pass its deadline reads word for word as the design writes it', () => {
+  const failed = (ms, code, message) => ({ type: 'decider-error', at: 1, error: { phase: 'route', callId: 'c1', provider: 'laya', ms, error: { class: 'Error', code, status: null, message } } })
+  assert.equal(line(failed(0, 'LAYA_PREDICTED_OVER', 'Laya would need about 150 s for this call on the CPU, over its 120 s deadline')), 'Laya route failed after 0 ms: Laya would need about 150 s for this call on the CPU, over its 120 s deadline')
+  // A call that was sent and did not answer still says the rules decide those domains.
+  assert.equal(line(failed(42000, 'LAYA_TIMEOUT', 'timed out (20 questions on the CPU)')), 'Laya route failed after 42000 ms: timed out (20 questions on the CPU); routing rules decide those domains')
+})
+
+test('a flat tool pick or tool argument is not said to be filled by the rules: the pick stands and only falls under its bar', () => {
+  const q = (name, over = {}) => ({ name, type: 'choice', used: true, informative: false, ...over })
+  const meta = { device: 'cpu', waitedMs: 0, requests: 1, atContextLimit: 0 }
+  const route = (questions) => line({ type: 'jev', trace: { phase: 'route', ms: 800, provider: 'laya', questions, meta } })
+  assert.equal(route([q('handler'), q('weather.fits', { type: 'noul' }), q('weather.units'), q('risk', { type: 'score' }), q('strategy')]), [
+    'Laya route: 5/5 questions in 800 ms on the CPU',
+    'Laya route: 2 answers too flat to use (risk, strategy); the routing rules filled them',
+  ].join('\n'))
+  assert.equal(route([q('handler'), q('weather.units'), q('taskType', { informative: true })]), 'Laya route: 3/3 questions in 800 ms on the CPU', 'with only the tool\'s answers flat, nothing is said to be filled')
+})
+
+test('a question answered directly tells the usage hook which row it came through: Laya\'s in Laya Auto, Jev\'s in Jev Auto', async () => {
+  const hooked = []
+  const a = jevAdapter({
+    ctx: chat(OK_TEXT), auxModel: aux2, route: async () => 'unused',
+    classify: async () => ({ kind: 'question', confidence: 0.95 }),
+    onDirectAnswer: (ms, m, row) => hooked.push([typeof ms, m, row]),
+  })
+  for (const id of ['laya-auto', 'jev-auto']) assert.match(await runAs(a, id, 'what does this flag do?'), /^An answer\./, id)
+  assert.deepEqual(hooked, [['number', aux2, { decider: 'laya' }], ['number', aux2, { decider: 'jev' }]])
 })

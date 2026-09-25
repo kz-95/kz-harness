@@ -1,0 +1,8 @@
+# Laya's Python packages (docs/laya-auto.md 7.2). scripts/laya-lock.mjs compiles this into
+# requirements.lock with uv, universal and hash-pinned, torch left out: its CUDA wheel comes from
+# the PyTorch index the driver allows, and is installed before the lock.
+# The line below bounds the resolution to what PyPI had then, so running the script again gives
+# the same lock until the line is moved on purpose.
+# exclude-newer: 2026-09-24T12:00:00Z
+laya[serve]==0.3.20
+torch==2.14.0

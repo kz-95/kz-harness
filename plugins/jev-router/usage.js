@@ -7,11 +7,13 @@ import { appendFile, mkdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_LIMITS, keyProviderOf, kindOf } from './accounts.js'
+import { DEFAULT_JEV, JEV_USD_PER_INPUT_TOKEN } from './providers.js'
 import { canAuth } from './setup.js'
 
 const TTL = 3 * 60_000
 const BACKOFF = 5 * 60_000
-export const JEV_USD_PER_INPUT_TOKEN = 0.042 / 1e6
+// Priced on the provider record now; exported here too, where it has always been read from.
+export { JEV_USD_PER_INPUT_TOKEN }
 
 /**
  * A prepaid balance as a share of the most that key has ever held. A subscription
@@ -288,6 +290,18 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     await appendFile(file, `${JSON.stringify(entry)}\n`)
   }
 
+  /**
+   * One acting decider call that answered, priced by the provider that answered it: a Jev row as
+   * it always was, a Laya row at $0 under `agent: 'laya'`, which neither Jev's spend nor "Saved by
+   * Jev" reads. A failed call never gets here, and neither does a Laya shadow call: spend records
+   * only what acted.
+   */
+  const logDecision = ({ provider, tokens, ...entry }) => append({
+    ts: new Date().toISOString(), agent: provider.id, ...entry,
+    tokens: { input: tokens?.input ?? 0, output: tokens?.output ?? 0 },
+    costUsd: (tokens?.input ?? 0) * provider.usdPerInputToken,
+  })
+
   return {
     snapshot,
     /** Last snapshot { out, keys }, synchronously; null before the first. */
@@ -297,11 +311,8 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     markExhausted: (key, v) => accounts.markExhausted(key, v),
     clearExpired: () => accounts.clearExpired(),
     logAttempt: (entry) => append({ ts: new Date().toISOString(), ...entry, limitHit: !!entry.limitHit }),
-    logJev: ({ tokens, ...entry }) => append({
-      ts: new Date().toISOString(), agent: 'jev', ...entry,
-      tokens: { input: tokens?.input ?? 0, output: tokens?.output ?? 0 },
-      costUsd: (tokens?.input ?? 0) * JEV_USD_PER_INPUT_TOKEN,
-    }),
+    logDecision,
+    logJev: (entry) => logDecision({ ...entry, provider: DEFAULT_JEV }),
     recent: async (n = 50) => (await lines()).slice(-n),
     lines,
     /** "Saved by Jev" estimate over usage.jsonl and history.jsonl; see computeSavings. */
@@ -318,6 +329,8 @@ async function readJsonl(path) {
 
 export const DEFAULT_BASELINE = { name: 'Chat LLM front desk (DeepSeek Flash)', inputPerMTok: 0.28, outputPerMTok: 1.1, outputTokens: 300, latencyMs: 4000 }
 const JEV_FALLBACK_MS = 800 // Jev call time when the log line predates `ms`
+/** Whether Jev decided it: a row or a run from before `decider` was recorded always was Jev's. */
+const byJev = (decider) => (decider ?? 'jev') === 'jev'
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2 }
 
 /**
@@ -330,6 +343,10 @@ const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const m = s.le
  *     rotated key or a peer, in runs that did not end paused. Counted, not priced.
  * Agent median = median durationMs of completed primary agent attempts, all time; agentMedianFallbackMs when none.
  * No clamping: a negative saving is reported as negative.
+ * Only what Jev decided counts: a direct answer whose row names another `decider`, and a run whose
+ *   `routing.decider` is another, are Laya Auto's and saved nothing by Jev. A row or run from
+ *   before the field existed was Jev's. Laya's own decisions are counted apart, at $0
+ *   (`layaDecisions`, `layaTokens`), so the Usage tab can say what Laya did without pricing it.
  * @param {object[]} usage usage.jsonl lines
  * @param {object[]} runs  history.jsonl records
  */
@@ -342,9 +359,13 @@ export function computeSavings(usage, runs, { baseline = DEFAULT_BASELINE, agent
   const periods = {}
   for (const [name, since] of Object.entries(starts)) {
     const within = (x) => Date.parse(x.ts) >= since
-    const p = { decisions: 0, jevCostUsd: 0, llmCostUsd: 0, savedUsd: 0, savedMs: 0, llmOutputTokensAvoided: 0, jevTokens: { input: 0, output: 0 }, directAnswers: 0, toolRuns: 0, limitsAvoided: 0 }
+    const p = { decisions: 0, jevCostUsd: 0, llmCostUsd: 0, savedUsd: 0, savedMs: 0, llmOutputTokensAvoided: 0, jevTokens: { input: 0, output: 0 }, directAnswers: 0, toolRuns: 0, limitsAvoided: 0, layaDecisions: 0, layaTokens: { input: 0, output: 0 } }
     for (const l of usage.filter(within)) {
-      if (l.agent === 'jev') {
+      if (l.agent === 'laya') {
+        p.layaDecisions++
+        p.layaTokens.input += l.tokens?.input ?? 0
+        p.layaTokens.output += l.tokens?.output ?? 0
+      } else if (l.agent === 'jev') {
         const input = l.tokens?.input ?? 0
         p.decisions++
         p.jevTokens.input += input
@@ -353,12 +374,12 @@ export function computeSavings(usage, runs, { baseline = DEFAULT_BASELINE, agent
         p.llmCostUsd += (input * b.inputPerMTok + b.outputTokens * b.outputPerMTok) / 1e6
         p.llmOutputTokensAvoided += b.outputTokens
         p.savedMs += b.latencyMs - (l.ms ?? JEV_FALLBACK_MS)
-      } else if (l.agent === 'chat' && l.role === 'direct-answer') {
+      } else if (l.agent === 'chat' && l.role === 'direct-answer' && byJev(l.decider)) {
         p.directAnswers++
         p.savedMs += agentMs - (l.durationMs ?? 0)
       }
     }
-    for (const r of runs.filter(within)) {
+    for (const r of runs.filter((x) => within(x) && byJev(x.routing?.decider))) {
       const work = (r.attempts ?? []).filter((a) => a.role !== 'review')
       if (work.length === 1 && work[0].role === 'tool' && r.finalStatus?.startsWith('accepted')) {
         p.toolRuns++

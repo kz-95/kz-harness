@@ -3,7 +3,10 @@
 #   powershell -ExecutionPolicy Bypass -File C:\Harness\scripts\Install-Harness.ps1
 # Local models are opt-in (nothing is downloaded by default):
 #   ... Install-Harness.ps1 -LocalModels qwen3-8b,gemma4-e4b    (or: all)
-param([switch]$NoShortcuts, [string[]]$LocalModels)
+# So is the Laya decision model (Python, PyTorch and its weights, several GB); uv, which it
+# installs with, is always kept at the version config\laya.json pins:
+#   ... Install-Harness.ps1 -Laya
+param([switch]$NoShortcuts, [string[]]$LocalModels, [switch]$Laya)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 # The data folder is whatever Start-KzH.ps1 sets, read from that file so there is
@@ -168,6 +171,34 @@ if (-not $LocalModels) {
   if ($need -gt $free) { throw "not enough disk space: needs $([math]::Round($need / 1GB, 1)) GB, $([math]::Round($free / 1GB, 1)) GB free" }
   if (-not $todo.Count) { Ok 'already installed' }
   foreach ($m in $todo) { Install-Module $m }
+}
+
+Step 'uv (for the optional Laya decision model)'
+# Pinned by version, size and SHA-256 in config\laya.json; it installs no Python and downloads
+# nothing else. Laya's own install (Settings, or -Laya below) runs everything with it.
+$layaPins = Get-Content (Join-Path $root 'config\laya.json') -Raw | ConvertFrom-Json
+$uvDir = Join-Path $root 'engine\uv'
+$uvExe = Join-Path $uvDir 'uv.exe'
+$uvWant = "^uv $([regex]::Escape($layaPins.uv.version))\b"
+$uvHave = ''
+if (Test-Path $uvExe) { try { $uvHave = (& $uvExe --version) -join '' } catch { $uvHave = '' } }
+if ($uvHave -notmatch $uvWant) {
+  New-Item -ItemType Directory -Force $uvDir | Out-Null
+  $uvZip = Join-Path $uvDir 'uv.zip'
+  Get-Verified ([pscustomobject]@{ source = $layaPins.uv.source; size = $layaPins.uv.size; sha256 = $layaPins.uv.sha256; file = 'uv.zip' }) $uvZip
+  Expand-Archive $uvZip -DestinationPath $uvDir -Force
+  Remove-Item $uvZip
+  $uvHave = (& $uvExe --version) -join ''
+  if ($uvHave -notmatch $uvWant) { throw "uv reports '$uvHave', not $($layaPins.uv.version)" }
+}
+Ok "uv $($layaPins.uv.version)"
+
+if ($Laya) {
+  Step 'Laya decision model'
+  # One implementation, the plugin's own (laya-install.js), as the Settings card runs it.
+  $env:DSH_HOME = $dshHome
+  node (Join-Path $root 'plugins\jev-router\laya\install-cli.mjs') install
+  if ($LASTEXITCODE) { throw 'Installing Laya failed (see above). Run this again to retry, or install it from Settings -> Jev setup -> Laya decision model.' }
 }
 
 Write-Host "`nDone. Start it with the Kz-harness icon, then check Settings -> Jev setup." -ForegroundColor Green

@@ -412,6 +412,29 @@ test('evidenceFromRun: a like or dislike becomes a human_outcome row when it mat
   assert.doesNotMatch(JSON.stringify(rows), new RegExp(MARKER), 'the reason text never rides along')
 })
 
+test('evidenceFromRun: a run Laya decided gives only whether each attempt completed, with no task type, and no verdict about it counts', async () => {
+  const { answererUnconfigured, evidenceWeight } = await import('../profiles.js')
+  const layaRun = run({
+    routing: { taskType: 'security', decider: 'laya', primaryAgent: 'claude' },
+    attempts: [attempt('claude', 'primary', { stopReason: 'error', checks: [{ name: 'test', passed: false }] }), attempt('codex', 'review'), attempt('deep', 'retry')],
+    assessments: [{ mode: 'laya', action: 'retry' }, { mode: 'laya', action: 'retry' }, { mode: 'laya', action: 'accept' }],
+  })
+  const rows = evidenceFromRun(layaRun, { modelOf, agents, priors })
+  assert.deepEqual(rows.map((r) => [r.subject.provider, r.dimension, r.source, r.score, r.confidence]), [['claude-code', 'reliability', 'objective_deterministic', 0, 0.9], ['deepseek', 'reliability', 'objective_deterministic', 1, 0.9]], 'completed or not, which rests on no judgment of Laya\'s')
+  assert.ok(rows.every((r) => !('taskType' in r) && r.runId === 'run-1'), 'Laya\'s task type never rides a row')
+  assert.equal(evidenceWeight(rows[1], { policy, nowMs: NOW, taskType: 'documentation' }).similarity, 1, 'so it never sets how much the row weighs when Jev Auto reads a profile')
+  // The same record, decided by Jev, gives everything it always did.
+  const taught = { ...layaRun, routing: { taskType: 'security', primaryAgent: 'claude' }, assessments: layaRun.assessments.map((a) => ({ ...a, mode: 'jev' })) }
+  const all = evidenceFromRun(taught, { modelOf, agents, priors })
+  assert.ok(pick(all, 'independent_review').length > 0 && all.every((r) => r.taskType === 'security'))
+  // A verdict is credited on the dimensions of the run's task type, which was Laya's: nothing.
+  const verdict = { ts: T0, runId: 'run-1', sessionId: 'sess-1', messageId: 'm1', verdict: 'dislike', provider: 'deep' }
+  assert.deepEqual(evidenceFromFeedback(verdict, layaRun, { modelOf, agents, priors }), [])
+  assert.ok(evidenceFromFeedback(verdict, taught, { modelOf, agents, priors }).length > 0, 'while about the Jev run it is a person\'s evidence')
+  assert.equal(answererUnconfigured(verdict, layaRun, { agents: [] }), false, 'an uninstalled agent is never the reason a Laya run gives a verdict no rows')
+  assert.equal(answererUnconfigured(verdict, taught, { agents: [] }), true)
+})
+
 test('registry persistence: rows append as JSONL, load reads them back, and a truncated line or a foreign line is dropped', () => {
   const file = tmp()
   const reg = createCapabilityRegistry({ file, priors, policy, now: () => NOW })

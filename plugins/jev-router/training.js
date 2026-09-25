@@ -15,19 +15,37 @@
 // resource labels the rescuer, never the pick. A run that gives no evidence (paused on a usage
 // limit, stopped, continued from a handoff) yields null rather than a guess. No row ever holds
 // task text, answers, diffs or secrets: ids, numbers, categories and timestamps only.
+//
+// A store has a kind (docs/laya-auto.md 6.1). The `jev` store, routing-samples.jsonl, holds what
+// Jev Auto decided and is what the local classifiers learn from; the `laya` store,
+// laya-samples.jsonl, holds every decision of a run Laya decided, and no classifier reads it.
+// The two are kept apart by the stores themselves: the Jev store refuses a Laya row outright,
+// because the ladders roll back on the failure rates of their own store, and a Laya run's
+// failures there would demote classifiers that decided none of those runs.
 import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, open, readFile, rename } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { FEATURE_SCHEMA_VERSION, validateFeatures } from './features.js'
 import { ROUTING_TAGS } from './feedback.js'
+import { TEACHER } from './providers.js'
 import { DISPOSITIONS, STRATEGIES, resolvePolicy, tierAtLeast } from './routing-policy.js'
 
 /** Where a label came from, from strongest to weakest evidence. */
 export const LABEL_SOURCES = Object.freeze(['verified_outcome', 'human', 'teacher_confirmed', 'verified_negative'])
 /** The label sources that count as outcome-backed: the run itself, or a person, said so. */
 export const OUTCOME_BACKED = Object.freeze(['verified_outcome', 'teacher_confirmed', 'human'])
-/** Who answered the decision the sample records. */
+/** Who answered the decision a sample in the Jev store records. */
 export const AUTHORITIES = Object.freeze(['jev', 'local', 'code', 'deterministic', 'fallback'])
+/** Who may answer a decision in any store: Jev's list, and the provider that decided a Laya run. */
+export const ALL_AUTHORITIES = Object.freeze(['jev', 'laya', 'local', 'code', 'deterministic', 'fallback'])
+/**
+ * The authorities each kind of store records. A Laya run is decided by Laya or by a rule, never by
+ * Jev and never by a local classifier: the owner decided that Laya decides, and a classifier Jev
+ * taught deciding would put Jev's teaching back into it.
+ */
+export const STORE_AUTHORITIES = Object.freeze({ jev: AUTHORITIES, laya: Object.freeze(['laya', 'code', 'deterministic', 'fallback']) })
+/** The kinds of store, each its own file. */
+export const STORE_KINDS = Object.freeze(Object.keys(STORE_AUTHORITIES))
 
 const WORK_ROLES = new Set(['primary', 'retry'])
 // A label or tag value that belongs to another module's vocabulary, checked when this file loads.
@@ -62,15 +80,51 @@ function* jsonl(rows) {
   for (let i = 0; i < rows.length; i += 1000) yield rows.slice(i, i + 1000).map((r) => `${JSON.stringify(r)}\n`).join('')
 }
 
+const isObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v)
+const str = (v) => (typeof v === 'string' && v ? v : null)
+
+/**
+ * What a provider that is not the teacher answered, as a Laya sample keeps it: its pick, its
+ * probabilities and confidence, whether it was informative enough to act on, and which model,
+ * identity and script answered. Only these fields are kept, so a caller cannot store a text by
+ * handing over more; a field that is not what it should be refuses the row.
+ */
+function providerAnswer(p) {
+  if (p === null || p === undefined) return null
+  if (!isObject(p) || !str(p.id) || p.id === TEACHER) throw new Error(`training sample: provider must be { id, label | chosenKey, ... } naming a provider that is not ${TEACHER}`)
+  if (p.probabilities !== undefined && !isObject(p.probabilities)) throw new Error('training sample: provider.probabilities must be an object')
+  if (p.confidence !== undefined && !(typeof p.confidence === 'number' && Number.isFinite(p.confidence))) throw new Error('training sample: provider.confidence must be a number')
+  return {
+    id: p.id,
+    label: str(p.label),
+    chosenKey: str(p.chosenKey),
+    probabilities: Object.fromEntries(Object.entries(p.probabilities ?? {}).filter(([, v]) => typeof v === 'number' && Number.isFinite(v))),
+    confidence: p.confidence ?? 0,
+    informative: p.informative !== false,
+    model: str(p.model),
+    identity: str(p.identity),
+    lang: str(p.lang),
+  }
+}
+
 /**
  * A validated, id-stamped sample row from what the decision engine hands over. Throws on a row
  * that could not be trained on (no domain, no input features), because a malformed sample on
  * disk is a malformed sample in every artifact after it.
+ *
+ * `kind` is the store's (docs/laya-auto.md 6.2). The Jev store throws on a Laya row, an authority
+ * `laya` or any `provider` field: that is a programming error, which the integrity tests prove
+ * never happens, and the domain controller logs if it ever does. The Laya store throws on a
+ * teacher, because Laya is never one, and keeps the provider's answer. An authority the store does
+ * not know is read as `fallback` in either, as it always was, so an old row reads unchanged.
  */
-export function normalizeSample(sample, { now }) {
+export function normalizeSample(sample, { now, kind = 'jev' }) {
+  if (!STORE_KINDS.includes(kind)) throw new Error(`training sample: unknown store kind ${kind}`)
   if (!sample || typeof sample !== 'object') throw new Error('training sample: an object is required')
   if (typeof sample.domain !== 'string' || !sample.domain) throw new Error('training sample: domain is required')
   if (!sample.input || typeof sample.input !== 'object' || !sample.input.features) throw new Error('training sample: input.features is required')
+  if (kind === 'jev' && (sample.authority === 'laya' || sample.provider !== undefined)) throw new Error('training: a laya sample was refused by the jev store')
+  if (kind !== 'jev' && sample.teacher !== undefined && sample.teacher !== null) throw new Error(`training: a sample with a teacher was refused by the ${kind} store`)
   // features.js decides what a well formed vector is, here as everywhere: a NaN numeric or a
   // non-string category refused now is one that cannot quietly poison every artifact after it.
   validateFeatures(sample.input.features)
@@ -88,7 +142,9 @@ export function normalizeSample(sample, { now }) {
     teacher: teacher ?? null,
     local: local ?? null,
     code: code ?? null,
-    authority: AUTHORITIES.includes(authority) ? authority : 'fallback',
+    authority: STORE_AUTHORITIES[kind].includes(authority) ? authority : 'fallback',
+    // The Jev sample's shape is unchanged: only a Laya row has the field at all.
+    ...(kind === 'jev' ? {} : { provider: providerAnswer(sample.provider) }),
     outcome: null,
     ...(extra && typeof extra === 'object' ? { extra } : {}),
   }
@@ -128,7 +184,9 @@ export function samplesCap(policy = resolvePolicy()) {
 
 /**
  * @param {object} p
- * @param {string} p.file          routing-samples.jsonl
+ * @param {string} p.file          routing-samples.jsonl, or laya-samples.jsonl for a `laya` store
+ * @param {'jev'|'laya'} [p.kind]  which runs the store holds (see normalizeSample); `jev` by default.
+ *   Both kinds keep the same cap and compaction
  * @param {() => string} [p.now]   the clock, ISO, injectable so a test can order rows
  * @param {object} [p.policy]      resolvePolicy() result, which the cap is derived from
  * @param {number} [p.cap]         samples kept per domain; samplesCap(policy) when not given
@@ -139,7 +197,8 @@ export function samplesCap(policy = resolvePolicy()) {
  *   or so runs, never on every append.
  * @param {(m: string) => void} [p.log]
  */
-export function createTrainingStore({ file, now = () => new Date().toISOString(), policy, cap = samplesCap(policy), slack = cap, log = () => {} }) {
+export function createTrainingStore({ file, kind = 'jev', now = () => new Date().toISOString(), policy, cap = samplesCap(policy), slack = cap, log = () => {} }) {
+  if (!STORE_KINDS.includes(kind)) throw new Error(`training store: kind must be one of ${STORE_KINDS.join(', ')}`)
   // A cap of 0 would drop every sample, and a slack of 0 rewrite the file on every append.
   if (!(cap >= 1) || !(slack >= 1)) throw new Error('training store: cap and slack must each be at least 1')
   const samples = new Map() // id -> sample row, in file order
@@ -308,6 +367,8 @@ export function createTrainingStore({ file, now = () => new Date().toISOString()
   const verifiedOf = (r) => r.outcome?.verified === true
 
   const api = {
+    /** Which runs this store holds: `jev` or `laya`. */
+    kind,
     /**
      * Read the file into memory, replacing what was there, and apply the cap to it (rewriting the
      * file when it has grown a slack past it). Returns the counts kept.
@@ -323,7 +384,7 @@ export function createTrainingStore({ file, now = () => new Date().toISOString()
      */
     async append(sample) {
       await ready()
-      return write(normalizeSample(sample, { now }))
+      return write(normalizeSample(sample, { now, kind }))
     },
     /** Append an outcome for a sample id. The newest outcome for an id is the one read back. */
     async resolveOutcome(id, outcome) {
@@ -395,7 +456,7 @@ export function createTrainingStore({ file, now = () => new Date().toISOString()
           if (OUTCOME_BACKED.includes(r.outcome.labelSource)) out.outcomeBacked++
           bump(out.byLabelSource, r.outcome.labelSource)
         } else out.teacherOnly++
-        bump(out.byLabel, labelOf(r.outcome) ?? labelOf(r.teacher) ?? labelOf(r.local))
+        bump(out.byLabel, labelOf(r.outcome) ?? labelOf(r.teacher) ?? labelOf(r.provider) ?? labelOf(r.local))
         if (r.teacher && r.local) {
           const t = labelOf(r.teacher); const l = labelOf(r.local)
           if (t != null && l != null) { out.localAgreement.n++; if (t === l) out.localAgreement.agree++ }
@@ -412,22 +473,28 @@ const labelOf = (p) => (p ? (p.label ?? p.chosenKey ?? null) : null)
 
 /**
  * The answer the run actually acted on: the local one when the local classifier had authority,
- * the rule's own when a rule in code did, otherwise the teacher's. It is the pick a label
- * confirms or contradicts. A local answer under any other authority is shadow data that never
- * ran, and a fallback or deterministic pick the sample does not record is nothing the run can
- * confirm, so both yield no pick and no label.
+ * the rule's own when a rule in code did, the provider's when a provider that is not the teacher
+ * (Laya) did, otherwise the teacher's. It is the pick a label confirms or contradicts. A local
+ * answer under any other authority is shadow data that never ran, and a fallback or deterministic
+ * pick the sample does not record is nothing the run can confirm, so both yield no pick and no
+ * label.
  */
-const pickOf = (sample) => (sample?.authority === 'local' ? sample.local ?? null : sample?.authority === 'code' ? sample.code ?? null : sample?.teacher ?? null)
+const pickOf = (sample) => (sample?.authority === 'local' ? sample.local ?? null
+  : sample?.authority === 'code' ? sample.code ?? null
+    : sample?.authority === 'laya' ? sample.provider ?? null
+      : sample?.teacher ?? null)
 
 /**
- * A run that went as planned only confirms a pick somebody else made. Under local authority the
- * pick is the classifier's own, so "it worked" is the classifier agreeing with itself: training on
- * it closes the loop, and the label would name a teacher that was never asked. A rule in code is
- * the same case: an accepted run would teach the classifier to reproduce the rule it is meant to
- * learn past. Evidence that contradicts the pick - a rescue, a negative outcome, a person's tag -
- * is real either way and still gets through; only the agreeing label is dropped.
+ * A run that went as planned only confirms the teacher's pick. Under local authority the pick is
+ * the classifier's own, so "it worked" is the classifier agreeing with itself: training on it
+ * closes the loop, and the label would name a teacher that was never asked. A rule in code is the
+ * same case: an accepted run would teach the classifier to reproduce the rule it is meant to learn
+ * past. So is Laya's: the accept that would confirm its pick came from its own review. A fallback
+ * or deterministic sample has no pick to confirm. Evidence that contradicts the pick - a rescue, a
+ * negative outcome, a person's tag - is real whoever picked and still gets through; only the
+ * agreeing label is dropped.
  */
-const confirms = (sample, outcome) => (sample?.authority === 'local' || sample?.authority === 'code' ? null : outcome)
+const confirms = (sample, outcome) => (sample?.authority === TEACHER ? outcome : null)
 
 const attemptsOf = (record) => (Array.isArray(record?.attempts) ? record.attempts : [])
 const workAttempts = (record) => attemptsOf(record).filter((a) => a && WORK_ROLES.has(a.role) && !a.limitHit)

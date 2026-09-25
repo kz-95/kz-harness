@@ -1,0 +1,579 @@
+{
+ "intent": {
+  "phase": "intent",
+  "state": {
+   "message": "why does the login form create two sessions?"
+  },
+  "questions": {
+   "kind": {
+    "type": "choice",
+    "instructions": {
+     "question": "What does `message` ask for?",
+     "focus": "Only work that reads or changes the project counts as a task. Questions about tools, accounts, concepts or this app are questions."
+    },
+    "criteria": {
+     "task": {
+      "what": "Work to carry out in the code project: fix, build, change, refactor, review, test, investigate or explain its code or files",
+      "not_for": "General questions or chat that need no project files"
+     },
+     "question": {
+      "what": "A question or conversation to answer directly, such as how something works, why something happened, or advice",
+      "not_for": "Requests to read, change or check files in the project"
+     }
+    }
+   },
+   "depth": {
+    "type": "choice",
+    "instructions": {
+     "question": "How much does answering `message` well depend on careful reasoning or wide, current knowledge?",
+     "focus": "Judge the question itself, not who is asking it or how it is worded."
+    },
+    "criteria": {
+     "everyday": {
+      "what": "Greetings, small talk, thanks, a short how-to or factual answer, or something a small local model handles well",
+      "not_for": "Anything whose answer needs several steps of reasoning, wide or current knowledge, or the details of this project"
+     },
+     "deep": {
+      "what": "Needs careful step-by-step reasoning, wide or up-to-date knowledge, or knowledge of this project: worth the strongest available model",
+      "not_for": "Greetings, thanks, small talk, and one-line factual or how-to answers"
+     }
+    }
+   },
+   "alsoWork": {
+    "type": "noul",
+    "instructions": "Even if `message` is a question to answer directly, does it also ask for work to be carried out in the project?"
+   }
+  }
+ },
+ "task": {
+  "phase": "route",
+  "state": {
+   "task": "The login form in src/auth/LoginForm.tsx lets a user submit twice when they double-click, which creates two sessions. Fix it so a second submit is ignored while the first is in flight, and add a test for it.",
+   "workspace": {
+    "gitRepo": true,
+    "productionCritical": false,
+    "branch": "feat/laya-auto",
+    "uncommittedFiles": [],
+    "uncommittedFileCount": 0,
+    "trackedFileCount": 118,
+    "fileTypes": {
+     ".js": 76,
+     ".mjs": 9,
+     ".json": 8,
+     ".md": 7,
+     ".png": 5,
+     ".ps1": 4,
+     ".yml": 3,
+     "(none)": 2
+    }
+   }
+  },
+  "questions": {
+   "taskType": {
+    "type": "choice",
+    "instructions": "What kind of work does `task` ask for?",
+    "criteria": {
+     "architecture": "Designing structure, data flow, or a strategy across components before or instead of writing code",
+     "implementation": "Writing new code or features to a known requirement",
+     "debugging": "Finding and fixing the cause of incorrect behavior, a failing test, or an error",
+     "review": "Reading existing code or a diff and reporting problems, without being asked to change it",
+     "refactor": "Restructuring or renaming existing code without changing behavior",
+     "testing": "Writing or repairing tests",
+     "documentation": "Writing or updating docs, comments, or READMEs",
+     "investigation": "Researching how something works or why something happens, producing findings rather than a change",
+     "security": "Work whose main concern is authentication, authorization, secrets, or vulnerabilities",
+     "performance": "Work whose main concern is speed, memory, or resource usage",
+     "simple_change": "A small, mechanical, low-judgment edit such as a typo, constant, or one-line fix",
+     "other": "None of the above fits"
+    }
+   },
+   "complexity": {
+    "type": "score",
+    "instructions": "How complex is `task` to carry out correctly in this workspace?",
+    "criteria": [
+     "Trivial: a mechanical edit in one place with an obvious answer",
+     "Small: a contained change in one or two files with a clear approach",
+     "Moderate: several files or some design judgment, but a well-understood problem",
+     "Hard: cross-cutting change, unclear root cause, or real design trade-offs",
+     "Extremely complex: ambiguous requirements, many interacting systems, or concurrency and distributed-state reasoning"
+    ]
+   },
+   "risk": {
+    "type": "score",
+    "instructions": "How much harm could a wrong result for `task` cause if shipped?",
+    "criteria": [
+     "Negligible: a mistake has no user-visible effect, for example docs or a test fixture",
+     "Low: a mistake causes a minor, easily noticed and reverted defect",
+     "Moderate: a mistake could break a feature for some users until fixed",
+     "High: a mistake could corrupt data, break a core flow, or cause an outage",
+     "Production-critical: a mistake could compromise security, authentication, money, or irreversible data"
+    ]
+   },
+   "humanReview": {
+    "type": "noul",
+    "instructions": "Should a person inspect the result of `task` before it is accepted, even if checks pass?"
+   },
+   "needsTests": {
+    "type": "noul",
+    "instructions": "Should deterministic checks (tests, type checker, lint, build) be required to pass before the result of `task` is accepted?"
+   },
+   "skill": {
+    "type": "choice",
+    "instructions": {
+     "question": "Which skill is the primary one `task` calls for?",
+     "focus": "The one discipline that finishing the task mostly is; supporting skills are read from the other probabilities."
+    },
+    "criteria": {
+     "debugging": {
+      "what": "Finding the cause of incorrect behaviour and fixing it"
+     },
+     "implementation": {
+      "what": "Writing new code to a known requirement"
+     },
+     "refactoring": {
+      "what": "Restructuring code without changing behaviour"
+     },
+     "architecture": {
+      "what": "Designing structure, data flow and boundaries"
+     },
+     "explanation": {
+      "what": "Explaining how something works or why a choice was made"
+     },
+     "review": {
+      "what": "Reading code or a diff and reporting problems"
+     },
+     "security": {
+      "what": "Authentication, authorization, secrets, vulnerabilities"
+     },
+     "testing": {
+      "what": "Writing or repairing tests"
+     },
+     "frontend": {
+      "what": "User interface code, layout, browser behaviour"
+     },
+     "backend": {
+      "what": "Services, APIs, background jobs"
+     },
+     "database": {
+      "what": "Schemas, queries, migrations, data integrity"
+     },
+     "performance": {
+      "what": "Speed, memory and resource usage"
+     },
+     "documentation": {
+      "what": "Docs, comments, READMEs"
+     },
+     "devops": {
+      "what": "Build, packaging, deployment, environments"
+     }
+    }
+   },
+   "minimumCapability": {
+    "type": "choice",
+    "instructions": {
+     "question": "What is the weakest tier of model that could complete `task` acceptably?",
+     "focus": "Judge the task, not the models on offer. Acceptable means passes verification without a person redoing it."
+    },
+    "criteria": {
+     "standard": {
+      "what": "A competent mid-range model: routine work with clear instructions"
+     },
+     "strong": {
+      "what": "A strong model: real judgment, several files, non-obvious fixes"
+     },
+     "frontier": {
+      "what": "The strongest models available: subtle multi-module reasoning, difficult design, security-sensitive or high-risk work"
+     }
+    }
+   },
+   "preferredCapability": {
+    "type": "choice",
+    "instructions": {
+     "question": "Which tier of model would give the best result for `task` if cost did not matter?",
+     "focus": "Judge the task, not the models on offer."
+    },
+    "criteria": {
+     "standard": {
+      "what": "A competent mid-range model: routine work with clear instructions"
+     },
+     "strong": {
+      "what": "A strong model: real judgment, several files, non-obvious fixes"
+     },
+     "frontier": {
+      "what": "The strongest models available: subtle multi-module reasoning, difficult design, security-sensitive or high-risk work"
+     }
+    }
+   },
+   "req.general_reasoning": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on careful multi-step reasoning?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.architecture": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on architecture and system design judgment?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.planning": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on planning the work and its sequence before doing it?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.explanation": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on explaining, communicating trade-offs and reasoning to a person?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.coding": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on writing correct code?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.debugging": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on finding the cause of incorrect behaviour?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.security_review": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on finding security flaws and subtle implementation problems?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.code_review": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on reviewing code critically for defects?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.testing": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on writing or repairing tests?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "req.long_context": {
+    "type": "score",
+    "instructions": {
+     "question": "How much does doing `task` well depend on holding and reasoning over a large amount of project context at once?",
+     "focus": "Judge the task as written, in this workspace."
+    },
+    "criteria": [
+     "Not needed: the task does not call on this at all",
+     "Marginal: a little helps but a weak model would still manage",
+     "Useful: noticeably better results with real strength here",
+     "Important: a model weak at this would likely produce a wrong or poor result",
+     "Central: the task is essentially this; only real strength here gives an acceptable result"
+    ]
+   },
+   "secondOpinion": {
+    "type": "noul",
+    "instructions": "Would an independent second agent reviewing the result of `task` likely catch mistakes worth the extra time?"
+   },
+   "capability": {
+    "type": "choice",
+    "instructions": {
+     "question": "What kind of outcome does `task` need?",
+     "focus": "Choose what finishing the task actually requires. Explaining while changing code is still `project_change`; reading the project without changing it is `project_read`."
+    },
+    "criteria": {
+     "quick_answer": {
+      "what": "A greeting, a short factual answer or small talk: no project access, no tools, answerable from general knowledge"
+     },
+     "reasoned_answer": {
+      "what": "A multi-step explanation or judgement that needs careful reasoning or wide knowledge, but no project files"
+     },
+     "ocr": {
+      "what": "Extract the text that appears in an image or scan, so it can be read or checked"
+     },
+     "image_inspection": {
+      "what": "Look at an image and describe, compare or check what it shows"
+     },
+     "document_processing": {
+      "what": "Read, transform or validate a document such as a PDF, spreadsheet or Word file"
+     },
+     "web_research": {
+      "what": "Find current information from outside this machine, with sources"
+     },
+     "deterministic_tool": {
+      "what": "A fixed, exact operation a registered script does completely, with no judgement"
+     },
+     "project_read": {
+      "what": "Read this project and explain how it behaves, without changing anything"
+     },
+     "project_change": {
+      "what": "Change this project: write, fix, refactor, test or build it"
+     },
+     "human_required": {
+      "what": "The request cannot proceed without a decision, permission or information only the person has"
+     },
+     "other": {
+      "what": "Nothing in this list fits: the request needs something these executors are not described as doing"
+     }
+    }
+   }
+  }
+ },
+ "resource": {
+  "phase": "route",
+  "state": {
+   "task": "The login form in src/auth/LoginForm.tsx lets a user submit twice when they double-click, which creates two sessions. Fix it so a second submit is ignored while the first is in flight, and add a test for it.",
+   "task_profile": {
+    "complexity": 0.4
+   }
+  },
+  "questions": {
+   "strategy": {
+    "type": "choice",
+    "instructions": {
+     "question": "How should the work for `task` be organised?",
+     "focus": "Every option is one the resources available for this task can run. A direct strategy runs one resource with the usual checks and review. The plan-then-execute and review strategies spend the strongest available resource only on planning or judging and a cheaper one on the bulk work. Prefer the least expensive strategy that still gives the quality `task_profile` says `task` requires."
+    },
+    "criteria": {
+     "CHEAP_DIRECT": {
+      "what": "The cheapest eligible resource does the work directly, with the usual checks and review"
+     },
+     "STANDARD_DIRECT": {
+      "what": "A mid-tier eligible resource does the work directly"
+     },
+     "PREMIUM_DIRECT": {
+      "what": "The strongest eligible resource does the work directly"
+     },
+     "CHEAP_THEN_PREMIUM_REVIEW": {
+      "what": "A cheap resource does the work and a stronger resource reviews it before acceptance"
+     }
+    }
+   },
+   "secondOpinion": {
+    "type": "noul",
+    "instructions": "Would an independent second agent reviewing the result of `task` likely catch mistakes worth the extra time?"
+   }
+  }
+ },
+ "review": {
+  "phase": "review",
+  "state": {
+   "task": "The login form in src/auth/LoginForm.tsx lets a user submit twice when they double-click, which creates two sessions. Fix it so a second submit is ignored while the first is in flight, and add a test for it.",
+   "routing": {
+    "task_type": "debugging",
+    "risk": 0.4,
+    "complexity": 0.3
+   },
+   "attempts": [
+    {
+     "agent": "claude",
+     "role": "executor",
+     "status": "end_turn",
+     "answer": "I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. I added a submitting flag to LoginForm and disabled the button while the request is in flight. ",
+     "changed_files": [
+      "src/auth/LoginForm.tsx",
+      "src/auth/LoginForm.test.tsx"
+     ]
+    }
+   ],
+   "verification": {
+    "results": [
+     {
+      "name": "test",
+      "passed": true,
+      "exitCode": 0,
+      "durationMs": 4000,
+      "output": "PASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\nPASS src/auth/LoginForm.test.tsx\n  ok 12 tests\n"
+     }
+    ],
+    "regressed": [],
+    "fixed": [],
+    "failing": []
+   },
+   "diff": {
+    "stat": " src/auth/LoginForm.tsx | 14 +++--\n src/auth/LoginForm.test.tsx | 30 ++++++",
+    "excerpt": "diff --git a/src/auth/LoginForm.tsx b/src/auth/LoginForm.tsx\n-  onSubmit={handleSubmit} // old line 0\n+  const [submitting, setSubmitting] = useState(false) // line 1\n+  const [submitting, setSubmitting] = useState(false) // line 2\n-  onSubmit={handleSubmit} // old line 3\n+  const [submitting, setSubmitting] = useState(false) // line 4\n+  const [submitting, setSubmitting] = useState(false) // line 5\n-  onSubmit={handleSubmit} // old line 6\n+  const [submitting, setSubmitting] = useState(false) // line 7\n+  const [submitting, setSubmitting] = useState(false) // line 8\n-  onSubmit={handleSubmit} // old line 9\n+  const [submitting, setSubmitting] = useState(false) // line 10\n+  const [submitting, setSubmitting] = useState(false) // line 11\n-  onSubmit={handleSubmit} // old line 12\n+  const [submitting, setSubmitting] = useState(false) // line 13\n+  const [submitting, setSubmitting] = useState(false) // line 14\n-  onSubmit={handleSubmit} // old line 15\n+  const [submitting, setSubmitting] = useState(false) // line 16\n+  const [submitting, setSubmitting] = useState(false) // line 17\n-  onSubmit={handleSubmit} // old line 18\n+  const [submitting, setSubmitting] = useState(false) // line 19\n+  const [submitting, setSubmitting] = useState(false) // line 20\n-  onSubmit={handleSubmit} // old line 21\n+  const [submitting, setSubmitting] = useState(false) // line 22\n+  const [submitting, setSubmitting] = useState(false) // line 23\n-  onSubmit={handleSubmit} // old line 24\n+  const [submitting, setSubmitting] = useState(false) // line 25\n+  const [submitting, setSubmitting] = useState(false) // line 26\n-  onSubmit={handleSubmit} // old line 27\n+  const [submitting, setSubmitting] = useState(false) // line 28\n+  const [submitting, setSubmitting] = useState(false) // line 29\n-  onSubmit={handleSubmit} // old line 30\n+  const [submitting, setSubmitting] = useState(false) // line 31\n+  const [submitting, setSubmitting] = useState(false) // line 32\n-  onSubmit={handleSubmit} // old line 33\n+  const [submitting, setSubmitting] = useState(false) // line 34\n+  const [submitting, setSubmitting] = useState(false) // line 35\n-  onSubmit={handleSubmit} // old line 36\n+  const [submitting, setSubmitting] = useState(false) // line 37\n+  const [submitting, setSubmitting] = useState(false) // line 38\n-  onSubmit={handleSubmit} // old line 39\n+  const [submitting, setSubmitting] = useState(false) // line 40\n+  const [submitting, setSubmitting] = useState(false) // line 41\n-  onSubmit={handleSubmit} // old line 42\n+  const [submitting, setSubmitting] = useState(false) // line 43\n+  const [submitting, setSubmitting] = useState(false) // line 44\n-  onSubmit={handleSubmit} // old line 45\n+  const [submitting, setSubmitting] = useState(false) // line 46\n+  const [submitting, setSubmitting] = useState(false) // line 47\n-  onSubmit={handleSubmit} // old line 48\n+  const [submitting, setSubmitting] = useState(false) // line 49\n+  const [submitting, setSubmitting] = useState(false) // line 50\n-  onSubmit={handleSubmit} // old line 51\n+  const [submitting, setSubmitting] = useState(false) // line 52\n+  const [submitting, setSubmitting] = useState(false) // line 53\n-  onSubmit={handleSubmit} // old line 54\n+  const [submitting, setSubmitting] = useState(false) // line 55\n+  const [submitting, setSubmitting] = useState(false) // line 56\n-  onSubmit={handleSubmit} // old line 57\n+  const [submitting, setSubmitting] = useState(false) // line 58\n+  const [submitting, setSubmitting] = useState(false) // line 59\n-  onSubmit={handleSubmit} // old line 60\n+  const [submitting, setSubmitting] = useState(false) // line 61\n+  const [submitting, setSubmitting] = useState(false) // line 62\n-  onSubmit={handleSubmit} // old line 63\n+  const [submitting, setSubmitting] = useState(false) // line 64\n+  const [submitting, setSubmitting] = useState(false) // line 65\n-  onSubmit={handleSubmit} // old line 66\n+  const [submitting, setSubmitting] = useState(false) // line 67\n+  const [submitting, setSubmitting] = useState(false) // line 68\n-  onSubmit={handleSubmit} // old line 69\n+  const [submitting, setSubmitting] = useState(false) // line 70\n+  const [submitting, setSubmitting] = useState(false) // line 71\n-  onSubmit={handleSubmit} // old line 72\n+  const [submitting, setSubmitting] = useState(false) // line 73\n+  const [submitting, setSubmitting] = useState(false) // line 74\n-  onSubmit={handleSubmit} // old line 75\n+  const [submitting, setSubmitting] = useState(false) // line 76\n+  const [submitting, setSubmitting] = useState(false) // line 77\n-  onSubmit={handleSubmit} // old line 78\n+  const [submitting, setSubmitting] = useState(false) // line 79\n+  const [submitting, setSubmitting] = useState(false) // line 80\n-  onSubmit={handleSubmit} // old line 81\n+  const [submitting, setSubmitting] = useState(false) // line 82\n+  const [submitting, setSubmitting] = useState(false) // line 83\n-  onSubmit={handleSubmit} // old line 84\n+  const [submitting, setSubmitting] = useState(false) // line 85\n+  const [submitting, setSubmitting] = useState(false) // line 86\n-  onSubmit={handleSubmit} // old line 87\n+  const [submitting, setSubmitting] = useState(false) // line 88\n+  const [submitting, setSubmitting] = useState(false) // line 89\n-  onSubmit={handleSubmit} // old line 90\n+  const [submitting, setSubmitting] = useState(false) // line 91\n+  const [submitting, setSubmitting] = useState(false) // line 92\n-  onSubmit={handleSubmit} // old line 93\n+  const [submitting, setSubmitting] = useState(false) // line 94\n+  const [submitting, setSubmitting] = useState(false) // line 95\n-  onSubmit={handleSubmit} // old line 96\n+  const [submitting, setSubmitting] = useState(false) // line 97\n+  const [submitting, setSubmitting] = useState(false) // line 98\n-  onSubmit={handleSubmit} // old line 99\n+  const [submitting, setSubmitting] = useState(false) // line 100\n+  const [submitting, setSubmitting] = useState(false) // line 101\n-  onSubmit={handleSubmit} // o\n...[truncated 1030 chars]"
+   }
+  },
+  "questions": {
+   "verdict": {
+    "type": "choice",
+    "instructions": {
+     "question": "Given the latest entry in `attempts`, `verification`, and `diff`, what should happen next for `task`?",
+     "focus": "Judge the evidence, not the agent's own claims. A failing required check in `verification` means the task is not done."
+    },
+    "criteria": {
+     "accept": {
+      "what": "The evidence shows the task is done: the result addresses the request and verification supports it",
+      "not_for": "Results with failing required checks, unaddressed parts of the task, or open risk that deserves another look"
+     },
+     "second_review": {
+      "what": "The result looks plausible, but its risk or uncertainty justifies an independent review by a different agent",
+      "not_for": "Results that are clearly wrong (retry) or clearly fine (accept)"
+     },
+     "retry": {
+      "what": "The result is incomplete or wrong, or checks fail because of it, and another attempt could fix it",
+      "not_for": "Problems that need a human decision such as unclear scope, destructive actions, or credentials"
+     },
+     "human": {
+      "what": "A person should decide: scope is unclear, the change is risky or destructive, agents failed repeatedly, or evidence is missing",
+      "not_for": "Routine outcomes an agent can settle"
+     }
+    }
+   },
+   "disposition": {
+    "type": "choice",
+    "instructions": {
+     "question": "Which disposition fits the latest entry in `attempts` for `task`?",
+     "focus": "The finer version of the verdict: whether a retry should stay on the same kind of resource or move, and whether a review needs the strongest resource or any independent one."
+    },
+    "criteria": {
+     "PASS": {
+      "what": "The result is done and verified well enough to accept"
+     },
+     "RETRY_SAME_TIER": {
+      "what": "Wrong or incomplete, but a model of the same strength would likely fix it with the feedback"
+     },
+     "RETRY_DIFFERENT_RESOURCE": {
+      "what": "Wrong or incomplete in a way this resource keeps getting wrong: a different resource should try"
+     },
+     "SECOND_OPINION": {
+      "what": "Plausible but uncertain: an independent review by another resource is worth its cost"
+     },
+     "FRONTIER_REVIEW": {
+      "what": "Plausible but risky or subtle enough that only the strongest available resource should judge it before acceptance"
+     },
+     "WRONG": {
+      "what": "Clearly wrong and not worth retrying as is: the approach itself must change"
+     },
+     "HUMAN": {
+      "what": "A person must decide: unclear scope, a destructive or irreversible action, repeated failure, or missing evidence"
+     }
+    }
+   },
+   "addressed": {
+    "type": "noul",
+    "instructions": "Does the latest entry in `attempts` (its answer and `diff`) do what `task` asked?"
+   },
+   "complete": {
+    "type": "noul",
+    "instructions": "Is every part of `task` handled by the latest entry in `attempts` and `diff`, with nothing left undone?"
+   },
+   "unrelatedChanges": {
+    "type": "noul",
+    "instructions": "Does `diff` change anything `task` did not ask for?"
+   },
+   "regressionRisk": {
+    "type": "noul",
+    "instructions": "Does `diff` carry meaningful risk of breaking behavior that `task` did not ask to change?"
+   },
+   "needsPerson": {
+    "type": "noul",
+    "instructions": "Does the latest entry in `attempts` ask a question, report being blocked, or need a decision only a person can make?"
+   },
+   "reviewAgent": {
+    "type": "choice",
+    "instructions": {
+     "question": "If another agent REVIEWS the latest attempt without changing it, which agent should judge it?",
+     "focus": "Judging rewards care and independence over speed or cost, and costs few tokens. Prefer an agent other than the one that produced the work, unless it is clearly the best judge."
+    },
+    "criteria": {
+     "claude": {
+      "what": "Claude Code"
+     },
+     "codex": {
+      "what": "Codex CLI"
+     }
+    }
+   },
+   "retryAgent": {
+    "type": "choice",
+    "instructions": {
+     "question": "If another agent has to FIX the latest attempt, which agent should do the work?",
+     "focus": "Fixing is bulk work: weigh track record on this kind of task and cost. Prefer an agent other than the one that just failed, unless it is clearly the best fit."
+    },
+    "criteria": {
+     "claude": {
+      "what": "Claude Code"
+     },
+     "codex": {
+      "what": "Codex CLI"
+     }
+    }
+   }
+  }
+ }
+}

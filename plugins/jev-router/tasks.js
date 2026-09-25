@@ -180,11 +180,15 @@ export const validJobId = (id) => validJobIds([id])[0]
 
 const clip = (s, n) => (String(s).length > n ? `${String(s).slice(0, n - 1)}…` : String(s))
 
-/** The fields that are written to disk, in one place: the record is the one source of truth. */
+/**
+ * The fields that are written to disk, in one place: the record is the one source of truth.
+ * `decider` is who decides the task when it runs (Jev, or Laya from Laya Auto), however long after
+ * it was queued: route() then asks whether that one can be asked at all.
+ */
 const SAVED = [
   'jobId', 'sessionId', 'workspace', 'taskName', 'taskText', 'capability', 'executor', 'agent', 'model',
   'state', 'phase', 'progressText', 'queuedAt', 'startedAt', 'finishedAt', 'terminalReason',
-  'deliveryState', 'deliveredAt', 'seq', 'settledSeq', 'effort', 'mode', 'finalStatus', 'statusReason', 'modalities',
+  'deliveryState', 'deliveredAt', 'seq', 'settledSeq', 'effort', 'mode', 'decider', 'finalStatus', 'statusReason', 'modalities',
 ]
 
 /** A record from disk (possibly written by an older version) with every field present. */
@@ -205,6 +209,8 @@ const hydrate = (raw) => ({
   seq: raw.seq ?? 1,
   settledSeq: raw.settledSeq ?? 0,
   finalStatus: raw.finalStatus ?? null,
+  // Every task before there was a choice was Jev's.
+  decider: raw.decider ?? 'jev',
 })
 
 /**
@@ -377,7 +383,7 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
    * Start `task` as a background job owned by `owner` (the session's live root agent).
    * Returns the task, or null when background jobs are unavailable (caller runs it blocking).
    */
-  function enqueue({ owner, sessionId, workspace, task, forceAgent, effort, mode, capability, taskName, executor, agent, modalities }) {
+  function enqueue({ owner, sessionId, workspace, task, forceAgent, effort, mode, decider, capability, taskName, executor, agent, modalities }) {
     const jobs = getJobs()
     if (!jobs) return null
     const ac = new AbortController()
@@ -387,7 +393,7 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
       jobId: null, sessionId, workspace,
       taskName: taskName ?? clip(String(task).replace(/\s+/g, ' '), 80), taskText: task, task,
       capability: capability ?? null, executor: executor ?? null, modalities: modalities ?? ['text'],
-      state: 'queued', phase: 'queued', agent: agent ?? forceAgent ?? null, model: null, mode: mode ?? 'auto', effort: effort && effort !== 'auto' ? effort : null,
+      state: 'queued', phase: 'queued', agent: agent ?? forceAgent ?? null, model: null, mode: mode ?? 'auto', decider: decider ?? 'jev', effort: effort && effort !== 'auto' ? effort : null,
       queuedAt: now(), startedAt: null, finishedAt: null, terminalReason: null, finalStatus: null,
       progressText: 'Waiting', lastLine: 'Waiting', report: null, runId: null,
       deliveryState: 'pending', deliveredAt: null, seq: 1, settledSeq: 0,
@@ -464,7 +470,7 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
     task: t.taskText, taskName: t.taskName, taskText: t.taskText,
     capability: t.capability, executor: t.executor,
     state: t.state, status: t.state, phase: t.phase, position: position(t), queuePosition: position(t),
-    mode: t.mode, agent: t.agent, model: t.model, effort: t.effort,
+    mode: t.mode, decider: t.decider, agent: t.agent, model: t.model, effort: t.effort,
     queuedAt: t.queuedAt, startedAt: t.startedAt, finishedAt: t.finishedAt,
     terminalReason: t.terminalReason, finalStatus: t.finalStatus, statusReason: t.statusReason,
     progressText: t.progressText, lastLine: t.progressText,
@@ -477,7 +483,7 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
   const resultOf = (t) => ({
     jobId: t.jobId, sessionId: t.sessionId, workspace: t.workspace,
     task: t.taskText, taskName: t.taskName, capability: t.capability,
-    agent: t.agent, model: t.model, state: t.state, status: t.state,
+    agent: t.agent, model: t.model, decider: t.decider, state: t.state, status: t.state,
     terminalReason: t.terminalReason, finalStatus: t.finalStatus,
     report: t.report,
     finishedAt: t.finishedAt, queuedAt: t.queuedAt, deliveryState: t.deliveryState, seq: t.seq,

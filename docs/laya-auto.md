@@ -705,6 +705,7 @@ One row per shadowed call in `~/.kzh/jev-router/laya-shadow.jsonl`, written when
   id, ts, runId,                                   // runId null for intent
   callId, phase: 'route' | 'review' | 'intent', groups: ['task'] | ['resource', 'judgments'] | null,
   attempt: 2 | null, review: { risk: 0.4, blockAccept: false, reviewed: false } | null,   // from onCall's context (2.3), numbers and booleans only, for reviewAction()
+  actions: { jev: 'accept', laya: 'second_review' } | null,   // review rows only: reviewAction() on each side's own nouls and thresholds, null for a side without them; the inspector's review line (5.6)
   identity: '<the identity string of 4.5>', device: 'cuda' | 'cpu', lang: 'latin' | 'non-latin',
   thresholds: { jev: '<sha256 of the Jev record's thresholds, 12>', laya: '<sha256 of Laya's, 12>' },
   status: 'answered' | 'partial' | 'skipped' | 'failed',

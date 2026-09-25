@@ -1264,3 +1264,197 @@ test('the RAM watchdog reads on its own once the model is loaded, and stops when
   assert.equal(reads, after, 'no reading once the engine is stopped')
   await local.dispose()
 })
+
+// ---------- the shared residency: llama beside Laya (docs/laya-auto.md 7.7) ----------
+
+/**
+ * A residency of the shape residency.js has, kept here so these tests load against a local.js that
+ * never had one: residents in a Map, a generation that moves whenever one comes or goes, and a
+ * record of what local.js asked of it.
+ */
+function residencyStub() {
+  const residents = new Map()
+  let gen = 0
+  const asked = []
+  const ramOf = (r) => r.workingSetGB ?? (typeof r.ramGB === 'function' ? r.ramGB() : r.ramGB) ?? 0
+  const others = (id, heldOnly) => [...residents.values()].filter((r) => r.id !== id && (!heldOnly || r.held()))
+  return {
+    asked,
+    set(id, entry) {
+      const stored = { busy: () => false, held: () => false, keepWhileHeld: false, name: id, ...entry, id, workingSetGB: null }
+      residents.set(id, stored)
+      gen++
+      asked.push(['set', id])
+      return stored
+    },
+    clear(id, entry) {
+      if (!residents.has(id) || (entry && residents.get(id) !== entry)) return
+      residents.delete(id)
+      gen++
+      asked.push(['clear', id])
+    },
+    get: (id) => residents.get(id) ?? null,
+    list: () => [...residents.values()],
+    generation: () => gen,
+    othersRamGB: (id, { heldOnly = false } = {}) => Math.round(others(id, heldOnly).reduce((a, r) => a + ramOf(r), 0) * 10) / 10,
+    othersVramGB: (id, { heldOnly = false } = {}) => others(id, heldOnly).reduce((a, r) => a + (r.vramGB ?? 0), 0),
+    othersNames: (id, { heldOnly = false } = {}) => others(id, heldOnly).map((r) => r.name),
+    async yieldFor(id, { name = id } = {}) {
+      asked.push(['yieldFor', id])
+      const gone = []
+      for (const r of others(id, false)) {
+        if (r.held() || r.busy()) continue
+        await r.unload({ kind: 'yield', for: name, text: `unloaded so ${name} could have the GPU and RAM` })
+        gone.push(r.id)
+      }
+      return gone
+    },
+  }
+}
+
+/** A Laya registered the way laya-sidecar.js registers it: its unload leaves the residency, as its stop does. */
+function layaIn(res, { held = false, busy = false, ramGB = 3.3, startedAt = Date.now() + 1000, pid = 4242 } = {}) {
+  const laya = { held, busy, unloads: [] }
+  laya.entry = res.set('laya', {
+    pid, startedAt, device: 'cuda', name: 'Laya', keepWhileHeld: true, ramGB, vramGB: 2.5,
+    held: () => laya.held, busy: () => laya.busy,
+    unload: async (why) => { laya.unloads.push(why); res.clear('laya', laya.entry) },
+  })
+  return laya
+}
+
+test('isBusy() says a request holds the engine: true while a stream is open, false once it has finished', async () => {
+  let finish
+  const body = new ReadableStream({ start(c) { finish = () => { c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')); c.close() } } })
+  const eng = fakeEngine()
+  const fetch = async (url) => (String(url).endsWith('/health') ? eng.fetch() : new Response(body))
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch })
+  assert.equal(typeof local.isBusy, 'function', 'the local models say whether a request is in flight')
+  assert.equal(local.isBusy(), false, 'nothing asked yet')
+  const chunks = []
+  const reading = (async () => { for await (const c of local.stream({ model: 'big', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })) chunks.push(c) })()
+  await waitFor('the stream is open', () => local.isBusy(), (b) => b === true, { timeoutMs: 10_000 })
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(local.isBusy(), true, 'still open: nothing has come back yet')
+  finish()
+  await reading
+  assert.equal(local.isBusy(), false, 'the stream has ended')
+  assert.ok(chunks.some((c) => c.type === 'text-delta'), JSON.stringify(chunks))
+  await local.dispose()
+})
+
+test('the loaded engine registers in the shared residency as llama, held, and leaves it when it stops', async () => {
+  const res = residencyStub()
+  const eng = fakeEngine()
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, residency: res })
+  assert.equal(res.get('llama'), null, 'not resident before it is loaded')
+  await local.start('big')
+  const llama = res.get('llama')
+  assert.ok(llama, 'resident once it is ready')
+  assert.deepEqual([llama.pid, llama.name, llama.held(), llama.busy(), llama.keepWhileHeld], [2147483647, 'big', true, false, false])
+  assert.ok(llama.ramGB() > 0 && llama.vramGB() > 0, 'it says what it holds, for the budget beside it')
+  assert.equal(typeof llama.unload, 'function')
+  await local.stop()
+  assert.equal(res.get('llama'), null, 'gone once stopped')
+  assert.deepEqual(res.asked.filter(([what]) => what !== 'yieldFor'), [['set', 'llama'], ['clear', 'llama']])
+  await local.dispose()
+})
+
+test('a local model start first unloads a Laya nothing holds; the plan counts only a held Laya against the RAM budget, and never unloads', async () => {
+  const wideOf = async (local) => (await local.status()).modules.find((m) => m.id === 'wide')
+  // What Wide gets with no Laya at all: under 5 GB it takes its whole 32k, and under the 1.7 GB a
+  // held Laya's 3.3 GB would leave of those 5, less.
+  const alone = fakeEngine()
+  const { local: plain } = await wideIn(tmp(), { spawn: alone.spawn, fetch: alone.fetch })
+  await plain.setSettings({ maxRamGB: 5 })
+  assert.equal((await wideOf(plain)).ctx, 32768)
+  await plain.start('wide')
+  const aloneArgs = alone.started[0].args
+  await plain.setSettings({ maxRamGB: 1.7 })
+  const heldCtx = (await wideOf(plain)).ctx
+  assert.ok(heldCtx < 32768, 'the smaller room sizes the context down')
+  await plain.dispose()
+
+  // A Laya nothing holds: planned as if it were not there, and unloaded when the model starts, so
+  // llama gets the context and the --fit target it would have had without Laya.
+  const res = residencyStub()
+  const eng = fakeEngine()
+  const { local } = await wideIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, residency: res })
+  await local.setSettings({ maxRamGB: 5 })
+  const unheld = layaIn(res, { held: false })
+  assert.equal((await wideOf(local)).ctx, 32768, 'a Laya nothing holds does not size llama down')
+  assert.equal((await local.readiness('wide')).loggedIn, true)
+  assert.deepEqual(unheld.unloads, [], 'reading the plan unloads nothing')
+  await local.start('wide')
+  assert.deepEqual(unheld.unloads.map((w) => [w.kind, w.for]), [['yield', 'wide']], 'Laya gave way before the load')
+  const i = res.asked.findIndex(([what]) => what === 'yieldFor')
+  assert.ok(i >= 0 && res.asked.findIndex(([what, id]) => what === 'set' && id === 'llama') > i, 'unloaded before llama came up')
+  for (const flag of ['-c', '--fit-target', '-ngl', '-t']) assert.equal(argOf(eng.started[0].args, flag), argOf(aloneArgs, flag), `${flag} as without Laya`)
+  await local.stop()
+
+  // A held Laya stays, and its RAM comes off the budget before llama's context is sized.
+  const held = layaIn(res, { held: true })
+  assert.equal((await wideOf(local)).ctx, heldCtx, 'sized as under 5 GB less the 3.3 GB Laya holds')
+  await local.start('wide')
+  assert.deepEqual(held.unloads, [], 'a held Laya is never unloaded for llama')
+  assert.equal(argOf(eng.started[1].args, '-c'), String(heldCtx))
+  await local.stop()
+  // Over what is left even at the floor: the refusal says what Laya holds.
+  await local.setSettings({ maxRamGB: 3.5 })
+  const refusal = 'Wide needs about 0.3 GB of RAM even at the 12k context floor (estimated: 4 GB VRAM + 0.3 GB RAM), over the resource budget of 3.5 GB RAM, less the 3.3 GB Laya holds. Raise the RAM budget or use a smaller model.'
+  assert.equal((await wideOf(local)).overBudget, refusal)
+  await assert.rejects(local.start('wide'), { message: refusal })
+  await local.dispose()
+})
+
+test('the RAM watchdog counts llama and Laya together, unloads a Laya nothing holds before a busy llama, and never trips llama on Laya\'s share', async () => {
+  const GIB = 1024 ** 3
+  let clock = 0
+  const res = residencyStub()
+  const eng = fakeEngine()
+  const rss = { 2147483647: 3 * GIB, 4242: 3 * GIB }
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, residency: res, now: () => clock, readWorkingSet: async (pid) => rss[pid] ?? null, watchEveryMs: 3_600_000 })
+  await local.setSettings({ maxRamGB: 5 })
+  await local.start('big')
+  const conn = await local.acquire('big') // a request in flight: llama is busy
+  const laya = layaIn(res, { held: false })
+  await local.checkMemory()
+  clock += 29_000
+  await local.checkMemory()
+  assert.deepEqual(laya.unloads, [], '6 GB together, over 5 GB, but not yet for 30 seconds')
+  clock += 1_000
+  await local.checkMemory()
+  assert.deepEqual(laya.unloads.map((w) => w.kind), ['budget'], 'the Laya nothing holds goes first')
+  assert.match(laya.unloads[0].text, /^the local models together stayed over the 5 GB RAM budget for 30 s \(last reading 6 GB: big 3 GB, Laya 3 GB\)$/)
+  assert.equal((await local.status()).engine.running, true, 'the busy llama keeps running')
+  assert.equal((await local.readiness('big')).loggedIn, true, "and llama's context is not marked as tripped on Laya's account")
+  conn.release()
+  // llama alone and over the budget is unloaded as it always was.
+  rss[2147483647] = 6 * GIB
+  await local.checkMemory()
+  clock += 30_000
+  await local.checkMemory()
+  assert.equal((await local.status()).engine.running, false)
+  assert.match((await local.readiness('big')).detail, /^the RAM watchdog unloaded Big: its working set stayed over the 5 GB RAM budget for 30 s \(last reading 6 GB\)/)
+  await local.dispose()
+})
+
+test('killTree stops a process and every process it started, by pid; on Windows through taskkill /t /f', async () => {
+  const { killTree } = await import('../local.js')
+  assert.equal(typeof killTree, 'function', 'local.js exports killTree(pid)')
+  const calls = []
+  const run = (cmd, args) => { calls.push([cmd, ...args]); return { status: 0 } }
+  assert.equal(killTree(1234, { platform: 'win32', run }), true)
+  assert.deepEqual(calls, [['taskkill', '/pid', '1234', '/t', '/f']])
+  assert.equal(killTree(undefined), false, 'no pid, nothing to do')
+  assert.equal(killTree(0), false)
+  if (process.platform === 'win32') return
+  const { spawn } = await import('node:child_process')
+  // A parent that starts a child of its own and prints its pid: both must go.
+  const parent = spawn(process.execPath, ['-e', "const c = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); console.log(c.pid); setInterval(() => {}, 1000)"], { stdio: ['ignore', 'pipe', 'ignore'] })
+  const childPid = Number(await new Promise((r) => parent.stdout.once('data', (d) => r(String(d).trim()))))
+  const alive = (pid) => { try { process.kill(pid, 0); return true } catch { return false } }
+  assert.ok(alive(parent.pid) && alive(childPid))
+  assert.equal(killTree(parent.pid), true)
+  await waitFor('the parent and its child have exited', () => [parent.exitCode === null && parent.signalCode === null, alive(childPid)], (x) => !x[0] && !x[1], { timeoutMs: 10_000 })
+})

@@ -22,6 +22,7 @@ your request
 ```
 
 Each judgment in those stages belongs to a **routing domain**, and each domain answers its own question about who is allowed to make it: Jev, a rule in code, the local classifier, or a deterministic fallback.
+In a run Laya decides (Laya Auto, [`laya-auto.md`](laya-auto.md)) the question has a fifth answer, `laya`: see [A second decider: Laya](#a-second-decider-laya).
 The hard eligibility and the conservation limit are not judgments, and belong to no domain.
 The domains mature separately, so task classification can be handled locally while the execution strategy is still asking Jev.
 
@@ -458,7 +459,10 @@ Recorded, in `~/.kzh/jev-router/` (the folder of `historyFile`):
 | `history.jsonl` | One row per routed run, written by the router, not by the learning store: the **task text as typed**, the workspace's absolute path, the routing context (branch, up to 30 uncommitted file paths, file-type counts, script and dependency names), the routing decision, each attempt's error diagnostic and changed file paths, and the **first 1000 characters of each attempt's answer**. |
 | `tasks.jsonl` | The last 100 background tasks: the **task text** again, and the finished **report**, clipped to 20,000 characters, which includes up to 4000 characters of the answer and the changed file names. |
 | `feedback.jsonl` | Each Like or Dislike, its tag, the reason the person typed, the answer's agent and model, the run it came from (`runId`), and `learningOff` when it was given with learning off. |
-| `usage.jsonl` | One row per agent attempt and per Jev call: ids, the workspace path, tokens, cost and quota. |
+| `usage.jsonl` | One row per agent attempt and per answered Jev or Laya call (`agent: 'laya'`, at $0): ids, the workspace path, tokens, cost and quota. A direct answer's row names the row's `decider`. |
+| `laya-samples.jsonl` | One row per domain decision of a run Laya decided, in the same shape as `routing-samples.jsonl` with `teacher: null` and Laya's answer as `provider`, then its outcome rows. Same cap and compaction. No classifier reads it. |
+| `laya-shadow.jsonl` | One row per Jev call in Jev Auto that Laya answered beside Jev, or was skipped for: both sides' answers as numbers and option keys (a tool parameter's as its index), the call's timings and why a comparison was skipped. Newest 10,000 rows. |
+| `laya-standing.jsonl` | Laya's standing per domain, appended at most once a minute after a run: a reading, never an authority. |
 
 Nothing redacts a key out of `history.jsonl`, `tasks.jsonl` or `feedback.jsonl`: a key pasted into a task or a reason is stored there as typed.
 
@@ -576,6 +580,27 @@ A `teacher: 'code'` domain whose classifier may decide (the frontier review) nam
 When a code-decided domain is at a local rung and its classifier does not decide, the decision's reason keeps why (out of distribution, too little confidence, a classifier that never decides) and appends `; a rule in code decides this one`.
 It prints every limit figure with its own provenance and confidence, so a DeepSeek balance reads, for example, `balance 60.0% used (estimated, little evidence), 40 USD left (from the provider, well evidenced)`, and scarcity is shown at its own confidence.
 The run view says when the weekly gate yielded or the decision engine kept a gated frontier resource, on the decision card or, where that card is not shown (the Overview ledger, a stored run), on the run itself, and it names every move the router made, each with where it went.
+
+## A second decider: Laya
+
+Laya, a decision model on this PC, answers the same questions as Jev ([`laya-auto.md`](laya-auto.md) is the design).
+Who decides a run is `routing.decider` on its record (`'jev'`, or `'laya'` for a Laya Auto run and `/laya`; a record without it was Jev's), and every cut-off the run reads comes from that provider's record (`providers.js`), never from a constant both share.
+The teacher stays Jev: `routing-policy.js` still refuses any teacher but `jev` or `code`, and a domain's `state().teacher` is unchanged.
+
+In a run Laya decides, every domain Jev would be asked about is answered by Laya, whatever rung its ladder holds, and records authority `laya`; the code-taught domains (`resource_selection`, `frontier_escalation`) are decided by their rules exactly as in Jev Auto; a domain whose Laya answer failed, or was too flat to use, takes its deterministic answer (`code` or `fallback`), never the local classifier and never Jev.
+The one exception is `outcome_disposition`, where a flat disposition still gives authority `laya` and only the sample says `informative: false`, because the review's action comes from Laya's yes/no answers, not from the disposition.
+The local classifier's answer is recorded beside Laya's and never decides, so Jev's teaching never enters a Laya run, and every domain reports `maturity: null` there: the local ladder's rung says nothing about a Laya run.
+
+The stores are kept apart by construction, not by filters:
+
+- `training.js` `createTrainingStore` takes a `kind`. The Jev store, `routing-samples.jsonl`, throws on authority `laya` and on any `provider` field; the Laya store, `laya-samples.jsonl`, throws on a teacher. `AUTHORITIES` is unchanged (the Jev store's list); `ALL_AUTHORITIES` adds `laya`, and `STORE_AUTHORITIES` gives each store its own.
+- A Laya run's decisions write to the Laya store only (`decide({ answeredBy: 'laya', sink })`), and never touch a domain's ladder: no out-of-distribution note, no maturity change, no state write. The review's `outcome_disposition` is decided behind a facade in `index.js` that sends it to the Laya store, so `jev-review` knows nothing of stores.
+- The labels a finished run earns are resolved in the store each sample was written to (`decisionSamples` entries carry `store`), and a person's verdict relabels in the store `routing.decider` names (`index.js` `onVerdict`). An accepted run confirms only the teacher's pick, so an accepted Laya run labels nothing; evidence against a Laya pick (a rescue, a negative outcome, a person's tag) is labelled as it is for any pick.
+- After a Laya-decided run the Jev evaluation pass (`maybeRetrain`) does not run: it stamps and saves every Jev domain state, and a Laya run gives those domains nothing new. Laya's own pass appends its standing to `laya-standing.jsonl`, outside `domains/`.
+- No local classifier reads `laya-samples.jsonl`, so their training, evaluation windows, drift and out-of-distribution statistics, `classProfiles` and `stats().localAgreement` cannot see a Laya answer.
+- A Laya-decided run's capability evidence is only whether each attempt completed (`reliability`), with no task type, because every other row would rest on Laya's own judgment; a person's verdict on such a run gives no capability evidence, and weighs in the feedback prior as a verdict on a run of unknown type.
+
+The decision line and the report name Laya where they name Jev: `Laya and routing rules decided; 2 Laya calls; 3 candidates considered`, and `AUTO (Laya and routing rules decided)`.
 
 ## What this does not do yet
 

@@ -4,6 +4,7 @@
 import { resolve } from 'node:path'
 import { eligible, rank } from './capabilities.js'
 import { isLocalLevel, localAgentFor } from './effort.js'
+import { TEACHER, providerName } from './providers.js'
 import { fileURLToPath } from 'node:url'
 
 export const JEV_PROVIDER = 'jev'
@@ -11,35 +12,60 @@ export const JEV_PROVIDER = 'jev'
 const NO_PROJECT = resolve(fileURLToPath(new URL('../../no-project', import.meta.url))).toLowerCase()
 export const isNoProject = (cwd) => !!cwd && resolve(cwd).toLowerCase() === NO_PROJECT
 const MODEL = 'jev-auto'
+const LAYA_MODEL = 'laya-auto'
 // Four ways to let Jev choose, by how much of the machine's outside world is in play.
 // Jev itself is a hosted call, so 'offline' drops it and falls back to the fixed rule.
 // 'local' and 'online' are mirrors: each keeps Jev routing and narrows the pool to one side.
 // 'offline' and a genuinely dead network both beat 'online', because those are statements about
 // what this machine CAN do, while 'online' is only a preference about what it SHOULD use.
+// `decider` is who answers the routing, intent and review questions of a row (providers.js):
+// Laya Auto is the one row Laya decides, with no Jev call at all (docs/laya-auto.md 3.1).
 const JEV_MODELS = {
   'jev-auto': {
     mode: 'auto',
+    decider: 'jev',
     name: 'Jev Auto',
     description: 'Every message goes straight to the Jev router, which picks Claude, Codex, DeepSeek or a tool, then reviews the result.',
+  },
+  // Right after Jev Auto, and only while Laya can be asked at all (listModels). There is no Laya
+  // twin of the rows below: offline, Laya Auto narrows the pool to the local agents itself, and a
+  // local effort forces the agent under it exactly as it does under Jev Auto.
+  'laya-auto': {
+    mode: 'auto',
+    decider: 'laya',
+    name: 'Laya Auto',
+    description: 'Laya, a decision model on this PC, routes every message and reviews the result instead of Jev. No Jev call is made and no routing or review question leaves this PC; offline it keeps routing, to the local models. The agent it picks still sees your task and code, and questions are answered by the chat model as in Jev Auto.',
   },
   // Key order is menu order, and it reads as a gradient from the most off-machine to the least.
   'jev-online': {
     mode: 'online',
+    decider: 'jev',
     name: 'Jev Auto · Online',
     description: 'Jev routes, but only over the cloud and subscription agents: Claude, Codex, DeepSeek. The local models on this PC are never picked, so nothing waits on your own hardware. Everything Jev Auto sends still applies, and the agent you are routed to sees your code.',
   },
   'jev-local': {
     mode: 'local',
+    decider: 'jev',
     name: 'Jev Auto · Local',
     description: 'Jev routes, but only over the local models on this PC. Your code is only edited here; Jev still sees the task text, file names, the answer, your check output and a slice of the diff when it reviews. It also sends the handoff note from a previous task (up to 3000 characters, quoting an earlier agent\'s answer) on the routing call.',
   },
   'jev-offline': {
     mode: 'offline',
+    // Named for the record; offline Jev is never called.
+    decider: 'jev',
     name: 'Offline · Local only',
     description: 'Nothing leaves this PC: local models, a fixed routing rule and the project checks. No Jev call, so no calibrated routing or review.',
   },
 }
-const modeOf = (model) => JEV_MODELS[String(model ?? '')]?.mode ?? 'auto'
+/**
+ * How wide the field of agents is (`mode`) and who decides (`decider`), for a picked model id. An
+ * unknown id (an agent row, an old selection) is Jev Auto; `laya-auto` is always known, so a saved
+ * Laya Auto selection never silently becomes Jev.
+ */
+export const rowOf = (model) => {
+  const row = JEV_MODELS[String(model ?? '')] ?? JEV_MODELS[MODEL]
+  return { mode: row.mode, decider: row.decider }
+}
 // A model pair is usable only when it names both a provider and a model. A failed aux
 // resolution still returns a truthy object with empty strings, so without this test that
 // object beats the local fallback in the `??` chains and the model-list filter below.
@@ -52,12 +78,15 @@ const usableModel = (m) => typeof m?.provider === 'string' && m.provider !== '' 
 // Only applies to Jev's own answer, which always carries a confidence. The offline classifier
 // is a deterministic word test with no confidence to report, and gating it on a number it does
 // not have would stop offline mode answering questions at all.
+// Both bars are the answering provider's (`cls.thresholds`, from classify): Laya's sit higher,
+// because it is zero-shot on these questions (docs/laya-auto.md 2.6); these are Jev's.
 const MIN_QUESTION_CONFIDENCE = 0.6
-const isQuestion = (c) => c?.kind === 'question' && (c.confidence === undefined || c.confidence >= MIN_QUESTION_CONFIDENCE)
+const isQuestion = (c) => c?.kind === 'question' && (c.confidence === undefined || c.confidence >= (c.thresholds?.minQuestionConfidence ?? MIN_QUESTION_CONFIDENCE))
 // How sure Jev must be that a question *also* asks for work before anything is queued. A wrong
 // "also" costs one background run of something the person only asked about, so the bar is above
 // the question floor but not as high as a destructive action's.
 const ALSO_WORK = 0.7
+const alsoWork = (c) => (c.alsoWork ?? 0) >= (c.thresholds?.alsoWork ?? ALSO_WORK)
 
 const AGENT_PREFIX = 'agent-'
 const agentIdOf = (model) => (String(model ?? '').startsWith(AGENT_PREFIX) ? String(model).slice(AGENT_PREFIX.length) : null)
@@ -84,7 +113,7 @@ const info = (provider, modalities = TEXT_ONLY, id = MODEL) => ({
   name: JEV_MODELS[id]?.name ?? JEV_MODELS[MODEL].name,
   description: JEV_MODELS[id]?.description ?? JEV_MODELS[MODEL].description,
   inputModalities: modalities,
-  reasoning: REASONING,
+  reasoning: JEV_MODELS[id]?.decider === 'laya' ? LAYA_REASONING : REASONING,
 })
 
 /** One agent as a pickable model: same checks and review, no routing question. */
@@ -115,6 +144,11 @@ const REASONING = Object.freeze({
     { id: 'local-low', name: 'Local · quick', description: 'The smallest local model on this PC. Free to run, fastest.' },
     { id: 'local-high', name: 'Local · best', description: 'The largest local model on this PC. Free to run, slower.' },
   ]),
+})
+// The same ladder on the Laya Auto row, where Laya's answers are what Auto reads.
+const LAYA_REASONING = Object.freeze({
+  ...REASONING,
+  efforts: Object.freeze(REASONING.efforts.map((e) => (e.id === 'auto' ? { ...e, description: 'Laya picks by task (Settings default applies)' } : e))),
 })
 
 // Text the person typed. DSH also sends plugin context (skill catalogs, reminders)
@@ -154,7 +188,7 @@ export function resultSection(r) {
     '**Background task result**',
     `Task: ${r.taskName ?? r.task}`,
     `Task ID: ${r.jobId}`,
-    `Agent: ${r.agent ?? 'Jev picks'}${r.model ? ` · ${r.model}` : ''}`,
+    `Agent: ${r.agent ?? `${providerName(r.decider ?? TEACHER)} picks`}${r.model ? ` · ${r.model}` : ''}`,
     `Status: ${TASK_LABELS[r.state] ?? r.state}`,
   ]
   // A task that did not complete says why first: the reason is the useful part.
@@ -171,14 +205,15 @@ function* textBlock(text, index = 0) {
   yield { type: 'block-end', index, block: { type: 'text', text } }
 }
 
-const AUTHORITY_ORDER = ['local', 'jev', 'code']
+const AUTHORITY_ORDER = ['local', 'jev', 'laya', 'code']
 const joinAnd = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`)
 /**
  * Who decided a routed run, in words, from its per-domain report: every authority that answered
  * a domain, named once, in a fixed order. The local router names what it decided, because that is
  * the part that changes as the router learns. `code` is the rules that rank the resources and
  * answer the frontier review, which decide part of every adaptive run, so a run Jev taught the
- * rest of reads "Jev and routing rules decided" rather than crediting Jev with the pick.
+ * rest of reads "Jev and routing rules decided" rather than crediting Jev with the pick, and a run
+ * Laya decided reads "Laya and routing rules decided".
  * @param {object} [domains]  routing.decision.domains
  * @param {{ detail?: boolean }} [opts]  false leaves out which domains the local router and the
  *   fallback answered, for a heading with the per-domain list right under it
@@ -194,12 +229,35 @@ export function decidedBy(domains, { detail = true } = {}) {
   // Nothing could decide anything: the deterministic stand-in answered every domain.
   if ([...by.keys()].every((a) => a === 'fallback')) return 'safe fallback, nothing could decide'
   const which = (a) => (detail ? ` (${by.get(a).join(', ')})` : '')
-  const names = AUTHORITY_ORDER.filter((a) => by.has(a)).map((a) => (a === 'local' ? `the local router${which(a)}` : a === 'jev' ? 'Jev' : 'routing rules'))
+  const names = AUTHORITY_ORDER.filter((a) => by.has(a)).map((a) => (a === 'local' ? `the local router${which(a)}` : a === 'code' ? 'routing rules' : providerName(a)))
   if (by.has('fallback')) names.push(`the safe fallback${which('fallback')}`)
   return `${joinAnd(names)} decided`
 }
 
-/** One line per router event, for the live reasoning block and the app log. */
+/** Where a provider on this PC ran a call, in the words the lines and the card use. */
+export const deviceName = (device) => ({ cuda: 'GPU', gpu: 'GPU', cpu: 'CPU' })[device] ?? String(device)
+
+// A route answer too flat to act on that the routing rules stand in for (docs/laya-auto.md 4.3):
+// a score or a choice of the task profile, the strategy, and the second-opinion yes/no, which the
+// code rule answers instead. Nothing else is filled: a flat tool pick and its arguments are kept
+// as answered, as is every other flat yes/no, and simply fall under their bars, so none of them
+// is said to be filled.
+const FILLED_BY_RULES = new Set(['taskType', 'complexity', 'risk', 'skill', 'minimumCapability', 'preferredCapability', 'capability', 'strategy', 'secondOpinion'])
+const filledByRules = (q) => q.used && q.informative === false && (FILLED_BY_RULES.has(q.name) || q.name.startsWith('req.'))
+
+// What the shadow of Jev Auto says once per run, at the routed event, and nothing else of it
+// reaches the live stream (docs/laya-auto.md 3.3). Whoever wires the shadow sets `shadow` on the
+// routed event: 'answering' when Laya takes this run's questions too, 'not_running' when it cannot.
+const SHADOW_NOTE = {
+  answering: 'Laya is answering the same questions in the background; compare them in Jev → Decisions',
+  not_running: 'Laya is not running, so this run is not compared',
+}
+
+/**
+ * One line per router event, for the live reasoning block and the app log. A call answered by a
+ * provider on this PC can say more than one thing (the device, answers too flat to use, evidence
+ * cut at the context limit), and each is a line of its own, joined with newlines.
+ */
 export function line(e) {
   switch (e.type) {
     // What it waits for, when the lanes said (tasks.js WAITING): the cap on tasks at once is not
@@ -207,22 +265,57 @@ export function line(e) {
     case 'queued': return e.text ?? 'Waiting: another task is running in this workspace'
     case 'loading': return e.text
     case 'start': return `Task received${e.forceAgent ? ` (forced: ${e.forceAgent})` : ''}`
-    case 'jev': return `Jev ${e.trace.phase}: ${e.trace.questions.filter((q) => q.used).length}/${e.trace.questions.length} questions in ${e.trace.ms} ms`
+    // An answered call. The event keeps its old name whoever answered, since it lives only in
+    // memory; the trace names the provider, and Laya's client adds the device and its wait.
+    case 'jev': {
+      const t = e.trace
+      const who = providerName(t.provider ?? TEACHER)
+      const where = t.meta?.device ? ` on the ${deviceName(t.meta.device)}` : ''
+      const waited = t.meta?.waitedMs > 0 ? ` (waited ${Math.round(t.meta.waitedMs)} ms for an earlier ${who} answer)` : ''
+      const out = [`${who} ${t.phase}: ${t.questions.filter((q) => q.used).length}/${t.questions.length} questions in ${t.ms} ms${where}${waited}`]
+      const flat = t.phase === 'route' ? t.questions.filter(filledByRules).map((q) => q.name) : []
+      if (flat.length) out.push(`${who} route: ${flat.length} answer${flat.length === 1 ? '' : 's'} too flat to use (${flat.join(', ')}); the routing rules filled ${flat.length === 1 ? 'it' : 'them'}`)
+      const cut = t.meta?.atContextLimit ?? 0
+      if (cut > 0) out.push(`${who} ${t.phase}: ${cut} of ${t.meta.requests ?? cut} request${(t.meta.requests ?? cut) === 1 ? '' : 's'} reached the 512-token limit, so part of the evidence was cut`)
+      return out.join('\n')
+    }
+    // A call that did not answer: it has no questions, only who, which call, how long and why.
+    // `error` is what createJev hands its onError hook, `{ phase, callId, provider, ms, error }`;
+    // those fields on the event itself are read too. The domains a failed Laya route call leaves
+    // behind take their deterministic fallback, and the line says so; a call never sent because
+    // Laya would pass its deadline reads as docs/laya-auto.md 3.5 writes it, the prediction alone.
+    case 'decider-error': {
+      const x = e.error ?? {}
+      const provider = x.provider ?? e.provider ?? TEACHER
+      const phase = x.phase ?? e.phase ?? 'call'
+      const message = x.error?.message ?? x.message ?? e.message ?? 'no reason given'
+      const predicted = (x.error?.code ?? x.code ?? e.code) === 'LAYA_PREDICTED_OVER'
+      const rules = provider !== TEACHER && phase === 'route' && !predicted ? '; routing rules decide those domains' : ''
+      return `${providerName(provider)} ${phase} failed after ${Math.round(x.ms ?? e.ms ?? 0)} ms: ${message}${rules}`
+    }
     case 'routed': {
-      if (e.tool) return `Routed to tool ${e.tool}`
+      const note = SHADOW_NOTE[e.shadow] ? `\n${SHADOW_NOTE[e.shadow]}` : ''
+      if (e.tool) return `Routed to tool ${e.tool}${note}`
       const strategy = e.plan?.strategy && e.plan.strategy !== 'STANDARD_DIRECT' ? `, ${e.plan.strategy.toLowerCase().replace(/_/g, ' ')}` : ''
       const reviewer = e.plan?.reviewer ? `, ${e.plan.reviewer} reviews` : ''
-      return `Routed to ${e.routing.primaryAgent} (${e.routing.mode})${strategy}${reviewer}`
+      // A run another provider decided names it, and the mode only when the pool was narrowed or
+      // nobody routed: `(laya)`, `(laya, local)`. Jev's line is as it always was.
+      const decider = e.routing.decider ?? TEACHER
+      const how = decider === TEACHER ? e.routing.mode : e.routing.mode === 'jev' ? decider : `${decider}, ${e.routing.mode}`
+      return `Routed to ${e.routing.primaryAgent} (${how})${strategy}${reviewer}${note}`
     }
     // Who decided, at what maturity, and how the candidates compared. One line: the inspector's
-    // Decisions tab carries the full table.
+    // Decisions tab carries the full table. The calls are counted to whoever decided the run.
     case 'decision': {
+      const name = providerName(e.decision?.decider ?? TEACHER)
       const calls = e.decision?.jevCalls ?? 0
-      const who = decidedBy(e.decision?.domains) ?? 'Jev decided'
+      const who = decidedBy(e.decision?.domains) ?? `${name} decided`
       const seen = e.decision?.candidates?.length ?? 0
-      return `${who}; ${calls ? `${calls} Jev call${calls === 1 ? '' : 's'}` : 'no Jev call'}; ${seen} candidate${seen === 1 ? '' : 's'} considered`
+      return `${who}; ${calls ? `${calls} ${name} call${calls === 1 ? '' : 's'}` : `no ${name} call`}; ${seen} candidate${seen === 1 ? '' : 's'} considered`
     }
-    case 'tiebreak': return `Jev could not tell ${e.from} from ${e.to} (confidence ${e.confidence == null ? 'unknown' : Math.round(e.confidence * 100)}%): ${e.to} takes the work as the standing policy`
+    // Under Laya the near tie is always the routing rules' own ranking (the resource is a code
+    // domain), so that is who could not tell; Jev's line is as it was.
+    case 'tiebreak': return `${(e.decider ?? TEACHER) === TEACHER ? 'Jev' : 'The routing rules'} could not tell ${e.from} from ${e.to} (confidence ${e.confidence == null ? 'unknown' : Math.round(e.confidence * 100)}%): ${e.to} takes the work as the standing policy`
     case 'stalled': return `${e.attempts} work attempts in a row changed no files (${(e.agents ?? []).join(', ')}): stopping instead of spending again`
     case 'checks': return `Baseline checks: ${e.checks.map((c) => `${c.name} ${c.passed ? 'pass' : 'FAIL'}`).join(', ')}`
     case 'capability': return `${e.from} cannot do this (${e.capability ?? 'capability unclear'}): ${e.to} takes the work`
@@ -240,23 +333,51 @@ export function line(e) {
   }
 }
 
+// Seconds as the picker says them: one decimal under ten, whole above.
+const seconds = (ms) => { const s = ms / 1000; return String(s >= 10 ? Math.round(s) : Math.round(s * 10) / 10) }
+
+/**
+ * The sentence the Laya Auto row adds to its description, by Laya's state on this PC
+ * (docs/laya-auto.md 3.1), so the menu says what a task costs before it is picked.
+ * @param {object} row  what `layaRow` answers: `state` (the sidecar's, 7.4), `device` ('cuda' or
+ *   'cpu'), `routeMs` (the measured intent, task group and resource and judgments calls together),
+ *   `reviewMs` (one measured review call) and `lastStartMs` (how long the last start took), each
+ *   null when unknown
+ * @returns {string}
+ */
+export function layaRowSentence(row) {
+  if (row?.state === 'failed') return 'Laya could not start: press Start in Settings → Jev setup → Laya decision model.'
+  if (row?.state === 'stopped') return `Laya is not running; the first message starts it${typeof row.lastStartMs === 'number' ? ` (the last start took ${seconds(row.lastStartMs)} s)` : ''}.`
+  if (row?.device && typeof row.routeMs === 'number' && typeof row.reviewMs === 'number') {
+    return `Measured on this PC, on the ${deviceName(row.device)}: about ${seconds(row.routeMs)} s to route a task and ${seconds(row.reviewMs)} s to review each attempt.`
+  }
+  return 'Not measured on this PC yet.'
+}
+
 /**
  * @param {object} p
  * @param {object} p.ctx     cordis context with `llm` and `agents`
- * @param {Function} p.route the router's route({ task, agent, signal, emit })
- * @param {Function} [p.classify] (message) -> { kind: 'task' | 'question' }
+ * @param {Function} p.route the router's route({ task, agent, forceAgent, mode, decider, signal, emit })
+ * @param {Function} [p.classify] (message, mode, decider, { onWait, signal }) -> { kind: 'task' | 'question', thresholds?, unsure?, why? };
+ *   `onWait(line)` is each line of what it waits for (Laya starting on this PC), shown as it comes
  * @param {{provider: string, model: string}} p.auxModel real model for title and compaction requests
- * @param {(ms: number, model: {provider: string, model: string}) => void} [p.onDirectAnswer] a question in a project was answered by a chat model, no agent
- * @param {() => Promise<boolean>} [p.isOffline] true when the internet is unreachable
+ * @param {(ms: number, model: {provider: string, model: string}, row: {decider: 'jev'|'laya'}) => void} [p.onDirectAnswer] a question in a project was answered by a chat model, no agent;
+ *   `row.decider` is who decides the row the question came through, for the usage row: "Saved by Jev" counts only Jev's
+ * @param {(decider: 'jev'|'laya') => Promise<boolean>} [p.isOffline] true when the internet is unreachable, probed where the
+ *   row's decider says: a Laya Auto session never contacts a TypeSafe host
  * @param {() => Promise<{provider: string, model: string}|null>} [p.localChat] the local chat model, when one is installed
- * @param {object} [p.orchestrator] background tasks: { pending(sessionId) -> string[], ackPending(sessionId), enqueue({ agent, task, effort, forceAgent, mode, sessionId }) -> chat text, or null to run blocking }
+ * @param {object} [p.orchestrator] background tasks: { pending(sessionId) -> string[], ackPending(sessionId), enqueue({ agent, task, effort, forceAgent, mode, sessionId, modalities }, { decider, why }) -> chat text, or null to run blocking }
  * @param {() => Promise<Array<{id: string, description?: string, kind?: string, enabled?: boolean}>>} [p.agents] enabled agents, each offered as its own model
  * @param {(model: {provider: string, model: string}) => Promise<boolean>} [p.canSeeImages] does this model's own catalog entry declare image input?
  * @param {(agentId: string) => Promise<boolean>} [p.agentSeesImages] can this agent be handed an image (its tools open the file)?
  * @param {(refs: Array<object>, o: {sessionId?: string, cwd?: string}) => Promise<string[]>} [p.handOffImages] save image bytes where an agent can read them, returning the paths
  * @param {() => Promise<Array<object>>} [p.answerExecutors] the registered chat executors, for capability-routed direct answers
+ * @param {(role: 'act') => void|Promise<void>} [p.layaUnavailable] throws, with the reply the person reads, when Laya cannot be
+ *   asked at all (docs/laya-auto.md 3.5); a Laya Auto message is refused with it before anything is sorted or run
+ * @param {() => Promise<object|null>} [p.layaRow] Laya's state for the Laya Auto row (layaRowSentence), or null while
+ *   the row is not offered: Laya not installed, switched off, its settings invalid, or adaptive routing off
  */
-export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isOffline, localChat, orchestrator, agents, canSeeImages, agentSeesImages, handOffImages, answerExecutors }) {
+export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isOffline, localChat, orchestrator, agents, canSeeImages, agentSeesImages, handOffImages, answerExecutors, layaUnavailable, layaRow }) {
   // Typed messages seen per session: a turn with no new one is a job notice (or a retry), not a new task.
   const seenTyped = new Map()
   // An image with no words is still something the person sent. Leaving it out of the count
@@ -291,9 +412,11 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
   // When the caller supplies a registry, the order comes from it instead: the same capability
   // filter and ranking the background executors get, so a chat model is chosen for what it can
   // actually do (`quick_answer` or `reasoned_answer`) rather than by a rule kept in here.
-  const chatModels = async (mode = 'auto', { deep = false, images = false } = {}) => {
+  // Whether the internet is there is asked where the row's decider says, so Laya Auto never
+  // probes a TypeSafe host to pick the model that answers.
+  const chatModels = async (mode = 'auto', { deep = false, images = false, decider = TEACHER } = {}) => {
     const local = await localChat?.().catch(() => null)
-    const offline = mode === 'offline' || await isOffline?.().catch(() => false)
+    const offline = mode === 'offline' || await isOffline?.(decider).catch(() => false)
     const wanted = {
       capability: deep ? 'reasoned_answer' : 'quick_answer',
       modalities: images ? ['text', 'image'] : ['text'],
@@ -324,23 +447,32 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
     return canRead
   }
   return {
-    providerInfo: (p) => ({ id: p, name: 'Jev' }),
+    // The group holds Laya Auto and the plain agent rows as well as Jev's, so it is named for the
+    // app; its id stays `jev`, so saved selections and the installer's default are untouched.
+    providerInfo: (p) => ({ id: p, name: 'Kz-harness' }),
     providerRetryPolicy: () => NO_RETRY,
     imageRequestPricing: () => undefined,
     async listModels(p) {
       // A catalog that cannot be read still offers Jev Auto, so the picker never comes up empty.
       const list = await agents?.().catch(() => []) ?? []
       const hasLocal = list.some((a) => a.kind === 'local' && a.enabled !== false)
+      // Laya Auto is on offer only while Laya can be asked at all, and says by its state what a
+      // task costs on this PC; a reader that fails offers nothing rather than a row that refuses.
+      const laya = await layaRow?.().catch(() => null) ?? null
       // Every extra row is about drawing a line between the local models and the rest, so with no
       // local model installed there is no line to draw: the two local rows cannot run, and Online
       // would be a second name for Jev Auto, which already has nothing but cloud agents to pick.
-      const ways = hasLocal ? Object.keys(JEV_MODELS) : [MODEL]
+      const ways = Object.keys(JEV_MODELS).filter((id) => (id === LAYA_MODEL ? !!laya : id === MODEL || hasLocal))
       // A Jev row can carry an image only when the run it starts will end somewhere that
       // reads it. Saying so otherwise is worse than refusing: the engine stops blocking the
       // attachment and the picture is silently dropped on the way to a model that never saw it.
       const any = await anyVisionPath()
       const rows = await Promise.all(list.filter((a) => a.enabled !== false).map(async (a) => [a, await agentInfo(p, a, (await agentSees(a)) ? BY_MODALITY : TEXT_ONLY)]))
-      return [...ways.map((id) => info(p, any ? BY_MODALITY : TEXT_ONLY, id)), ...rows.map(([, row]) => row)]
+      const row = (id) => {
+        const r = info(p, any ? BY_MODALITY : TEXT_ONLY, id)
+        return id === LAYA_MODEL ? { ...r, description: `${r.description} ${layaRowSentence(laya)}` } : r
+      }
+      return [...ways.map(row), ...rows.map(([, r]) => r)]
     },
     async resolveModel(p, m) {
       const id = agentIdOf(m)
@@ -361,12 +493,16 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       const images = (lastTyped?.content ?? []).filter((b) => b?.type === 'image')
       // "Claude Code" or "Codex (GPT)" picked in the model menu: that agent, every message.
       const pickedAgent = agentIdOf(options.model) ?? undefined
-      // Jev Auto / Local / Online / Offline: how wide the field of agents is.
-      let mode = modeOf(options.model)
+      // Jev Auto / Local / Online / Offline: how wide the field of agents is. Laya Auto: Laya
+      // decides instead of Jev, over the same field Jev Auto has.
+      const row = rowOf(options.model)
+      let mode = row.mode
+      const { decider } = row
       // A local-* effort means "run it locally on this size of model": it forces the
       // agent and keeps the run local, whichever Jev row is picked. That includes Online:
       // the effort is a per-message choice and the row is a standing one, so the specific
-      // choice wins, exactly as it already does over plain Jev Auto.
+      // choice wins, exactly as it already does over plain Jev Auto. It changes only the mode:
+      // under Laya Auto the forced run is still Laya's to review.
       let effort = options.reasoningEffort
       let localForced
       if (!options.purpose && isLocalLevel(effort)) {
@@ -386,8 +522,9 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
         const local = await localChat?.().catch(() => null)
         // The local model is the only thing the probe could switch to, and with none installed
         // offline and online pick the same model, so the probe would decide nothing and is
-        // skipped: a session title must not be what sends the HEAD out on its own.
-        const offline = local ? await isOffline?.().catch(() => false) : false
+        // skipped: a session title must not be what sends the HEAD out on its own. When it does
+        // go out, it goes where the row's decider says, never to TypeSafe from Laya Auto.
+        const offline = local ? await isOffline?.(decider).catch(() => false) : false
         const aux = usableModel(auxModel) ? auxModel : null
         const m = (offline ? local : aux) ?? local ?? auxModel
         // A title has a tiny output budget: no thinking, as the official DeepSeek connector did.
@@ -426,16 +563,53 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       }
       // Highest block index the model used, so later blocks do not collide with its own.
       const pos = { last: -1 }
-      if (!task && !images.length) { yield* textReply('Type a task and Jev will route it.'); return }
+      if (!task && !images.length) { yield* textReply(`Type a task and ${providerName(decider)} will route it.`); return }
       // A bare `/skill` message only loads that skill into the conversation; there is nothing to run yet.
       const skill = task.match(/^\/([\w:.-]+)$/)
       if (skill && !images.length) { yield* textReply(`Skill \`${skill[1]}\` is loaded into this conversation. Tell me what to do with it.`); return }
-      // One classifier call for both branches below. `depth` is Jev saying how much answering
-      // this well depends on real reasoning: it decides which model answers, not how hard
-      // anyone works.
-      const cls = forceAgent || !task ? null : await classify?.(task, mode).catch(() => null)
+      // Laya Auto when Laya cannot be asked at all (not installed, switched off, its settings
+      // invalid, routing off, or stopped after an error): the same reply route() would give, but
+      // at once, before anything is sorted or run, and never a switch to Jev (docs/laya-auto.md 3.5).
+      if (decider === 'laya' && layaUnavailable) {
+        try { await layaUnavailable('act') } catch (err) { yield* textReply(String(err?.message ?? err)); return }
+      }
+      // One classifier call for both branches below. `depth` is the decider saying how much
+      // answering this well depends on real reasoning: it decides which model answers, not how
+      // hard anyone works. While it waits (Laya starting on this PC) it says what it waits for,
+      // as it happens, in a reasoning block of its own that opens only if there is something to say.
+      let cls = null
+      // The first block free for what the message shows next: 0, or after the waiting lines.
+      let first = 0
+      if (!forceAgent && task && classify) {
+        const waits = []
+        let wake
+        let settled = false
+        const onWait = (w) => { waits.push(typeof w === 'string' ? w : w?.text ?? line(w)); wake?.() }
+        const onStop = () => wake?.()
+        options.signal?.addEventListener('abort', onStop, { once: true })
+        Promise.resolve()
+          .then(() => classify(task, mode, decider, { onWait, signal: options.signal }))
+          .then((r) => { cls = r ?? null }, () => { cls = null })
+          .finally(() => { settled = true; wake?.() })
+        let at = null
+        let said = ''
+        try {
+          while ((!settled || waits.length) && !options.signal?.aborted) {
+            if (!waits.length) { await new Promise((r) => { wake = r }); wake = undefined; continue }
+            if (at === null) { at = pos.last + 1; yield { type: 'block-start', index: at, blockType: 'reasoning' } }
+            const text = `${waits.shift()}\n`
+            said += text
+            yield { type: 'reasoning-delta', index: at, text }
+          }
+        } finally { options.signal?.removeEventListener('abort', onStop) }
+        if (at !== null) { yield { type: 'block-end', index: at, block: { type: 'reasoning', text: said } }; pos.last = at; first = at + 1 }
+        if (!settled) throw new DOMException('Stopped', 'AbortError')
+      }
       const deep = cls?.depth === 'deep'
       const answer = async function* (plan, note, onAnswered) {
+        // Whatever this message already showed (the lines of a Laya start) keeps its blocks: the
+        // model's own blocks are numbered after them.
+        pos.shift = first
         return yield* answerWithAny(ctx, options, plan, onAnswered, note, pos)
       }
       // An image cannot ride the agent prompt: that prompt is one string, and the Claude Code
@@ -460,16 +634,17 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       // "No project": everything is chat. Project work needs a real folder for the agents.
       if (isNoProject(agent?.session?.header?.cwd)) {
         // Unsure stays on the answering side here, unlike in a real project: no agent can run
-        // in this space at all, so refusing an unsure message helps nobody.
-        if (forceAgent || cls?.kind === 'task') {
-          yield* textReply('This is the **No project** space, so no agent can work on files here. Pick or add your project folder in the workspace menu next to the message box, then send the task again. Questions are answered here directly.')
+        // in this space at all, so refusing an unsure message helps nobody. A message Laya could
+        // not sort is such a message: a task only because nothing said otherwise.
+        if (forceAgent || (cls?.kind === 'task' && !cls.unsure)) {
+          yield* textReply('This is the **No project** space, so no agent can work on files here. Pick or add your project folder in the workspace menu next to the message box, then send the task again. Questions are answered here directly.', first)
           return
         }
-        const answered = yield* answer(await chatModels(mode, { deep, images: images.length > 0 }), deepNote(deep, mode))
+        const answered = yield* answer(await chatModels(mode, { deep, images: images.length > 0, decider }), deepNote(deep, mode, decider))
         if (answered !== true) {
           yield* textReply(images.length
             ? 'No model available here can read an image: the chat model is text-only and no local vision model is installed. Add the vision add-on in Settings → Jev setup → Local models, or switch to a model that reads images, then send it again.'
-            : `No chat model could answer (${answered}). Check DeepSeek or Local models in Settings → Jev setup, or ask inside a project folder so an agent can answer.`)
+            : `No chat model could answer (${answered}). Check DeepSeek or Local models in Settings → Jev setup, or ask inside a project folder so an agent can answer.`, first)
           return
         }
         return
@@ -484,15 +659,16 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       // falls to the task side.
       if (!forceAgent && isQuestion(cls)) {
         const started = Date.now()
-        const choices = await chatModels(mode, { deep, images: images.length > 0 })
-        const answered = yield* answer(choices, deepNote(deep, mode), (m) => onDirectAnswer?.(Date.now() - started, m))
+        const choices = await chatModels(mode, { deep, images: images.length > 0, decider })
+        const answered = yield* answer(choices, deepNote(deep, mode, decider), (m) => onDirectAnswer?.(Date.now() - started, m, { decider }))
         if (answered === true) {
           // "One message may do both": a message can be a question and also ask for work. The
           // answer has just gone out, so the work is queued behind it and the queue line rides
           // at the end of this same message - the person is answered now and the work starts.
-          if ((cls.alsoWork ?? 0) >= ALSO_WORK && orchestrator) {
+          // Who decides rides beside the task's own fields: the queued run is the row's.
+          if (alsoWork(cls) && orchestrator) {
             try {
-              const queued = await orchestrator.enqueue({ agent, task: (await imageLine()) + task, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] })
+              const queued = await orchestrator.enqueue({ agent, task: (await imageLine()) + task, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider })
               if (queued) yield* textBlock(`\n\n${queued}`, pos.last + 1)
             } catch (err) { yield* textBlock(`\n\njev-router: ${err.message}`, pos.last + 1) }
           }
@@ -508,18 +684,21 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       // an agent working from the words alone would answer about a picture it never saw.
       if (images.length) {
         if (!(await handOff()).length) {
-          yield* textReply('I could not put the attached image anywhere an agent can read it, so I have not started this task: the agent would work from your words alone and never see the picture. Nothing was run. Attach the file instead (the paperclip), which agents can open by path, or ask about the image in a chat.')
+          yield* textReply('I could not put the attached image anywhere an agent can read it, so I have not started this task: the agent would work from your words alone and never see the picture. Nothing was run. Attach the file instead (the paperclip), which agents can open by path, or ask about the image in a chat.', first)
           return
         }
         routeTask = (await imageLine()) + routeTask
       }
 
+      // A message the decider could not sort is run as a task, and the person is told why: with
+      // the queued line (queuedLine appends it), or first among the live lines.
+      const why = cls?.why ?? null
       // Project work runs in the background (one at a time per workspace); the chat stays free.
       if (!answerOnly && orchestrator) {
         let queued
         // routeTask, not task: a queued run needs the image path with its prompt too.
-        try { queued = await orchestrator.enqueue({ agent, task: routeTask, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }) } catch (err) { yield* textReply(`jev-router: ${err.message}`); return }
-        if (queued) { yield* textReply(queued); return }
+        try { queued = await orchestrator.enqueue({ agent, task: routeTask, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider, why }) } catch (err) { yield* textReply(`jev-router: ${err.message}`, first); return }
+        if (queued) { yield* textReply(queued, first); return }
       }
       // Live routing progress first, then the report. `pos` keeps the block indices honest so a
       // finished result can be appended after all of it instead of in front.
@@ -530,13 +709,13 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       const ac = new AbortController()
       const onAbort = () => { ac.abort(options.signal?.reason); wake?.() }
       if (options.signal?.aborted) onAbort(); else options.signal?.addEventListener('abort', onAbort, { once: true })
-      const queue = []
+      const queue = why ? [why] : []
       let wake
       let done = false
       let result
       let error
       const emit = (e) => { queue.push(line(e)); wake?.() }
-      route({ task: routeTask, answerOnly, agent, forceAgent, mode, effort, modalities: images.length ? ['text', 'image'] : ['text'], signal: ac.signal, emit })
+      route({ task: routeTask, answerOnly, agent, forceAgent, mode, decider, effort, modalities: images.length ? ['text', 'image'] : ['text'], signal: ac.signal, emit })
         .then((r) => { result = r }, (e) => { error = e })
         .finally(() => { done = true; wake?.() })
 
@@ -570,9 +749,9 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
  */
 const ABOUT = 'You are talking with the person who runs this app: Kz-harness, where the Jev router sends coding work to Claude Code, Codex, DeepSeek or models on this PC, and questions like this one are answered directly (logins, keys and usage limits are in Settings → Jev setup). Reply the way a person talks in chat: a couple of plain sentences, no headings, no bullet lists, no restating the question. Say so briefly when you are unsure.'
 
-/** Jev's reason for putting a stronger model first, said out loud in the answer's credit line. */
-const deepNote = (deep, mode) => (deep && mode !== 'offline'
-  ? 'Jev judged this worth the stronger model, so '
+/** The decider's reason for putting a stronger model first, said out loud in the answer's credit line. */
+const deepNote = (deep, mode, decider = TEACHER) => (deep && mode !== 'offline'
+  ? `${providerName(decider)} judged this worth the stronger model, so `
   : '')
 
 /** Try each chat model in order until one answers; returns true, or the last failure reason. */
@@ -610,11 +789,14 @@ async function* answerDirectly(ctx, options, auxModel, offline = false, note = '
     : m))
   const held = []
   let flowing = false
-  let lastIndex = 0
+  // Blocks the stream already holds come first; the model's own are numbered after them.
+  const shift = pos?.shift ?? 0
+  let lastIndex = shift
   // The name the picker shows, plus the id a bug report needs.
   const credit = `\n\n> ${offline ? 'OFFLINE: local models only. ' : ''}${note}Answered by: ${label}${label === pair ? '' : ` (\`${pair}\`)`}, directly: a question, no agents or project work`
   try {
-    for await (const chunk of ctx.llm.stream({ ...rest, messages, provider: auxModel.provider, model: auxModel.model })) {
+    for await (const raw of ctx.llm.stream({ ...rest, messages, provider: auxModel.provider, model: auxModel.model })) {
+      const chunk = shift && typeof raw.index === 'number' ? { ...raw, index: raw.index + shift } : raw
       if (typeof chunk.index === 'number') { lastIndex = Math.max(lastIndex, chunk.index); if (pos) pos.last = Math.max(pos.last, lastIndex) }
       if (flowing && chunk.type === 'finish' && chunk.reason?.kind === 'stop') {
         const i = lastIndex + 1
@@ -632,10 +814,13 @@ async function* answerDirectly(ctx, options, auxModel, offline = false, note = '
   return true
 }
 
-/** The chat line for a queued task. */
-export function queuedLine({ jobId, agent, position, workspace }) {
+/**
+ * The chat line for a queued task. With no agent forced, whoever decides the task picks one; `why`
+ * is the reason a message the decider could not sort was queued as a task (classify), said after.
+ */
+export function queuedLine({ jobId, agent, position, workspace, decider = TEACHER, why }) {
   const where = String(workspace).split(/[\\/]/).filter(Boolean).at(-1) ?? workspace
-  return `Queued → ${agent ?? 'Jev picks'} as **${jobId}** (${position > 0 ? `${ordinal(position)} in line for ${where}` : `starting now in ${where}`}). Keep chatting: the result posts here when done.`
+  return `Queued → ${agent ?? `${providerName(decider ?? TEACHER)} picks`} as **${jobId}** (${position > 0 ? `${ordinal(position)} in line for ${where}` : `starting now in ${where}`}). Keep chatting: the result posts here when done.${why ? ` ${why}` : ''}`
 }
 
 async function* textReply(text, index = 0) {

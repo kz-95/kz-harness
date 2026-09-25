@@ -95,25 +95,29 @@ export function effortFamily(agentDef) {
   return null
 }
 
-/** Jev's 'auto': cheap tasks medium, most high, hard or risky xhigh. Never ultra. */
-export function autoLevel({ complexity, risk } = {}) {
+/**
+ * The decider's 'auto': cheap tasks medium, most high, hard or risky xhigh. Never ultra. `bands`
+ * are the cuts on the larger of complexity and risk, from the record of the provider that
+ * decided (thresholds.effortBands); the default is Jev's.
+ */
+export function autoLevel({ complexity, risk } = {}, bands = { medium: 0.25, high: 0.6 }) {
   const x = Math.max(complexity ?? 0.5, risk ?? 0.5)
-  return x < 0.25 ? 'medium' : x < 0.6 ? 'high' : 'xhigh'
+  return x < bands.medium ? 'medium' : x < bands.high ? 'high' : 'xhigh'
 }
 
 /**
  * Effort value to send to one agent, or null to leave its default.
  * @param {string} level  unified level (LEVELS)
  * @param {object} agentDef
- * @param {{complexity?: number, risk?: number, override?: string, model?: string}} [jev]
- *   override: the agent's own value from Settings (wins over level)
+ * @param {{complexity?: number, risk?: number, override?: string, model?: string, bands?: {medium: number, high: number}}} [jev]
+ *   override: the agent's own value from Settings (wins over level); bands: autoLevel's cuts
  */
-export function toAgentEffort(level, agentDef, { complexity, risk, override, model } = {}) {
+export function toAgentEffort(level, agentDef, { complexity, risk, override, model, bands } = {}) {
   const family = effortFamily(agentDef)
   if (!family) return null
   // A local-* level names a model, not an effort: the agent keeps its own default.
   if (isLocalLevel(override || level)) return null
-  const l = override || (!level || level === 'auto' ? autoLevel({ complexity, risk }) : level)
+  const l = override || (!level || level === 'auto' ? autoLevel({ complexity, risk }, bands) : level)
   if (family === 'claude') return CLAUDE[l] ?? null
   if (family === 'deepseek') return DEEPSEEK[l] ?? null
   const i = CODEX_ORDER.indexOf(l)

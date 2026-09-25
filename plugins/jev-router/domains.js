@@ -16,11 +16,17 @@
 // performance and label quality its risk class demands; an out-of-distribution input goes to Jev
 // whatever the classifier's confidence says; and a critical failure drops the domain to
 // JEV_PRIMARY immediately. Local authority is a privilege the evidence keeps paying for.
+//
+// A run Laya decides (docs/laya-auto.md 6.3) goes through the same decide(), told so by
+// `answeredBy`: Laya answers every domain it is asked, the rules decide the rest, the local
+// classifier is only recorded beside it, and the ladder is left exactly as it was. Laya is never a
+// teacher, so nothing it answers can move a rung, and its samples go to a store of their own.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import {
   FEATURE_SCHEMA_VERSION, calibrate, calibrationMetrics, evaluate, loadArtifact, predict, rank, saveArtifact, trainMulticlass, trainRanker, verifyArtifact,
 } from './classifier.js'
+import { TEACHER, providerName } from './providers.js'
 import { MATURITY, gatesFor, resolvePolicy } from './routing-policy.js'
 
 /** The ladder, in order. ROLLBACK is a state, not a rung: it is where a domain waits to re-earn one. */
@@ -48,6 +54,10 @@ export const STATE_VERSION = 3
 const MIN_DRIFT_BINS = 3
 // How many recent observations a drift reading needs before it means anything.
 const MIN_DRIFT_SAMPLES = 30
+// The domains where an answer a provider marks too flat to use still decides. The outcome domain's
+// disposition only labels the sample: what the review does comes from the provider's yes/no
+// answers (jev-review), so a flat disposition is no reason to throw its review away.
+const FLAT_STILL_DECIDES = new Set(['outcome_disposition'])
 
 const nextRung = (state) => LADDER[LADDER.indexOf(state) + 1] ?? null
 /** The higher of two states on the ladder; anything off it (null, ROLLBACK) is below every rung. */
@@ -331,8 +341,12 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
     persist()
   }
 
-  /** The local prediction for one input, or null when there is no usable artifact. */
-  const localAnswer = (features, candidates) => {
+  /**
+   * The local prediction for one input, or null when there is no usable artifact. `readOnly` (a
+   * run another provider decides) leaves a prediction that throws for the next decision that may
+   * act on it: the artifact and the ladder stay as they are.
+   */
+  const localAnswer = (features, candidates, { readOnly = false } = {}) => {
     if (!artifact) return null
     try {
       if (kind === 'ranking') {
@@ -347,6 +361,7 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       const p = predict(artifact, features, { ood: policy.ood })
       return { label: p.label, probabilities: p.probabilities, confidence: p.confidence, rawConfidence: p.rawConfidence, margin: p.margin, ood: p.ood, artifactVersion: artifact.classifierVersion }
     } catch (err) {
+      if (readOnly) return null
       // A prediction that throws is a broken artifact, not an unlucky input: stop trusting it.
       artifactReason = `prediction failed: ${err.message}`
       artifact = null
@@ -379,6 +394,86 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
     state.oodRecent = { n, flagged: decay + (flagged ? 1 : 0) }
   }
   const oodRate = () => (state.oodRecent.n ? state.oodRecent.flagged / state.oodRecent.n : 0)
+
+  /**
+   * One decision of a run another provider decides (docs/laya-auto.md 6.3); `ask` is that
+   * provider's call. The ladder is read-only here: nothing notes an unfamiliar input, moves a rung
+   * or writes the state, because the provider is no teacher and its run says nothing about the
+   * rung. The local classifier answers and is recorded beside, and never decides at any rung: the
+   * owner decided that this provider decides, and a classifier Jev taught deciding would put Jev's
+   * teaching back into the run. A domain a rule decides is decided by its rule, as in any run.
+   * Every other domain takes the provider's answer, or the deterministic one when it gave none,
+   * failed, or marked its answer too flat to act on. The sample goes to `sink`, the provider's own
+   * store, with the answer as `provider` and no teacher.
+   */
+  async function decideFor(answeredBy, { features, candidates, ask, fallback, codeAuthority, context, sink }) {
+    const name = providerName(answeredBy)
+    if (!sink) throw new Error(`routing domain ${domain}: a ${name} decision needs the store its sample goes to`)
+    const local = localAnswer(features, candidates, { readOnly: true })
+    const unfamiliar = unfamiliarCandidates(candidates)
+    const ood = {
+      flag: !!local?.ood?.flag || unfamiliar.length > 0,
+      reasons: [...(local?.ood?.reasons ?? []), ...unfamiliar.map((k) => `unfamiliar_candidate:${k}`)],
+    }
+    const beside = local ? `; the local classifier is recorded beside it and never decides a ${name} run` : ''
+    let authority = codeAuthority ? 'code' : 'fallback'
+    let provider = null
+    let answer = null
+    let reason
+    if (ask) {
+      try {
+        provider = await ask()
+        if (!provider) reason = `${name} had no answer for this question; using the deterministic fallback`
+        else if (provider.informative === false && !FLAT_STILL_DECIDES.has(domain)) reason = `${name}'s answer was too flat to use`
+        else { authority = answeredBy; answer = provider; reason = `${name} decides this run${beside}` }
+      } catch (err) {
+        reason = `${name} unavailable (${err.message}); using the deterministic fallback`
+      }
+    } else {
+      reason = codeAuthority ? `a rule in code decides this domain${beside}` : `${name} was not asked this one; using the deterministic fallback`
+    }
+    if (!answer) {
+      answer = fallback ? fallback() : null
+      if (!answer) throw new Error(`routing domain ${domain}: nothing could decide and no fallback was given`)
+    }
+    let sampleId = null
+    try {
+      const row = await sink.append({
+        domain,
+        runId: context.runId ?? null,
+        input: { features, ...(candidates ? { candidates: candidates.map((c) => ({ key: c.key, id: c.id, features: c.features })) } : {}) },
+        teacher: null,
+        local: local ? { label: local.label, chosenKey: local.chosenKey, probabilities: local.probabilities ?? {}, confidence: num(local.confidence, 0), artifactVersion: local.artifactVersion ?? null, ood: !!ood.flag } : null,
+        authority,
+        ...(authority === 'code' ? { code: { label: answer.label, chosenKey: answer.chosenKey, probabilities: answer.probabilities ?? {}, confidence: num(answer.confidence, 0) } } : {}),
+        // What the provider said, whether or not it decided: an answer too flat to act on is kept
+        // with its flag, so a reading of the provider can leave it out rather than never see it.
+        provider: provider ? {
+          id: answeredBy, label: provider.label, chosenKey: provider.chosenKey, probabilities: provider.probabilities ?? {}, confidence: num(provider.confidence, 0),
+          informative: provider.informative !== false, model: provider.model ?? null, identity: provider.identity ?? null, lang: provider.lang ?? null,
+        } : null,
+        ...(extraOf(context.extra, { authority, answer, teacher: null, local, provider }) ?? {}),
+      })
+      sampleId = row.id
+    } catch (err) { log(`routing domain ${domain}: sample not recorded (${err.message})`) }
+    // No maturity: the local ladder's rung says nothing about a run this provider decided.
+    return {
+      authority,
+      label: answer.label,
+      chosenKey: answer.chosenKey,
+      probabilities: answer.probabilities ?? {},
+      confidence: num(answer.confidence, 0.5),
+      local,
+      teacher: null,
+      provider,
+      reason,
+      maturity: null,
+      requiredConfidence: gates.confidenceThreshold,
+      ood,
+      jevCalled: false,
+      sampleId,
+    }
+  }
 
   const api = {
     /** The domain's whole state, for the inspector. Pure read: nothing here decides anything. */
@@ -424,10 +519,18 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
      *   A domain whose policy says `teacher: 'code'` is held to `codeAuthority`, and the teacher
      *   call is ignored: the rule is its authority, not a stand-in for one
      * @param {object} [p.context]    `extra` is stored on the training sample
-     * @returns {Promise<object>} `{ authority, label|chosenKey, probabilities, confidence, local, teacher, reason, maturity, requiredConfidence, ood, jevCalled, sampleId }`
+     * @param {string} [p.answeredBy]  who answers this run: `jev`, the teacher, by default. Anything
+     *   else (`laya`) is a run that provider decides, and `jev` is then its call: see decideFor.
+     *   An answer the call marks `informative: false` is too flat to act on
+     * @param {object} [p.sink]       the store the sample goes to: this domain's own by default, and
+     *   required when `answeredBy` is not the teacher
+     * @returns {Promise<object>} `{ authority, label|chosenKey, probabilities, confidence, local, teacher, reason, maturity, requiredConfidence, ood, jevCalled, sampleId }`,
+     *   and `provider`, its answer, in a run another provider decides
      */
-    async decide({ features, candidates, jev, fallback, codeAuthority = false, localMayDecide = true, context = {} } = {}) {
+    async decide({ features, candidates, jev, fallback, codeAuthority = false, localMayDecide = true, context = {}, answeredBy = TEACHER, sink } = {}) {
       if (codeTaught) { codeAuthority = true; jev = null }
+      if (answeredBy !== TEACHER) return decideFor(answeredBy, { features, candidates, ask: jev, fallback, codeAuthority, context, sink })
+      const target = sink ?? store
       const deterministic = codeAuthority ? 'code' : 'fallback'
       const maturity = state.maturity
       const local = localAnswer(features, candidates)
@@ -509,9 +612,9 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       // Every decision is a training candidate, whoever made it. This is the line that makes
       // using the router the thing that teaches it.
       let sampleId = null
-      if (store) {
+      if (target) {
         try {
-          const row = await store.append({
+          const row = await target.append({
             domain,
             runId: context.runId ?? null,
             input: { features, ...(candidates ? { candidates: candidates.map((c) => ({ key: c.key, id: c.id, features: c.features })) } : {}) },

@@ -11,13 +11,24 @@
 //             judgments jev-review turns into a decision
 // `route()` batches whichever of the first two groups are still needed into one call, so a
 // domain that has matured locally costs no Jev tokens while the others still ask.
+//
+// The same questions go to whichever decision provider answers (providers.js): Jev, or Laya on
+// this PC through a client of its own. Nothing here knows which; the record handed to createJev
+// carries the model, the retries and the cut-offs, and a mark a provider sets on an answer is
+// read the same way whoever set it.
+import { randomUUID } from 'node:crypto'
 import { TypeSafeClient, choice, noul, score } from '@typesafe-ai/sdk'
 import { CAPABILITIES } from './capabilities.js'
 import { redactSecrets } from './export.js'
 import { identityNames, modelIdOf } from './features.js'
+import { JEV_THRESHOLDS, deepFreeze, jevRecord } from './providers.js'
 import { DISPOSITIONS, REQUIREMENT_DIMENSIONS, SKILLS, STRATEGIES } from './routing-policy.js'
 
-export const TASK_TYPES = {
+// The criteria constants below are frozen, all the way down. The SDK keeps a reference to them
+// in every question it builds, and a question is handed to other readers besides the call (the
+// Laya shadow renders the same objects for its own model): a reader that rewrote one in place
+// would change every later Jev request in this process.
+export const TASK_TYPES = deepFreeze({
   architecture: 'Designing structure, data flow, or a strategy across components before or instead of writing code',
   implementation: 'Writing new code or features to a known requirement',
   debugging: 'Finding and fixing the cause of incorrect behavior, a failing test, or an error',
@@ -30,32 +41,32 @@ export const TASK_TYPES = {
   performance: 'Work whose main concern is speed, memory, or resource usage',
   simple_change: 'A small, mechanical, low-judgment edit such as a typo, constant, or one-line fix',
   other: 'None of the above fits',
-}
+})
 
-const COMPLEXITY_LEVELS = [
+const COMPLEXITY_LEVELS = deepFreeze([
   'Trivial: a mechanical edit in one place with an obvious answer',
   'Small: a contained change in one or two files with a clear approach',
   'Moderate: several files or some design judgment, but a well-understood problem',
   'Hard: cross-cutting change, unclear root cause, or real design trade-offs',
   'Extremely complex: ambiguous requirements, many interacting systems, or concurrency and distributed-state reasoning',
-]
+])
 
-const RISK_LEVELS = [
+const RISK_LEVELS = deepFreeze([
   'Negligible: a mistake has no user-visible effect, for example docs or a test fixture',
   'Low: a mistake causes a minor, easily noticed and reverted defect',
   'Moderate: a mistake could break a feature for some users until fixed',
   'High: a mistake could corrupt data, break a core flow, or cause an outage',
   'Production-critical: a mistake could compromise security, authentication, money, or irreversible data',
-]
+])
 
 // One scale for every requirement dimension: how much the task leans on it.
-const REQUIREMENT_LEVELS = [
+const REQUIREMENT_LEVELS = deepFreeze([
   'Not needed: the task does not call on this at all',
   'Marginal: a little helps but a weak model would still manage',
   'Useful: noticeably better results with real strength here',
   'Important: a model weak at this would likely produce a wrong or poor result',
   'Central: the task is essentially this; only real strength here gives an acceptable result',
-]
+])
 
 const REQUIREMENT_TEXT = {
   general_reasoning: 'careful multi-step reasoning',
@@ -70,13 +81,13 @@ const REQUIREMENT_TEXT = {
   long_context: 'holding and reasoning over a large amount of project context at once',
 }
 
-const TIERS = {
+const TIERS = deepFreeze({
   standard: { what: 'A competent mid-range model: routine work with clear instructions' },
   strong: { what: 'A strong model: real judgment, several files, non-obvious fixes' },
   frontier: { what: 'The strongest models available: subtle multi-module reasoning, difficult design, security-sensitive or high-risk work' },
-}
+})
 
-export const VERDICTS = {
+export const VERDICTS = deepFreeze({
   accept: {
     what: 'The evidence shows the task is done: the result addresses the request and verification supports it',
     not_for: 'Results with failing required checks, unaddressed parts of the task, or open risk that deserves another look',
@@ -93,10 +104,10 @@ export const VERDICTS = {
     what: 'A person should decide: scope is unclear, the change is risky or destructive, agents failed repeatedly, or evidence is missing',
     not_for: 'Routine outcomes an agent can settle',
   },
-}
+})
 
 /** The outcome dispositions as Jev is asked to choose between them. Deterministic failures override the answer in code. */
-export const DISPOSITION_CRITERIA = {
+export const DISPOSITION_CRITERIA = deepFreeze({
   PASS: { what: 'The result is done and verified well enough to accept' },
   RETRY_SAME_TIER: { what: 'Wrong or incomplete, but a model of the same strength would likely fix it with the feedback' },
   RETRY_DIFFERENT_RESOURCE: { what: 'Wrong or incomplete in a way this resource keeps getting wrong: a different resource should try' },
@@ -104,7 +115,13 @@ export const DISPOSITION_CRITERIA = {
   FRONTIER_REVIEW: { what: 'Plausible but risky or subtle enough that only the strongest available resource should judge it before acceptance' },
   WRONG: { what: 'Clearly wrong and not worth retrying as is: the approach itself must change' },
   HUMAN: { what: 'A person must decide: unclear scope, a destructive or irreversible action, repeated failure, or missing evidence' },
-}
+})
+
+/**
+ * The criteria above that are not exported on their own, in one frozen object, so a reader can
+ * see they are frozen before any call has touched them.
+ */
+export const CRITERIA = Object.freeze({ COMPLEXITY_LEVELS, RISK_LEVELS, REQUIREMENT_LEVELS, TIERS })
 
 /**
  * Mask key-shaped strings on anything that goes to Jev, with the same scrubber the
@@ -409,8 +426,13 @@ function numbersState(c) {
   }
 }
 
-/** One Jev call as the Inspector shows it: timing, usage, every question and its full answer. */
-function traceOf(phase, questions, res, ms, used) {
+/**
+ * One decider call as the Inspector shows it: timing, usage, every question and its full answer.
+ * `callId` pairs it with the Laya shadow's answer to the same call, `provider` names who answered,
+ * and `meta` is whatever the client adds about the call (the Laya client's device, wait and
+ * identity). A provider's own marks on an answer ride along where the answer carries them.
+ */
+function traceOf(phase, questions, res, ms, used, { callId, provider }) {
   return {
     phase,
     ms,
@@ -420,71 +442,163 @@ function traceOf(phase, questions, res, ms, used) {
     // judgment looks wrong.
     requestId: res.requestId,
     usage: res.usage,
+    callId,
+    provider,
+    ...(res.meta !== undefined ? { meta: res.meta } : {}),
     questions: Object.entries(questions).map(([name, q]) => {
+      // A question the response left out stays in the trace, with no answer and unused.
       const a = res.answers[name]
       return {
         name,
         type: q.type,
         question: typeof q.instructions === 'string' ? q.instructions : q.instructions.question,
         options: q.type === 'choice' ? Object.fromEntries(Object.entries(q.criteria).map(([k, v]) => [k, typeof v === 'string' ? v : v?.what])) : q.type === 'score' ? { ...q.criteria } : undefined,
-        answer: a.type === 'choice' ? a.choice : a.type === 'score' ? a.score : a.noul,
-        confidence: a.confidence,
-        probabilities: a.probabilities,
-        used: used(name, res.answers),
+        answer: a?.type === 'choice' ? a.choice : a?.type === 'score' ? a.score : a?.noul,
+        confidence: a?.confidence,
+        probabilities: a?.probabilities,
+        used: a ? used(name, res.answers) : false,
+        ...Object.fromEntries(ANSWER_MARKS.filter((k) => a?.[k] !== undefined).map((k) => [k, a[k]])),
       }
     }),
   }
 }
 
-/** The task profile from the task-group answers, in the shape the rest of the router reads. */
-export function profileFromAnswers(answers) {
+// What a provider may mark on an answer: too flat to use, re-tempered, and the confidence it
+// served before KzH read the top probability instead (docs/laya-auto.md 4.3). Jev marks none.
+const ANSWER_MARKS = ['informative', 'corrected', 'servedConfidence']
+
+/**
+ * The names of the answers the provider marked too flat to mean anything. Read generically,
+ * whoever set the mark, so nothing provider-specific enters this file; always empty for Jev.
+ */
+const flatNames = (answers) => Object.keys(answers ?? {}).filter((n) => answers[n]?.informative === false)
+
+// The score and choice answers the profile is made of. A flat one is left out, so the routing
+// rules fill that field; a flat noul is kept, because every bar that reads one sits away from 0.5
+// and a flat answer simply falls under it.
+const PROFILE_ANSWERS = ['taskType', 'complexity', 'risk', 'skill', 'minimumCapability', 'preferredCapability', 'capability', ...REQUIREMENT_DIMENSIONS.map((d) => `req.${d}`)]
+
+/**
+ * The task profile from the task-group answers, in the shape the rest of the router reads.
+ * `thresholds` are the answering provider's (supportingSkill, verificationChecks), Jev's by
+ * default. `filledByRules` names the answers left out as too flat, and is there only when one was.
+ */
+export function profileFromAnswers(answers, thresholds = JEV_THRESHOLDS) {
+  const filledByRules = PROFILE_ANSWERS.filter((n) => answers[n]?.informative === false)
+  const a = (n) => (filledByRules.includes(n) ? undefined : answers[n])
   const requirements = {}
-  for (const d of REQUIREMENT_DIMENSIONS) if (answers[`req.${d}`]) requirements[d] = unit(answers[`req.${d}`], REQUIREMENT_LEVELS)
-  const primary = answers.skill?.choice
+  for (const d of REQUIREMENT_DIMENSIONS) if (a(`req.${d}`)) requirements[d] = unit(a(`req.${d}`), REQUIREMENT_LEVELS)
+  const primary = a('skill')?.choice
   // Supporting skills: the next strongest choices of the same question, above a floor. One
   // question instead of one per skill, and never more than three, so the prompt stays clean.
-  const supporting = Object.entries(answers.skill?.probabilities ?? {})
-    .filter(([k, p]) => k !== primary && p >= 0.15)
-    .sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k]) => k)
+  const floor = thresholds?.supportingSkill ?? JEV_THRESHOLDS.supportingSkill
+  const supporting = Object.entries(a('skill')?.probabilities ?? {})
+    .filter(([k, p]) => k !== primary && p >= floor)
+    .sort((x, y) => y[1] - x[1]).slice(0, 3).map(([k]) => k)
+  // 'always' lists checks whatever the answer, and whether there is one.
+  const checksAt = thresholds?.verificationChecks ?? JEV_THRESHOLDS.verificationChecks
   const verification = []
-  if ((answers.needsTests?.noul ?? 0) >= 0.5) verification.push('checks')
+  if (checksAt === 'always' || (answers.needsTests?.noul ?? 0) >= checksAt) verification.push('checks')
   return {
-    taskType: answers.taskType?.choice,
-    taskTypeConfidence: answers.taskType?.confidence,
-    taskTypeProbabilities: answers.taskType?.probabilities,
-    complexity: answers.complexity ? unit(answers.complexity, COMPLEXITY_LEVELS) : undefined,
-    risk: answers.risk ? unit(answers.risk, RISK_LEVELS) : undefined,
+    taskType: a('taskType')?.choice,
+    taskTypeConfidence: a('taskType')?.confidence,
+    taskTypeProbabilities: a('taskType')?.probabilities,
+    complexity: a('complexity') ? unit(a('complexity'), COMPLEXITY_LEVELS) : undefined,
+    risk: a('risk') ? unit(a('risk'), RISK_LEVELS) : undefined,
     requirements,
     skills: primary ? { primary, supporting } : undefined,
-    skillConfidence: answers.skill?.confidence,
-    capability: answers.capability?.choice,
-    capabilityConfidence: answers.capability?.confidence,
-    minimumCapability: answers.minimumCapability?.choice,
-    minimumCapabilityConfidence: answers.minimumCapability?.confidence,
-    preferredCapability: answers.preferredCapability?.choice,
+    skillConfidence: a('skill')?.confidence,
+    capability: a('capability')?.choice,
+    capabilityConfidence: a('capability')?.confidence,
+    minimumCapability: a('minimumCapability')?.choice,
+    minimumCapabilityConfidence: a('minimumCapability')?.confidence,
+    preferredCapability: a('preferredCapability')?.choice,
     verification,
     needsSecondOpinion: answers.secondOpinion?.noul,
     needsHumanReview: answers.humanReview?.noul,
     needsTests: answers.needsTests?.noul,
     continueHandoff: answers.continueHandoff?.noul,
+    ...(filledByRules.length ? { filledByRules } : {}),
   }
 }
 
-export function createJev({ apiKey, model, timeoutMs, onTrace }) {
-  const client = new TypeSafeClient({ apiKey, ...(model ? { defaultModel: model } : {}) })
-  const ask = async (phase, state, questions, signal, used = () => true) => {
+/** A hook's error or rejection never reaches the call it watches, and nothing waits for it. */
+function quietly(fn, arg) {
+  if (typeof fn !== 'function') return undefined
+  try {
+    const out = fn(arg)
+    if (typeof out?.then === 'function') out.then(undefined, () => {})
+    return out
+  } catch { return undefined }
+}
+
+/** What a failed call was, in fields a log line and the inspector can show. */
+const errorOf = (err) => ({ class: err?.constructor?.name ?? typeof err, code: err?.code ?? null, status: err?.status ?? null, message: String(err?.message ?? err) })
+
+/**
+ * The typed-question client of one decision provider.
+ *
+ *   createJev({ provider, apiKey, client, onTrace, onError, onCall })  `provider` is the record
+ *     of the provider that answers (providers.js). `client` defaults to a TypeSafe client on the
+ *     record's model and retries; the Laya client is passed here instead, and nothing in this
+ *     file knows which one it is talking to. A local record (Laya's) has no default: without a
+ *     client, createJev throws.
+ *   createJev({ apiKey, model, timeoutMs, onTrace })  the old form: Jev, with these values.
+ *
+ * `onTrace(trace)` gets every call that answered, and only those; an answer the response left
+ * out is in the trace without one. `onError({ phase, callId, provider, ms, error })` gets every
+ * call that failed, a response with no answers included, before the error is rethrown to the
+ * caller. `onCall({ callId, phase, state, questions, used, context })` sees each call before it
+ * is sent, with its questions deep-frozen, and if it returns a function, that function gets
+ * `{ trace }` or `{ error }` once the call settles. None of them is awaited, and an error or a
+ * rejection in one never reaches the call.
+ */
+export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace, onError, onCall } = {}) {
+  const P = provider ?? jevRecord({ model, timeoutMs })
+  // A provider on this PC is asked through its own client, never TypeSafe's: handed over without
+  // one, it would send its questions to the TypeSafe host with whatever key the environment holds.
+  if (!client && P.local) throw new Error(`createJev: ${P.name} runs on this PC and needs its own client`)
+  const api = client ?? new TypeSafeClient({ apiKey, defaultModel: P.model, retry: { maxRetries: P.maxRetries } })
+  // `context` is the numbers-only object a caller hands in for the watchers (the review's attempt,
+  // risk and bars), null otherwise; it never goes out with the call.
+  const ask = async (phase, state, questions, signal, used = () => true, context = null) => {
+    const callId = randomUUID()
     const t0 = Date.now()
-    const call = client.systemOne({ state, questions }, { timeout: timeoutMs, signal })
-    // `.withResponse()` is how the SDK hands back the request id; without it the id never
-    // reaches the log. Falls back cleanly if a future SDK drops the method.
-    const { data: res, requestId } = typeof call?.withResponse === 'function'
-      ? await call.withResponse()
-      : { data: await call, requestId: undefined }
-    onTrace?.(traceOf(phase, questions, requestId ? { ...res, requestId } : res, Date.now() - t0, used))
+    // A watcher is handed these very objects, never a copy, so they are frozen first: nothing it
+    // does to them can reach this request or a later one.
+    deepFreeze(questions)
+    const settle = quietly(onCall, { callId, phase, state, questions, used, context })
+    let res
+    let trace
+    try {
+      // `phase` is no SDK option: the SDK copies only the options it knows, and the Laya client
+      // reads it.
+      const call = api.systemOne({ state, questions }, { timeout: P.timeoutMs?.[phase], signal, phase })
+      // `.withResponse()` is how the SDK hands back the request id; without it the id never
+      // reaches the log. Falls back cleanly if a future SDK drops the method, and the Laya client
+      // has none.
+      let requestId
+      ;({ data: res, requestId } = typeof call?.withResponse === 'function'
+        ? await call.withResponse()
+        : { data: await call, requestId: undefined })
+      // Built here, so a response no trace can be made of (one with no answers at all) fails the
+      // call as an error does, and the watchers still hear of it.
+      trace = traceOf(phase, questions, requestId ? { ...res, requestId } : res, Date.now() - t0, used, { callId, provider: P.id })
+    } catch (err) {
+      // A failed call answered no question and used no tokens, so it is never a trace.
+      quietly(onError, { phase, callId, provider: P.id, ms: Date.now() - t0, error: errorOf(err) })
+      if (typeof settle === 'function') quietly(settle, { error: err })
+      throw err
+    }
+    if (typeof settle === 'function') quietly(settle, { trace })
+    onTrace?.(trace)
     return res
   }
 
   return {
+    /** The record of the provider that answers: every consumer reads its thresholds and name here. */
+    provider: P,
+
     /**
      * Routing. One batched call over whichever judgment groups are still needed:
      *
@@ -664,9 +778,12 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
       const { answers, model: usedModel } = await ask('route', state, questions, signal, used)
       const handler = answers.handler?.choice ?? 'agent'
       const params = handler === 'agent' ? [] : Object.keys(tools.find((t) => t.id === handler)?.params ?? {})
-      const profile = askTask ? profileFromAnswers(answers) : null
+      const profile = askTask ? profileFromAnswers(answers, P.thresholds) : null
       return {
         model: usedModel,
+        // The only way a caller learns that an answer outside the profile was flat: `strategy`
+        // and `secondOpinion` carry no flag of their own. decision.js reads it.
+        uninformative: flatNames(answers),
         ...(askAgent ? {
           primaryAgent: answers.agent.choice,
           agentConfidence: answers.agent.confidence,
@@ -736,6 +853,8 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         depth: answers.depth?.choice,
         depthConfidence: answers.depth?.confidence,
         alsoWork: answers.alsoWork?.noul,
+        // `depth` flat here means the caller keeps the cheap default, as when it is missing.
+        uninformative: flatNames(answers),
       }
     },
 
@@ -743,8 +862,12 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
      * Post-execution assessment over summarized, deterministic evidence. The disposition is the
      * teacher label for the outcome domain; the atomic Nouls are what jev-review decides from,
      * and deterministic facts (a failing required check) override both in code.
+     *
+     * `context` is what jev-review knows about this review and the state does not carry, numbers
+     * only (`{ attempt, risk, blockAccept, reviewed }`): it goes to the call's watchers, so the
+     * shadow can work out the review action either provider would have taken, and never out.
      */
-    async assess({ task, routing, attempts, checks, diff, agents = [], strategy, modelOf }, signal) {
+    async assess({ task, routing, attempts, checks, diff, agents = [], strategy, modelOf }, signal, context = null) {
       // With a decision record the review and retry picks are made over the same anonymous,
       // machine-readable candidate data the resource pick was, never over prose descriptions:
       // a description is a capability claim, and it would outvote the owner's priors and the
@@ -794,7 +917,7 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
       // One snap judgment per question: atomic Nouls (yes = the thing named) decide
       // in jev-review; the broad verdict and the disposition are kept as displayed signals and
       // as the outcome domain's teacher label.
-      const { answers } = await ask('review', state, {
+      const { answers, model: usedModel } = await ask('review', state, {
         verdict: choice(
           {
             question: 'Given the latest entry in `attempts`, `verification`, and `diff`, what should happen next for `task`?',
@@ -832,8 +955,12 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
           },
           options,
         ),
-      }, signal, (name) => name !== 'verdict')
+      }, signal, (name) => name !== 'verdict', context ?? null)
       return {
+        // The served model, so an outcome sample records who judged it.
+        model: usedModel,
+        // jev-review reads `disposition`, `reviewAgent` and `retryAgent` here.
+        uninformative: flatNames(answers),
         verdict: answers.verdict.choice,
         verdictConfidence: answers.verdict.confidence,
         verdictProbabilities: answers.verdict.probabilities,

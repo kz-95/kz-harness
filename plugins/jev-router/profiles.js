@@ -24,9 +24,15 @@
 // yet: no importer, fetcher or job in this plugin records a `benchmark` row or a
 // `benchmark_prior`. The effective capability today is the prior plus execution evidence (runs,
 // reviews, feedback); the benchmark slots exist so a future importer has a schema to write to.
+//
+// Capability profiles are shared by Jev Auto and Laya Auto, so a run another provider decided
+// (docs/laya-auto.md 6.6) gives only what depends on no judgment of its: whether each attempt
+// completed. Every other row would rest on that provider's task type, accept or assessment, and a
+// zero-shot model must not move what Jev Auto believes about the agents.
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { TEACHER } from './providers.js'
 import { DIMENSIONS, RELATED_TASK_TYPES, TASK_DIMENSIONS, resolvePolicy } from './routing-policy.js'
 
 /**
@@ -616,6 +622,9 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
 }
 
 const isSuccess = (status) => String(status ?? '').startsWith('accepted') || status === 'answered'
+// Whether the teacher decided the run. A record from before there were two deciders says nothing,
+// and it was Jev.
+const taughtRun = (record) => (record?.routing?.decider ?? TEACHER) === TEACHER
 // A run that ran out of allowance or was stopped by the person says nothing about the work.
 const NO_EVIDENCE = new Set(['paused_limit', 'stopped'])
 const isWork = (a) => (a.role === 'primary' || a.role === 'retry') && !a.limitHit
@@ -689,7 +698,8 @@ function subjectOfAttempt(attempt, def, { versionOf, priors }) {
  * @param {{ agents?: object[] }} [deps]
  */
 export function answererUnconfigured(verdict, record, { agents = [] } = {}) {
-  if (!record || NO_EVIDENCE.has(record.finalStatus) || !verdictIsAbout(verdict, record)) return false
+  // A run another provider decided gives no verdict rows at all (evidenceFromFeedback).
+  if (!record || !taughtRun(record) || NO_EVIDENCE.has(record.finalStatus) || !verdictIsAbout(verdict, record)) return false
   const work = (Array.isArray(record.attempts) ? record.attempts : []).filter(isWork)
   if (!work.length) return false
   const scored = work.length === 1 ? work : [work[0], work.at(-1)]
@@ -700,13 +710,17 @@ export function answererUnconfigured(verdict, record, { agents = [] } = {}) {
 }
 
 // What evidenceFromRun and evidenceFromFeedback share: the work attempts worth scoring, each with
-// the subject it stands for, and the dimensions the task type exercises.
+// the subject it stands for, and the dimensions the task type exercises. A run the teacher did not
+// decide has no task type to give a row: it would be that provider's label, and it would set how
+// much the row weighs when Jev Auto reads a profile (evidenceWeight); a row with none is general
+// evidence, fully relevant.
 function runShape(record, { versionOf, agents, priors, now }) {
   if (!record || NO_EVIDENCE.has(record.finalStatus)) return null
   const attempts = Array.isArray(record.attempts) ? record.attempts : []
   const work = attempts.filter(isWork)
   if (!work.length) return null
-  const taskType = str(record.routing?.taskType) ?? 'other'
+  const taught = taughtRun(record)
+  const taskType = taught ? str(record.routing?.taskType) ?? 'other' : null
   const dims = TASK_DIMENSIONS[taskType] ?? TASK_DIMENSIONS.other
   const first = work[0]; const last = work.at(-1)
   // The version reported now says what runs NOW. It is only the version that ran this record when
@@ -725,9 +739,9 @@ function runShape(record, { versionOf, agents, priors, now }) {
   }
   const out = []
   const push = (subject, dimension, source, score, confidence, extra = {}) => out.push({
-    ...(record.ts ? { ts: record.ts } : {}), subject, dimension, score, source, confidence, n: 1, taskType, ...(record.runId ? { runId: record.runId } : {}), ...extra,
+    ...(record.ts ? { ts: record.ts } : {}), subject, dimension, score, source, confidence, n: 1, ...(taskType ? { taskType } : {}), ...(record.runId ? { runId: record.runId } : {}), ...extra,
   })
-  return { attempts, work, first, last, taskType, dims, reviewDims: dims.filter((d) => d !== 'reliability'), scored, out, push }
+  return { attempts, work, first, last, taught, taskType, dims, reviewDims: dims.filter((d) => d !== 'reliability'), scored, out, push }
 }
 
 /**
@@ -741,6 +755,12 @@ function runShape(record, { versionOf, agents, priors, now }) {
  * about THIS run (verdictIsAbout), credited to one attempt and keyed by the verdict so the
  * registry counts it once however often it is derived. Nothing from the record's text reaches a
  * row: ids, numbers, categories and timestamps only.
+ *
+ * A run another provider decided (`routing.decider` is not Jev) gives only the `reliability` row
+ * of each scored attempt, with no task type (runShape): the dimensions come from that provider's
+ * task type, the objective row rests on its accept, and a review row on its assessment. The loop
+ * over review attempts below is never reached for one, so it needs no mode check of its own; one
+ * that read `mode === 'jev'` would drop Jev Auto's own local-mode review evidence.
  * @param {object} record  one history.jsonl row
  * @param {{ versionOf?: Function, agents?: object[], feedback?: object[], until?: string, priors?: object, now?: () => number|string }} [deps]
  *   `until` is the ts of the next run in the same session, when known (a backfill over history).
@@ -750,7 +770,11 @@ function runShape(record, { versionOf, agents, priors, now }) {
 export function evidenceFromRun(record, { versionOf, agents = [], feedback = [], until, priors, now = Date.now } = {}) {
   const shape = runShape(record, { versionOf, agents, priors, now })
   if (!shape) return []
-  const { attempts, work, first, last, dims, reviewDims, scored, out, push } = shape
+  const { attempts, work, first, last, taught, dims, reviewDims, scored, out, push } = shape
+  if (!taught) {
+    for (const { attempt, subject } of scored) push(subject, 'reliability', 'objective_deterministic', attempt.stopReason === 'completed' ? 1 : 0, 0.9)
+    return out
+  }
   // Two dimensions have their own rule below, so the task loop leaves them out.
   const taskDims = dims.filter((d) => d !== 'first_pass_quality' && d !== 'reliability')
   const success = isSuccess(record.finalStatus)
@@ -787,14 +811,15 @@ export function evidenceFromRun(record, { versionOf, agents = [], feedback = [],
  * before anyone could judge its answer. The caller passes the run the verdict is about (the run
  * it was credited to before, else the last run of the session that ended before it); a verdict
  * that is not about that run gives nothing. Rows carry the verdict's key, so a changed verdict
- * replaces the earlier one in the registry.
+ * replaces the earlier one in the registry. A run another provider decided gives nothing: the
+ * dimensions a verdict is credited on come from that provider's task type.
  * @param {object} verdict  one feedback.js row
  * @param {object} record   the history.jsonl row of the run it is about
  * @param {{ versionOf?: Function, agents?: object[], until?: string, priors?: object, now?: () => number|string }} [deps]
  */
 export function evidenceFromFeedback(verdict, record, { versionOf, agents = [], until, priors, now = Date.now } = {}) {
   const shape = runShape(record, { versionOf, agents, priors, now })
-  if (!shape) return []
+  if (!shape?.taught) return []
   humanRows(record, [verdict], shape.scored, { lastWork: shape.last, reviewDims: shape.reviewDims, until, push: shape.push })
   return shape.out
 }

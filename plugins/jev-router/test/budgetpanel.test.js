@@ -774,3 +774,105 @@ test('a model the budget sizes down shows the context it will load with and says
   })
   await odd.local.dispose()
 })
+
+// ---------- Laya beside the local models (docs/laya-auto.md 7.7) ----------
+
+/**
+ * Laya's status as the route carries it beside the local models' (`laya`, the answer of GET
+ * /jev-router/laya, 8.4): installed for the GPU, and running there with the figures status()
+ * reports, unless told otherwise. `need` is what it would take at its next start.
+ */
+const layaStatus = ({ running = {}, ...over } = {}) => ({
+  state: running ? 'ready' : 'stopped',
+  installed: { laya: '0.3.20', torch: '2.14.0+cu128', cuda: true, gpu: PC.gpus[0].name, python: '3.12.11', weights: null, diskBytes: null },
+  running: running && { port: 8091, pid: 1234, interpreterPid: 1240, device: 'cuda', deviceWhy: null, spilling: false, threads: 6, loadMs: 41000, ramGB: 1.9, vramGB: 2.3, msPerToken: { intent: 0.2, route: 0.3, review: 0.2 }, busy: false, held: [], lastCallMs: 950, ...running },
+  settings: { startWithKzh: false, keepLoaded: false, idleMinutes: 30, device: 'auto', shadow: true },
+  need: { device: 'cuda', cpu: { ramGB: 3.3 }, cuda: { ramGB: 1.5, vramGB: 2.5 } },
+  ...over,
+})
+
+test('the budget table adds Laya to Now and Estimated peak, with each one\'s share, and counts it with the local model only while it is held', async () => {
+  const { local, run } = await installed()
+  const status = await local.status()
+  const cellsWith = (laya) => byKey(helpers.budgetCells({ ...status, laya }))
+  const figure = (c) => [c.text, c.note]
+  const alone = cellsWith(undefined)
+  // Laya on the GPU, llama.cpp not loaded: Now is Laya's own figure, and says whose it is.
+  let cells = cellsWith(layaStatus())
+  assert.deepEqual(figure(cells.maxVramGB.now), ['2.3 GB', 'Laya 2.3 GB, llama.cpp not loaded'])
+  assert.deepEqual(figure(cells.maxRamGB.now), ['1.9 GB', 'Laya 1.9 GB, llama.cpp not loaded'])
+  // Not held, it gives its memory up when a local model starts: the peak is the larger of the two,
+  // never both, since llama.cpp's figure is the model it would load (Big, estimated).
+  assert.deepEqual(figure(cells.maxVramGB.peak), ['4 GB', 'the larger of Laya 2.3 GB and llama.cpp 4 GB'])
+  assert.deepEqual(figure(cells.maxRamGB.peak), ['2.7 GB', 'the larger of Laya 1.9 GB and llama.cpp 2.7 GB'])
+  assert.match(cells.maxRamGB.peak.title, /^llama\.cpp: Big at 12k context, .*Laya is not held, so it gives its memory up when a local model starts, and the two are never counted together\.$/)
+  // Held (Keep Laya loaded, or a Laya Auto run open), it stays beside the model, and both count.
+  for (const held of [layaStatus({ running: { held: ['run:5f0c'] } }), layaStatus({ running: { held: ['keepLoaded'] } })]) {
+    cells = cellsWith(held)
+    assert.deepEqual(figure(cells.maxVramGB.peak), ['6.3 GB', 'Laya 2.3 GB, llama.cpp 4 GB'])
+    assert.deepEqual(figure(cells.maxRamGB.peak), ['4.6 GB', 'Laya 1.9 GB, llama.cpp 2.7 GB'])
+    assert.match(cells.maxRamGB.peak.title, /Laya is held \(Keep Laya loaded, or a Laya Auto run\), so it keeps its memory beside a local model, and the two are counted together\.$/)
+  }
+  // With the local model loaded beside it, Now is the two together, each named.
+  await run('small', ['CUDA0 model buffer size = 2355.20 MiB', 'CPU model buffer size = 2867.20 MiB'])
+  const loaded = byKey(helpers.budgetCells({ ...(await local.status()), laya: layaStatus() }))
+  assert.deepEqual(figure(loaded.maxVramGB.now), ['4.6 GB', 'Laya 2.3 GB, llama.cpp 2.3 GB'])
+  assert.deepEqual(figure(loaded.maxRamGB.now), ['4.7 GB', 'Laya 1.9 GB, llama.cpp 2.8 GB'])
+  assert.equal(loaded.maxRamGB.now.title, "llama.cpp: What the loaded model took, from the engine's own load report. Its real use is read only while a RAM budget is set. Laya: what it takes now on the GPU.")
+  assert.equal(loaded.maxVramGB.now.title, "llama.cpp: What the loaded model took, from the engine's own load report. Laya: what it takes now on the GPU.")
+  // On the CPU it holds no GPU memory: the VRAM row is llama.cpp's alone.
+  cells = cellsWith(layaStatus({ running: { device: 'cpu', vramGB: null, ramGB: 3.3 } }))
+  assert.deepEqual(cells.maxVramGB, alone.maxVramGB)
+  assert.deepEqual(figure(cells.maxRamGB.now), ['3.3 GB', 'Laya 3.3 GB, llama.cpp not loaded'])
+  // Stopped, it holds nothing now, and the peak takes what its next start would.
+  cells = cellsWith(layaStatus({ running: null, settings: { ...layaStatus().settings, keepLoaded: true } }))
+  assert.deepEqual([cells.maxVramGB.now, cells.maxRamGB.now], [alone.maxVramGB.now, alone.maxRamGB.now])
+  assert.deepEqual(figure(cells.maxVramGB.peak), ['6.5 GB', 'Laya 2.5 GB, llama.cpp 4 GB'])
+  assert.match(cells.maxVramGB.peak.title, /Laya: what it would take at its next start, on the GPU\./)
+  // Not installed, or a status with no figure: the table is llama.cpp's, as it always was.
+  assert.deepEqual(cellsWith(null), alone)
+  assert.deepEqual(cellsWith(layaStatus({ installed: null, running: null, need: null })), alone)
+  assert.deepEqual(Object.keys(cellsWith(layaStatus())), Object.keys(alone), 'and the rows stay the four limits')
+  await local.dispose()
+})
+
+test('with no local model the budget lets load, the Estimated peak is Laya\'s, and its note says why, never "llama.cpp no model"', async () => {
+  const figure = (c) => [c.text, c.note]
+  // No model installed, and models installed that the RAM budget refuses: either way none can load.
+  const bare = await installed({}, { models: [] })
+  const none = await bare.local.status()
+  const refused = await installed()
+  await refused.local.setSettings({ maxRamGB: 0.2 })
+  const over = await refused.local.status()
+  assert.ok(over.modules.filter((m) => m.kind === 'model' && m.state === 'installed').every((m) => m.overBudget), 'every installed model is over the budget')
+  for (const status of [none, over]) {
+    const cellsWith = (laya) => byKey(helpers.budgetCells({ ...status, laya }))
+    for (const laya of [layaStatus(), layaStatus({ running: { held: ['keepLoaded'] } })]) {
+      const cells = cellsWith(laya)
+      assert.deepEqual(figure(cells.maxVramGB.peak), ['2.3 GB', 'Laya 2.3 GB; no local model the budget lets load'])
+      assert.deepEqual(figure(cells.maxRamGB.peak), ['1.9 GB', 'Laya 1.9 GB; no local model the budget lets load'])
+      assert.match(cells.maxRamGB.peak.title, /^Laya: what it takes now on the GPU\./)
+    }
+  }
+  await bare.local.dispose()
+  await refused.local.dispose()
+})
+
+test('the words under the table say what a held Laya costs the local models on the GPU, and the table shows Laya\'s share', async () => {
+  const { local } = await installed()
+  const status = await local.status()
+  const notes = (laya) => helpers.budgetNotes({ ...status, laya }).map((n) => n.text)
+  const held = 'While Laya is held (Keep Laya loaded, or a Laya Auto run), the VRAM budget holds Laya and the chat model together, and on a 4 GB GPU local models get about 2.3 GB less. Otherwise Laya gives the GPU up when a local model starts.'
+  assert.ok(notes(layaStatus()).includes(held))
+  assert.ok(notes(layaStatus({ running: null })).includes(held.replace('2.3 GB', '2.5 GB')), 'stopped, what its next start would take')
+  assert.deepEqual(notes(layaStatus({ installed: { ...layaStatus().installed, cuda: false } })), notes(null), 'Laya installed for the CPU holds no GPU memory')
+  assert.ok(!notes(null).some((t) => /Laya/.test(t)))
+  // In the table, as the person reads it.
+  const tree = loadPlugin().__test.ResourceBudget({ data: { ...status, laya: layaStatus() }, edits: {}, errors: {}, onEdit() {}, onSave() {} })
+  const row = (label) => nodes(tree).find((n) => n.type === 'tr' && textOf(n.children[0]) === label)
+  const now = (label) => textOf(row(label).children.filter((c) => c?.type === 'td')[1])
+  assert.equal(now('VRAM'), '2.3 GB (Laya 2.3 GB, llama.cpp not loaded)')
+  assert.equal(now('RAM'), '1.9 GB (Laya 1.9 GB, llama.cpp not loaded)')
+  assert.ok(textOf(tree).includes(held))
+  await local.dispose()
+})

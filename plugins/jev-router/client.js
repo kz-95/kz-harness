@@ -97,6 +97,12 @@ window.__ModuleLoader__.load({
 .jevi table.budget th,.jevi table.budget td{font:inherit;text-align:left;vertical-align:middle;padding:3px 12px 3px 0}
 .jevi table.budget thead th{color:var(--dsw-alias-label-tertiary)}
 .jevi table.budget td{font-variant-numeric:tabular-nums}
+/* Jev and Laya side by side: the budget table's type, wide enough to scroll inside its card. */
+.jevi table.cmp{display:block;overflow-x:auto;border-collapse:collapse;margin:4px 0 8px;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary)}
+.jevi table.cmp th,.jevi table.cmp td{font:inherit;text-align:left;vertical-align:top;padding:3px 10px 3px 0}
+.jevi table.cmp thead th{color:var(--dsw-alias-label-tertiary)}
+.jevi table.cmp td{font-variant-numeric:tabular-nums}
+.jevi .why.shadow{margin-top:2px}
 .jevi ol.steps{margin:0;padding-left:18px}
 .jevi ol.steps li{margin:0 0 8px}
 .jevi details.q{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);border-radius:10px;padding:8px 10px;margin:0 0 6px}
@@ -1208,11 +1214,16 @@ window.__ModuleLoader__.load({
     function summarize(run) {
       const ev = run.events
       const first = run.startedAt ?? ev[0]?.at ?? Date.now()
-      const last = ev.at(-1)
+      // The run's own last event. Laya's shadow rows land in the same log (5.3), often after the
+      // run has ended, and their time is Laya's background work, not how long the run took.
+      const last = ev.filter((e) => e.type !== 'shadow').at(-1)
       const final = ev.find((e) => e.type === 'final')
       const error = ev.find((e) => e.type === 'error')
       const routed = ev.find((e) => e.type === 'routed')
       const traces = ev.filter((e) => e.type === 'jev').map((e) => e.trace)
+      // Every decider call in the order it settled: an answered one carries its trace, a failed one
+      // (`'decider-error'`) only who, which call, how long and why (3.3).
+      const calls = ev.filter((e) => e.type === 'jev' || e.type === 'decider-error').map((e) => (e.type === 'jev' ? { trace: e.trace } : { failed: e }))
       const starts = ev.filter((e) => e.type === 'attempt_start')
       const ends = ev.filter((e) => e.type === 'attempt_end')
       const reviews = ev.filter((e) => e.type === 'review')
@@ -1223,7 +1234,10 @@ window.__ModuleLoader__.load({
       const jevMs = traces.reduce((t, x) => t + x.ms, 0)
       const q = traces.flatMap((t) => t.questions)
       return {
-        running, final, error, routed, traces, attempts, jevMs, toolMs, agentMs,
+        running, final, error, routed, traces, calls, attempts, jevMs, toolMs, agentMs,
+        // Who answered this run's routing and review questions: its routing says, else its first call.
+        decider: routed?.routing ? deciderOf(routed.routing) : traces[0]?.provider ?? calls[0]?.failed?.error?.provider ?? 'jev',
+        endedAt: running ? null : last?.at ?? first,
         total: (running ? Date.now() : last?.at ?? first) - first,
         questions: q.length, used: q.filter((x) => x.used).length,
         tokIn: traces.reduce((t, x) => t + (x.usage?.input_tokens ?? 0), 0),
@@ -1235,7 +1249,7 @@ window.__ModuleLoader__.load({
     function Stats({ s }) {
       const tile = (label, value, sub) => h('div', { className: 'stat' }, h('small', null, label), h('b', null, value), sub ? h('small', null, sub) : null)
       return h('div', { className: 'stats' },
-        tile('Jev', ms(s.jevMs)),
+        tile(deciderName(s.decider), ms(s.jevMs)),
         s.toolMs ? tile('Tool', ms(s.toolMs)) : tile('Agents', ms(s.agentMs)),
         tile('Total', ms(s.total), s.running ? 'running…' : null),
         tile('Questions', `${s.used}/${s.questions}`, `${s.tokIn} in / ${s.tokOut} out tok`))
@@ -1254,12 +1268,17 @@ window.__ModuleLoader__.load({
       if (!R) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'What the code did'), h('div', { className: 'muted' }, s.error ? s.error.message : 'Routing…'))
       const kind = s.routed.tool ? 'tool' : R.mode === 'jev' ? 'agent' : R.mode
       const badge = { tool: 'tool', agent: 'agent', manual: 'manual', fallback: 'fallback' }[kind]
+      // A run Laya decided names Laya (3.2), and offline Laya still decides, over the local agents.
+      const decider = deciderOf(R)
+      const who = deciderName(decider)
+      const picked = R.mode === 'jev' || (R.mode === 'local' && decider !== 'jev')
+      const pickLine = decider === 'jev' ? `Jev picked ${movesOf(R)[0]?.from ?? R.primaryAgent} (confidence ${pct(R.agentConfidence)})` : `${who} picked ${movesOf(R)[0]?.from ?? R.primaryAgent} (confidence ${pct(R.agentConfidence)})`
       const line = s.routed.tool
-        ? `Jev picked tool ${s.routed.tool} (fits ${pct(R.toolFits)}, args ${pct(R.toolArgConfidence)}); no LLM needed`
-        : R.mode === 'jev' ? `Jev picked ${movesOf(R)[0]?.from ?? R.primaryAgent} (confidence ${pct(R.agentConfidence)})`
-          : R.mode === 'manual' ? `You forced ${R.primaryAgent}` : `Jev unavailable (${R.reason}); default agent ${movesOf(R)[0]?.from ?? R.primaryAgent}`
+        ? `${who} picked tool ${s.routed.tool} (fits ${pct(R.toolFits)}, args ${pct(R.toolArgConfidence)}); no LLM needed`
+        : picked ? pickLine
+          : R.mode === 'manual' ? `You forced ${R.primaryAgent}` : `${who} unavailable (${R.reason}); default agent ${movesOf(R)[0]?.from ?? R.primaryAgent}`
       const rows = []
-      if (R.mode === 'jev') {
+      if (picked) {
         rows.push(['Task type', `${R.taskType} (${pct(R.taskTypeConfidence)})`], ['Complexity', pct(R.complexity)], ['Risk', pct(R.risk)],
           ['Second opinion', pct(R.needsSecondOpinion)], ['Human review', pct(R.needsHumanReview)], ['Needs tests', pct(R.needsTests)])
       }
@@ -1360,11 +1379,161 @@ window.__ModuleLoader__.load({
         : m.kind === 'gate' ? `Work moved off ${m.from} (past its weekly gate) to ${m.to}`
           : m.kind === 'feedback' ? `Feedback moved the pick off ${m.from} to ${m.to}`
             : `Work moved from ${m.from} to ${m.to}`))
+
+    // Who decided, by the provider's id (providers.js providerName): every string that names the
+    // decider of a run or the provider of a call reads it here. A run or a call from before the
+    // field was recorded was Jev's.
+    const DECIDER_NAMES = { jev: 'Jev', laya: 'Laya' }
+    const deciderName = (id) => DECIDER_NAMES[id ?? 'jev'] ?? String(id)
+    /** Who decided a run: its routing's `decider`, else its decision record's (docs/laya-auto.md 3.2). */
+    const deciderOf = (R) => R?.decider ?? R?.decision?.decider ?? 'jev'
+    const wholePct = (n, of) => `${of ? Math.round((n / of) * 100) : 0}%`
+    const PHASE_WORDS = { route: 'Routing', review: 'Review', intent: 'Intent' }
+    const deviceWord = (device) => ({ cuda: 'GPU', gpu: 'GPU', cpu: 'CPU' })[device] ?? String(device)
+
+    // The answers the rules stand in for when Laya's is too flat to use (4.3): those of a route call,
+    // as adapter.js FILLED_BY_RULES names them for its live line (the page cannot import it), and
+    // the review's agent picks (pickOther) and the intent's depth (the cheap default). Every other
+    // flat answer is kept as answered and simply falls under its bar: a yes/no, the disposition, a
+    // tool pick and its arguments.
+    const FILLED_BY_RULES = new Set(['taskType', 'complexity', 'risk', 'skill', 'minimumCapability', 'preferredCapability', 'capability', 'strategy', 'secondOpinion', 'reviewAgent', 'retryAgent', 'depth'])
+    /**
+     * The pills an answer carries by its own marks, never by its question's name: Laya picks the
+     * temperature bucket by option count, so any question asked with that many options can be
+     * re-tempered, and none other is (4.3). A flat answer says whether the rules filled it or it
+     * was kept as answered.
+     */
+    const answerPills = (q) => {
+      const out = []
+      if (q?.corrected === true) out.push(['warn', `uncalibrated (${Object.keys(q.probabilities ?? q.options ?? {}).length} options)`])
+      if (q?.informative === false) {
+        const filled = FILLED_BY_RULES.has(q.name) || String(q.name).startsWith('req.')
+        out.push(['warn', filled ? 'too flat, filled by rules' : 'too flat, kept as answered'])
+      }
+      return out
+    }
+
+    /**
+     * One decider call as its card heads it (3.3). A call to a provider on this PC names the provider,
+     * the model its client relabelled the answer with, and what it counted, at no cost, and it has no
+     * request id to hand anyone; a Jev call is as it was, with the id TypeSafe support can act on.
+     * Laya's client splits a call into one request per state view, and says when it waited for an
+     * earlier answer, when a request reached the 512-token context and when the task is not English.
+     */
+    const callCard = (t) => {
+      const local = !!t?.provider && t.provider !== 'jev'
+      const n = t?.questions?.length ?? 0
+      const requests = local ? t.meta?.requests ?? 1 : 1
+      const onDevice = local && t.meta?.device ? ` on the ${deviceWord(t.meta.device)}` : ''
+      const head = `${PHASE_WORDS[t?.phase] ?? t?.phase}: ${n} question${n === 1 ? '' : 's'} in ${requests === 1 ? 'one request' : `${requests} requests`}${onDevice}`
+      const tokens = Number(t?.usage?.input_tokens ?? 0)
+      const label = local
+        ? `${deciderName(t.provider)} · ${t.model} · ${tokens.toLocaleString('en-US')} tokens on this PC ($0)`
+        : `${t?.model} · ${t?.usage?.input_tokens ?? 0} in / ${t?.usage?.output_tokens ?? 0} out tokens`
+      const notes = []
+      if (local && t.meta?.waitedMs > 0) notes.push(`Waited ${Math.round(t.meta.waitedMs)} ms for an earlier ${deciderName(t.provider)} answer.`)
+      if (local && t.meta?.atContextLimit > 0) notes.push(`${t.meta.atContextLimit} of ${requests} request${requests === 1 ? '' : 's'} reached the 512-token limit, so part of the evidence was cut.`)
+      if (local && t.meta?.lang === 'non-latin') notes.push("Laya's English checkpoint is unreliable outside English.")
+      return { head, label, requestId: local ? 'none (local)' : t?.requestId ?? 'none', notes }
+    }
+    /**
+     * A call that did not answer (the live event `'decider-error'`): who, which call, how long and
+     * why, and no questions. Its `error` is what createJev hands onError, `{ phase, callId, provider,
+     * ms, error }`; the same fields on the event itself are read too, as adapter.js line() reads them.
+     */
+    const failedCall = (e) => {
+      const x = e?.error ?? {}
+      const provider = x.provider ?? e?.provider ?? 'jev'
+      const phase = x.phase ?? e?.phase ?? 'call'
+      return {
+        head: `${deciderName(provider)} · ${PHASE_WORDS[phase] ?? phase}`,
+        text: `failed after ${Math.round(x.ms ?? e?.ms ?? 0)} ms: ${x.error?.message ?? x.message ?? e?.message ?? 'no reason given'}`,
+      }
+    }
+
+    // What became of the Laya side of a Jev call in Jev Auto (5.6), by the shadow row's reason.
+    const SHADOW_SKIPS = {
+      not_running: 'skipped: Laya was not running',
+      starting: 'skipped: Laya was starting',
+      queue_full: 'skipped: Laya was busy',
+      too_old: 'skipped: Laya was busy',
+      yielded: 'skipped: Laya gave its memory to a local model',
+      jev_failed: 'skipped: the Jev call failed',
+    }
+    /** Whether two answers agree, by the comparison's own rule (shadow-stats.js): the same pick, the same side of 0.5, the same level. */
+    const shadowAgrees = (type, j, l) => (type === 'choice' ? j === l : type === 'noul' ? (j >= 0.5) === (l >= 0.5) : type === 'score' ? Math.round(j) === Math.round(l) : false)
+    /** Laya's answer as the column shows it: the pick and its probability, P(true) for a yes/no. */
+    const shadowAnswer = (l) => (l.type === 'noul' ? pct(l.answer)
+      : l.type === 'score' ? `${Number(l.answer).toFixed(2)} of ${(l.p?.length ?? 1) - 1} (${pct(l.confidence)})`
+        : `${l.answer ?? 'no answer'} (${pct(l.confidence)})`)
+    const shadowMarkOf = (row) => (row.status === 'skipped' ? SHADOW_SKIPS[row.reason] ?? `skipped: ${String(row.reason).replace(/_/g, ' ')}` : 'failed')
+    /**
+     * The Laya column of one question of a Jev call (5.6): Laya's answer beside Jev's, and whether
+     * the two agree, from the shadow row of that call (5.3), which holds both sides as recorded.
+     * No row yet is `waiting for Laya` only while one can still land (`waiting`); otherwise the
+     * question has no Laya column at all. A row that was skipped or failed marks every question.
+     */
+    const shadowCell = (name, row, { waiting = false } = {}) => {
+      if (!row) return waiting ? { text: null, mark: 'waiting for Laya' } : null
+      if (row.status === 'skipped' || row.status === 'failed') return { text: null, mark: shadowMarkOf(row) }
+      const l = row.laya?.questions?.[name]
+      // A partial row is one whose remaining chunks waited too long behind acting calls.
+      if (!l) return { text: null, mark: row.status === 'partial' ? SHADOW_SKIPS.too_old : 'failed' }
+      const j = row.jev?.questions?.[name]
+      return { text: shadowAnswer(l), mark: j && j.type === l.type ? (shadowAgrees(l.type, j.answer, l.answer) ? 'agrees' : 'differs') : null, flat: l.informative === false }
+    }
+    /**
+     * The shadow's header on a Jev call's card (5.6): how many of its questions Laya answered and
+     * how many of those agree, and, for a review, the action each side's answers give under its own
+     * thresholds, when the row carries them.
+     */
+    const shadowHeader = (names, row, { waiting = false } = {}) => {
+      if (!row) return waiting ? ['Laya shadow: waiting for Laya. Laya decides nothing in Jev Auto.'] : []
+      if (row.status === 'skipped' || row.status === 'failed') return [`Laya shadow: ${shadowMarkOf(row)}. Laya decides nothing in Jev Auto.`]
+      let answered = 0
+      let agree = 0
+      for (const name of names) {
+        const cell = shadowCell(name, row)
+        if (!cell?.text) continue
+        answered++
+        if (cell.mark === 'agrees') agree++
+      }
+      const out = [`Laya shadow: ${answered} of ${names.length} questions answered, ${agree} agree (${wholePct(agree, answered)}). Laya decides nothing in Jev Auto.`]
+      if (row.phase === 'review' && row.actions?.jev && row.actions?.laya) out.push(`Review action: Jev ${row.actions.jev}, Laya ${row.actions.laya}.`)
+      return out
+    }
+
+    // ---- the Router tab's side-by-side card, from GET /jev-router/laya/compare (8.4)
+    /** A count and its rate, `{ n, agree }`; a source with no rows says so and never shows a rate. */
+    const cmpAgree = (x) => (x?.n ? `${x.agree} of ${x.n} (${wholePct(x.agree, x.n)})` : 'none yet')
+    const cmpWords = (id) => String(id).replace(/_/g, ' ')
+    /** The subtitle's checkpoint, weights and adapter, read from the identity string (4.5). */
+    const identityWords = (identity) => {
+      const [, checkpoint, commit, adapter] = String(identity ?? '').split('|')
+      if (!checkpoint || !commit) return 'Every checkpoint, weights and adapter recorded.'
+      return `Checkpoint ${checkpoint}, weights ${commit.slice(0, 7)}, adapter ${String(adapter ?? '').replace(/^adapter-/, '') || 'unknown'}.`
+    }
+    const COMPARE_SKIPS = [['not_running', 'not running'], ['starting', 'starting'], ['queue_full', 'queue full'], ['too_old', 'waited too long'], ['yielded', 'gave way to a local model'], ['jev_failed', 'Jev call failed']]
+    const skipsLine = (k) => `Skipped: ${COMPARE_SKIPS.map(([key, w]) => `${k?.skipped?.[key] ?? 0} ${w}`).join(', ')}; ${k?.failed ?? 0} failed.`
+    const latencyLine = (l) => {
+      const side = (x) => ['intent', 'route', 'review'].map((p) => `${p} ${typeof x?.[p] === 'number' ? `${x[p]} ms` : 'not measured'}`).join(', ')
+      return `Median answer time: Jev ${side(l?.jev)}; Laya ${side(l?.laya)}.`
+    }
+    const ACTED_WORDS = { task_type: 'Task type', capability: 'Capability', strategy: 'Strategy', second_opinion: 'Second opinion', checks_required: 'Checks required', needs_human: 'Stop for a person', review_action: 'Review action' }
+    /** "Would it have acted the same" (5.5), and the review actions each provider's own accept bar stopped. */
+    const actedLines = (a) => [
+      ...(a?.wouldHaveActedSame ?? []).map((w) => `${ACTED_WORDS[w.what] ?? cmpWords(w.what)}: ${w.n ? `the same in ${w.same} of ${w.n} (${wholePct(w.same, w.n)})` : 'none compared yet'}`),
+      ...['jev', 'laya'].filter((p) => a?.review?.[p]).map((p) => {
+        const r = a.review[p]
+        return `Review actions, ${deciderName(p)}: accept ${r.accept ?? 0}, second review ${r.second_review ?? 0}, human ${r.human ?? 0}, retry ${r.retry ?? 0}; ${r.belowAcceptBar ?? 0} stopped under ${deciderName(p)}'s accept bar`
+      }),
+    ]
     // ---- end pure display helpers
     const AUTHORITY = {
       local: ['ok', 'local router'],
       code: ['ok', 'routing rules'],
       jev: ['', 'Jev'],
+      laya: ['', 'Laya'],
       fallback: ['warn', 'safe fallback'],
       none: ['', 'not asked'],
     }
@@ -1414,7 +1583,8 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'card' },
         h('div', { className: 'label' }, 'How the router decided'),
         h('div', null,
-          h('span', { className: cx('badge', d.jevCalls ? 'agent' : 'tool') }, d.jevCalls ? `${d.jevCalls} Jev call${d.jevCalls === 1 ? '' : 's'}` : 'no Jev call'),
+          // The calls are counted to whoever decided the run (3.3): `2 Laya calls`.
+          h('span', { className: cx('badge', d.jevCalls ? 'agent' : 'tool') }, d.jevCalls ? `${d.jevCalls} ${deciderName(d.decider ?? R.decider)} call${d.jevCalls === 1 ? '' : 's'}` : `no ${deciderName(d.decider ?? R.decider)} call`),
           `${R.strategy ?? 'STANDARD_DIRECT'}${extras.length ? ` (${extras.join(', ')})` : ''}`),
         p.notes?.length ? h('div', { className: 'why' }, p.notes.join('; ')) : null,
         ...gateNotes(R).map((t, i) => h('div', { className: 'why', key: `gate${i}` }, t)),
@@ -1476,11 +1646,70 @@ window.__ModuleLoader__.load({
       : (d?.teacher === 'code' ? CODE_MATURITY_WORDS : MATURITY_WORDS)[d?.maturity] ?? '')
 
     /**
+     * The comparison of Jev and Laya over the last 7 days, for the current Laya identity (8.4):
+     * computed on the server in a worker and cached there for a minute, so it is read once a minute
+     * while the Router tab is open. A server with Laya not set up answers with an error, and the
+     * card then shows nothing.
+     */
+    function useLayaCompare(visible, every = 60_000) {
+      const [state, setState] = useState({ data: null, error: '' })
+      useEffect(() => {
+        if (!visible) return
+        let stop = false
+        let timer
+        const tick = async () => {
+          try { const d = await api('/jev-router/laya/compare?days=7&identity=current'); if (!stop) setState({ data: d, error: '' }) } catch (e) { if (!stop) setState({ data: null, error: e.message }) }
+          if (!stop) timer = setTimeout(tick, every)
+        }
+        tick()
+        return () => { stop = true; clearTimeout(timer) }
+      }, [visible, every])
+      return state
+    }
+
+    /**
+     * Jev and Laya, side by side (5.6): what Laya answered in the background in Jev Auto and what
+     * came of the runs Laya decided in Laya Auto, from the comparison of 8.4. Every figure is shown
+     * with its count, a source with no rows says so, and agreement is never called accuracy: only
+     * what a person said is, and each column says what it can judge.
+     */
+    function LayaCompare({ data }) {
+      if (!data) return null
+      const table = (heads, rows) => h('table', { className: 'cmp' },
+        h('thead', null, h('tr', null, ...heads.map((t) => h('th', { key: t, scope: 'col' }, t)))),
+        h('tbody', null, ...rows))
+      const cell = (x) => h('td', null, x)
+      const person = (p) => (p?.n ? `${p.jevRight} / ${p.layaRight} of ${p.n}` : 'none yet')
+      const contradicted = (c) => (c?.n ? `${c.layaRight} of ${c.n}` : 'none yet')
+      const failedRuns = (r) => (r?.runs ? `${r.failed} of ${r.runs}` : 'none yet')
+      const domains = (data.domains ?? []).map((d) => h('tr', { key: d.domain },
+        h('th', { scope: 'row' }, cmpWords(d.domain)), cell(String(d.layaAnswered ?? 0)), cell(cmpAgree(d.agree?.informative)),
+        cell(person(d.personSaid)), cell(contradicted(d.whereJevWasContradicted)), cell(failedRuns(d.layaAutoRuns))))
+      const fields = (data.domains ?? []).filter((d) => d.fieldAgreement && Object.keys(d.fieldAgreement).length)
+      const questions = (data.questions ?? []).map((q) => h('tr', { key: q.name },
+        h('th', { scope: 'row' }, h('code', null, q.name), q.corrected ? h('span', { className: 'pill warn' }, `uncalibrated (${q.options} options)`) : null),
+        cell(String(q.compared ?? 0)), cell(cmpAgree(q.agree?.all)), cell(cmpAgree(q.agree?.informative)),
+        cell(typeof q.meanDifference === 'number' ? q.meanDifference.toFixed(2) : '-'), cell(typeof q.layaMedianMs === 'number' ? `${q.layaMedianMs} ms` : '-')))
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-cmp-h' },
+        h('div', { className: 'label', id: 'jevi-cmp-h' }, 'Jev and Laya, side by side'),
+        h('div', { className: 'why', style: { margin: '0 0 8px' } }, `From the calls Laya answered in the background in Jev Auto, and the runs Laya decided in Laya Auto. ${identityWords(data.identity)} Agreement is not accuracy, and outcomes are counted only where they can judge: see each column.`),
+        table(['Domain', 'Laya answered', 'Agrees with Jev (informative only)', 'A person said (Jev right / Laya right)', "Where Jev's pick was contradicted (Laya had it right)", 'Laya Auto runs that failed'], domains),
+        h('div', { className: 'why', style: { marginTop: 4 } }, "A person said: the rows a person labelled, the least biased. Where Jev's pick was contradicted: rows that exist only because Jev's pick went wrong, so they say how often Laya would have had it right there, never Laya's accuracy. Laya Auto runs that failed: a failure rate of the runs Laya decided, never an accuracy."),
+        ...fields.map((d) => h('div', { className: 'why', key: `f${d.domain}` }, `${cmpWords(d.domain)}, profile fields that agree with Jev: ${Object.entries(d.fieldAgreement).map(([k, v]) => `${k} ${pct(v)}`).join(', ')}`)),
+        table(['Question', 'Compared', 'Agree', 'Agree, informative only', 'Mean difference', 'Laya median ms'], questions),
+        h('div', { className: 'label', style: { margin: '10px 0 4px' } }, 'Would it have acted the same'),
+        ...actedLines(data.actions).map((t, i) => h('div', { className: 'why', key: `a${i}` }, t)),
+        h('div', { className: 'why', style: { marginTop: 8 } }, skipsLine(data.skips)),
+        h('div', { className: 'why' }, latencyLine(data.latency)))
+    }
+
+    /**
      * The Router view: how far each routing domain has matured, what is blocking the next step,
      * and what the capability registry currently believes about each resource and on what
-     * evidence. This is the tab that answers "why did it pick that, and who decided".
+     * evidence. This is the tab that answers "why did it pick that, and who decided". `laya` is
+     * the comparison of Jev and Laya (useLayaCompare), shown under the domains when there is one.
      */
-    function RouterView({ data, error, busy, onRefresh }) {
+    function RouterView({ data, error, busy, onRefresh, laya = null }) {
       if (error) return h('div', { className: 'err', role: 'alert' }, error)
       if (!data) return h('div', { className: 'empty' }, busy ? 'Reading the router…' : 'No routing state yet.')
       if (!data.enabled) return h('div', { className: 'empty' }, 'Adaptive routing is switched off in the config; Jev routes every task.')
@@ -1537,22 +1766,28 @@ window.__ModuleLoader__.load({
           h('div', { className: 'label', style: { margin: 0 } }, data.learning ? 'The router is learning from every routed task' : 'Learning is switched off: Jev and the rules in code decide, and nothing is recorded'),
           h('button', { onClick: onRefresh, disabled: busy }, busy ? 'Reading…' : 'Refresh')),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'Routing domains'), ...domains),
+        h(LayaCompare, { data: laya?.data ?? null }),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'Resources, as the provider adapters report them'), h('ul', { className: 'plain' }, ...resources)),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'What each resource is believed to be good at'),
           h('div', { className: 'why', style: { margin: '4px 0 8px' } }, 'Priors are the owner\'s starting observations. Recorded runs, reviews and feedback move them; an unknown dimension stays unknown.'),
           ...profiles))
     }
 
-    function Question({ q }) {
+    /** One answer of a call. `shadow` is Laya's answer to the same question in Jev Auto (shadowCell), or null. */
+    function Question({ q, shadow = null }) {
       const probs = q.probabilities ?? {}
       const opts = q.type === 'noul'
         ? [['yes', 'Probability the answer is yes', q.answer]]
         : Object.keys(probs).map((k) => [k, q.options?.[k] ?? '', probs[k]]).sort((a, b) => b[2] - a[2])
       const answer = q.type === 'choice' ? q.answer : q.type === 'score' ? `${Number(q.answer).toFixed(2)} of ${Object.keys(probs).length - 1}` : pct(q.answer)
+      const markTone = (m) => (m === 'agrees' ? 'ok' : m === 'differs' || m === 'failed' ? 'bad' : 'warn')
       return h('details', { className: cx('q', !q.used && 'unused') },
         h('summary', null,
-          h('div', null, h('span', { className: 'pill' }, q.type), h('code', { style: { marginLeft: 6 } }, q.name), q.used ? h('span', { className: 'pill ok' }, 'used') : null),
-          h('div', { className: 'ans' }, '→ ', answer, q.type === 'choice' && q.options?.[q.answer] ? h('span', { className: 'muted', style: { fontWeight: 400 } }, ` ${q.options[q.answer]}`) : null)),
+          h('div', null, h('span', { className: 'pill' }, q.type), h('code', { style: { marginLeft: 6 } }, q.name), q.used ? h('span', { className: 'pill ok' }, 'used') : null,
+            ...answerPills(q).map(([tone, text]) => h('span', { className: cx('pill', tone), key: text }, text))),
+          h('div', { className: 'ans' }, '→ ', answer, q.type === 'choice' && q.options?.[q.answer] ? h('span', { className: 'muted', style: { fontWeight: 400 } }, ` ${q.options[q.answer]}`) : null),
+          shadow ? h('div', { className: 'why shadow' }, 'Laya: ', shadow.text ?? '', shadow.flat ? ' (too flat to use)' : '',
+            shadow.mark ? h('span', { className: cx('pill', markTone(shadow.mark)) }, shadow.mark) : null) : null),
         h('div', { className: 'muted', style: { margin: '6px 0' } }, q.question),
         ...opts.map(([k, desc, p]) => h('div', { className: 'opt', key: k },
           h('div', { className: 'row' }, h('span', { title: desc }, h('code', null, k), desc ? ` ${desc}` : ''), h('span', null, pct(p))),
@@ -1560,25 +1795,91 @@ window.__ModuleLoader__.load({
         typeof q.confidence === 'number' ? h('div', { className: 'why', style: { marginTop: 6 } }, `confidence ${q.confidence.toFixed(3)}`) : null)
     }
 
-    function Questions({ traces }) {
+    /**
+     * Every decider call of a run, in the order it settled: the questions and answers of each call
+     * that answered, and a card saying why for each that did not (3.3). A Jev call in Jev Auto also
+     * shows what Laya answered to the same questions in the background (`shadow`: the rows by call
+     * id, and whether a row still missing can yet land), which decides nothing (5.6).
+     */
+    function Questions({ calls, shadow = null }) {
       const [onlyUsed, setOnlyUsed] = useState(false)
-      if (!traces.length) return null
-      return h('div', null, ...traces.map((t, i) => {
+      if (!calls.length) return null
+      const first = calls.findIndex((c) => c.trace)
+      return h('div', null, ...calls.map((c, i) => {
+        if (c.failed) {
+          const f = failedCall(c.failed)
+          return h('div', { className: 'card', key: i }, h('div', { className: 'label' }, f.head), h('div', { className: 'err' }, f.text))
+        }
+        const t = c.trace
+        const card = callCard(t)
         const qs = t.questions.filter((q) => !onlyUsed || q.used)
+        const compared = !!shadow && (t.provider ?? 'jev') === 'jev'
+        const row = compared ? shadow.rows.get(t.callId) ?? null : null
+        const waiting = compared && shadow.waiting && !!t.callId
         return h('div', { className: 'card', key: i },
           h('div', { className: 'head' },
-            h('div', { className: 'label', style: { margin: 0 } }, `${t.phase === 'route' ? 'Routing' : 'Review'}: ${t.questions.length} questions in one request · ${ms(t.ms)}`),
-            i === 0 ? h('label', { className: 'toggle' }, h('input', { type: 'checkbox', checked: onlyUsed, onChange: (e) => setOnlyUsed(e.target.checked) }), 'Only used') : null),
-          h('div', { className: 'why', style: { margin: '4px 0 8px' } }, `${t.model} · ${t.usage?.input_tokens ?? 0} in / ${t.usage?.output_tokens ?? 0} out tokens. Greyed-out answers were not needed for this run.`),
-          ...qs.map((q) => h(Question, { key: q.name, q })))
+            h('div', { className: 'label', style: { margin: 0 } }, `${card.head} · ${ms(t.ms)}`),
+            i === first ? h('label', { className: 'toggle' }, h('input', { type: 'checkbox', checked: onlyUsed, onChange: (e) => setOnlyUsed(e.target.checked) }), 'Only used') : null),
+          h('div', { className: 'why', style: { margin: '4px 0 0' } }, `${card.label}. Greyed-out answers were not needed for this run.`),
+          h('div', { className: 'why' }, `Request id: ${card.requestId}`),
+          ...card.notes.map((n, k) => h('div', { className: 'warnline', key: `n${k}` }, n)),
+          ...(compared ? shadowHeader(t.questions.map((q) => q.name), row, { waiting }) : []).map((line, k) => h('div', { className: 'why', key: `s${k}` }, line)),
+          h('div', { style: { marginTop: 8 } }),
+          ...qs.map((q) => h(Question, { key: q.name, q, shadow: compared ? shadowCell(q.name, row, { waiting }) : null })))
       }))
+    }
+
+    // A shadow job waits at most 10 minutes (laya.shadow.maxAgeMs) before its row is written as
+    // waited too long, so a row can land until then after the run has ended, and not after.
+    const SHADOW_WAIT_MS = 11 * 60_000
+    /**
+     * The Laya shadow's rows for one Jev-decided run (5.6), by call id, from GET
+     * /jev-router/laya/shadow?runId=<id>: the run's inspector id is its run id (2.4), and the rows
+     * come from the shadow's memory. Read when the run is shown, and every 5 s while one of its Jev
+     * calls has no row and one can still land: while the run goes on, and after it only when the
+     * shadow took it, so a run no row can ever come for (Laya not installed, the comparisons off)
+     * is read once. A server with no shadow route answers nothing, and no Laya column is shown.
+     * `waiting` says a missing row is still to come: the shadow took this run (the routed event
+     * says so, or a row of it has landed) and a row can still land.
+     */
+    function useShadow(run, s, visible, every = 5000) {
+      const [got, setGot] = useState({ runId: null, rows: [] })
+      const runId = run?.id ?? null
+      const ours = s?.decider === 'jev'
+      const jevCalls = (s?.traces ?? []).filter((t) => (t.provider ?? 'jev') === 'jev' && t.callId).length
+      const read = got.runId === runId
+      const rows = read ? got.rows : []
+      // From the run's own end, which a row landing after it does not move.
+      const recent = !!s && (s.running || Date.now() - s.endedAt < SHADOW_WAIT_MS)
+      const missing = (s?.traces ?? []).some((t) => (t.provider ?? 'jev') === 'jev' && t.callId && !rows.some((r) => r.callId === t.callId))
+      const took = rows.length > 0 || s?.routed?.shadow === 'answering'
+      const wanted = ours && recent && missing && (took || s.running)
+      useEffect(() => {
+        if (!visible || !runId || !ours || !jevCalls) return
+        // Read once; again only while a row can still land, so the last row landing is not read twice.
+        if (read && !wanted) return
+        let stop = false
+        let timer
+        const tick = async () => {
+          let d
+          try { d = await api(`/jev-router/laya/shadow?runId=${encodeURIComponent(runId)}`) } catch { return }
+          if (stop) return
+          setGot({ runId, rows: Array.isArray(d?.rows) ? d.rows : [] })
+          if (wanted) timer = setTimeout(tick, every)
+        }
+        tick()
+        return () => { stop = true; clearTimeout(timer) }
+      }, [runId, visible, ours, wanted, jevCalls, every])
+      if (!ours) return null
+      return { rows: new Map(rows.map((r) => [r.callId, r])), waiting: recent && took }
     }
 
     function Decisions({ runs }) {
       const [pick, setPick] = useState(null)
-      if (!runs.length) return h('div', { className: 'empty' }, 'No routed tasks in this session yet. Pick "Jev Auto" in the model menu, or use /auto, then send a task.')
-      const run = runs.find((r) => r.id === pick) ?? runs.at(-1)
-      const s = summarize(run)
+      const run = runs.length ? runs.find((r) => r.id === pick) ?? runs.at(-1) : null
+      const s = run ? summarize(run) : null
+      const shadow = useShadow(run, s, !!run)
+      if (!run) return h('div', { className: 'empty' }, 'No routed tasks in this session yet. Pick "Jev Auto" in the model menu, or use /auto, then send a task.')
       return h('div', null,
         runs.length > 1 ? h('select', { value: run.id, onChange: (e) => setPick(e.target.value), 'aria-label': 'Run', style: { width: '100%' } },
           ...runs.slice().reverse().map((r) => h('option', { key: r.id, value: r.id }, `${new Date(r.startedAt).toLocaleTimeString()} · ${r.task.slice(0, 60)}`))) : null,
@@ -1586,7 +1887,7 @@ window.__ModuleLoader__.load({
         h(Stats, { s }),
         h(WhatHappened, { s, decisionCard: true }),
         h(RoutingDecision, { s }),
-        h(Questions, { traces: s.traces }))
+        h(Questions, { calls: s.calls, shadow }))
     }
 
     function useSubagentCatalog(sessionId) {
@@ -1698,7 +1999,8 @@ window.__ModuleLoader__.load({
         : elapsed(t.startedAt, now)
       const meta = [
         queued ? (pos > 1 ? `${ordinal(pos)} in line` : 'next up') : null,
-        t.agent ?? (queued ? 'Jev picks' : null),
+        // A queued task waits for whoever decides it: the task record keeps its decider (3.1).
+        t.agent ?? (queued ? `${deciderName(t.decider)} picks` : null),
         t.model, t.effort,
         phase, folderOf(t.workspace), timing || null,
       ].filter(Boolean).join(' · ')
@@ -1790,7 +2092,7 @@ window.__ModuleLoader__.load({
         const cur = s.attempts.at(-1)
         const status = r.stopped ? 'stopped' : s.running ? 'running' : s.error || s.final?.status === 'limit_reached' ? 'failed' : 'done'
         return {
-          key: `r${r.id}`, at: r.startedAt ?? 0, status, title: r.task, kind: 'Jev',
+          key: `r${r.id}`, at: r.startedAt ?? 0, status, title: r.task, kind: deciderName(s.decider),
           meta: [cur ? `${cur.agent} (${cur.role})` : s.routed?.routing?.primaryAgent ?? 'routing…', s.final ? STATUS[s.final.status]?.[1] ?? s.final.status : null, ms(s.total)].filter(Boolean).join(' · '),
           body: h('div', { className: 'answer-text', 'aria-live': status === 'running' ? 'polite' : undefined }, r.events.map((e) => e.text ?? e.type).join('\n')),
           stop: status === 'running' && { what: r.task, run: () => post('/jev-router/runs/stop', { runId: r.id }) },
@@ -2562,6 +2864,8 @@ window.__ModuleLoader__.load({
           tile('Tokens avoided', count(p.llmOutputTokensAvoided)),
           tile('Decisions made', count(p.decisions))),
         h('div', { className: 'why' }, `Jev cost ${usd(p.jevCostUsd)} vs LLM ${usd(p.llmCostUsd)} · Jev used ${count(p.jevTokens.input)} in / ${count(p.jevTokens.output)} out tokens`),
+        // Laya's own decisions, counted apart and never priced or saved by Jev (docs/laya-auto.md 3.3).
+        p.layaDecisions ? h('div', { className: 'why' }, `Laya: ${count(p.layaDecisions)} decisions on this PC, $0 (Laya counted ${count((p.layaTokens?.input ?? 0) + (p.layaTokens?.output ?? 0))} tokens; not billed).`) : null,
         h('div', { className: 'why' }, `${count(p.directAnswers)} direct answers · ${count(p.toolRuns)} tool runs · ${count(p.limitsAvoided)} limit saves (failed runs avoided)`),
         h('details', { className: 'answer' },
           h('summary', null, 'How this is estimated'),
@@ -2681,6 +2985,7 @@ window.__ModuleLoader__.load({
       useEffect(() => { if (visible) loadNames() }, [visible])
       const { usage, error: usageErr, busy: usageBusy, load: loadUsage } = useUsage(visible)
       const routing = useRouting(visible && view === 'router')
+      const layaCompare = useLayaCompare(visible && view === 'router')
       const [agents, setAgents] = useState(null)
       const [chipBusy, setChipBusy] = useState(false)
       const [chipErr, setChipErr] = useState('')
@@ -2698,7 +3003,7 @@ window.__ModuleLoader__.load({
         chipErr ? h('div', { className: 'err', role: 'alert' }, chipErr) : null,
         h('div', { className: 'tabs', role: 'tablist' }, tab('decisions', 'Decisions', runs.length), tab('router', 'Router'), tab('subagents', 'Subagents', liveKids), tab('jobs', 'Background', live), tab('usage', 'Usage', limited)),
         view === 'decisions' ? h(Decisions, { runs })
-          : view === 'router' ? h(RouterView, { ...routing, onRefresh: routing.load })
+          : view === 'router' ? h(RouterView, { ...routing, onRefresh: routing.load, laya: layaCompare })
             : view === 'subagents' ? h(Subagents, { sessionId, entries })
               : view === 'usage' ? h(UsageView, { usage, error: usageErr, busy: usageBusy, onRefresh: () => loadUsage(true), onSaved: () => loadUsage(false) }) : h(Tasks, { sessionId, runs, jobs, entries, tasks }))
     }
@@ -3022,7 +3327,12 @@ window.__ModuleLoader__.load({
     /** A durable run's detail, read from the stored record's own fields (never reshaped). */
     function HistoryRunDetail({ record }) {
       const R = record.routing ?? {}
-      const line = R.mode === 'jev' ? `Jev picked ${movesOf(R)[0]?.from ?? R.primaryAgent ?? '?'}` : R.mode === 'manual' ? `You forced ${R.primaryAgent ?? '?'}` : `Mode ${R.mode ?? '?'}`
+      // A run Laya decided names Laya (3.2), offline too; an old record without `decider` was Jev's.
+      const decider = deciderOf(R)
+      const conf = Number.isFinite(R.agentConfidence) ? ` (confidence ${pct(R.agentConfidence)})` : ''
+      const line = R.mode === 'jev' || (R.mode === 'local' && decider !== 'jev')
+        ? (decider === 'jev' ? `Jev picked ${movesOf(R)[0]?.from ?? R.primaryAgent ?? '?'}${conf}` : `${deciderName(decider)} picked ${movesOf(R)[0]?.from ?? R.primaryAgent ?? '?'}${conf}`)
+        : R.mode === 'manual' ? `You forced ${R.primaryAgent ?? '?'}` : `Mode ${R.mode ?? '?'}`
       return h('div', { className: 'card' },
         h('div', { className: 'label' }, 'Stored run record'),
         h('div', null, line, Number.isFinite(R.risk) ? h('span', { className: 'why' }, ` · risk ${pct(R.risk)}`) : null),
@@ -3155,6 +3465,462 @@ window.__ModuleLoader__.load({
             e.codexSpeed === 'fast' ? '1.5x (uses more of your plan)' : 'Normal'))))
     }
 
+    // ---------- settings: Jev setup: the Laya decision model ----------
+    // ---- pure laya helpers: no React, no state. test/laya-card.test.js evaluates this block on its
+    // own (the runner cannot import a classic script), so nothing in it may reach outside it.
+    //
+    // Everything the Laya card says (docs/laya-auto.md 8.2 and 8.3) comes from one GET
+    // /jev-router/laya answer: the sidecar's status (laya-sidecar.js status(), the shape of 8.4)
+    // with the shadow's counters, and the few figures that status has no place for yet: what an
+    // install would take before anything is installed (`offer`), where Laya lives (`paths`), what
+    // Laya would take at its next start (`need`) and what a task costs it here (`running.routeMs`,
+    // `running.reviewMs`). Each is optional, and without it the card says less rather than guess.
+
+    const LAYA_INTRO = 'Laya is an open decision model (Apache-2.0) that runs on this PC. In Laya Auto it routes and reviews instead of Jev, and no routing or review question leaves this PC. In Jev Auto it can answer the same questions in the background, so you can compare the two.'
+    /** The card's buttons by id, in the words it shows. */
+    const LAYA_BUTTONS = {
+      install: 'Install Laya…', cancel: 'Cancel', retry: 'Try again', log: 'Show log', cpu: 'Install for the CPU instead',
+      start: 'Start', stop: 'Stop', restart: 'Restart', gpu: 'Restart on the GPU', test: 'Test Laya', remove: 'Remove…',
+      weightsCheck: 'Check for a newer model', weightsApply: 'Use the newer model', repair: 'Repair', update: 'Update Laya',
+    }
+    const layaDevice = (device) => (device === 'cuda' || device === 'gpu' ? 'GPU' : 'CPU')
+    /** Seconds as the model menu says them (adapter.js): one decimal under ten, whole above. */
+    const layaSeconds = (ms) => { const s = ms / 1000; return String(s >= 10 ? Math.round(s) : Math.round(s * 10) / 10) }
+    const layaGB = (x) => (typeof x === 'number' && Number.isFinite(x) ? String(Math.round(x * 10) / 10) : '?')
+    const layaBytes = (b) => (typeof b !== 'number' || !Number.isFinite(b) ? '?' : b >= 1024 ** 3 ? `${(b / 1024 ** 3).toFixed(1)} GB` : `${Math.round(b / 1024 ** 2)} MB`)
+    /** The CUDA version a PyTorch build was made for, from its local version: 2.14.0+cu128 is 12.8. */
+    const torchCuda = (torch) => { const m = /\+cu(\d+)(\d)$/.exec(String(torch ?? '')); return m ? `${m[1]}.${m[2]}` : null }
+    const commit7 = (c) => (c ? String(c).slice(0, 7) : 'unknown')
+    const sentence = (t) => String(t ?? '').trim().replace(/\.$/, '')
+    /**
+     * What a task costs Laya on this PC, as the model menu says it (3.1), or that it is not measured
+     * yet while the device has no per-phase figure (`msPerToken`). Measured, with no figure for a
+     * task, it says nothing rather than call a measured Laya unmeasured.
+     */
+    const measuredLine = (r) => (typeof r?.routeMs === 'number' && typeof r?.reviewMs === 'number'
+      ? `Measured here: about ${layaSeconds(r.routeMs)} s to route a task and ${layaSeconds(r.reviewMs)} s to review each attempt.`
+      : Object.values(r?.msPerToken ?? {}).some((x) => typeof x === 'number') ? '' : 'Not measured on this PC yet.')
+
+    /**
+     * The Jev router card's line (8.1): where Jev calls go, and when TYPESAFE_BASE_URL sends them
+     * elsewhere, that the Jev column of every comparison is that server's answers. Null while the
+     * server does not say, since the page cannot know.
+     */
+    const jevHostLine = (jev) => (!jev?.host ? null : jev.hostFromEnv
+      ? `TYPESAFE_BASE_URL is set, so Jev calls go to ${jev.host}, and the Jev column of the comparisons is that server's answers.`
+      : `Jev calls go to ${jev.host}.`)
+
+    /**
+     * The status lines and buttons for the state Laya is in (8.2), each line `{ text, tone }`
+     * (tone '' for the state itself, 'why', 'warn' or 'err'), and the last log lines of a failure.
+     * A settings error outranks every state, since Laya Auto is off until it is fixed; a Laya left
+     * running by an earlier session and stopped at start is said above the state's own line.
+     */
+    function layaState(st, now = Date.now()) {
+      const out = { lines: [], buttons: [], log: [] }
+      if (!st) return out
+      const line = (text, tone = '') => out.lines.push({ text, tone })
+      if (st.configError) {
+        line(`Laya settings error: ${sentence(st.configError)}. Fix jev-router laya in cordis.patch.yml; Laya Auto is off until then.`, 'err')
+        return out
+      }
+      // The sweep could not always read the orphan's working set (ramGB null): then no figure is said.
+      const orphan = st.orphanStopped
+      if (orphan) line(`Stopped a Laya left running by an earlier session (pid ${orphan.pid}${typeof orphan.ramGB === 'number' ? `, ${orphan.ramGB} GB RAM` : ''}).`, 'warn')
+      if (st.recovered) line(st.recovered, 'warn')
+      const i = st.installed
+      const r = st.running ?? {}
+      const job = st.install ?? {}
+      switch (st.state) {
+        case 'not_installed': {
+          const o = st.offer
+          const disk = o?.disk?.[o.gpu ? 'gpu' : 'cpu']
+          line(disk ? `Not installed. Needs about ${disk.installingGB} GB of free disk while installing and ${disk.afterGB} GB after, and the internet once.` : 'Not installed. Installing it needs free disk and the internet once.')
+          if (o) line(o.gpu ? `PyTorch with CUDA will be installed for your ${o.gpu.name}.` : 'No usable NVIDIA GPU found: Laya will run on the CPU. On a 4-core test machine that took about 20 s to route a task and about 10 s to review each attempt; this PC is not measured yet.', 'why')
+          out.buttons = ['install']
+          break
+        }
+        case 'installing': {
+          const verb = { update: 'Updating', repair: 'Repairing' }[job.kind] ?? 'Installing'
+          const progress = job.total > 0 ? ` (${layaBytes(job.received)} of about ${layaBytes(job.total)})`
+            : typeof job.startedAt === 'number' ? ` (${Math.max(0, Math.round((now - job.startedAt) / 60_000))} min)` : ''
+          line(job.step ? `${verb}, step ${job.step} of ${job.of ?? 8}: ${job.name}${progress}.` : `${verb}: getting ready.`)
+          out.buttons = ['cancel']
+          break
+        }
+        case 'install_failed': {
+          const step = job.failedStep ?? job.step
+          if (job.kind === 'update' && i) line(`Update failed at step ${step} (${job.name}); still on Laya ${i.laya}.`, 'err')
+          else line(`Install failed at step ${step} (${job.name}): ${sentence(job.error)}. The previous install, if any, is untouched.`, 'err')
+          out.buttons = ['retry', 'log', ...(job.offerCpu ? ['cpu'] : [])]
+          break
+        }
+        case 'stopped': {
+          if (st.stoppedBecause === 'idle') line(`Stopped after ${st.settings?.idleMinutes ?? '?'} min without a Laya Auto request. It starts again when Laya Auto needs it; the Jev Auto comparisons never start it.`)
+          else if (st.stoppedBecause === 'budget') line(`Stopped by the resource budget: ${sentence(st.why)}.`)
+          else if (st.stoppedBecause === 'yielded') line(`Unloaded so ${st.why ?? 'a local model'} could have the GPU and RAM; it starts again when Laya Auto needs it.`)
+          if (st.stoppedBecause) { out.buttons = ['start']; break }
+          // A start the RAM budget or a GPU with no room turned down leaves it stopped with the
+          // reason and no stoppedBecause (7.7): the reason names the numbers, above the usual line.
+          if (st.why) line(`Not started: ${sentence(st.why)}.`, 'warn')
+          const cuda = torchCuda(i?.torch)
+          line(`Installed, not running. Laya ${i?.laya}, English checkpoint ${commit7(i?.weights?.commit)}, PyTorch ${i?.torch} (${i?.cuda ? `for the GPU${cuda ? `, CUDA ${cuda}` : ''}` : 'for the CPU'}).`)
+          out.buttons = ['start', 'test', 'remove']
+          break
+        }
+        case 'starting': {
+          out.buttons = ['stop']
+          // Before the process is launched (an install's swap waited out, the orphan sweep, the
+          // device and RAM checks, the weights) nothing is loading yet, on either device.
+          if (!st.running) { line('Starting: getting ready…'); break }
+          const secs = typeof r.startedAt === 'number' ? Math.max(0, Math.round((now - r.startedAt) / 1000)) : 0
+          const last = typeof r.lastLoadMs === 'number' ? `; the last start took ${Math.round(r.lastLoadMs / 1000)} s` : ''
+          line(`Starting: loading the model on the ${layaDevice(r.device)} (${secs} s${last})${r.measuring ? ', measuring Laya on this PC' : ''}…`)
+          break
+        }
+        case 'ready': {
+          const said = measuredLine(r)
+          const measured = said ? ` ${said}` : ''
+          if (r.device === 'cuda' && r.spilling) {
+            line("Running on the GPU, but its memory is spilling into system memory, so Laya and the local models are slow. Stop the local model, pick CPU for Laya, or set Prefer No Sysmem Fallback for Laya's python.exe in the NVIDIA Control Panel.", 'warn')
+            out.buttons = ['stop', 'restart', 'test']
+          } else if (r.device === 'cuda') {
+            line(`Running on the GPU (${r.gpu ?? i?.gpu ?? 'GPU'}): ${layaGB(r.vramGB)} GB VRAM, ${layaGB(r.ramGB)} GB RAM.${measured}`)
+            out.buttons = ['stop', 'restart', 'test']
+          } else if (r.deviceWhy) {
+            // On the CPU for a reason, not by choice: the GPU is offered again, where PyTorch has CUDA.
+            line(`Running on the CPU, not the GPU: ${sentence(r.deviceWhy)}.${measured}`)
+            out.buttons = i?.cuda ? ['gpu', 'stop', 'test'] : ['stop', 'restart', 'test']
+          } else {
+            line(`Running on the CPU (${r.threads ?? '?'} threads): ${layaGB(r.ramGB)} GB RAM.${measured}`)
+            out.buttons = ['stop', 'restart', 'test']
+          }
+          break
+        }
+        case 'restarting': {
+          const x = st.restart ?? {}
+          line(`Laya stopped unexpectedly (exit code ${x.code ?? x.signal ?? 'unknown'}) and is restarting (attempt ${x.attempt ?? '?'} of ${x.of ?? 3}).`, 'warn')
+          // Stop ends the backoff (7.4), so a crash loop can be ended from here.
+          out.buttons = ['stop']
+          break
+        }
+        case 'stopping': line('Stopping…'); break
+        case 'failed': {
+          line(`Stopped after an error: ${sentence(st.why)}. Laya Auto refuses messages until you press Start.`, 'err')
+          out.log = st.logTail ?? []
+          out.buttons = ['start', 'log']
+          break
+        }
+        case 'disabled': line('Switched off in the configuration (jev-router laya.enabled is false).'); break
+        default: line(`Laya is ${String(st.state).replace(/_/g, ' ')}.`)
+      }
+      // A failed update leaves the old Laya running (7.10); a failed repair, removal or model check
+      // leaves Laya as it was. Either says so while Laya goes on.
+      if (job.error && st.state !== 'install_failed') {
+        if (job.kind === 'update' && i) line(`Update failed at step ${job.failedStep ?? job.step} (${job.name}); still on Laya ${i.laya}.`, 'err')
+        else if (job.kind !== 'install') line(`${{ repair: 'Repair', remove: 'Removing Laya', weights: 'The model check' }[job.kind] ?? 'Laya'} failed: ${sentence(job.error)}.`, 'err')
+      }
+      // What the installer had to say: each CUDA tag it tried, and why it installed for the CPU (7.2).
+      if (['install', 'update'].includes(job.kind)) for (const n of job.notes ?? []) line(n, 'why')
+      // Why the supervisor last restarted it on its own (7.5), until the person starts it again: an
+      // exit, a request past the hard limit (whose line says it all), or the health, 500 and 401 checks.
+      const re = st.lastRestart
+      if (re?.why && ['ready', 'starting'].includes(st.state)) {
+        line(re.kind === 'exit' ? `Laya stopped unexpectedly (${re.why}) and was restarted.`
+          : re.kind === 'hung' ? re.why : `Laya was restarted: ${sentence(String(re.why).replace(/; restarting.*$/, ''))}.`, 'why')
+      }
+      return out
+    }
+
+    /** The shadow's skips by reason, in the order the card and the Router tab list them (5.6, 8.2). */
+    const LAYA_SKIPS = [['not_running', 'not running'], ['starting', 'starting'], ['queue_full', 'queue full'], ['too_old', 'waited too long'], ['yielded', 'gave way to a local model'], ['jev_failed', 'Jev call failed']]
+    /**
+     * The counters (8.2), from the comparison of the last 7 days (8.4): how many of Jev's calls
+     * Laya answered in the background, every skip by its reason, and how often the two agreed over
+     * every question both answered. Null until the comparison has been read.
+     */
+    const layaCounters = (compare) => {
+      const k = compare?.skips
+      if (!k) return null
+      const skipped = LAYA_SKIPS.reduce((n, [key]) => n + (k.skipped?.[key] ?? 0), 0)
+      const answered = (k.answered ?? 0) + (k.partial ?? 0)
+      const all = (compare.questions ?? []).reduce((a, q) => ({ n: a.n + (q.agree?.all?.n ?? 0), agree: a.agree + (q.agree?.all?.agree ?? 0) }), { n: 0, agree: 0 })
+      return `Last 7 days: Laya answered ${answered} of ${answered + (k.failed ?? 0) + skipped} Jev calls in the background (${skipped} skipped: ${LAYA_SKIPS.map(([key, w]) => `${k.skipped?.[key] ?? 0} ${w}`).join(', ')}). ${all.n ? `Agreement ${Math.round((all.agree / all.n) * 100)}%.` : 'No answers compared yet.'}`
+    }
+
+    // laya-selfcheck.js selfTestLine, which the page cannot import: the test holds the two to the
+    // same words for every result.
+    const listed = (names) => (names.length < 2 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`)
+    /** The card's line for the last Test Laya (4.6, 8.2). */
+    const selfTestLine = (r) => {
+      const commit = String(r?.identity ?? '').split('|')[2]?.slice(0, 7) || 'unknown'
+      const out = [`Test Laya (model ${commit}):`]
+      out.push(r?.protocol?.ok && !r?.error ? 'protocol ok.' : `protocol failed (${r?.error ?? r?.protocol?.problems?.[0] ?? 'no answer'}).`)
+      if (r?.timings) {
+        const where = r.device === 'cuda' ? 'the GPU' : r.device === 'cpu' ? 'the CPU' : 'this PC'
+        out.push(`On ${where}: intent ${r.timings.intent} ms, routing ${r.timings.route} ms, review ${r.timings.review} ms.`)
+      }
+      // A run that stopped at an error asked only some of the pairs, so no count is made of them.
+      const pairs = r?.error ? [] : r?.pairs ?? []
+      if (pairs.length) {
+        const misses = pairs.filter((p) => !p.separates)
+        let text = `${pairs.length - misses.length} of ${pairs.length} yes/no questions separate`
+        if (misses.length) {
+          const n = misses.filter((p) => p.noOnYes).length
+          const m = misses.filter((p) => p.yesOnNo).length
+          const why = [n ? `${n} answered no to the clear yes, the pattern of Laya issue #156` : '', m ? `${m} answered yes to the clear no` : ''].filter(Boolean).join('; ')
+          text += `; ${listed(misses.map((p) => p.name))} ${misses.length === 1 ? 'does' : 'do'} not${why ? ` (${why})` : ''}`
+        }
+        out.push(`${text}.`)
+      }
+      if (r?.kind) out.push(`Task or question: ${r.kind.separates ? 'separates' : 'does not separate'}.`)
+      return out.join(' ')
+    }
+
+    /**
+     * The lines under the card's switches (8.2): what to turn on to test Jev and Laya together once
+     * an install has finished, that the comparisons stop while Laya is not running, the counters,
+     * the last Test Laya, and Laya's own warnings.
+     */
+    function layaNotes(st, compare) {
+      const out = []
+      if (!st?.installed || st.configError || st.state === 'disabled') return out
+      const s = st.settings ?? {}
+      if (st.install?.kind === 'install' && !st.install.error && st.state !== 'installing' && !(s.startWithKzh && s.keepLoaded)) {
+        out.push({ text: 'To test Jev and Laya together, turn on Start Laya when KzH starts and Keep Laya loaded.', tone: 'note' })
+      }
+      if (s.shadow && ['stopped', 'failed'].includes(st.state)) out.push({ text: 'Laya is not running, so Jev Auto records no comparisons now. Press Start, or turn on Start Laya when KzH starts and Keep Laya loaded.', tone: 'warn' })
+      const counters = layaCounters(compare)
+      if (counters) out.push({ text: counters, tone: 'why' })
+      if (st.selfTest) out.push({ text: selfTestLine(st.selfTest), tone: 'why' })
+      for (const w of st.warnings ?? []) out.push({ text: w?.text ?? String(w), tone: 'warn' })
+      return out
+    }
+
+    /**
+     * The versions (8.2 and 7.10): which Laya and model this PC has, with the model's own buttons,
+     * and when this KzH version pins another Laya, that too with `Update Laya`. The result of the
+     * last `Check for a newer model` (`weights`) says whether there is one to use.
+     */
+    function layaVersions(st) {
+      const i = st?.installed
+      if (!i || st.configError || st.state === 'disabled') return []
+      const want = st.expected ?? {}
+      const pinned = want.laya && i.laya !== want.laya ? `This KzH version pins Laya ${want.laya}; ${i.laya} is installed.`
+        : want.torch && i.torch && !String(i.torch).startsWith(want.torch) ? `This KzH version pins PyTorch ${want.torch}; ${i.torch} is installed.` : null
+      const w = i.weights
+      const out = [{
+        text: `Laya ${i.laya}${pinned ? '' : ', pinned by this KzH version'}. Model ${commit7(w?.commit)}${w?.downloadedAt ? `, downloaded ${String(w.downloadedAt).slice(0, 10)}` : ''}.`,
+        buttons: ['weightsCheck', ...(st.weights?.changed ? ['weightsApply'] : []), 'repair'],
+      }]
+      if (st.weights) {
+        out.push({ text: st.weights.changed ? `A newer Laya model is available (${commit7(st.weights.latest)}; this PC has ${commit7(st.weights.current)}).` : 'This PC has the newest Laya model.', buttons: [] })
+      }
+      if (pinned) out.push({ text: pinned, buttons: ['update'] })
+      return out
+    }
+
+    /**
+     * The help under each switch (8.2), with what Laya takes when it is kept loaded: its figure now
+     * where it runs, else what it would take at its next start (`need`).
+     */
+    function layaHelp(st) {
+      const r = st?.running
+      const vram = r?.device === 'cuda' && typeof r.vramGB === 'number' ? r.vramGB : st?.need?.cuda?.vramGB
+      const ram = r?.device === 'cpu' && typeof r.ramGB === 'number' ? r.ramGB : st?.need?.cpu?.ramGB
+      const kept = 'Laya stays loaded and keeps its memory even when a local model starts: '
+      const counted = 'which the RAM budget counts before a local model\'s context is sized.'
+      return {
+        device: "While Laya is loaded on the GPU and kept loaded, the VRAM budget holds Laya and the chat model together. On a 4 GB GPU, pick CPU here if the chat model needs the whole GPU. If Laya gets slow on the GPU, set Prefer No Sysmem Fallback for Laya's python.exe in the NVIDIA Control Panel.",
+        startWithKzh: 'Laya then has its model loaded before your first message. Unless Keep Laya loaded is on, it still unloads after the idle time, and whenever a local model needs its memory.',
+        keepLoaded: st?.installed?.cuda === false
+          ? `${kept}${typeof ram === 'number' ? `about ${layaGB(ram)} GB of RAM` : 'its RAM'}, ${counted}`
+          : typeof vram === 'number' && typeof ram === 'number'
+            ? `${kept}about ${layaGB(vram)} GB of GPU memory, so local models get fewer GPU layers, or about ${layaGB(ram)} GB of RAM, ${counted}`
+            : `${kept}its GPU memory, so local models get fewer GPU layers, or its RAM, ${counted}`,
+        shadow: "Laya answers every Jev question too, on this PC, and both answers are recorded side by side. It never delays a Jev Auto run and never starts or keeps Laya loaded: when Laya is busy, starting or not running, or a local model is answering or needs Laya's memory, the comparison waits or is skipped and counted. Only Keep Laya loaded makes Laya hold memory beside a local model. Nothing is sent anywhere.",
+        vramGB: typeof vram === 'number' ? vram : null,
+      }
+    }
+
+    /** The install dialog (8.3) for the device picked in it: where, what it downloads, the disk it needs, and the choice. */
+    function layaInstallDialog(st, device) {
+      const o = st?.offer ?? {}
+      const want = st?.expected ?? {}
+      const torch = o.torch?.[device]
+      const disk = o.disk?.[device]
+      return {
+        title: 'Install Laya',
+        lines: [
+          ...(st?.paths ? [`Where: ${st.paths.engine} (Python and PyTorch) and ${st.paths.models} (the model).`] : []),
+          `Downloads once, then works offline: Python${o.python ? ` ${o.python}` : ''} (about 30 MB, GitHub), PyTorch ${want.torch}${torch ? ` (${torch.size}, ${torch.source})` : ''}, Laya ${want.laya} and its libraries (about 100 MB, PyPI), and Laya's English model (0.8 to 1.7 GB, Hugging Face).`,
+          ...(disk ? [`Needs about ${disk.installingGB} GB of free disk while installing and ${disk.afterGB} GB after.`] : []),
+        ],
+        // The GPU is offered where there is a usable one, and where the server does not say: the
+        // installer itself falls back to the CPU wheel when the driver has no CUDA to offer (7.2).
+        choices: [
+          ...(o.gpu ? [{ value: 'gpu', label: `GPU: ${o.gpu.name} with CUDA ${o.gpu.cuda} (speed not measured on this PC yet; Test Laya measures it after the install)` }]
+            : !st?.offer ? [{ value: 'gpu', label: 'GPU (speed not measured on this PC yet; Test Laya measures it after the install)' }] : []),
+          { value: 'cpu', label: 'CPU only (smaller download; on a 4-core test machine, about 20 s to route a task and about 10 s to review each attempt)' },
+        ],
+      }
+    }
+
+    /** The remove dialog (8.3), with each folder's size where the server reports it. */
+    function layaRemoveDialog(st) {
+      const p = st?.paths ?? { engine: 'engine\\laya', models: 'models\\laya' }
+      const b = st?.installed?.bytes
+      const size = (x) => (typeof x === 'number' ? ` (${layaBytes(x)})` : '')
+      return {
+        title: 'Remove Laya?',
+        body: `Stops Laya and deletes ${p.engine}${size(b?.engine)} and ${p.models}${size(b?.models)}. Your recorded comparisons and Laya samples are kept. Laya Auto leaves the model menu.`,
+        confirmLabel: 'Remove Laya',
+      }
+    }
+    // ---- end pure laya helpers
+
+    /**
+     * Laya's status, GET /jev-router/laya, polled while shown: every 1.5 s while it installs, starts,
+     * stops or restarts, else every 5 s. Only the newest read is applied, as the local models card does.
+     */
+    function useLaya(active) {
+      const [data, setData] = useState(null)
+      const [error, setError] = useState('')
+      const seq = useRef(0)
+      const load = useCallback(async () => {
+        const n = ++seq.current
+        try { const d = await api('/jev-router/laya'); if (n === seq.current) { setData(d); setError('') } } catch (e) { if (n === seq.current) setError(e.message) }
+      }, [])
+      const moving = ['installing', 'starting', 'stopping', 'restarting'].includes(data?.state)
+      useEffect(() => {
+        if (!active) return
+        load()
+        const t = setInterval(() => { if (!document.hidden) load() }, moving ? 1500 : 5000)
+        return () => clearInterval(t)
+      }, [active, moving, load])
+      return { data, error, load }
+    }
+
+    /**
+     * The install dialog (8.3): what an install takes, and the choice of GPU or CPU. Escape closes
+     * it from wherever the focus is inside it, which starts on Cancel.
+     */
+    function LayaInstallDialog({ st, device, onDevice, onInstall, onClose }) {
+      const d = layaInstallDialog(st, device)
+      return h('div', { className: 'jevi jevi-modal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'jevi-laya-install-t', onClick: onClose, onKeyDown: (e) => { if (e.key === 'Escape') onClose() } },
+        h('div', { className: 'box wide', onClick: (e) => e.stopPropagation() },
+          h('h3', { id: 'jevi-laya-install-t' }, d.title),
+          ...d.lines.map((l, i) => h('p', { key: i, className: 'why' }, l)),
+          h('div', { role: 'radiogroup', 'aria-label': 'Where Laya runs' }, ...d.choices.map((c) => h('label', { key: c.value, className: 'toggle', style: { margin: '6px 0' } },
+            h('input', { type: 'radio', name: 'jevi-laya-device', value: c.value, checked: device === c.value, onChange: () => onDevice(c.value) }), c.label))),
+          h('div', { className: 'actions' },
+            h('button', { className: 'btn', onClick: onClose, autoFocus: true }, 'Cancel'),
+            h('button', { className: 'btn primary', onClick: () => onInstall(device) }, 'Install'))))
+    }
+
+    /**
+     * Settings → Jev setup → Laya decision model (8.2): the state Laya is in and what can be done
+     * about it, its per-PC switches (laya.json, saved through POST /jev-router/laya/settings), what
+     * the comparisons in Jev Auto have counted, the last Test Laya, and its versions. Every button
+     * posts to its route of 8.4 and reloads; a refusal (Stop while a Laya Auto run is open, a
+     * setting out of range) is shown as the server words it.
+     */
+    function LayaCard({ ask }) {
+      const { data: st, error, load } = useLaya(true)
+      const [compare, setCompare] = useState(null)
+      const [msg, setMsg] = useState('')
+      const [busy, setBusy] = useState('')
+      const [shownLog, setShownLog] = useState(null)
+      const [installing, setInstalling] = useState(null)
+      // The idle time as typed, until it is saved: the field shows it over the saved value, so a
+      // status poll never puts the saved one back mid-edit, and follows the saved one otherwise.
+      const [idleEdit, setIdleEdit] = useState(null)
+      const installed = !!st?.installed
+      useEffect(() => {
+        if (!installed) return
+        let stop = false
+        const read = () => api('/jev-router/laya/compare?days=7&identity=current').then((d) => { if (!stop) setCompare(d) }, () => {})
+        read()
+        const t = setInterval(read, 60_000)
+        return () => { stop = true; clearInterval(t) }
+      }, [installed])
+      if (!st) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Laya decision model'), h('div', { className: error ? 'err' : 'muted' }, error || 'Loading…'))
+      const act = async (id, fn) => { setMsg(''); setBusy(id); try { await fn(); await load() } catch (e) { setMsg(e.message) } finally { setBusy('') } }
+      // The dialog's first choice: the GPU, unless the server says there is no usable one.
+      const device = st.offer && !st.offer.gpu ? 'cpu' : 'gpu'
+      const save = (patch) => act('settings', () => post('/jev-router/laya/settings', patch))
+      // Saved and reloaded, and only then the edit dropped, so the field goes from what was typed to
+      // what was saved; a refused value is dropped too, and the field shows what is saved beside the
+      // refusal. Whatever was typed while the save was on its way is kept.
+      const saveIdle = async () => {
+        const typed = idleEdit
+        if (typed == null) return
+        if (Number(typed) !== st.settings?.idleMinutes) await save({ idleMinutes: Number(typed) })
+        setIdleEdit((v) => (v === typed ? null : v))
+      }
+      const press = {
+        install: () => setInstalling(device),
+        cancel: () => act('cancel', () => post('/jev-router/laya/install/cancel', {})),
+        // Again for the device the failed install was for, when the server says which; otherwise
+        // the dialog asks again, since a guess could install for the GPU what was asked for the CPU.
+        retry: () => (st.install?.kind === 'update' ? act('retry', () => post('/jev-router/laya/update', {}))
+          : st.install?.device ? act('retry', () => post('/jev-router/laya/install', { device: st.install.device }))
+            : setInstalling(device)),
+        cpu: () => act('cpu', () => post('/jev-router/laya/install', { device: 'cpu' })),
+        log: () => act('log', async () => setShownLog((await api('/jev-router/laya/log?lines=200')).lines ?? [])),
+        start: () => act('start', () => post('/jev-router/laya/start', {})),
+        stop: () => act('stop', () => post('/jev-router/laya/stop', {})),
+        restart: () => act('restart', () => post('/jev-router/laya/restart', {})),
+        gpu: () => act('gpu', () => post('/jev-router/laya/restart', { device: 'gpu' })),
+        test: () => act('test', () => post('/jev-router/laya/selftest', {})),
+        remove: () => ask({ ...layaRemoveDialog(st), run: async () => { await post('/jev-router/laya/remove', {}); await load() } }),
+        weightsCheck: () => act('weightsCheck', () => post('/jev-router/laya/weights/check', {})),
+        weightsApply: () => act('weightsApply', () => post('/jev-router/laya/weights/apply', {})),
+        repair: () => act('repair', () => post('/jev-router/laya/repair', {})),
+        update: () => act('update', () => post('/jev-router/laya/update', {})),
+      }
+      const button = (id) => h('button', { key: id, className: cx('btn', id === 'install' && 'primary', id === 'remove' && 'danger'), disabled: !!busy, onClick: press[id] }, busy === id && id === 'test' ? 'Testing…' : LAYA_BUTTONS[id])
+      const tone = (t) => ({ why: 'why', warn: 'warnline', err: 'err', note: 'note' })[t] ?? undefined
+      const view = layaState(st)
+      const s = st.settings ?? {}
+      const help = layaHelp(st)
+      const switchable = installed && !st.configError && st.state !== 'disabled'
+      const toggle = (id, label, key, text) => [
+        h('dt', { key: `${id}t` }, label),
+        h('dd', { key: `${id}d` },
+          h('label', { className: 'toggle' }, h('input', { id, type: 'checkbox', role: 'switch', checked: !!s[key], disabled: busy === 'settings', 'aria-label': label, onChange: (e) => save({ [key]: e.target.checked }) }), s[key] ? 'On' : 'Off'),
+          h('div', { className: 'why' }, text)),
+      ]
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-laya-h' },
+        h('div', { className: 'label', id: 'jevi-laya-h' }, 'Laya decision model'),
+        h('p', { className: 'why', style: { margin: '0 0 8px' } }, LAYA_INTRO),
+        ...view.lines.map((l, i) => h('div', { key: `l${i}`, className: tone(l.tone) }, l.text)),
+        view.log.length ? h('div', { className: 'answer-text' }, view.log.join('\n')) : null,
+        view.buttons.length ? h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 } }, ...view.buttons.map(button)) : null,
+        msg ? h('div', { className: 'err', role: 'alert' }, msg) : null,
+        shownLog ? h('div', null, h('div', { className: 'answer-text' }, shownLog.length ? shownLog.join('\n') : 'The log is empty.'), h('button', { className: 'btn', onClick: () => setShownLog(null) }, 'Hide log')) : null,
+        switchable ? h('dl', null,
+          h('dt', null, h('label', { htmlFor: 'jevi-laya-device' }, 'Device')),
+          h('dd', null,
+            h('select', { id: 'jevi-laya-device', value: s.device ?? 'auto', disabled: busy === 'settings', onChange: (e) => save({ device: e.target.value }) },
+              h('option', { value: 'auto' }, 'Auto (the GPU when it has room)'), h('option', { value: 'gpu' }, 'GPU'), h('option', { value: 'cpu' }, 'CPU')),
+            h('div', { className: 'why' }, help.device)),
+          ...toggle('jevi-laya-start', 'Start Laya when KzH starts', 'startWithKzh', help.startWithKzh),
+          ...toggle('jevi-laya-keep', 'Keep Laya loaded', 'keepLoaded', help.keepLoaded),
+          h('dt', null, h('label', { htmlFor: 'jevi-laya-idle' }, 'Unload after idle (minutes)')),
+          h('dd', null, h('input', { id: 'jevi-laya-idle', type: 'number', min: 1, max: 240, value: idleEdit ?? String(s.idleMinutes ?? ''), disabled: !!s.keepLoaded, style: { width: 64 }, onChange: (e) => setIdleEdit(e.target.value), onBlur: saveIdle })),
+          ...toggle('jevi-laya-shadow', 'Answer beside Jev in Jev Auto', 'shadow', help.shadow)) : null,
+        switchable && st.installed.cuda ? h('div', { className: 'why' }, layaHeldNote(help.vramGB)) : null,
+        ...layaNotes(st, compare).map((n, i) => h('div', { key: `n${i}`, className: tone(n.tone), style: { marginTop: 6 } }, n.text)),
+        ...layaVersions(st).map((v, i) => h('div', { key: `v${i}`, style: { marginTop: 8 } },
+          h('div', { className: 'why' }, v.text),
+          v.buttons.length ? h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 4 } }, ...v.buttons.map(button)) : null)),
+        installing ? h(LayaInstallDialog, {
+          st, device: installing, onDevice: setInstalling, onClose: () => setInstalling(null),
+          onInstall: (d) => { setInstalling(null); act('install', () => post('/jev-router/laya/install', { device: d })) },
+        }) : null)
+    }
+
     // ---------- settings: Jev setup ----------
     function SetupSection() {
       useStyle()
@@ -3188,7 +3954,10 @@ window.__ModuleLoader__.load({
         h('div', { className: 'card', style: { marginTop: 12 } },
           h('div', { className: 'label' }, 'Jev router'),
           h('div', null, h('span', { className: cx('dot', data.jev.configured ? 'on' : 'off') }),
-            data.jev.configured ? `${data.jev.credentialRef} is set. Jev routes and reviews.` : `${data.jev.credentialRef} missing. Routing falls back to the default agent. See C:\\Harness\\README.md step 2.`)),
+            data.jev.configured ? `${data.jev.credentialRef} is set. Jev routes and reviews.` : `${data.jev.credentialRef} missing. Routing falls back to the default agent. See C:\\Harness\\README.md step 2.`),
+          jevHostLine(data.jev) ? h('div', { className: 'why' }, jevHostLine(data.jev)) : null),
+
+        h(LayaCard, { ask: setConfirm }),
 
         h('div', { className: 'card' },
           h('div', { className: 'head' }, h('div', { className: 'label', style: { margin: 0 } }, `LLM agents · ${usable} ready`),
@@ -3461,6 +4230,53 @@ window.__ModuleLoader__.load({
         title: `Agent runs holding a slot now, across every workspace: a foreground /auto, /<agent> or jev_route counts as much as a background task.${over}${waits}`,
       }
     }
+
+    /**
+     * Laya's share of the memory the budget holds (docs/laya-auto.md 7.7), from the Laya status the
+     * response carries as `laya` (null or absent when Laya is not installed): what it takes now while
+     * it runs, else what it would take at its next start (`need`), on the device it runs or would
+     * run on. A held Laya (Keep Laya loaded, or an open Laya Auto run) keeps its memory beside a
+     * local model; any other gives it up when a local model starts, so the two are never counted
+     * together. Null when Laya is not installed.
+     */
+    const layaShare = (laya) => {
+      if (!laya?.installed) return null
+      const r = laya.running
+      const held = (r?.held ?? []).length > 0 || !!laya.settings?.keepLoaded
+      const device = r ? r.device : laya.need?.device ?? null
+      const from = r ?? (device ? { vramGB: laya.need?.cuda?.vramGB, ramGB: laya.need?.[device]?.ramGB } : {})
+      return { running: !!r, held, device, vramGB: device === 'cuda' ? from.vramGB ?? null : null, ramGB: from.ramGB ?? null }
+    }
+    const sumGB = (a, b) => Math.round(((a ?? 0) + (b ?? 0)) * 100) / 100
+    const layaOn = (l) => (l.device === 'cuda' ? 'the GPU' : 'the CPU')
+    /** A Now cell with Laya in it while Laya runs: the two together, and each one's share (7.7). */
+    const withLayaNow = (cell, llama, laya, side) => {
+      const mine = laya?.running ? laya[side] : null
+      if (typeof mine !== 'number') return cell
+      return {
+        text: gbText(sumGB(llama, mine)),
+        note: `Laya ${gbText(mine)}, llama.cpp ${typeof llama === 'number' ? gbText(llama) : 'not loaded'}`,
+        title: `${typeof llama === 'number' ? `llama.cpp: ${String(cell.title).replace(/\.$/, '')}. ` : ''}Laya: what it takes now on ${layaOn(laya)}.`,
+      }
+    }
+    /**
+     * An Estimated peak cell with Laya in it: added when Laya is held, else the larger of the two
+     * (7.7). With no local model the budget lets load, the peak is Laya's, and the note says so.
+     */
+    const withLayaPeak = (cell, llama, laya, side) => {
+      const mine = laya?.[side]
+      if (typeof mine !== 'number') return cell
+      const hasModel = typeof llama === 'number'
+      const figure = laya.running ? `what it takes now on ${layaOn(laya)}` : `what it would take at its next start, on ${layaOn(laya)}`
+      const model = hasModel ? `llama.cpp: ${cell.title} ` : ''
+      const note = !hasModel ? `Laya ${gbText(mine)}; no local model the budget lets load`
+        : laya.held ? `Laya ${gbText(mine)}, llama.cpp ${gbText(llama)}` : `the larger of Laya ${gbText(mine)} and llama.cpp ${gbText(llama)}`
+      return laya.held
+        ? { text: gbText(sumGB(llama, mine)), note, title: `${model}Laya: ${figure}. Laya is held (Keep Laya loaded, or a Laya Auto run), so it keeps its memory beside a local model, and the two are counted together.` }
+        : { text: gbText(Math.max(llama ?? 0, mine)), note, title: `${model}Laya: ${figure}. Laya is not held, so it gives its memory up when a local model starts, and the two are never counted together.` }
+    }
+    /** What a held Laya on the GPU costs the local models, said on the Laya card and under this table (7.7). */
+    const layaHeldNote = (vramGB) => `While Laya is held (Keep Laya loaded, or a Laya Auto run), the VRAM budget holds Laya and the chat model together${typeof vramGB === 'number' ? `, and on a 4 GB GPU local models get about ${Math.round(vramGB * 10) / 10} GB less` : ''}. Otherwise Laya gives the GPU up when a local model starts.`
     /**
      * The table's cells from GET /jev-router/local, one row per limit: the saved budget as its field
      * shows it, what the loaded model uses now, and the most the next load could take.
@@ -3488,13 +4304,17 @@ window.__ModuleLoader__.load({
         return { text: gbText(top.memory[side]), note: top.memory.source, title: `${top.name} at ${ctxText(top.ctx)} context, the most any installed model the budget lets load would take.${over}` }
       }
       const report = "What the loaded model took, from the engine's own load report"
+      const ramNow = e.running && e.workingSetGB != null ? { text: gbText(e.workingSetGB), note: 'working set', title: "The loaded model's real memory use, read every 5 seconds while a RAM budget is set" }
+        : loaded ? { text: gbText(loaded.ramGB), note: 'load report', title: `${report}. Its real use is read only while a RAM budget is set.` } : NO_FIGURE
+      // llama.cpp's own figures, for Laya's share beside them.
+      const llama = {
+        now: { vramGB: loaded?.vramGB ?? null, ramGB: e.running ? e.workingSetGB ?? loaded?.ramGB ?? null : null },
+        peak: (side) => loadable.reduce((a, m) => Math.max(a ?? 0, m.memory[side] ?? 0), null),
+      }
+      const laya = layaShare(status?.laya)
       const cells = {
-        maxVramGB: { now: loaded ? { text: gbText(loaded.vramGB), note: 'load report', title: report } : NO_FIGURE, peak: peak('vramGB') },
-        maxRamGB: {
-          now: e.running && e.workingSetGB != null ? { text: gbText(e.workingSetGB), note: 'working set', title: "The loaded model's real memory use, read every 5 seconds while a RAM budget is set" }
-            : loaded ? { text: gbText(loaded.ramGB), note: 'load report', title: `${report}. Its real use is read only while a RAM budget is set.` } : NO_FIGURE,
-          peak: peak('ramGB'),
-        },
+        maxVramGB: { now: withLayaNow(loaded ? { text: gbText(loaded.vramGB), note: 'load report', title: report } : NO_FIGURE, llama.now.vramGB, laya, 'vramGB'), peak: withLayaPeak(peak('vramGB'), llama.peak('vramGB'), laya, 'vramGB') },
+        maxRamGB: { now: withLayaNow(ramNow, llama.now.ramGB, laya, 'ramGB'), peak: withLayaPeak(peak('ramGB'), llama.peak('ramGB'), laya, 'ramGB') },
         maxCores: {
           now: e.running && e.threads ? { text: threadsText(e.threads), note: null, title: 'Threads the loaded model runs on' } : NO_FIGURE,
           // A core budget above what this PC has gives it every processor there is, and no more.
@@ -3583,6 +4403,7 @@ window.__ModuleLoader__.load({
       { text: `RAM is a soft limit: nothing KzH can use stops a process's memory from growing. A model whose figure is over the RAM budget loads with a smaller context, down to the ${ctxText(MIN_CTX)} floor; one still over it there is refused before it loads, and a watchdog unloads a model whose real use stays over it for 30 seconds.`, warn: false },
       { text: 'The app window and its browser view are never capped, since the app cannot run without them, and they are not in these figures: leave room for them when you set the RAM budget.', warn: false },
       ...(status?.budget?.vramNotApplied ? [{ text: `VRAM budget not applied: ${status.budget.vramNotApplied}.`, warn: true }] : []),
+      ...(status?.laya?.installed?.cuda ? [{ text: layaHeldNote(status.laya.running?.device === 'cuda' ? status.laya.running.vramGB : status.laya.need?.cuda?.vramGB), warn: false }] : []),
       { text: `The context floor is ${ctxText(MIN_CTX)} (${MIN_CTX} tokens): the system prompt and the tool list alone take about 8.6k tokens, and below roughly 12k a local model stops mid-chat with a context-exceeded error that looks like a fault in the model but is not one.`, warn: false },
     ]
     // ---- end pure budget helpers
@@ -4539,8 +5360,9 @@ window.__ModuleLoader__.load({
       // cannot be imported by node. `taskLabels` is the copy the anti-drift test compares with
       // adapter.js TASK_LABELS on the server. The two start* schedulers are exposed with stubbable
       // DOM globals so a test can prove a pass lands on a timer while no frame is ever delivered.
-      // ResourceBudget and LocalModelsCard are rendered with stand-in Reacts in test/budgetpanel.test.js.
-      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords },
+      // ResourceBudget and LocalModelsCard are rendered with stand-in Reacts in test/budgetpanel.test.js,
+      // SetupSection in test/laya-card.test.js and InspectorBody in test/routerview.test.js.
+      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, taskItems },
       apply(ctx) {
         sessionsApi = ctx.sessions
         sidebarRight = ctx.sidebarRight

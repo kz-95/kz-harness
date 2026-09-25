@@ -11,6 +11,7 @@ import { createServer } from 'node:net'
 import { cpus, freemem, totalmem } from 'node:os'
 import { dirname, join } from 'node:path'
 import { localAgentFor, quickestLocal } from './effort.js'
+import { createBudgetWatchdog, createResidency } from './residency.js'
 
 export const LOCAL_PROVIDER = 'local'
 
@@ -678,18 +679,16 @@ export function fitTargetMiB({ maxVramGB, gpuTotalGB }) {
  * @param {{ maxVramGB?: number|null, maxRamGB?: number|null }} budget
  * @param {{ name: string, ctx: number }} about  the model and context, for the message
  */
-function overBudget(memory, { maxVramGB = null, maxRamGB = null }, { name, ctx }) {
-  if (!overRam(memory, maxRamGB)) return null
+function overBudget(memory, { maxVramGB = null, maxRamGB = null }, { name, ctx, held = { gb: 0, by: [] } }) {
+  if (!overRam(memory, maxRamGB == null ? null : maxRamGB - held.gb)) return null
   const budget = [maxVramGB != null && `${maxVramGB} GB VRAM`, `${maxRamGB} GB RAM`].filter(Boolean).join(' + ')
   const at = ctx === MIN_CTX ? `even at the ${MIN_CTX / 1024}k context floor` : `at ${ctx} context`
-  return `${name} needs about ${memory.ramGB} GB of RAM ${at} (${memory.source}: ${memory.vramGB} GB VRAM + ${memory.ramGB} GB RAM), over the resource budget of ${budget}. Raise the RAM budget or use a smaller model.`
+  const less = held.gb > 0 ? `, less the ${held.gb} GB ${held.by.join(' and ')} holds` : ''
+  return `${name} needs about ${memory.ramGB} GB of RAM ${at} (${memory.source}: ${memory.vramGB} GB VRAM + ${memory.ramGB} GB RAM), over the resource budget of ${budget}${less}. Raise the RAM budget or use a smaller model.`
 }
 
 /** Whether a memory figure puts more into RAM than the RAM budget allows; never with no RAM budget. */
 const overRam = (memory, maxRamGB) => maxRamGB != null && !!memory && memory.ramGB > maxRamGB
-
-/** How long the working set must stay over the RAM budget before the watchdog unloads the model. */
-const WATCH_GRACE_MS = 30_000
 
 /**
  * A process's working set in bytes, as this OS reports it: tasklist on Windows, whose "Mem Usage"
@@ -717,6 +716,30 @@ export function parseTasklistMemory(out) {
 export function parsePsRss(out) {
   const kib = /^\s*(\d+)\s*$/.exec(String(out ?? ''))?.[1]
   return kib ? Number(kib) * 1024 : null
+}
+
+/**
+ * Kill a process and every process it started, by pid. On Windows that is `taskkill /t /f`, as the
+ * engine has always been stopped; a venv's python.exe there can be a redirector whose child is the
+ * real interpreter, so killing the one pid alone would leave the model loaded. Elsewhere the tree is
+ * read from `ps` and every process in it gets SIGKILL. Synchronous, so the process exit hook can use
+ * it. Returns whether anything was killed; a pid that has gone already is not an error.
+ * `run` (spawnSync's shape) and `platform` are injectable for tests.
+ */
+export function killTree(pid, { platform = process.platform, run = spawnSync } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  if (platform === 'win32') return run('taskkill', ['/pid', String(pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' }).status === 0
+  const children = new Map()
+  for (const line of String(run('ps', ['-A', '-o', 'pid=,ppid='], { encoding: 'utf8' }).stdout ?? '').split('\n')) {
+    const [p, pp] = line.trim().split(/\s+/).map(Number)
+    if (Number.isSafeInteger(p) && Number.isSafeInteger(pp)) children.set(pp, [...(children.get(pp) ?? []), p])
+  }
+  const tree = []
+  const walk = (p) => { if (tree.includes(p)) return; tree.push(p); for (const c of children.get(p) ?? []) walk(c) }
+  walk(pid)
+  let killed = false
+  for (const p of tree) { try { process.kill(p, 'SIGKILL'); killed = true } catch { /* gone already */ } }
+  return killed
 }
 
 // ---------- the engine ----------
@@ -747,17 +770,18 @@ function unzip(zip, dir, spawn) {
  * @param {(pid: number) => Promise<number|null>} [p.readWorkingSet]  the RAM watchdog's reading, in bytes (tests)
  * @param {() => number} [p.now]  the RAM watchdog's clock (tests)
  * @param {number} [p.watchEveryMs]  how often the RAM watchdog reads, while a RAM budget is set
+ * @param {object} [p.residency]  createResidency(): every local model process on this PC, llama-server
+ *   and Laya's laya.serve, under one RAM budget. The loaded engine registers there as 'llama'; one of
+ *   its own is made when none is shared, which holds llama alone, exactly as before there was a second.
  */
-export function createLocalModels({ modules, engineDir, modelsDir, settingsFile, port: basePort = 8081, contextSize, specs: getSpecs = async () => null, spawn = nodeSpawn, fetch = globalThis.fetch, log = () => {}, onChange = () => {}, onSettings = () => {}, readWorkingSet = workingSetOf, now = Date.now, watchEveryMs = 5000 }) {
+export function createLocalModels({ modules, engineDir, modelsDir, settingsFile, port: basePort = 8081, contextSize, specs: getSpecs = async () => null, spawn = nodeSpawn, fetch = globalThis.fetch, log = () => {}, onChange = () => {}, onSettings = () => {}, readWorkingSet = workingSetOf, now = Date.now, watchEveryMs = 5000, residency = createResidency({ log }) }) {
   const exe = join(engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server')
   const engines = modules.filter((m) => m.kind === 'engine')
   const models = modules.filter((m) => m.kind === 'model')
   const mod = (id) => modules.find((m) => m.id === id)
-  let engine = null // { child, modelId, port, key, ready, startedAt, gpuLayers, tail, threads, fitTargetMiB, workingSetGB, overSince }
+  let engine = null // { child, modelId, port, key, ready, startedAt, gpuLayers, tail, threads, fitTargetMiB, resident }
   let busy = 0
   let idleTimer = null
-  let watchTimer = null
-  let watching = null // the watchdog reading in flight, so a slow tasklist never stacks up a second one
   // Models the RAM watchdog unloaded: why, and the context it was running with. Loading one again at
   // that context or a larger one would only end the same way, so until a setting that decides how
   // much of it lands in RAM changes, planFor sizes it below that context, and refuses it only when
@@ -820,6 +844,11 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     await writeFile(`${settingsFile}.tmp`, JSON.stringify(s, null, 2))
     await rename(`${settingsFile}.tmp`, settingsFile)
   }
+
+  // One RAM watchdog over every resident local model process, llama and Laya together. It reads
+  // nothing while nothing is resident, so it can run for as long as the local models are up.
+  const watchdog = createBudgetWatchdog({ residency, readSettings, readWorkingSet, now, everyMs: watchEveryMs, log: (t) => log(`local: ${t}`) })
+  watchdog.start()
 
   /**
    * Keep what a real load took, under the model and the context size it was measured at, so the
@@ -1005,6 +1034,11 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    * A model the RAM watchdog unloaded is sized below the context it was unloaded at: its real use
    * there was over the budget, whatever the figure says, and says nothing about a smaller context.
    * Only one unloaded at the smallest context it can have is refused on the watchdog's account.
+   *
+   * The RAM budget is shared with the other resident local model processes (Laya's laya.serve),
+   * but only those a hold keeps loaded count against it here: one nothing holds is unloaded before
+   * this model starts (start() yields it), so a context is never sized down for a Laya that would
+   * be gone by the time the model loads. The plan only reads the residency; unloading is start()'s.
    */
   async function planFor(m, s) {
     const specs = await getSpecs().catch(() => null)
@@ -1013,19 +1047,21 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const gpuLayers = s.gpuLayers ?? d.gpuLayers
     const room = !specs || gpuLayers === 0 ? 0 : Math.min(usableVramGB(specs, variant), s.maxVramGB ?? Infinity)
     const figureAt = (ctx) => estimateMemory(m, { ctx, vramGB: room, measured: measuredFor(s, m.id, ctx, { roomGB: room, gpuLayers }) })
+    const held = { gb: residency.othersRamGB('llama', { heldOnly: true }), by: residency.othersNames('llama', { heldOnly: true }) }
+    const ramLeft = s.maxRamGB == null ? null : s.maxRamGB - held.gb
     const all = contextSteps(d.ctx)
     const unloaded = tripped.get(m.id)
     const steps = unloaded ? all.filter((c) => c < unloaded.ctx) : all
-    const ctx = steps.find((c) => !overRam(figureAt(c), s.maxRamGB)) ?? steps.at(-1) ?? all.at(-1)
+    const ctx = steps.find((c) => !overRam(figureAt(c), ramLeft)) ?? steps.at(-1) ?? all.at(-1)
     const memory = figureAt(ctx)
     planned.set(m.id, ctx)
-    const refusal = unloaded && !steps.length ? `the RAM watchdog unloaded ${m.name ?? m.id}: ${unloaded.why}. Raise the RAM budget to load it again.` : overBudget(memory, s, { name: m.name ?? m.id, ctx })
+    const refusal = unloaded && !steps.length ? `the RAM watchdog unloaded ${m.name ?? m.id}: ${unloaded.why}. Raise the RAM budget to load it again.` : overBudget(memory, s, { name: m.name ?? m.id, ctx, held })
     return { ctx, reducedFrom: ctx < d.ctx ? d.ctx : null, gpuLayers, room, specs, variant, memory, refusal }
   }
 
   function kill(child) {
     if (!child || child.exitCode !== null) return
-    if (process.platform === 'win32' && child.pid) spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' })
+    if (process.platform === 'win32' && child.pid) killTree(child.pid)
     else child.kill('SIGKILL')
   }
   const onExit = () => kill(engine?.child)
@@ -1033,48 +1069,44 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
 
   async function stop() {
     clearTimeout(idleTimer)
-    clearInterval(watchTimer)
     const e = engine
     engine = null
-    if (e) { kill(e.child); log(`local: engine stopped (${e.modelId})`) }
+    if (e) { residency.clear('llama', e.resident); kill(e.child); log(`local: engine stopped (${e.modelId})`) }
   }
 
   /**
-   * One reading of the RAM watchdog. RAM cannot be capped, so while a RAM budget is set the engine's
-   * real working set is read every few seconds, and a model that stays over the budget for
-   * WATCH_GRACE_MS is unloaded, even mid-answer: the budget is there to keep the PC usable. Only
-   * readings that all say "over" count, so a reading that cannot be taken restarts the count rather
-   * than adding to it; not knowing is no evidence the model is over. The interval takes a reading
-   * every `watchEveryMs`; tests take them by hand, on their own clock.
+   * What the RAM watchdog does when llama is the resident it unloads: today's trip-and-stop. The
+   * model is kept as tripped at the context it ran with, so planFor sizes it below that until what
+   * decides its RAM changes, and whoever follows the local models is told at once. Only llama's own
+   * unload records a trip: a Laya unloaded for the budget never shrinks llama's context.
    */
-  function checkMemory() {
-    watching ??= (async () => {
-      const e = engine
-      if (!e?.loaded) return
-      const { maxRamGB } = await readSettings()
-      if (maxRamGB == null) { e.overSince = null; e.workingSetGB = null; return }
-      const bytes = await readWorkingSet(e.child.pid).catch(() => null)
-      if (engine !== e) return
-      e.workingSetGB = bytes == null ? null : r1(bytes / GB)
-      if (bytes == null || bytes <= maxRamGB * GB) { e.overSince = null; return }
-      e.overSince ??= now()
-      const forMs = now() - e.overSince
-      if (forMs < WATCH_GRACE_MS) return
-      const why = `its working set stayed over the ${maxRamGB} GB RAM budget for ${Math.round(forMs / 1000)} s (last reading ${e.workingSetGB} GB)`
-      tripped.set(e.modelId, { why, ctx: e.ctx })
-      log(`local: unloaded ${e.modelId}: ${why}`)
-      await stop()
-      // The router caches readiness for minutes and the chat model with it. Told now, it stops
-      // offering this model at once, instead of sending it tasks that each fail at the load.
-      onChange(mod(e.modelId))
-    })().finally(() => { watching = null })
-    return watching
+  const unloadFor = (e) => async (why) => {
+    if (engine !== e) return
+    tripped.set(e.modelId, { why: why.text, ctx: e.ctx })
+    log(`local: unloaded ${e.modelId}: ${why.text}`)
+    await stop()
+    // The router caches readiness for minutes and the chat model with it. Told now, it stops
+    // offering this model at once, instead of sending it tasks that each fail at the load.
+    onChange(mod(e.modelId))
   }
+
+  /**
+   * One reading of the RAM watchdog, which watches every resident local model process together
+   * (residency.js): while a RAM budget is set their working sets are read every `watchEveryMs`, and
+   * when the sum stays over the budget for 30 seconds one of them is unloaded, a Laya nothing holds
+   * first. With llama alone resident this is exactly the old per-engine watchdog. Tests take
+   * readings by hand, on their own clock.
+   */
+  const checkMemory = () => watchdog.check()
 
   async function start(modelId) {
     const m = (await installed()).find((x) => x.id === modelId)
     if (!m) throw new Error(`local model ${modelId} is not installed (type /install-llm)`)
     if (!(await engineInstalled())) throw new Error('llama.cpp engine not installed (type /install-llm)')
+    // A resident nothing holds (a Laya loaded earlier by a test or a run that has ended) gives the
+    // GPU and RAM up first, so --fit sees the whole GPU and the context is sized as if it were
+    // never there. A held Laya stays, and planFor counts its RAM.
+    await residency.yieldFor('llama', { name: m.id })
     const s = await readSettings()
     // Refused before anything is spawned: RAM cannot be capped once the model is loading, so a
     // model the budget cannot hold is not started at all.
@@ -1124,11 +1156,17 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
           e.memory = readMemoryUsage(e.memoryLines)
           if (e.memory) { await recordMemory(m.id, ctx, { ...e.memory, roomGB: plan.room, gpuLayers }); log(`local: ${m.id} took ${e.memory.vramGB} GB VRAM + ${e.memory.ramGB} GB RAM at ctx ${ctx}`) }
           log(`local: engine ready: ${m.id}, ${e.gpuLayers ? `${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : 'GPU layers unknown'}`)
-          // Watched from here on, not while loading: the budget is about the model as it runs, and a
-          // model too big to load under it was refused before it started.
-          clearInterval(watchTimer)
-          watchTimer = setInterval(() => { checkMemory().catch((err) => log(`local: RAM watchdog: ${err.message}`)) }, watchEveryMs)
-          watchTimer.unref?.()
+          // Resident, and watched, from here on, not while loading: the budget is about the model as
+          // it runs, and a model too big to load under it was refused before it started. Held,
+          // because the local model is what the person is using: nothing is ever unloaded for it
+          // to yield to, though the watchdog may still unload it for the budget as it always could.
+          if (engine === e) {
+            e.resident = residency.set('llama', {
+              pid: child.pid, startedAt: e.startedAt, device: gpuLayers === 0 || plan.variant === 'cpu' ? 'cpu' : 'gpu', name: m.id,
+              busy: () => busy > 0, held: () => true, unload: unloadFor(e),
+              ramGB: () => e.memory?.ramGB ?? plan.memory.ramGB, vramGB: () => e.memory?.vramGB ?? plan.memory.vramGB,
+            })
+          }
           return
         }
         await Promise.race([sleep(500), exited])
@@ -1297,7 +1335,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const variant = (await engineVariant()) ?? 'cpu'
     const limits = limitsFor(s, await getSpecs().catch(() => null), variant, s.gpuLayers ?? (variant === 'cpu' ? 0 : 'auto'))
     return {
-      engine: { installed: await engineInstalled(), variant: await engineVariant(), running: !!engine, ready, model: engine?.modelId ?? null, vision: !!engine?.vision, port: engine?.port ?? null, ctx: engine?.ctx ?? null, gpuLayers: engine?.gpuLayers ?? null, threads: engine?.threads ?? null, fitTargetMiB: engine?.fitTargetMiB ?? null, memory: engine?.memory ?? null, workingSetGB: engine?.workingSetGB ?? null, startedAt: engine?.startedAt ?? null, busy },
+      engine: { installed: await engineInstalled(), variant: await engineVariant(), running: !!engine, ready, model: engine?.modelId ?? null, vision: !!engine?.vision, port: engine?.port ?? null, ctx: engine?.ctx ?? null, gpuLayers: engine?.gpuLayers ?? null, threads: engine?.threads ?? null, fitTargetMiB: engine?.fitTargetMiB ?? null, memory: engine?.memory ?? null, workingSetGB: engine?.resident?.workingSetGB ?? null, startedAt: engine?.startedAt ?? null, busy },
       settings: { ...s, chatModel: await chatModel() },
       // What the budget makes of the next load: the thread count (and the default an unset core
       // limit means), the VRAM kept free, and why the VRAM budget cannot be held when it cannot.
@@ -1321,11 +1359,13 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     readiness, installed, agents, chatModel, stream, acquire, status, install, plan, remove, setSettings, settled, engineVariant, visionFor, readSettings, checkMemory,
     /** True when `modelId` is loaded and answering (no cold start). */
     isLoaded: (modelId) => !!engine?.loaded && engine.modelId === modelId,
+    /** True while a request holds the engine: a stream is open, or a start is under way for one. */
+    isBusy: () => busy > 0,
     /** Expected load time: the last one measured this session, else ~8 s. */
     loadEstimateMs: (modelId) => loadMs.get(modelId) ?? 8000,
     start: async (id) => { const c = await acquire(id); c.release() },
     stop: async () => { if (busy > 0) throw new Error('a local model is answering right now'); await stop() },
-    dispose: async () => { process.off('exit', onExit); await stop() },
+    dispose: async () => { process.off('exit', onExit); watchdog.stop(); await stop() },
     /**
      * The context window a request to `id` meets: the one llama-server was started with while it runs
      * `id`, else the one it was last planned with (planFor), which the next load gets, else what its

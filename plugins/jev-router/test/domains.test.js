@@ -1237,3 +1237,88 @@ test('a version 2 state keeps its rollback point and owes every rung', async () 
   assert.equal(ctl.state().recoverTo, 'LOCAL_ONLY')
   assert.equal(ctl.state().consecutiveGoodWindows, 0, 'a window it counted may have had no new rows in it')
 })
+
+// ---------------------------------------------------------------- a run Laya decides (docs/laya-auto.md 6.3)
+
+/** Laya's answer, as the teacher closures of decision.js and jev-review hand it over. */
+const laya = (label, over = {}) => async () => ({
+  label, probabilities: { [label]: 0.6 }, confidence: 0.6, informative: true,
+  model: 'laya-english/0.3.20@1a2b3c4', identity: 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1', lang: 'latin', ...over,
+})
+const layaStoreAt = (root) => createTrainingStore({ file: join(root, 'laya-samples.jsonl'), kind: 'laya' })
+
+test('in a Laya run a mature, confident local classifier never decides, and the ladder is left exactly as it was', async () => {
+  const root = dir()
+  const store = storeAt(root)
+  await fill(store, 'task_classification', 100)
+  const ctl = controller({ store, root })
+  assert.equal(await climbTo(ctl, 'LOCAL_ONLY'), 'LOCAL_ONLY')
+  const stateFile = join(root, 'task_classification.state.json')
+  const onDisk = readFileSync(stateFile, 'utf8')
+  const inMemory = JSON.stringify(ctl.state())
+  const sink = layaStoreAt(root)
+  const asLaya = (jev, over = {}) => ctl.decide({ features: highFeatures, jev, fallback: fallback(), answeredBy: 'laya', sink, ...over })
+
+  // At LOCAL_ONLY, confident and in distribution, the classifier would have decided 'high' alone.
+  const d = await asLaya(laya('low'), { context: { runId: 'run-laya' } })
+  assert.equal(d.authority, 'laya')
+  assert.equal(d.label, 'low', 'Laya decides')
+  assert.equal(d.local?.label, 'high', 'and the local answer is recorded beside it')
+  assert.equal(d.teacher, null)
+  assert.equal(d.provider?.label, 'low')
+  assert.equal(d.maturity, null, 'the local rung says nothing about a run Laya decided')
+  assert.equal(d.jevCalled, false)
+  const row = await sink.get(d.sampleId)
+  assert.equal(row.runId, 'run-laya')
+  assert.equal(row.teacher, null)
+  assert.equal(row.authority, 'laya')
+  assert.deepEqual({ label: row.provider.label, informative: row.provider.informative, model: row.provider.model, lang: row.provider.lang }, { label: 'low', informative: true, model: 'laya-english/0.3.20@1a2b3c4', lang: 'latin' })
+  assert.equal(row.local.label, 'high')
+  assert.equal(await store.get(d.sampleId), null, 'nothing reached the store Jev teaches from')
+
+  // An unseen category that pulls LOCAL_ONLY down in a Jev run (scenario W) moves no rung here.
+  const odd = await asLaya(laya('high'), { features: { numeric: { score: 0.8, other: 0.3 }, categorical: { kind: 'something-new' } } })
+  assert.equal(odd.authority, 'laya')
+  assert.equal(odd.ood.flag, true, 'the input is still seen as unfamiliar')
+
+  // No answer is the deterministic one, never the local classifier's and never Jev's.
+  const down = await asLaya(async () => { throw new Error('timed out after 40 s') })
+  assert.deepEqual([down.authority, down.label, down.reason], ['fallback', 'low', 'Laya unavailable (timed out after 40 s); using the deterministic fallback'])
+  const none = await asLaya(async () => null)
+  assert.equal(none.authority, 'fallback')
+  // Nor is an answer Laya marked too flat to use, which is still kept on the sample, flagged.
+  const flat = await asLaya(laya('high', { informative: false }))
+  assert.deepEqual([flat.authority, flat.label, flat.reason], ['fallback', 'low', 'Laya\'s answer was too flat to use'])
+  assert.equal((await sink.get(flat.sampleId)).provider.informative, false)
+  assert.equal(await store.get(flat.sampleId), null)
+
+  assert.equal(readFileSync(stateFile, 'utf8'), onDisk, 'the state file is byte-identical')
+  assert.equal(JSON.stringify(ctl.state()), inMemory, 'and so is the state in memory, its out-of-distribution count included')
+  await assert.rejects(() => ctl.decide({ features: highFeatures, jev: laya('low'), fallback: fallback(), answeredBy: 'laya' }), /a Laya decision needs the store its sample goes to/)
+})
+
+test('in a Laya run a flat disposition still decides, a domain a rule decides keeps its rule, and none reports a rung', async () => {
+  const root = dir()
+  const store = storeAt(root)
+  const sink = layaStoreAt(root)
+  const policy = smallPolicy()
+  const outcome = controller({ domain: 'outcome_disposition', store, root, policy })
+  const d = await outcome.decide({ features: highFeatures, jev: laya('PASS', { informative: false }), fallback: fallback('RETRY_SAME_TIER'), answeredBy: 'laya', sink, context: { extra: { decidedAt: 0 } } })
+  assert.equal(d.authority, 'laya', 'the review action comes from Laya\'s yes/no answers, so its flat disposition is kept')
+  assert.equal(d.label, 'PASS')
+  const row = await sink.get(d.sampleId)
+  assert.equal(row.provider.informative, false, 'and only the sample says it was flat')
+  assert.deepEqual(row.extra, { decidedAt: 0 })
+  // A rule in code decides the frontier review in any run; Laya is not asked for it.
+  let asked = 0
+  const frontier = controller({ domain: 'frontier_escalation', store, root, policy })
+  const f = await frontier.decide({ features: highFeatures, jev: async () => { asked++; return { label: 'yes', confidence: 1 } }, fallback: fallback('no'), answeredBy: 'laya', sink })
+  assert.deepEqual([f.authority, f.label, f.maturity, asked], ['code', 'no', null, 0])
+  assert.equal((await sink.get(f.sampleId)).code.label, 'no', 'the rule\'s answer is the pick the sample records')
+  // The resource ranking likewise, over its candidates.
+  const cands = [{ key: 'RESOURCE_A', id: 'claude', features: { numeric: { fit: 0.8 }, categorical: { tier: 'frontier' } } }]
+  const r = await controller({ domain: 'resource_selection', store, root, policy }).decide({ features: highFeatures, candidates: cands, jev: null, fallback: () => ({ chosenKey: 'RESOURCE_A', probabilities: { RESOURCE_A: 1 }, confidence: 1 }), codeAuthority: true, localMayDecide: false, answeredBy: 'laya', sink })
+  assert.deepEqual([r.authority, r.chosenKey, r.maturity], ['code', 'RESOURCE_A', null])
+  assert.equal((await store.list()).length, 0, 'the Jev store holds nothing of the run')
+  assert.equal((await sink.list()).length, 3)
+})

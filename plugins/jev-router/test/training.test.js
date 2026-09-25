@@ -12,6 +12,9 @@ import { createDomainController, splitRows } from '../domains.js'
 import { FEATURE_SCHEMA_VERSION } from '../features.js'
 import { resolvePolicy } from '../routing-policy.js'
 import { AUTHORITIES, LABEL_SOURCES, OUTCOME_BACKED, attachOutcomes, createTrainingStore, labelFromRun, samplesCap } from '../training.js'
+// The Laya store's exports, read through the namespace so this file still loads where they are
+// missing and each test says for itself what it needs.
+import * as training from '../training.js'
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), 'kz-training-')), 'routing-samples.jsonl')
 /** A clock that ticks one second per call, so rows order deterministically. */
@@ -703,4 +706,79 @@ test('the plugin hands its training store the policy it resolved, so the gates i
     assert.equal(training.total, 25, 'the small gates in config cap the store at 25')
     assert.deepEqual(training.dropped, { samples: 15, verified: 0 })
   } finally { for (const d of disposers) d() }
+})
+
+// ---------------------------------------------------------------- the Laya store (docs/laya-auto.md 6.1 to 6.4)
+
+/** A sample as a Laya-decided run writes it: no teacher, and Laya's answer as `provider`. */
+const layaSample = (over = {}) => sample({
+  teacher: null,
+  authority: 'laya',
+  provider: { id: 'laya', label: 'implementation', probabilities: { implementation: 0.7, debugging: 0.3 }, confidence: 0.7, informative: true, model: 'laya-english/0.3.20@1a2b3c4', identity: 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1', lang: 'latin' },
+  ...over,
+})
+
+test('the Jev store keeps its list of authorities, and every store\'s list is named beside it', () => {
+  assert.ok(Array.isArray(training.ALL_AUTHORITIES), 'ALL_AUTHORITIES is exported')
+  assert.deepEqual([...training.ALL_AUTHORITIES], ['jev', 'laya', 'local', 'code', 'deterministic', 'fallback'])
+  assert.equal(training.STORE_AUTHORITIES.jev, AUTHORITIES, 'the Jev store reads the list it always had')
+  assert.deepEqual([...training.STORE_AUTHORITIES.laya], ['laya', 'code', 'deterministic', 'fallback'], 'a Laya run is never decided by Jev or by a local classifier')
+  assert.deepEqual([...AUTHORITIES], ['jev', 'local', 'code', 'deterministic', 'fallback'], 'and that list has not moved')
+})
+
+test('store kinds: the Jev store refuses a Laya row, and the Laya store refuses a teacher and keeps what Laya said', async () => {
+  const now = clock()
+  const jevStore = createTrainingStore({ file: tmp(), now })
+  const layaStore = createTrainingStore({ file: tmp(), kind: 'laya', now })
+  assert.equal(layaStore.kind, 'laya')
+  assert.equal(jevStore.kind, 'jev', 'a store that names no kind is the Jev store, as every store was')
+  assert.throws(() => createTrainingStore({ file: tmp(), kind: 'shadow' }), /kind must be one of jev, laya/)
+
+  // The Jev store: a Laya authority, or a provider field of any value, is a programming error.
+  await assert.rejects(() => jevStore.append(layaSample()), /training: a laya sample was refused by the jev store/)
+  await assert.rejects(() => jevStore.append(sample({ authority: 'laya' })), /refused by the jev store/)
+  await assert.rejects(() => jevStore.append(sample({ provider: null })), /refused by the jev store/, 'even an empty provider field')
+  const jevRow = await jevStore.append(sample())
+  assert.equal('provider' in jevRow, false, 'a Jev row has the shape it always had')
+  assert.equal((await jevStore.append(sample({ authority: 'nobody' }))).authority, 'fallback', 'an unknown authority still reads as the fallback')
+  assert.equal((await jevStore.list()).length, 2, 'nothing refused reached the file')
+
+  // The Laya store: Laya is never a teacher, and it cannot ride in as one under another name.
+  await assert.rejects(() => layaStore.append(layaSample({ teacher: { label: 'implementation', confidence: 0.9 } })), /a sample with a teacher was refused by the laya store/)
+  await assert.rejects(() => layaStore.append(layaSample({ provider: { id: 'jev', label: 'x' } })), /provider must be/)
+  const row = await layaStore.append(layaSample({ provider: { ...layaSample().provider, informative: false, prompt: 'the task text as typed', raw: { profile: {} } } }))
+  assert.equal(row.teacher, null)
+  assert.equal(row.authority, 'laya')
+  assert.deepEqual(row.provider, {
+    id: 'laya', label: 'implementation', chosenKey: null, probabilities: { implementation: 0.7, debugging: 0.3 }, confidence: 0.7,
+    informative: false, model: 'laya-english/0.3.20@1a2b3c4', identity: 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1', lang: 'latin',
+  }, 'only the answer is kept: no field a caller adds beside it reaches the file')
+  assert.equal((await layaStore.get(row.id)).provider.informative, false, 'and it reads back as written')
+  assert.equal((await layaStore.append(layaSample({ authority: 'local' }))).authority, 'fallback', 'an authority the Laya store does not hold reads as the fallback')
+  assert.equal((await layaStore.append(layaSample({ authority: 'code', provider: null, code: { label: 'yes', probabilities: {}, confidence: 1 } }))).provider, null)
+  const s = await layaStore.stats('task_classification')
+  assert.equal(s.byAuthority.laya, 1)
+  assert.equal(s.byLabel.implementation, 2, 'a Laya row is counted by the label Laya gave')
+})
+
+test('pickOf and confirms: a Laya pick is contradicted as any pick is, and an accepted run never confirms it', () => {
+  // Task type: a person's tag decides either way, and an accepted run alone says nothing.
+  const s = layaSample()
+  const misread = [{ ts: AFTER, sessionId: 'sess-1', messageId: 'm1', verdict: 'dislike', tag: 'misread my question' }]
+  const good = [{ ts: AFTER, sessionId: 'sess-1', messageId: 'm1', verdict: 'like', tag: 'good pick' }]
+  assert.deepEqual(labelFromRun('task_classification', s, record(), { feedback: misread }), { label: null, negativeLabel: 'implementation', labelSource: 'human', verified: true, details: { finalStatus: 'accepted', attempts: 1, escalated: false } }, 'the pick is Laya\'s answer')
+  assert.equal(labelFromRun('task_classification', s, record(), { feedback: good })?.label, 'implementation')
+  assert.equal(labelFromRun('task_classification', s, record()), null, 'the accept that would confirm it came from Laya\'s own review')
+  // Resource: a rescue labels the rescuer, and the pick doing the accepted work confirms nothing.
+  const res = resourceSample('RESOURCE_C', { teacher: null, authority: 'laya', provider: { id: 'laya', chosenKey: 'RESOURCE_C', probabilities: { RESOURCE_C: 0.6 }, confidence: 0.6, informative: true } })
+  const rescued = record({ attempts: [attempt('deepseek', 'primary', { stopReason: 'error' }), attempt('claude', 'retry')] })
+  assert.deepEqual(labelFromRun('resource_selection', res, rescued), { chosenKey: 'RESOURCE_A', labelSource: 'verified_outcome', negativeKey: 'RESOURCE_C', verified: true, details: { finalStatus: 'accepted', attempts: 2, escalated: true } })
+  assert.equal(labelFromRun('resource_selection', res, record()), null)
+  // Disposition: what followed the review labels it only where it contradicts it.
+  const disp = sample({ domain: 'outcome_disposition', teacher: null, authority: 'laya', provider: { id: 'laya', label: 'PASS', confidence: 0.5, informative: false }, extra: { decidedAt: 0 } })
+  const retried = record({ attempts: [attempt('deepseek'), attempt('deepseek', 'retry')] })
+  assert.equal(labelFromRun('outcome_disposition', disp, retried)?.label, 'RETRY_SAME_TIER')
+  assert.equal(labelFromRun('outcome_disposition', disp, record()), null, 'a PASS the run then accepted is Laya agreeing with itself')
+  // A Jev pick is confirmed as it always was.
+  assert.equal(labelFromRun('task_classification', sample(), record()).labelSource, 'teacher_confirmed')
 })

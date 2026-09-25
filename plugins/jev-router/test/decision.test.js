@@ -5,7 +5,7 @@
 // incompatibility, and the owner's priors reaching routing as numbers rather than names.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -785,4 +785,236 @@ test('a near tie answers with a low confidence, and a clear winner with a high o
   const measured = { ...SCARCE_STRONG, id: 'known', key: 'RESOURCE_F', scarcity: 0, expectedCost: { total: 0.8 }, fit: 0.8, capabilities: rankCaps(0.8) }
   const r = rankCandidates({ candidates: [guessed, measured], profile: rankProfile({ complexity: 0.9, risk: 0.8 }), policy })
   assert.equal(r.chosenKey, 'RESOURCE_F', 'the lower but measured score wins over the higher guess')
+})
+
+test('the ranking trusts a candidate over the dimensions the deciding provider counts as wanted', () => {
+  // Trust is averaged over the wanted dimensions: a well-measured one alone, or with one nobody
+  // has measured beside it. Which of them is wanted is the provider's requirementWanted.
+  const c = { ...CHEAP_STANDARD, fit: 0.9, capabilities: { coding: { score: 0.9, confidence: 0.9, samples: 10 }, testing: { score: 0.9, confidence: 0.1, samples: 0 } } }
+  const profile = rankProfile({ requirements: { coding: 0.9, testing: 0.55 } })
+  const atJev = rankCandidates({ candidates: [c], profile, policy }).scores[c.key]
+  const atLaya = rankCandidates({ candidates: [c], profile, policy: { ...policy, requirementWanted: 0.6 } }).scores[c.key]
+  assert.ok(atLaya > atJev, `at 0.6 the unmeasured testing score is not wanted, so trust rises (${atLaya} against ${atJev})`)
+  assert.equal(rankCandidates({ candidates: [c], profile, policy: { ...policy, requirementWanted: 0.5 } }).scores[c.key], atJev, 'and Jev\'s 0.5 is the default')
+})
+
+// --- a run Laya decides (docs/laya-auto.md 2.5, 4.3, 6.3) ---------------------------------------
+
+/**
+ * A fake Laya: jev.route's shape as createJev returns it over the Laya client, with the model the
+ * client relabels and the names of the answers Laya gave too flat to use, per call (`flat.task`,
+ * `flat.resource`), as jev.js lists them in `uninformative`. Nothing more: createJev keeps the
+ * client's `meta` on the trace and returns none from route() (docs/laya-auto.md 2.3).
+ */
+function fakeLaya({ profile = profileOf(), strategy = 'STANDARD_DIRECT', secondOpinion = 0.2, flat = {} } = {}) {
+  const calls = []
+  return {
+    calls,
+    route: async (args) => {
+      calls.push(args)
+      const task = args.ask?.task !== false
+      const out = { model: 'laya-english/0.3.20@1a2b3c4', uninformative: [...(task ? flat.task ?? [] : flat.resource ?? [])] }
+      if (task) { out.profile = profile; Object.assign(out, { taskType: profile.taskType, complexity: profile.complexity, risk: profile.risk, handler: 'agent' }) }
+      if (args.candidates && args.ask?.resource !== false) out.strategy = { choice: strategy, confidence: 0.4, probabilities: { [strategy]: 0.4 } }
+      if (args.candidates && args.ask?.judgments !== false) out.secondOpinion = secondOpinion
+      return out
+    },
+  }
+}
+/**
+ * An engine with a real domain registry over Jev's store, and Laya's store beside it. `ladder`
+ * puts domains of Jev's ladder at a rung, as their state files hold it, read back as at start-up;
+ * such a registry has no artifacts folder, since a missing artifact would take a local rung away
+ * at load.
+ */
+function layaEngine({ ladder = {} } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'kz-decision-'))
+  const stateDir = join(root, 'domains')
+  const store = createTrainingStore({ file: join(root, 'routing-samples.jsonl') })
+  const sink = createTrainingStore({ file: join(root, 'laya-samples.jsonl'), kind: 'laya' })
+  const artifactsDir = Object.keys(ladder).length ? undefined : join(root, 'classifiers')
+  const domains = createDomainRegistry({ policy, store, artifactsDir, stateDir, now: () => now })
+  if (Object.keys(ladder).length) {
+    mkdirSync(stateDir, { recursive: true })
+    for (const [id, maturity] of Object.entries(ladder)) writeFileSync(join(stateDir, `${id}.state.json`), JSON.stringify({ stateVersion: 3, maturity }))
+    domains.load()
+  }
+  const e = createDecisionEngine({ policy, domains, profiles: createCapabilityRegistry({ priors: PRIORS, policy }), priors: PRIORS, store, now: () => now })
+  return { e, store, sink, domains, stateDir }
+}
+const records = async () => (await import('../providers.js')).resolveProviders({}, { policy })
+
+test('fillFlat takes every field the provider answered, merges the requirements per dimension, and fills the tiers', async () => {
+  const { fillFlat } = await import('../decision.js')
+  assert.equal(typeof fillFlat, 'function', 'decision.js exports fillFlat')
+  const heuristic = heuristicProfile('fix the login bug')
+  assert.ok(Object.keys(heuristic.requirements).length >= 2, 'the setting: the heuristic wants some dimensions for this type')
+  const [kept, flat] = Object.keys(heuristic.requirements)
+  // As jev.js builds it: a flat score or choice is left out, and named in filledByRules.
+  const answered = {
+    taskType: 'debugging', taskTypeConfidence: 0.41, complexity: undefined, risk: 0.3,
+    requirements: { [kept]: 0.9, context_handling: 0.2 }, skills: { primary: 'debugging', supporting: [] },
+    minimumCapability: undefined, preferredCapability: undefined, capability: undefined,
+    verification: ['checks'], needsSecondOpinion: 0.5, needsHumanReview: 0.5, needsTests: 0.5,
+    filledByRules: ['complexity', 'minimumCapability', 'preferredCapability', 'capability', `req.${flat}`],
+  }
+  const p = fillFlat(heuristic, answered)
+  assert.deepEqual([p.taskType, p.taskTypeConfidence, p.risk, p.needsHumanReview], ['debugging', 0.41, 0.3, 0.5], 'what was answered is the provider\'s')
+  assert.equal(p.complexity, heuristic.complexity, 'a flat score is the rules\'')
+  assert.deepEqual(p.requirements, { ...heuristic.requirements, [kept]: 0.9, context_handling: 0.2 }, 'per dimension: a flat one is the heuristic\'s 0.7 where its type exercises it')
+  assert.equal(p.requirements[flat], 0.7)
+  assert.deepEqual([p.minimumCapability, p.preferredCapability], ['standard', 'strong'], 'flat tiers take the heuristic\'s fixed ones')
+  assert.equal(p.capability, undefined, 'a flat capability is no capability: no filter, no stop')
+  assert.equal('heuristic' in p, false, 'a profile that is mostly the provider\'s is not the heuristic\'s')
+  assert.deepEqual(p.filledByRules, answered.filledByRules, 'and it still says what the rules filled')
+  assert.equal(heuristic.heuristic, true, 'the heuristic it started from is left as it was')
+})
+
+test('a Laya run: Laya decides every domain it is asked, the rules keep theirs, and every sample goes to Laya\'s store', async () => {
+  const { laya } = await records()
+  const { e, store, sink } = layaEngine()
+  const decider = fakeLaya()
+  const d = await decide(e, undefined, { decider, provider: laya, sink, runId: 'run-laya' })
+  const authorities = Object.fromEntries(Object.entries(d.domains).map(([id, r]) => [id, r.authority]))
+  assert.deepEqual(authorities, { task_classification: 'laya', skill_selection: 'laya', resource_selection: 'code', execution_strategy: 'laya', second_opinion: 'laya', frontier_escalation: 'code' })
+  for (const [id, r] of Object.entries(d.domains)) assert.equal(r.maturity, null, `${id} reports no rung`)
+  assert.equal(d.routing.decision.decider, 'laya', 'the decision names who decided')
+  assert.equal(d.routing.decision.jevCalls, 2, 'and counts the calls made to it')
+  assert.equal(decider.calls.length, 2)
+  assert.ok(d.samples.length >= 4 && d.samples.every((s) => s.store === 'laya'), 'every sample the run labels is found in Laya\'s store')
+  assert.deepEqual(d.routing.decision.samples.map((s) => s.store), d.samples.map(() => 'laya'))
+  assert.equal((await store.list()).length, 0, 'the store Jev teaches from holds nothing of it')
+  const rows = await sink.list()
+  assert.ok(rows.length >= 6)
+  for (const r of rows) {
+    assert.equal(r.teacher, null)
+    assert.equal(r.runId, 'run-laya')
+    assert.ok(['laya', 'code'].includes(r.authority), `${r.domain}: ${r.authority}`)
+  }
+  const task = rows.find((r) => r.domain === 'task_classification')
+  assert.deepEqual([task.provider.label, task.provider.model], ['implementation', 'laya-english/0.3.20@1a2b3c4'])
+  assert.deepEqual([task.provider.identity, task.provider.lang], [null, null], 'route() hands over no meta, so nothing makes up an identity or a script')
+  assert.equal(task.extra.profile, undefined, 'no class average can read Laya\'s numbers')
+  assert.equal(task.extra.providerProfile.risk, 0.2)
+  // A Jev run with the same wiring is Jev's, in Jev's store, as it always was, even when it is
+  // handed Laya's store: that one would refuse Jev's rows, and they would be lost.
+  const { jev } = await records()
+  const j = await decide(e, fakeJev(), { provider: jev, sink })
+  assert.equal(j.domains.task_classification.authority, 'jev')
+  assert.equal(j.routing.decision.decider, 'jev')
+  assert.ok(j.samples.length >= 4 && j.samples.every((s) => s.store === 'jev'))
+  assert.equal((await store.list()).length, rows.length, 'every domain of the Jev run wrote its sample to Jev\'s store')
+  assert.ok((await store.list({ domain: 'task_classification' }))[0].extra.profile, 'and its numbers are Jev\'s profile')
+  assert.equal((await sink.list()).length, rows.length, 'and none to Laya\'s')
+})
+
+test('a Laya run: what Laya answered too flat to use is filled by the rules, field by field, and the rest stays Laya\'s', async () => {
+  const { laya } = await records()
+  const { e, sink } = layaEngine()
+  const task = 'implement the parser change'
+  const heuristic = heuristicProfile(task)
+  const taskFlat = ['taskType', 'complexity', 'minimumCapability', 'preferredCapability']
+  const profile = profileOf({ taskType: undefined, taskTypeConfidence: undefined, complexity: undefined, minimumCapability: undefined, preferredCapability: undefined, risk: 0.2, filledByRules: taskFlat })
+  const decider = fakeLaya({ profile, secondOpinion: 0.9, flat: { task: taskFlat, resource: ['strategy', 'secondOpinion'] } })
+  const d = await decide(e, undefined, { decider, provider: laya, sink, task })
+  const t = d.domains.task_classification
+  assert.deepEqual([t.authority, t.reason], ['fallback', 'Laya\'s answer was too flat to use'])
+  assert.equal(d.profile.taskType, heuristic.taskType, 'the rules gave the type')
+  assert.equal(d.profile.complexity, heuristic.complexity, 'and the score Laya left flat')
+  assert.equal(d.profile.risk, 0.2, 'while the risk Laya did answer is Laya\'s, not the heuristic\'s 0.5')
+  assert.deepEqual(d.profile.requirements, { ...heuristic.requirements, coding: 0.8, testing: 0.4 })
+  assert.deepEqual([d.profile.minimumCapability, d.profile.preferredCapability], ['standard', 'strong'])
+  assert.equal(d.profile.heuristic, undefined)
+  assert.deepEqual(d.profile.filledByRules, taskFlat, 'the report can say what the rules filled')
+  assert.equal(d.domains.skill_selection.authority, 'laya', 'the skill Laya did answer still decides')
+  assert.equal(d.plan.skill.authority, 'laya', 'and is not reported as the fallback')
+  // The resource call: a flat strategy and a flat second opinion take the rules.
+  const s = d.domains.execution_strategy
+  assert.deepEqual([s.authority, s.reason], ['fallback', 'Laya\'s answer was too flat to use'])
+  const so = d.domains.second_opinion
+  assert.deepEqual([so.authority, so.label], ['fallback', 'no'], 'the rule reads risk 0.2 against Laya\'s riskForReview 0.45, never Laya\'s flat yes')
+  // Each flat answer is kept on its sample, flagged, so a reading of Laya can leave it out.
+  const rows = await sink.list()
+  for (const domain of ['task_classification', 'execution_strategy', 'second_opinion']) {
+    assert.equal(rows.find((r) => r.domain === domain).provider.informative, false, domain)
+  }
+  assert.equal(rows.find((r) => r.domain === 'skill_selection').provider.informative, true)
+})
+
+test('the cut-offs are the deciding provider\'s, read from its record through the per-run policy', async () => {
+  const { jev, laya } = await records()
+  // The second-opinion rule when nobody answers: the heuristic's risk 0.5 is under Jev's
+  // riskForReview 0.6 and at or over Laya's 0.45.
+  assert.equal((await decide(engine(), undefined, { provider: jev })).routing.decision.judgments.secondOpinion, 0)
+  assert.equal((await decide(engine(), undefined, { provider: laya })).routing.decision.judgments.secondOpinion, 1)
+  // Easy enough to move off a scarce resource: complexity 0.45 is, for Jev (0.5), and is not, for Laya (0.4).
+  const easyish = profileOf({ complexity: 0.45, risk: 0.1 })
+  assert.equal((await decide(engine(), undefined, { decider: fakeJev({ profile: easyish }), provider: jev, snapshots: scarce() })).routing.conservedFrom, 'claude')
+  assert.equal((await decide(engine(), undefined, { decider: fakeLaya({ profile: easyish }), provider: laya, snapshots: scarce() })).routing.conservedFrom, undefined)
+  // A requirement at 0.55 is wanted at Jev's requirementWanted 0.5 and not at Laya's 0.6.
+  const halfway = profileOf({ requirements: { coding: 0.55, testing: 0.8 } })
+  const shown = async (decider, provider) => Object.keys((await decide(engine(), undefined, { decider, provider })).routing.decision.candidates[0].capabilities)
+  assert.ok((await shown(fakeJev({ profile: halfway }), jev)).includes('coding'))
+  assert.ok(!(await shown(fakeLaya({ profile: halfway }), laya)).includes('coding'))
+  // A judgment's P(true) is read at the record's own judgmentYes.
+  const strict = (await import('../providers.js')).resolveProviders({ laya: { thresholds: { judgmentYes: 0.7 } } }, { policy }).laya
+  const yesAt = async (provider) => (await decide(engine(), undefined, { decider: fakeLaya({ secondOpinion: 0.6 }), provider })).domains.second_opinion
+  assert.deepEqual([(await yesAt(laya)).authority, (await yesAt(laya)).label], ['laya', 'yes'])
+  assert.equal((await yesAt(strict)).label, 'no')
+  // Without a record the run is Jev's, on the policy's own minimumReview, as before there were two.
+  const raised = resolvePolicy({ minimumReview: { riskForReview: 0.4 } })
+  const e = createDecisionEngine({ policy: raised, domains: undefined, profiles: createCapabilityRegistry({ priors: PRIORS, policy: raised }), priors: PRIORS, now: () => now })
+  assert.equal((await decide(e, undefined)).routing.decision.judgments.secondOpinion, 1)
+})
+
+test('a Laya run asks Laya every question whatever rung Jev\'s ladder holds a domain at, and leaves that ladder as it was', async () => {
+  const { laya } = await records()
+  // Jev's ladder has earned every domain Laya answers the top rung, and so costs Jev nothing there.
+  const ladder = { task_classification: 'LOCAL_ONLY', skill_selection: 'LOCAL_ONLY', execution_strategy: 'LOCAL_ONLY', second_opinion: 'LOCAL_ONLY' }
+  const { e, sink, domains, stateDir } = layaEngine({ ladder })
+  assert.equal(domains.get('second_opinion').state().maturity, 'LOCAL_ONLY', 'the setting: Jev\'s ladder holds the judgment at its top rung')
+  const files = () => Object.fromEntries(readdirSync(stateDir).map((f) => [f, readFileSync(join(stateDir, f), 'utf8')]))
+  const before = files()
+  const decider = fakeLaya({ secondOpinion: 0.9 })
+  const d = await decide(e, undefined, { decider, provider: laya, sink, runId: 'run-laya' })
+  assert.deepEqual(decider.calls.map((c) => c.ask), [{ task: true, resource: false, judgments: false }, { task: false, resource: true, judgments: true }], 'the judgment rides the resource call, as at JEV_PRIMARY')
+  const so = d.domains.second_opinion
+  assert.deepEqual([so.authority, so.label, so.maturity], ['laya', 'yes', null], `Laya decides it (${so.reason})`)
+  assert.deepEqual(Object.fromEntries(Object.entries(d.domains).map(([id, r]) => [id, r.authority])), { task_classification: 'laya', skill_selection: 'laya', resource_selection: 'code', execution_strategy: 'laya', second_opinion: 'laya', frontier_escalation: 'code' })
+  assert.deepEqual(files(), before, 'and Jev\'s ladder is exactly as it was')
+  // A Jev run on the same ladder still leaves out the group only mature domains would read.
+  const jev = fakeJev()
+  await decide(layaEngine({ ladder }).e, jev)
+  assert.deepEqual(jev.calls.map((c) => c.ask), [{ task: true, resource: false, judgments: false }, { task: false, resource: true, judgments: false }])
+})
+
+test('a Jev run reads rows 20 and 21 from routing.minimumReview whichever Jev record it is handed, the router\'s default one included', async () => {
+  const { DEFAULT_JEV, resolveProviders } = await import('../providers.js')
+  const raised = resolvePolicy({ minimumReview: { riskForReview: 0.4, riskForFrontierReview: 0.45 } })
+  const e = createDecisionEngine({ policy: raised, domains: undefined, profiles: createCapabilityRegistry({ priors: PRIORS, policy: raised }), priors: PRIORS, now: () => now })
+  // Nobody answers, so the rules read the heuristic's risk 0.5: at or over the policy's 0.4 and
+  // 0.45, under the 0.6 and 0.8 the default record carries.
+  const cuts = raised.codeJudgments.frontierReview
+  for (const [name, over] of [['no record', {}], ['DEFAULT_JEV', { provider: DEFAULT_JEV }], ['Jev\'s record from this policy', { provider: resolveProviders({}, { policy: raised }).jev }]]) {
+    const { secondOpinion, frontierReview } = (await decide(e, undefined, over)).routing.decision.judgments
+    assert.deepEqual([secondOpinion, frontierReview], [1, cuts.risky], name)
+  }
+})
+
+test('a Laya run stores as Laya\'s numbers only what Laya answered, and nothing when it gave no answer', async () => {
+  const { laya } = await records()
+  const { e, sink } = layaEngine()
+  const down = { route: async () => { throw new Error('timed out after 42 s') } }
+  await decide(e, undefined, { decider: down, provider: laya, sink, runId: 'run-down' })
+  const row = (await sink.list({ domain: 'task_classification' }))[0]
+  assert.deepEqual([row.authority, row.provider], ['fallback', null], 'the setting: Laya gave nothing, and the rules decided')
+  assert.equal(row.extra?.providerProfile, undefined, 'the rules\' profile is never stored as Laya\'s numbers')
+  assert.equal(row.extra?.profile, undefined, 'nor as a teacher\'s')
+  // Only the type was too flat: the rules gave the type, and the numbers Laya did give are Laya's.
+  const flat = layaEngine()
+  const profile = profileOf({ taskType: undefined, taskTypeConfidence: undefined, filledByRules: ['taskType'] })
+  await decide(flat.e, undefined, { decider: fakeLaya({ profile, flat: { task: ['taskType'] } }), provider: laya, sink: flat.sink })
+  const given = (await flat.sink.list({ domain: 'task_classification' }))[0]
+  assert.equal(given.authority, 'fallback')
+  assert.equal(given.extra.providerProfile.risk, 0.2, 'Laya\'s risk, not the heuristic\'s 0.5')
 })
