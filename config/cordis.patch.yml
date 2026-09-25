@@ -21,6 +21,22 @@
   config:
     permissionMode: approve-for-me
 
+# Conversation compaction (the engine's compaction-basic): a conversation is
+# summarised when it reaches 97% of its model's context window, not the
+# engine's default 80% (decided by the owner on 25 Sep). The newest 16% stays
+# word for word; everything older is replayed to the model and summarised.
+# That request has to fit the window too, so on the local models (12,288 to
+# 16,384 tokens once the RAM budget has sized them) the summary is capped at
+# 1,024 tokens: the engine's 8,192 would not fit beside what is summarised.
+# Every local chat model in config/local-models.json needs its row here;
+# plugins/jev-router/test/compaction-config.test.js checks the arithmetic.
+- id: compaction-basic
+  config:
+    thresholdRatio: 0.97
+    modelPolicies:
+      - { provider: local, model: qwen3-8b, maxTokens: 1024 }
+      - { provider: local, model: gemma4-e4b, maxTokens: 1024 }
+
 # Router plugin. Agents, limits and thresholds are configurable here; omitted
 # fields use the defaults in the plugin's Config schema.
 # jev-review holds the review code that judges every result (pass / second

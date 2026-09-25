@@ -37,6 +37,7 @@ feature is silently gone.
 
 One line per finished workflow step, newest first, written by `scripts/doc-queue.mjs log` when the step ends.
 
+- 2026-09-25 17:21 UTC, Compaction at 97 percent: The engine's compaction-basic set to 0.97 of the window in config/cordis.patch.yml, with a 1,024-token summary on local models and a test of the arithmetic.
 - 2026-09-25 16:53 UTC, Wording fixes and the doc queue: The CPU-fallback note and the signal restart line corrected; scripts/doc-queue.mjs added with its tests, and red-check taught repository scripts (1196 tests, 1195 pass, 0 fail, 1 skipped).
 - 2026-09-25 16:24 UTC, Real laya.serve run on the fixed code: 8 of 9 end-to-end steps passed, step 1 not run for disk; figures within about 10 percent of the first run.
 - 2026-09-25 15:55 UTC, Whole-branch review and fixes: 54 findings from five lenses and the finished end-to-end test; 50 fixed with tests, 4 already fixed, none refuted (1188 tests, 1187 pass, 0 fail, 1 skipped).
@@ -327,8 +328,11 @@ independently re-derived.
      First speed and memory: load each installed local model at the configured context, time real generation, and store `tokensPerSec` beside the VRAM and RAM `local.json` already records per model and context, so the picker's `~X words/s est.` becomes measured.
      Then capability: a small fixed task set per skill, each task in a throwaway workspace with its own tests, run on every agent through the normal routing, the pass rate written as `source: 'benchmark'` rows in `capability-evidence.jsonl` (`profiles.js` already weighs them at 0.7 with a 180-day half-life and the Router tab already shows them).
      The task set is the part that decides what the scores mean; cloud agents cost real usage, so it is a button behind a confirmation, never automatic.
-  2. **Compaction at 97 percent.**
-     Conversation compaction belongs to the DSH engine, not to KzH, which only picks the model that writes the summary (`auxModel`); find out on the installed engine whether its threshold can be set, and set it to 97 percent if it can.
+  2. **Compaction at 97 percent: done on 25 Sep, in the cloud.**
+     Conversation compaction belongs to the engine's `compaction-basic` plugin (`@deepseek-ai/dsh-compaction-basic`, read at the pinned 0.1.5-rc.2), whose `thresholdRatio` defaults to 0.8; `config/cordis.patch.yml` now sets it to 0.97.
+     The engine replays all but the newest 16% of the conversation to the model and asks for a summary of up to `maxTokens` (8,192 by default), which on a local model's 12,288 to 16,384-token window does not fit even at the old 80%, so each local chat model gets a 1,024-token summary; `test/compaction-config.test.js` checks that arithmetic for every chat model in `config/local-models.json` at the smallest window the RAM budget allows.
+     An existing install gets the new rows only by hand: `Update-Harness.ps1` lists them under "missing in" the live config and merges nothing, by design, so the owner pastes the `compaction-basic` block into the live `cordis.patch.yml`.
+     Two limits stay: every KzH row tells the engine it has a 1,000,000-token window (`adapter.js`), so a Jev Auto or Laya Auto chat compacts only at 970,000 tokens, which a chat of messages and answers seldom reaches; and Claude Code and Codex compact their own sessions by their own rules, which this setting does not touch.
   3. **Laya's thresholds and temperatures from the desktop export**, as `laya-auto.md` section 10 lays out, once the export is back.
   4. **Run fix batches in parallel.**
      A review's fixes were run one batch at a time in the cloud, where two helpers can run at once; on the owner's PC (up to 10), batches that own distinct files run in parallel worktrees, followed by one merge and full-suite step.
