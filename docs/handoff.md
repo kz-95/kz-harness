@@ -15,7 +15,7 @@ branch        main                         977e39e, pushed; adaptive routing mer
               fix/roadmap-open-items       pushed, NOT merged into main; the second pass of 24 Sep
               fix/routing-self-labelling   merged into main, pushed, safe to delete
               feat/routing-stability-local-context   parked by the owner, not merged
-              feat/laya-auto               Laya Auto, built group by group (docs/laya-auto.md 11); G1 to G8 integrated, G9 (the cloud end-to-end test and the desktop helpers) next
+              feat/laya-auto               Laya Auto, built group by group (docs/laya-auto.md 11); G1 to G8 integrated and pushed, G9 run in part (see the Laya section)
 remote        origin github.com/kz-95/kz-harness, PUBLIC
 tests         820 tests, 819 pass, 0 fail, 1 skipped on fix/roadmap-open-items  (npm --prefix plugins/jev-router test)
 app           NOT rebuilt; the running app is on older plugin code than either branch
@@ -67,7 +67,7 @@ What the second pass did:
 What is next, in order:
 
 1. Everything under "For the desktop agent" below, starting with getting the branch into the app and watching one routed run.
-2. Laya: the providerised `jev.js` and Laya Auto are built on `feat/laya-auto` (see "Laya: built on `feat/laya-auto`, not yet observed"); what is left is its cloud end-to-end test (G9) and the owner's desktop checklist.
+2. Laya: the providerised `jev.js` and Laya Auto are built on `feat/laya-auto` (see "Laya: built on `feat/laya-auto`, not yet observed"); what is left is the rest of its cloud end-to-end test (G9), a final review of the whole branch, and the owner's desktop checklist.
 
 ### The first pass, for context
 
@@ -136,7 +136,25 @@ The card's status poll applies only its newest response (`client.js` `useLocal`)
 The design the owner decided on 24 Sep is [`laya-auto.md`](laya-auto.md), and branch `feat/laya-auto` builds it group by group (its section 11).
 With G8 integrated, the plugin wires all of it (`index.js`): both provider records built once, Laya's sidecar with its install recovery and orphan sweep run first in `apply()`, the Laya client every Laya call goes through, the shadow of Jev Auto, the RAM residency shared with llama, one run id per run across `usage.jsonl`, `history.jsonl`, the samples, the shadow rows, the inspector and Stop, the Laya Auto row and `/laya` with the refusals of 3.5, Laya's own sample store and verdict relabelling, and the Laya routes of 8.4.
 Whole runs are tested in `plugins/jev-router/test/laya-integration.test.js` against a fake `laya.serve` supervised by the real sidecar; the store and authority rules are in [`adaptive-routing.md`](adaptive-routing.md), "A second decider: Laya".
-Nothing of it has run in the app or against real Laya weights. G9 adds the cloud test against the real `laya.serve` on a random-weight checkpoint; after that the owner runs the desktop checklist, `laya-auto.md` 9.5.
+Nothing of it has run in the app or against real Laya weights.
+
+G9, the cloud test against the real `laya.serve`, was run in part on 25 Sep with `plugins/jev-router/test/e2e/laya.e2e.mjs` (run by hand, `KZH_LAYA_E2E=1 KZH_LAYA_HARNESS=<dir>`; `npm test` never runs it).
+The harness held laya 0.3.20, torch 2.14.0 and transformers 5.17.0 from the pinned lock, and a random-weight checkpoint at the real English architecture planted as a Hugging Face snapshot, because huggingface.co is blocked in the cloud.
+Laya's own `fetch_weights.py` loaded it offline, and KzH's real supervisor, adapter and client drove the real `laya.serve` on 4 vCPU:
+
+| Step | Result |
+| --- | --- |
+| Start through `createLayaSidecar`, first start with its warm-up | ready in 132 s on the CPU with 1 thread, 2.41 GB RAM, the temperature warning parsed |
+| A wrong key | refused by `laya.serve` with 401 |
+| KzH's four real bodies through `createLayaClient` | every question answered, the model relabelled `laya-english/0.3.20@<commit>`; intent 1.7 s, resource 3.2 s, routing task group 49.7 s, review 18.6 s |
+| `createJev` with Laya's record, an intent | answered in 1.8 s; with random weights every answer is flat, named in `uninformative` |
+| The interpreter killed mid-call | the call failed with "Laya stopped while answering (the process ended); it is restarting", the supervisor restarted it in 13 s, and the next call answered |
+
+The CPU figures are slow because the thread default (`limitsFor`) gives a 4-vCPU machine one thread; a PC with more cores gets more, and the GPU is expected to be far faster, unmeasured.
+Not run yet, from `laya-auto.md` 9.4: the install through `laya-install.js` itself (the disk here could not hold a second torch), the deadline gate against the real lock (step 5), a whole Jev Auto run with the shadow and a whole Laya Auto run against the real server (steps 6 and 7), the watchdog and idle checks (step 8) and the render check (step 9).
+Those need the session's helpers, which hit the account's weekly limit on 25 Sep (it resets 28 Sep, 07:00 UTC), as does the planned final review of the whole branch across all nine groups.
+Each group was reviewed and fixed on its own before its merge, and the suite passes: 1132 tests, 1131 pass, 0 fail, 1 skipped, three runs in a row.
+After that the owner runs the desktop checklist, `laya-auto.md` 9.5.
 
 What follows is the reasoning from before the design, kept for why it is shaped this way.
 `laya-serve` speaks the same `POST /v1/systemone` protocol as Jev, with the same `choice`, `score`
@@ -347,10 +365,10 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
 
 ## Built but NOT observed, do not claim these as working
 
-- **Laya Auto and the Laya comparison in Jev Auto** (`feat/laya-auto`). Tested against a fake
-  `laya.serve` only: no real Laya weights have answered a KzH question, no GPU has run it, no
-  Windows process handling has been seen, and nobody has looked at the Laya card or the inspector's
-  Laya column. The desktop checklist is `laya-auto.md` 9.5.
+- **Laya Auto and the Laya comparison in Jev Auto** (`feat/laya-auto`).
+  Whole runs are tested against a fake `laya.serve`; the real `laya.serve` has answered KzH's real bodies only on random weights in the cloud (the Laya section above).
+  No real Laya weights have answered a KzH question, no GPU has run it, no Windows process handling has been seen, and nobody has looked at the Laya card or the inspector's Laya column.
+  The desktop checklist is `laya-auto.md` 9.5.
 - **The whole adaptive router** (22 Sep, `feat/adaptive-routing`, audited and fixed 23 Sep). It is
   covered by its own test files (`adaptive`, `classifier`, `decision`, `domains`, `governor`,
   `jev`, `observability`, `policy`, `profiles`, `resources`, `training` under
