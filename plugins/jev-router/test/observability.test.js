@@ -164,9 +164,9 @@ test('the inspector names every move the router made, in the report\'s own words
   const legacy = { primaryAgent: 'claude', gatedFrom: 'acme', tiebrokeFrom: 'deepseek' }
   assert.deepEqual(moveNotes(legacy), movesOf(legacy).map((m) => moveLine(m, legacy)))
   assert.deepEqual(moveNotes({ primaryAgent: 'claude' }), [])
-  // Rendered on the live run view and on a stored run, and "Jev picked" names Jev's own pick.
+  // Rendered on the live run view and on a stored run, and "<decider> picked" names the decider's own pick.
   assert.equal((client.match(/\.\.\.moveNotes\(R\)\.map/g) ?? []).length, 2)
-  assert.match(client, /Jev picked \$\{movesOf\(R\)\[0\]\?\.from \?\? R\.primaryAgent\}/)
+  assert.match(client, /\$\{who\} picked \$\{movesOf\(R\)\[0\]\?\.from \?\? R\.primaryAgent\}/)
 })
 
 // ---------- who decided, and what Laya answered beside Jev (docs/laya-auto.md 3.3, 5.6) ----------
@@ -208,10 +208,17 @@ const answering = (questions, marks = {}) => Object.fromEntries(Object.entries(q
  * of a call that failed, that the inspector is handed: so the card reads the names jev.js writes.
  */
 async function calls() {
-  const { createJev } = await import('../jev.js')
+  const jevJs = await import('../jev.js')
   const { resolveProviders } = await import('../providers.js')
   const { resolvePolicy } = await import('../routing-policy.js')
   const providers = resolveProviders({}, { policy: resolvePolicy() })
+  // createJev with a provider record and a client of the caller's own, which it must use. One that
+  // took neither would build a TypeSafe client, and with no key that client refuses to exist.
+  const createJev = (options) => {
+    let made
+    assert.doesNotThrow(() => { made = jevJs.createJev(options) }, 'createJev takes a provider record and the client it is handed')
+    return made
+  }
   const traces = []
   const errors = []
   const laya = createJev({
@@ -281,6 +288,30 @@ test('the uncalibrated pill follows each answer\'s own corrected mark, never its
   const tree = expand(plugin().Questions({ calls: [{ trace: t.laya }] }))
   const kind = nodes(tree).find((n) => n.type === 'details' && nodes(n).some((c) => c.type === 'code' && textOf(c) === 'kind'))
   assert.ok(nodes(kind).some((n) => n.type === 'span' && n.props.className === 'pill warn' && textOf(n) === 'uncalibrated (2 options)'))
+})
+
+test('a flat second opinion is filled by the rules on the judgments call only; on a task-group call it is the profile\'s, kept as answered', () => {
+  const { Questions } = plugin()
+  assert.equal(typeof Questions, 'function', 'the call cards can be rendered')
+  const q = (name, type = 'noul') => ({ name, type, used: true, informative: false, answer: type === 'noul' ? 0.5 : 'a', probabilities: type === 'noul' ? undefined : { a: 0.5, b: 0.5 }, question: name })
+  const call = (questions) => ({ trace: { phase: 'route', ms: 900, provider: 'laya', model: 'laya-english/0.3.20@1a2b3c4', questions, meta: { device: 'cpu' } } })
+  const pillOf = (tree, name) => {
+    const card = nodes(tree).find((n) => n.type === 'details' && nodes(n).some((c) => c.type === 'code' && textOf(c) === name))
+    return nodes(card).filter((n) => n.type === 'span' && n.props.className === 'pill warn').map(textOf)
+  }
+  const [task, judgments] = expand(Questions({ calls: [call([q('taskType', 'choice'), q('secondOpinion')]), call([q('strategy', 'choice'), q('secondOpinion')])] })).children
+  assert.deepEqual(pillOf(task, 'taskType'), ['too flat, filled by rules'])
+  assert.deepEqual(pillOf(task, 'secondOpinion'), ['too flat, kept as answered'])
+  assert.deepEqual(pillOf(judgments, 'secondOpinion'), ['too flat, filled by rules'])
+})
+
+test('a Laya call that timed out is a card that says how many questions it asked and where, as the live line does', () => {
+  const { failedCall } = display()
+  // What jev.js keeps of the Laya client's timeout (errorOf): the size and device beside the message.
+  const late = (error) => ({ type: 'decider-error', at: 1, error: { phase: 'route', provider: 'laya', ms: 42000, error: { class: 'Error', status: null, message: 'timed out after 40 s', ...error } } })
+  assert.deepEqual(failedCall(late({ code: 'LAYA_TIMEOUT', questions: 20, device: 'cpu' })), { head: 'Laya · Routing', text: 'failed after 42000 ms: timed out after 40 s (20 questions on the CPU)' })
+  assert.deepEqual(failedCall(late({ code: 'LAYA_TIMEOUT', questions: 4, device: 'cuda' })).text, 'failed after 42000 ms: timed out after 40 s (4 questions on the GPU)')
+  assert.deepEqual(failedCall(late({ code: 'LAYA_HTTP_500', message: 'Laya refused this call (HTTP 500: inference failed)' })).text, 'failed after 42000 ms: Laya refused this call (HTTP 500: inference failed)')
 })
 
 test('a call that did not answer is a card that says who, which call, how long and why, with no questions', async () => {
@@ -603,6 +634,61 @@ test('a shadow row that lands after the run has ended does not lengthen it: the 
   assert.match(item.meta, / · 30\.0 s$/)
 })
 
+test('the Background list shows a run\'s own lines, never a word for each of Laya\'s shadow rows in the same log', () => {
+  const { taskItems } = plugin()
+  assert.equal(typeof taskItems, 'function', 'the Background list can be built')
+  const t0 = 1_000_000
+  const run = {
+    id: 'r1', task: 'fix the flaky test', startedAt: t0, events: [
+      { type: 'start', at: t0, text: 'Task received' },
+      { type: 'routed', at: t0 + 950, text: 'Routed to claude (jev)', routing: { mode: 'jev', decider: 'jev', primaryAgent: 'claude' }, shadow: 'answering' },
+      { type: 'final', at: t0 + 30_000, text: 'Final: accepted', status: 'accepted' },
+      { type: 'shadow', at: t0 + 32_000, row: { callId: 'c1', status: 'answered' } },
+      { type: 'shadow', at: t0 + 33_000, row: { callId: 'c2', status: 'skipped', reason: 'queue_full' } },
+    ],
+  }
+  const [item] = taskItems({ sessionId: 's', runs: [run], jobs: [], entries: [], tasks: [], open: new Set(), now: t0 + 40_000 })
+  assert.equal(textOf(expand(item.body)), 'Task received\nRouted to claude (jev)\nFinal: accepted')
+})
+
+test('the decider tile counts the time of the calls that failed too, and says how many failed', async () => {
+  const { summarize, Stats } = plugin()
+  const t = await calls()
+  const t0 = 1_000_000
+  const late = { type: 'decider-error', at: t0 + 121_000, error: { phase: 'route', callId: 'c2', provider: 'laya', ms: 120_000, error: { class: 'Error', code: 'LAYA_TIMEOUT', status: null, message: 'timed out after 120 s', questions: 20, device: 'cpu' } } }
+  const run = { id: 'r1', task: 't', startedAt: t0, events: [{ type: 'start', at: t0 }, { type: 'jev', at: t0 + 1000, trace: t.laya }, late, { type: 'final', at: t0 + 180_000, status: 'accepted' }] }
+  const s = summarize(run)
+  const tiles = nodes(expand(Stats({ s }))).filter((n) => n.props.className === 'stat').map((n) => n.children.map(textOf))
+  assert.deepEqual(tiles[0], ['Laya', `${((t.laya.ms + 120_000) / 1000).toFixed(1)} s`, '1 call failed'])
+  // With every call answered, the tile is as it was.
+  const answered = nodes(expand(Stats({ s: summarize({ ...run, events: run.events.filter((e) => e !== late) }) }))).filter((n) => n.props.className === 'stat')[0]
+  assert.equal(answered.children.filter(Boolean).length, 2, textOf(answered))
+  assert.doesNotMatch(textOf(answered), /failed/)
+})
+
+test('Laya\'s pick of a tool parameter, recorded by its option\'s index, is shown as the option it names', () => {
+  const { shadowCell } = display()
+  const row = { status: 'answered', jev: { questions: { 'fmt.style': { type: 'choice', answer: '#1' } } }, laya: { questions: { 'fmt.style': { type: 'choice', answer: '#1', confidence: 0.9, informative: true } } } }
+  assert.deepEqual(shadowCell('fmt.style', row, { keys: ['a', 'b'] }), { text: 'b (90.0%)', mark: 'agrees', flat: false })
+  // As the Decisions card hands it the question's own option keys.
+  const { Questions } = plugin()
+  const q = { name: 'fmt.style', type: 'choice', used: true, answer: 'b', options: { a: 'plain', b: 'bold' }, probabilities: { a: 0.1, b: 0.9 }, question: 'Which style?' }
+  const trace = { phase: 'route', ms: 800, provider: 'jev', callId: 'c1', questions: [q], model: 'jev-1.13.0' }
+  const tree = expand(Questions({ calls: [{ trace }], shadow: { rows: new Map([['c1', row]]), waiting: false } }))
+  const laya = nodes(tree).find((n) => n.props?.className === 'why shadow')
+  assert.equal(textOf(laya), 'Laya: b (90.0%)agrees')
+})
+
+test('a run Jev routed over the local agents alone (Jev Auto · Local) names Jev as who picked, live and stored', () => {
+  const { HistoryRunDetail, WhatHappened, summarize } = plugin()
+  for (const [name, f] of Object.entries({ HistoryRunDetail, WhatHappened, summarize })) assert.equal(typeof f, 'function', `${name} can be rendered`)
+  const routing = { mode: 'local', decider: 'jev', primaryAgent: 'qwen-local', agentConfidence: 0.7, taskType: 'debugging', taskTypeConfidence: 0.8 }
+  const live = textOf(expand(WhatHappened({ s: summarize({ id: 'r1', task: 't', startedAt: 1, events: [{ type: 'routed', at: 2, routing }, { type: 'final', at: 3, status: 'accepted' }] }) })))
+  assert.match(live, /Jev picked qwen-local \(confidence 70\.0%\)/)
+  assert.doesNotMatch(live, /unavailable/)
+  assert.match(textOf(expand(HistoryRunDetail({ record: { routing, attempts: [], assessments: [] } }))), /^Stored run recordJev picked qwen-local \(confidence 70\.0%\)/)
+})
+
 test('a flat tool pick and its arguments are kept as answered, as the routing rules keep them; the rules fill the route\'s profile, strategy and second opinion, the review\'s agent picks and the intent\'s depth', () => {
   const { answerPills } = display()
   const pill = (name, type = 'choice') => answerPills({ name, type, probabilities: { a: 0.5, b: 0.5 }, informative: false }).map(([, text]) => text)
@@ -616,6 +702,7 @@ test('a flat tool pick and its arguments are kept as answered, as the routing ru
 
 test('a stored run names who picked the agent and how sure it was, as the live run does', () => {
   const { HistoryRunDetail, WhatHappened, summarize } = plugin()
+  for (const [name, f] of Object.entries({ HistoryRunDetail, WhatHappened, summarize })) assert.equal(typeof f, 'function', `${name} can be rendered`)
   const routing = { mode: 'jev', decider: 'laya', primaryAgent: 'claude', agentConfidence: 0.41 }
   const stored = (R) => textOf(expand(HistoryRunDetail({ record: { routing: R, attempts: [], assessments: [] } })))
   const live = (R) => textOf(expand(WhatHappened({ s: summarize({ id: 'r1', task: 't', startedAt: 1, events: [{ type: 'routed', at: 2, routing: R }] }) })))

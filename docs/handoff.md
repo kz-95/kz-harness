@@ -15,9 +15,10 @@ branch        main                         977e39e, pushed; adaptive routing mer
               fix/roadmap-open-items       pushed, NOT merged into main; the second pass of 24 Sep
               fix/routing-self-labelling   merged into main, pushed, safe to delete
               feat/routing-stability-local-context   parked by the owner, not merged
-              feat/laya-auto               Laya Auto, built group by group (docs/laya-auto.md 11); G1 to G8 integrated and pushed, G9 run in part (see the Laya section)
+              feat/laya-auto               Laya Auto, built group by group (docs/laya-auto.md 11); G1 to G9 integrated, the cloud end-to-end test run but for its install step, the final review done and fixed, and the end-to-end test run again on the fixed code; pushed (see the Laya section)
 remote        origin github.com/kz-95/kz-harness, PUBLIC
 tests         820 tests, 819 pass, 0 fail, 1 skipped on fix/roadmap-open-items  (npm --prefix plugins/jev-router test)
+              1196 tests, 1195 pass, 0 fail, 1 skipped on feat/laya-auto
 app           NOT rebuilt; the running app is on older plugin code than either branch
 ```
 
@@ -31,6 +32,17 @@ Plugin-loaded check, the cheap signal worth keeping: from inside the running pag
 everything, because the API wants the engine's per-process token. If cordis ever marks the plugin
 INACTIVE the app still boots and looks normal, so that 404 is the only cheap sign every KzH
 feature is silently gone.
+
+## Progress log
+
+One line per finished workflow step, newest first, written by `scripts/doc-queue.mjs log` when the step ends.
+
+- 2026-09-25 16:53 UTC, Wording fixes and the doc queue: The CPU-fallback note and the signal restart line corrected; scripts/doc-queue.mjs added with its tests, and red-check taught repository scripts (1196 tests, 1195 pass, 0 fail, 1 skipped).
+- 2026-09-25 16:24 UTC, Real laya.serve run on the fixed code: 8 of 9 end-to-end steps passed, step 1 not run for disk; figures within about 10 percent of the first run.
+- 2026-09-25 15:55 UTC, Whole-branch review and fixes: 54 findings from five lenses and the finished end-to-end test; 50 fixed with tests, 4 already fixed, none refuted (1188 tests, 1187 pass, 0 fail, 1 skipped).
+- 2026-09-25 09:30 UTC, First real laya.serve run: Start, a wrong key, KzH's four real bodies and a kill mid-call against the real server on random weights (commit 79bc6c0).
+- 2026-09-25 09:05 UTC, Laya build, groups G1 to G8: Nine groups in five waves, each built in a worktree, reviewed, fixed and merged; G9 stopped by the weekly usage limit (commit 6ebfabe; 1132 tests, 1131 pass, 0 fail, 1 skipped).
+- 2026-09-24 18:20 UTC, Laya design: Three designs judged, the winner synthesised into laya-auto.md and 80 review issues fixed (commit 1549455).
 
 ## Where this was left, 24 Sep (second pass): read this first
 
@@ -67,7 +79,7 @@ What the second pass did:
 What is next, in order:
 
 1. Everything under "For the desktop agent" below, starting with getting the branch into the app and watching one routed run.
-2. Laya: the providerised `jev.js` and Laya Auto are built on `feat/laya-auto` (see "Laya: built on `feat/laya-auto`, not yet observed"); what is left is the rest of its cloud end-to-end test (G9), a final review of the whole branch, and the owner's desktop checklist.
+2. Laya: the providerised `jev.js` and Laya Auto are built on `feat/laya-auto`, and the final review of the whole branch is done and its fixes are in (see "Laya: built on `feat/laya-auto`, not yet observed"); what is left is the owner's desktop checklist.
 
 ### The first pass, for context
 
@@ -138,23 +150,54 @@ With G8 integrated, the plugin wires all of it (`index.js`): both provider recor
 Whole runs are tested in `plugins/jev-router/test/laya-integration.test.js` against a fake `laya.serve` supervised by the real sidecar; the store and authority rules are in [`adaptive-routing.md`](adaptive-routing.md), "A second decider: Laya".
 Nothing of it has run in the app or against real Laya weights.
 
-G9, the cloud test against the real `laya.serve`, was run in part on 25 Sep with `plugins/jev-router/test/e2e/laya.e2e.mjs` (run by hand, `KZH_LAYA_E2E=1 KZH_LAYA_HARNESS=<dir>`; `npm test` never runs it).
-The harness held laya 0.3.20, torch 2.14.0 and transformers 5.17.0 from the pinned lock, and a random-weight checkpoint at the real English architecture planted as a Hugging Face snapshot, because huggingface.co is blocked in the cloud.
-Laya's own `fetch_weights.py` loaded it offline, and KzH's real supervisor, adapter and client drove the real `laya.serve` on 4 vCPU:
+G9, the cloud test against the real `laya.serve`, is `plugins/jev-router/test/e2e/laya.e2e.mjs` with `plugin-host.mjs`, `check_render.py` and `scripts/laya-render-check.mjs` (committed as `7519f8f`), run by hand with `KZH_LAYA_E2E=1 KZH_LAYA_HARNESS=<dir> npm --prefix plugins/jev-router run test:e2e`; `npm test` never runs it.
+The harness held laya 0.3.20, torch 2.14.0 and transformers 5.17.0 from the pinned lock, and a random-weight checkpoint at the real English architecture planted as a Hugging Face snapshot, because huggingface.co is blocked in the cloud; `test/e2e/make_ckpt.py` builds that checkpoint, `test/e2e/plant_hf_cache.py` plants it, and Laya's own `fetch_weights.py` loaded it offline.
+Its final run, on 25 Sep 2026 from 11:16:08 to 11:26:11 UTC, drove the real `laya.serve` through KzH's real supervisor, adapter, client and plugin on 4 vCPU (load 0.67 at the start), with Laya on the CPU on the one thread `defaultThreads` gives that machine.
+It passed 8 steps, failed none and did not run 1; `laya-auto.md` 9.4 has every figure, and these are the ones to know:
 
-| Step | Result |
+| Step of 9.4 | Result |
 | --- | --- |
-| Start through `createLayaSidecar`, first start with its warm-up | ready in 132 s on the CPU with 1 thread, 2.41 GB RAM, the temperature warning parsed |
-| A wrong key | refused by `laya.serve` with 401 |
-| KzH's four real bodies through `createLayaClient` | every question answered, the model relabelled `laya-english/0.3.20@<commit>`; intent 1.7 s, resource 3.2 s, routing task group 49.7 s, review 18.6 s |
-| `createJev` with Laya's record, an intent | answered in 1.8 s; with random weights every answer is flat, named in `uninformative` |
-| The interpreter killed mid-call | the call failed with "Laya stopped while answering (the process ended); it is restarting", the supervisor restarted it in 13 s, and the next call answered |
+| 1, the install through `laya-install.js` | not run: the disk had 1.7 GB free and the venv's packages already take 5.4 GB, so a second torch does not fit |
+| 2 and 3, the checkpoint and the start | the planted snapshot complete, `weights.json` present; ready in 9.5 s with the short warm-up (the full warm-up of a first start took 131.6 s in an earlier run), 2.41 GB RAM, the temperature warning parsed; a wrong key got 401, and the machine's non-loopback address was refused |
+| 4, KzH's four real bodies | intent 1.63 s, resource and judgments 3.19 s, task group 48.71 s (20 questions, 2 requests), review 18.40 s (9 questions, 4 requests); every question answered, every answer flat, none at the context limit; an intent through `createJev` with Laya's record in 1.76 s |
+| 5, the gate against the real lock | this PC's own figures refused a route call with a 3 s deadline in 2 ms (`Laya would need about 46 s for this call on the CPU, over its 3 s deadline`) and sent nothing; with the prediction set low, the call rejected at 3001 ms while `laya.serve` answered it 45.1 s after the call, only 1 of its 2 requests went, and an intent issued at the rejection waited 42.1 s in the gate and then took 1.65 s alone; a caller aborting at 2 s did the same, and an intent aborted while queued was never sent; never more than 1 request on the wire |
+| 6, Jev Auto with the shadow | 2136 ms with the shadow off and 2101 ms with it on, with a fake Jev at 300 ms and a stub agent at 500 ms; every shadow row answered, the last landing 42.5 s after the run ended; no usage row for Laya |
+| 7, Laya Auto through the plugin | a 188.2 s run whose first agent worked 125 s, headed `**Laya router** · AUTO (routing rules and the safe fallback decided)`; the flat answers filled by the rules and said so, both reviews Laya's, `needs_human` from the flat review; 0 TypeSafe requests, 0 Jev calls, 0 SDK clients built without a `baseURL`; Laya held 184.2 s on one interpreter, and stopped for idle 65.1 s after the run |
+| 8, supervision | 6.91, 9.37 and 7.31 ms per token for intent, route and review, a 2.42 GB working set; killed mid-route, the call failed with the reason and Laya answered again in 11.0 s; with a 1 GB RAM budget the watchdog kept a held Laya, took llama before a held Laya, and took an unheld Laya first; the idle stop came 62.0 s after the last acting request while all 21 shadow intents offered were answered, and `ensureReady` restarted it in 11.0 s |
+| 9, the render check | 32 calls, 55 requests and 194 rows encoded with Laya's own code and the proxy tokenizer: 0 options, views or instructions cut, 0 refused; the tightest row had 15 tokens to spare |
 
+Two earlier full runs passed every step too, the later one within about 10 percent of these figures; the earlier one printed `(waited 1 ms for an earlier Laya answer)` on a call that had waited for nothing, which the review then fixed.
 The CPU figures are slow because the thread default (`limitsFor`) gives a 4-vCPU machine one thread; a PC with more cores gets more, and the GPU is expected to be far faster, unmeasured.
-Not run yet, from `laya-auto.md` 9.4: the install through `laya-install.js` itself (the disk here could not hold a second torch), the deadline gate against the real lock (step 5), a whole Jev Auto run with the shadow and a whole Laya Auto run against the real server (steps 6 and 7), the watchdog and idle checks (step 8) and the render check (step 9).
-Those need the session's helpers, which hit the account's weekly limit on 25 Sep (it resets 28 Sep, 07:00 UTC), as does the planned final review of the whole branch across all nine groups.
-Each group was reviewed and fixed on its own before its merge, and the suite passes: 1132 tests, 1131 pass, 0 fail, 1 skipped, three runs in a row.
-After that the owner runs the desktop checklist, `laya-auto.md` 9.5.
+
+The final review of the whole branch, across all nine groups, came next, and every finding was checked against the code before anything changed: of 54 findings, 46 distinct problems were fixed, 4 repeated another finding, and 4 were already fixed when checked.
+Every fix but the one that corrected 9.4's text has a test that fails on the code before it, and where the code was right and the design was not, `laya-auto.md` was changed to match; it now describes what exists.
+What was fixed, by kind:
+
+- **Learning and the standing.**
+  Laya's samples lost the identity and script the client reported, so no Laya Auto run ever counted in Laya's standing or on the side-by-side card; `route()`, `intent()` and `assess()` now hand the client's `meta` on.
+  A Laya Auto run was counted as failed on its own review's action and in domains no outcome can judge; now only independent evidence counts, and `task_classification` and `skill_selection` say `not measured`.
+  A task type too flat to use threw away the tool Laya had picked, and the model menu's cost of routing a task left out the resource and judgments call.
+- **What the person reads.**
+  The model menu called a measured Laya unmeasured while it restarted or updated; a timeout's line left out the call's size; a lone call said it had waited 1 ms; the task-group call claimed the rules filled `secondOpinion`.
+  The card read fields the server never sent, disabled Stop while a Start waited, told the person to fix cordis.patch.yml when the harness's own pins could not be read, hid Start after a failed update, and offered no Remove after an idle stop; the Router tab showed a comparison card on a PC without Laya.
+  The inspector printed shadow events as a bare `shadow`, showed tool-parameter answers as indexes, gave failed calls 0 ms in the Stats tile, and read a Jev Auto · Local pick as `Jev unavailable (undefined)`; the budget table's peak could be below Now, and its Laya cells called stored figures what Laya takes now.
+  A crash that left Laya failed still said it was restarting; the wait lines misdescribed a stop or a crash backoff; a start the budget refused sent the person to Start and the log; a hung request's restart never reached the card; a step's second line reached the server log without its `[jev] ` prefix.
+- **Supervision and install.**
+  An update was refused only after its download while a Laya Auto run was open; every command the installer ran inherited the person's TypeSafe settings and Hugging Face token; a start could declare a Laya that had just exited ready; the GPU spill warning cleared while the spill went on; a disposed supervisor could still start Laya; a stop held the engine's process open for 15 s; a crashed `llama-server` stayed in the RAM budget beside Laya; `laya.connectivityUrl` took a TypeSafe address or no address at all.
+- **Tests that proved too little.**
+  Three owner decisions are now guarded through `index.js` itself (a failed Laya call never goes to Jev, offline Laya Auto routes to the local models, Laya Auto is never shadowed), and so is a Jev Auto run replying before a slow Laya has answered; a shadow row the disk refuses, and the event loop during a comparison or compaction at the file's cap, are measured; tests that passed on the old code were rewritten or moved into `test/fixtures.test.js`, whose tests test only the shared test code.
+  `scripts/red-check.mjs` passes on every test the branch adds or extends: a test that fails at the base only because a file the change adds is missing runs again with those files in place (365 new tests when it was last run over all of them, at `caf7ad3`).
+- **G9 finished**: the integrity check and the export of the desktop checklist, `make_ckpt.py`, `plant_hf_cache.py` and the `test:e2e` script.
+
+The run in the table above was of `7519f8f`, before those fixes.
+After them the whole test ran again against the real `laya.serve`, on 25 Sep from 16:12 to 16:24 UTC on the fixed code, and passed the same 8 steps with step 1 again not run for disk.
+Its figures are within about 10 percent of the table: ready in 16.0 s with the short warm-up; intent 1.64 s, resource 3.02 s, task group 46.5 s, review 18.6 s; the gate refused a 3 s route call in 2 ms (`about 45 s`), held its slot until `laya.serve` answered 44.8 s later, and never sent the aborted queued call; Jev Auto took 2168 ms with the shadow off and 2207 ms with it on, the last shadow row landing 43.4 s after the run; the Laya Auto run took 192.2 s with 0 TypeSafe requests and named the 17 fields the rules filled; a kill mid-call now reads `Laya stopped while answering (signal SIGKILL); it is restarting` and Laya answered again in 13.3 s; the render check cut nothing in 194 rows.
+Still testable only on the owner's PC: the install itself (step 1 of 9.4, and whether each pinned CUDA tag has a torch 2.14.0 wheel for Windows), the GPU (its speed, its memory beside the chat model, the sysmem spill), answer quality and issue #156 with the labels workaround on the real English weights, Windows process handling (the venv redirector's interpreter pid, the tree kill, priorities, the orphan sweep), the render check with the real tokenizer, and the shadow on real Jev Auto runs; `laya-auto.md` 9.5 walks through all of it.
+The desktop helpers of 9.5 are in `scripts/`: `laya-render-check.mjs` (step 5), `laya-integrity-check.mjs` (step 12, which exits 1 naming every violation) and `laya-export.mjs` (step 13, the one file to bring back, which reduces `history.jsonl` field by field and redacts every string); `test/laya-desktop-helpers.test.js` runs the last two on data of their own, with a task text and keys planted in `history.jsonl` that never reach the export.
+Two wording gaps found in that pass are fixed: the CPU-fallback note now says to choose Remove and Install Laya again (the card has no Reinstall button), and the restarting line names an exit by a signal as `signal SIGKILL`, not as an exit code.
+The suite passes: 1196 tests, 1195 pass, 0 fail, 1 skipped, three runs in a row on the pushed head.
+Everything above is pushed on `feat/laya-auto`.
+What is left is the owner's desktop checklist, `laya-auto.md` 9.5.
 
 What follows is the reasoning from before the design, kept for why it is shaped this way.
 `laya-serve` speaks the same `POST /v1/systemone` protocol as Jev, with the same `choice`, `score`
@@ -214,7 +257,9 @@ These need the Windows machine, the running app or the owner, and could not be d
    Done when a re-run adds a missing setting, the key lives only in `~/.kzh/.env`, and the projects folder follows `-Workspace`.
 5. **Jev and Laya together, on the desktop** (roadmap §2; built on `feat/laya-auto`, see "Laya: built on `feat/laya-auto`, not yet observed" above).
    The providerised `jev.js` and all of Laya are built and tested in the cloud; Laya needs this machine to install, run on the GPU and shadow real Jev Auto runs.
-   Done when the owner has worked through `docs/laya-auto.md` 9.5 and brought back its one export file.
+   The test machine is the owner's desktop: an RTX 3080 with 10 GB of VRAM, an i7-8700K (6 cores, 12 threads) and 32 GB of RAM.
+   Expect Laya on the GPU (about 2.5 GB of VRAM before it is measured, leaving about 7 GB for a local chat model beside it), the installer choosing the newest CUDA tag the NVIDIA driver allows (cu130, cu128 or cu126; with an older driver it says so and installs for the CPU), and 4 threads on the CPU when it falls back.
+   Done when the owner has worked through `docs/laya-auto.md` 9.5 and brought back its one export file, the one `node scripts\laya-export.mjs` writes, never `history.jsonl` or `usage.jsonl`.
 6. **Exercise the gemma transfer against a real local model** (`plugins/jev-router/format.js`).
    Done when one finished background result is posted in the running app with a local chat model installed.
 7. **The `Use it here` kill path.**
@@ -275,6 +320,18 @@ unverified end to end. Several of the eleven items above came from a single lens
 independently re-derived.
 
 ## Open work an agent can do
+
+- **Next time, after the owner's desktop test: optimisation, done on the owner's PC.**
+  The owner decided on 25 Sep that work continues locally from here, not in the cloud.
+  1. **A benchmark.**
+     First speed and memory: load each installed local model at the configured context, time real generation, and store `tokensPerSec` beside the VRAM and RAM `local.json` already records per model and context, so the picker's `~X words/s est.` becomes measured.
+     Then capability: a small fixed task set per skill, each task in a throwaway workspace with its own tests, run on every agent through the normal routing, the pass rate written as `source: 'benchmark'` rows in `capability-evidence.jsonl` (`profiles.js` already weighs them at 0.7 with a 180-day half-life and the Router tab already shows them).
+     The task set is the part that decides what the scores mean; cloud agents cost real usage, so it is a button behind a confirmation, never automatic.
+  2. **Compaction at 97 percent.**
+     Conversation compaction belongs to the DSH engine, not to KzH, which only picks the model that writes the summary (`auxModel`); find out on the installed engine whether its threshold can be set, and set it to 97 percent if it can.
+  3. **Laya's thresholds and temperatures from the desktop export**, as `laya-auto.md` section 10 lays out, once the export is back.
+  4. **Run fix batches in parallel.**
+     A review's fixes were run one batch at a time in the cloud, where two helpers can run at once; on the owner's PC (up to 10), batches that own distinct files run in parallel worktrees, followed by one merge and full-suite step.
 
 - **Exercise the gemma transfer against a real local model** (`plugins/jev-router/format.js`).
   No real local call has ever been made, only fake streams.
@@ -366,7 +423,7 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
 ## Built but NOT observed, do not claim these as working
 
 - **Laya Auto and the Laya comparison in Jev Auto** (`feat/laya-auto`).
-  Whole runs are tested against a fake `laya.serve`; the real `laya.serve` has answered KzH's real bodies only on random weights in the cloud (the Laya section above).
+  Whole runs are tested against a fake `laya.serve`; the real `laya.serve` has answered KzH's real bodies, and whole Jev Auto and Laya Auto runs through the plugin, only on random weights in the cloud, and only on the code from before the final review's fixes (the Laya section above).
   No real Laya weights have answered a KzH question, no GPU has run it, no Windows process handling has been seen, and nobody has looked at the Laya card or the inspector's Laya column.
   The desktop checklist is `laya-auto.md` 9.5.
 - **The whole adaptive router** (22 Sep, `feat/adaptive-routing`, audited and fixed 23 Sep). It is
@@ -534,6 +591,11 @@ helper's fallback: an unreachable primitives module costs formatting, never the 
 - Reviewers run with `/caveman` and `/ponytail`, and never review their own work.
 - Status vocabulary is strict: `verified` means the behaviour was observed. Tests passing without
   watching the app is `built`. Do not upgrade either on anyone's assertion.
+- The docs are updated as the work goes, never only at the end, so they say how far a run got even when it dies (decided by the owner on 25 Sep).
+  Agents working in parallel never edit the docs themselves: each queues what the docs must now say with `node scripts/doc-queue.mjs add --doc <file> --fact "<text>" [--section ...] [--evidence ...]`.
+  One writer, never two at once, runs after each step: it reads `node scripts/doc-queue.mjs list`, checks every note against the code, writes it into the docs, marks it with `done <id>`, and commits with that step.
+  Each finished step also gets its dated line in this file's Progress log with `node scripts/doc-queue.mjs log --step "<step>" --summary "<one line>" [--commit <sha>] [--tests "<tests> <pass> <fail> <skipped>"]`, which needs no model.
+  A final docs step is only a check that the queue is empty and that no two docs contradict each other.
 
 ## Gotchas that will waste your time otherwise
 

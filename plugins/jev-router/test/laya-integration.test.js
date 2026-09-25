@@ -391,6 +391,22 @@ test('what a task and a review cost Laya on this PC: from each phase\'s measured
   assert.equal(layaReason(new Error('timed out after 8 s')), 'timed out after 8 s')
 })
 
+test('what routing a task costs counts every call it sends Laya: the intent, the task group, and the resource and judgments call', async () => {
+  const selfcheck = await import('../laya-selfcheck.js')
+  const { estimateRequestTokens, renderForLaya } = await import('../laya-questions.js')
+  assert.equal(typeof selfcheck.taskCalls, 'function', 'the self-check holds what routing one task sends')
+  const calls = selfcheck.taskCalls()
+  assert.deepEqual(calls.map((c) => c.phase), ['intent', 'route', 'route'], 'an intent, then two route calls, as decision.js sends them')
+  const [, group, resource] = calls
+  assert.ok(group.questions.taskType && !group.questions.strategy, 'the task group first')
+  assert.ok(resource.questions.strategy && resource.questions.secondOpinion && !resource.questions.taskType, 'then the resource and judgments call, once the pool exists')
+  const tokens = (c) => renderForLaya(c, { role: 'act' }).reduce((n, r) => n + estimateRequestTokens(r), 0)
+  const { layaCosts } = jevRouter
+  assert.equal(typeof layaCosts, 'function', 'the plugin works out what Laya costs')
+  assert.equal(layaCosts({ intent: 1, route: 0, review: 0 }).routeMs, tokens(calls[0]))
+  assert.equal(layaCosts({ intent: 0, route: 1, review: 0 }).routeMs, tokens(group) + tokens(resource), 'the routing figure is both route calls, never the task group alone')
+})
+
 test('the model menu offers Laya Auto only while Laya can be asked, and says what it costs once this PC has measured it', async (t) => {
   const none = await plugin(t, { installed: false })
   assert.deepEqual((await none.adapter().listModels('jev')).map((m) => m.id).filter((id) => !id.startsWith('agent-')), ['jev-auto'], 'not installed: no Laya Auto row')
@@ -413,9 +429,21 @@ test('the model menu offers Laya Auto only while Laya can be asked, and says wha
   assert.match((await rowOf()).description, /Laya is not running; the first message starts it \(the last start took [\d.]+ s\)\.$/)
 })
 
+test('the model menu keeps what this PC measured while Laya restarts after a crash, never calling it unmeasured', async (t) => {
+  // A long crash backoff, so the restart waits while the menu is read.
+  const p = await plugin(t, { supervisor: { timing: { backoffMs: [60_000] } } })
+  const rowOf = async () => (await p.adapter().listModels('jev')).find((m) => m.id === 'laya-auto')
+  const MEASURED = /Measured on this PC, on the CPU: about [\d.]+ s to route a task and [\d.]+ s to review each attempt\.$/
+  await started(p)
+  assert.match((await rowOf()).description, MEASURED)
+  p.world.children.at(-1).kill('SIGKILL')
+  await until('Laya is restarting', () => laya(p), (s) => s.state === 'restarting')
+  assert.match((await rowOf()).description, MEASURED, 'a crash does not take away what this PC measured')
+})
+
 // ---------------------------------------------------------------- Laya Auto, end to end
 
-test('a Laya Auto run end to end: Laya starts, sorts the message, routes and reviews, with its own lines and records and no Jev call', async (t) => {
+test('a Laya Auto run end to end: Laya starts, sorts the message, routes and reviews, with its own lines and records, no Jev call and nothing shadowed', async (t) => {
   const p = await plugin(t)
   const jevBefore = jev.calls.length
   const out = await p.say('Fix the failing test in the parser')
@@ -447,10 +475,54 @@ test('a Laya Auto run end to end: Laya starts, sorts the message, routes and rev
   const samples = p.rows('laya-samples.jsonl').filter((r) => r.domain)
   assert.ok(samples.some((s) => s.domain === 'task_classification' && s.authority === 'laya' && s.runId === record.runId && s.teacher === null))
   assert.equal(p.read('routing-samples.jsonl'), '', 'nothing of a Laya-decided run reaches the Jev store')
+  // Laya Auto has no shadow (5.1): with the shadow on, as it is by default, none of Laya's own
+  // calls is compared, which would record Laya's answers as Jev's side of the comparison.
+  assert.notEqual((await laya(p)).settings.shadow, false, 'the setting: the shadow is on')
+  assert.equal(p.read('laya-shadow.jsonl'), '', 'a Laya Auto run writes no shadow row')
   // The inspector's entry is the run.
   const { body: log } = await p.http('GET', `/jev-router/log?session=${SESSION}`)
   assert.equal(log.at(-1).id, record.runId)
+  assert.ok(!log.at(-1).events.some((e) => e.type === 'shadow'), 'and its inspector entry holds none')
   assert.deepEqual((await laya(p)).running.held, [], 'the run let go of Laya when it returned')
+})
+
+test('a Laya call that fails mid-run is said and filled by the rules, never asked of Jev: the run stays Laya\'s and Jev is not called', async (t) => {
+  const p = await plugin(t)
+  await started(p)
+  // The task group fails on the server once the run has started: Laya is up, and only this call breaks.
+  p.world.said.taskType = () => { throw new Error('model error') }
+  const jevBefore = jev.calls.length
+  const out = await p.say('Fix the failing test in the parser')
+  assert.match(out.text, /^\*\*Laya router\*\* · AUTO/, out.text)
+  assert.match(out.text, /\n- Laya did not answer: route: /, 'the report says which call Laya did not answer')
+  assert.equal(jev.calls.length, jevBefore, 'Jev is never asked in its place')
+  assert.doesNotMatch(`${out.reasoning}\n${out.text}`, /\bJev\b/, 'and no line of the run names Jev')
+  await quiet(p.dataDir)
+  const [record] = p.rows('history.jsonl')
+  assert.equal(record.routing.decider, 'laya')
+  assert.equal(record.routing.decision.domains.task_classification.authority, 'fallback', 'the rules gave what Laya did not answer')
+  assert.equal(p.rows('usage.jsonl').filter((u) => u.agent === 'jev').length, 0, 'and no Jev call was paid for')
+})
+
+test('offline, Laya Auto keeps deciding: Laya routes the task to a local model, and Jev is not asked', async (t) => {
+  const local = { readiness: async () => ({ installed: true, loggedIn: true, detail: 'ready' }), chatModel: async () => 'qwen3-8b' }
+  const agents = [...AGENTS, { id: 'qwen-local', name: 'Local agent', provider: 'spawn', description: 'The native harness agent on the local model on this PC.', enabled: true, llm: { provider: 'local', model: 'qwen3-8b' } }]
+  const p = await plugin(t, { local, config: { agents } })
+  await started(p)
+  net.online = false
+  t.after(() => { net.online = true })
+  const jevBefore = jev.calls.length
+  const out = await p.say('Fix the failing test in the parser')
+  assert.match(out.text, /^\*\*Laya router\*\* · AUTO \(Laya and routing rules decided\)/, out.text)
+  assert.ok(out.text.split('\n')[0].includes('OFFLINE: local models only'), 'the heading says it is offline')
+  assert.match(out.reasoning, /Laya route: \d+\/\d+ questions in \d+ ms on the CPU/, 'Laya was asked offline')
+  assert.match(out.reasoning, /Routed to qwen-local \(laya, local\)/, 'and routed to the local model')
+  assert.doesNotMatch(out.reasoning, /no Laya call/)
+  assert.equal(jev.calls.length, jevBefore, 'Jev is not asked')
+  await quiet(p.dataDir)
+  const [record] = p.rows('history.jsonl')
+  assert.equal(record.routing.decider, 'laya')
+  assert.equal(record.routing.decision.domains.task_classification.authority, 'laya', 'Laya decided the task')
 })
 
 test('invariant 5: a Laya Auto session never builds a TypeSafe client without 127.0.0.1 and never reaches a TypeSafe host: a question, a task and a title', async (t) => {
@@ -570,6 +642,16 @@ test('Laya\'s pins that cannot be read take Laya out as the harness file they ar
   assert.equal(p.world.spawned.length, 0, 'and Laya was never started')
 })
 
+test('the status says pins that cannot be read apart from an error in the laya block, so the card can give each its own remedy', async (t) => {
+  const unread = await laya(await plugin(t, { pins: false }))
+  assert.equal(unread.state, 'disabled')
+  assert.equal(unread.configError, null, 'nothing is wrong with the laya block')
+  assert.match(String(unread.pinsError), /ENOENT.*config[\\/]laya\.json/)
+  const both = await laya(await plugin(t, { pins: false, laya: { thresholds: { accept: { low: 1.5 } } } }))
+  assert.match(String(both.configError), /^providers: laya\.thresholds\.accept/, both.configError)
+  assert.match(String(both.pinsError), /ENOENT.*config[\\/]laya\.json/)
+})
+
 test('a Laya that cannot start refuses the run with its reason, through /laya, a message and a task queued before it failed', async (t) => {
   // The start fails: the run that waited for it is refused as 3.5 says, and Laya is then `failed`.
   const p = await plugin(t)
@@ -653,6 +735,53 @@ test('a Jev Auto run with the shadow: Laya answers the same calls beside Jev, Je
   const said = await stopped.say('Fix the failing test in the parser', { model: 'jev-auto' })
   assert.match(said.reasoning, /\nLaya is not running, so this run is not compared\n/)
   assert.equal(stopped.world.spawned.length, 0)
+})
+
+test('a Jev Auto run replies without waiting for the shadow: with Laya at 3 s a question, the reply comes before Laya has answered any of its calls', async (t) => {
+  const p = await plugin(t, { settings: { shadow: true } })
+  await started(p)
+  // Laya, loaded and ready, now takes 3 s a question, so even the intent's three take it 9 s: a
+  // run that waited for any comparison would reply no sooner than that (5.2).
+  const MS_PER_ROW = 3000
+  const fake = p.world.fakes.at(-1)
+  fake.setMsPerRow(MS_PER_ROW)
+  const t0 = Date.now()
+  const out = await p.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  const took = Date.now() - t0
+  assert.match(out.text, /^\*\*Jev router\*\* · AUTO/, out.text)
+  assert.match(out.reasoning, /\nLaya is answering the same questions in the background; /, 'the setting: the run is shadowed')
+  const [record] = p.rows('history.jsonl')
+  const { body: shadow } = await p.http('GET', `/jev-router/laya/shadow?runId=${record.runId}`)
+  assert.deepEqual(shadow.rows, [], 'no comparison of the run had landed when it replied')
+  const phases = shadow.waiting.map((w) => w.phase)
+  assert.ok(phases.includes('route') && phases.includes('review'), `its route and review calls still wait for Laya: ${JSON.stringify(shadow.waiting)}`)
+  const asked = fake.requests.filter((r) => r.arrivedAt >= t0)
+  assert.ok(asked.length >= 1, 'Laya was being asked meanwhile')
+  assert.ok(asked.every((r) => r.finishedAt == null), 'and had answered nothing when the run replied')
+  assert.ok(took < 3 * MS_PER_ROW, `the run replied in ${took} ms, before Laya could answer even the intent's three questions`)
+  // What the run writes after it replies (its learning) lands before the plugin is closed.
+  await quiet(p.dataDir)
+})
+
+test('every line of a run\'s step reaches the server log under [jev], a step of several lines included, so the app files each one as the router\'s', async (t) => {
+  const p = await plugin(t, { settings: { shadow: true } })
+  await started(p)
+  // The server log as the Kz-harness app reads it: the plugin's writes, split into lines, each
+  // filed as a router line only by its own `[jev] ` prefix (app/main.js levelOf).
+  const written = []
+  const write = process.stdout.write
+  process.stdout.write = function capture(chunk, ...rest) {
+    if (String(chunk).startsWith('[jev] ')) { written.push(String(chunk)); return true }
+    return write.call(this, chunk, ...rest)
+  }
+  let out
+  try { out = await p.say('Fix the failing test in the parser', { model: 'jev-auto' }) } finally { process.stdout.write = write }
+  const note = 'Laya is answering the same questions in the background; compare them in Jev → Decisions'
+  assert.match(out.reasoning, new RegExp(`\\nRouted to \\w+ \\(jev\\)[^\\n]*\\n${note}\\n`), 'the setting: the routed step carries the shadow\'s note on a second line')
+  const lines = written.join('').split('\n').slice(0, -1)
+  assert.ok(lines.some((l) => /^\[jev\] Routed to \w+ \(jev\)/.test(l)), lines.join('\n'))
+  assert.ok(lines.includes(`[jev] ${note}`), `the note is a router line of its own:\n${lines.join('\n')}`)
+  for (const l of lines) assert.match(l, /^\[jev\] /, 'no line of a step reaches the log without the prefix')
 })
 
 test('one run id: usage.jsonl, history.jsonl, the shadow\'s rows, the inspector\'s entry and Stop all name the run alike', async (t) => {
@@ -751,6 +880,36 @@ test('a Laya review sample\'s outcome lands in laya-samples.jsonl, and invariant
   assert.equal(relabelled?.labelSource, 'human')
   assert.equal(relabelled.negativeLabel, task.provider.label)
   assert.equal(p.read('routing-samples.jsonl'), '', 'invariant 9: the Jev store is untouched')
+})
+
+test('a Laya Auto run is read under the identity that decided it: its samples name Laya\'s identity and script, and the comparison and the standing count the run and a person\'s word on it', async (t) => {
+  const p = await plugin(t)
+  const out = await p.say('Fix the failing test in the parser')
+  assert.match(out.text, /^\*\*Laya router\*\*/, out.text)
+  await quiet(p.dataDir)
+  const [record] = p.rows('history.jsonl')
+  const { body: log } = await p.http('GET', `/jev-router/log?session=${SESSION}`)
+  const identity = log.at(-1).events.find((e) => e.type === 'jev' && e.trace.phase === 'route')?.trace.meta?.identity
+  assert.equal(identity?.split('|')[2], COMMIT.slice(0, 12), 'the setting: the route call\'s trace names the identity that answered')
+  // Every sample Laya decided names that identity and the script of what it read, the review's too.
+  const decided = p.rows('laya-samples.jsonl').filter((r) => r.domain && r.authority === 'laya')
+  assert.deepEqual([...new Set(decided.map((s) => s.domain))].sort(), ['execution_strategy', 'outcome_disposition', 'second_opinion', 'skill_selection', 'task_classification'])
+  for (const s of decided) assert.deepEqual([s.provider.identity, s.provider.lang], [identity, 'latin'], s.domain)
+  // The standing recorded after the run counts it under the current identity.
+  const recorded = p.rows('laya-standing.jsonl').find((r) => r.domain === 'task_classification')
+  assert.equal(recorded?.identity, identity)
+  assert.deepEqual(recorded.laya.layaAutoFailed, { runs: 1, failed: null }, 'laya-standing.jsonl counts the Laya Auto run, whose task type no outcome can fault')
+  // A person says the pick was good: the comparison the card asks for reads it as said of Laya.
+  const said = await p.http('POST', '/jev-router/feedback', { sessionId: SESSION, messageId: 'answer-1', verdict: 'like', tag: 'good pick', runId: record.runId })
+  assert.equal(said.status, 200, JSON.stringify(said.body))
+  await quiet(p.dataDir)
+  const compare = (await p.http('GET', '/jev-router/laya/compare?days=7&identity=current')).body
+  assert.equal(compare.identity, identity)
+  const task = compare.domains.find((d) => d.domain === 'task_classification')
+  assert.deepEqual(task.layaAutoRuns, { runs: 1, failed: null }, 'the side-by-side card counts the Laya Auto run')
+  const standing = compare.standing.find((s) => s.domain === 'task_classification')
+  assert.deepEqual(standing.laya.personSaid, { n: 1, right: 1 }, 'and the person\'s word on it')
+  assert.deepEqual(standing.laya.layaAutoFailed, { runs: 1, failed: null })
 })
 
 test('invariant 7: "Saved by Jev" and Jev\'s spend are unchanged by Laya\'s usage rows, a Laya Auto direct answer, and a Laya Auto run that ran a tool with a limited agent skipped', async (t) => {
@@ -894,6 +1053,18 @@ test('a marker in a Laya Auto task, a tool description and a tool option key nev
     assert.ok(text.length > 0, `${file} was written`)
     assert.ok(!text.includes(MARKER), `${file} holds no task text, tool description or option key`)
   }
+})
+
+test('the comparison is not found on a PC where Laya cannot be asked and nothing was compared, so the Router tab shows no card of nothing', async (t) => {
+  const bare = await plugin(t, { installed: false })
+  const none = await bare.http('GET', '/jev-router/laya/compare?days=7&identity=current')
+  assert.equal(none.status, 404, JSON.stringify(none.body))
+  assert.equal(none.body.error, 'Laya cannot be asked on this PC, and nothing has been compared')
+  // Installed, the comparison is there from the start, with nothing in it yet.
+  const p = await plugin(t)
+  const fresh = await p.http('GET', '/jev-router/laya/compare?days=7&identity=current')
+  assert.equal(fresh.status, 200)
+  assert.equal(fresh.body.skips.answered, 0)
 })
 
 test('the routes of 8.4: Laya\'s status, its settings, log, Test Laya, Stop while a run holds it, the shadow\'s rows and the comparison', async (t) => {

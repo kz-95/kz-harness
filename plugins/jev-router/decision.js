@@ -465,8 +465,8 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     const answered = rawOf(taskDecision)
     if (taskDecision?.authority === P.id && answered?.profile) { routed = answered; profile = filled(routed.profile) }
     // The provider's type was too flat to use: the rules give the type, and the provider still
-    // gives every field it did answer.
-    else if (taskDecision?.authority === 'fallback' && answered?.profile) profile = filled(answered.profile)
+    // gives every field it did answer, the tool it picked and that tool's numbers included.
+    else if (taskDecision?.authority === 'fallback' && answered?.profile) { routed = answered; profile = filled(answered.profile) }
     else if (taskDecision?.authority === 'local') profile = profileFromClass(taskDecision.label, taskDecision.probabilities, classes, {})
     else if (taskDecision?.authority === 'fallback') profile = heuristicProfile(task)
     else if (!taskCtl && decider) { try { routed = await askJev('task'); profile = filled(routed.profile) } catch (err) { if (signal?.aborted) throw err; profile = { ...heuristicProfile(task), fallbackReason: String(err?.message ?? err) } } }

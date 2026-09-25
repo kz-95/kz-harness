@@ -80,22 +80,24 @@ function answerOf(q, said, informative) {
  * Laya on this PC as createJev meets it through the Laya client (docs/laya-auto.md 4.5): the
  * relabelled model, the marks the client sets on each answer, and the call's meta. A choice answers
  * `said[name]` or its first option, a score level `said[name]` or 1, a yes/no `said[name]` or 0.2;
- * a `said` value may be a function of the call's state. `flat` names answers too flat to use, and
- * `fail` the phases that time out.
+ * a `said` value may be a function of the call's state. `flat` names answers too flat to use, or is
+ * a function of an answer's name and its call's phase; `fail` names the phases that time out.
  */
 function layaClient({ said = {}, flat = [], fail = [], device = 'cpu' } = {}) {
+  const isFlat = typeof flat === 'function' ? flat : (name) => flat.includes(name)
   const phases = []
   return {
     phases,
     async systemOne({ state, questions }, { phase } = {}) {
       phases.push(phase)
       const names = Object.keys(questions)
-      if (fail.includes(phase)) throw Object.assign(new Error(`timed out after 42 s (${names.length} questions on the ${device === 'cuda' ? 'GPU' : 'CPU'})`), { code: 'LAYA_TIMEOUT' })
+      // As the Laya client times out: the deadline in the message, the call's size and device beside it.
+      if (fail.includes(phase)) throw Object.assign(new Error('timed out after 42 s'), { code: 'LAYA_TIMEOUT', questions: names.length, device })
       const say = { ...GOOD, ...said }
-      const answers = Object.fromEntries(names.map((n) => [n, answerOf(questions[n], typeof say[n] === 'function' ? say[n](state) : say[n], !flat.includes(n))]))
+      const answers = Object.fromEntries(names.map((n) => [n, answerOf(questions[n], typeof say[n] === 'function' ? say[n](state) : say[n], !isFlat(n, phase))]))
       return {
         model: LABEL, answers, usage: { input_tokens: 40 * names.length, output_tokens: 0 },
-        meta: { provider: 'laya', device, waitedMs: 0, requests: 1, rows: names.length, atContextLimit: 0, uninformative: flat.filter((n) => names.includes(n)), corrected: [], lang: 'latin', identity: IDENTITY },
+        meta: { provider: 'laya', device, waitedMs: 0, requests: 1, rows: names.length, atContextLimit: 0, uninformative: names.filter((n) => isFlat(n, phase)), corrected: [], lang: 'latin', identity: IDENTITY },
       }
     },
   }
@@ -111,6 +113,16 @@ function world() {
   // What index.js hands the review of a Laya run, so jev-review stays ignorant of stores.
   const outcome = { decide: (args) => domains.get('outcome_disposition').decide({ ...args, answeredBy: 'laya', sink }) }
   return { store, sink, domains, engine, outcome }
+}
+
+/**
+ * createJev as index.js calls it for either decider: with the provider's record and a client of its
+ * own, which it must use. A createJev that took neither would build a TypeSafe client instead.
+ */
+function deciderOf(options) {
+  let decider
+  assert.doesNotThrow(() => { decider = createJev(options) }, 'createJev takes a provider record and the client it is handed')
+  return decider
 }
 
 /**
@@ -134,7 +146,7 @@ function wire({ laya = layaClient(), jev: jevClient, offline = false, work } = {
   const route = async ({ task, forceAgent, mode = 'auto', decider = 'jev', signal = new AbortController().signal, emit }) => {
     const on = (e) => { events.push(e); emit?.(e) }
     const provider = providerOf(decider)
-    const client = createJev({
+    const client = deciderOf({
       provider, client: clientOf(decider),
       onTrace: (trace) => on({ type: 'jev', at: Date.now(), trace }),
       onError: (error) => on({ type: 'decider-error', at: Date.now(), error }),
@@ -160,7 +172,7 @@ function wire({ laya = layaClient(), jev: jevClient, offline = false, work } = {
     return formatReport(r)
   }
   const classify = async (message, mode, decider = 'jev') => {
-    const r = await createJev({ provider: providerOf(decider), client: clientOf(decider) }).intent({ message }, AbortSignal.timeout(5000))
+    const r = await deciderOf({ provider: providerOf(decider), client: clientOf(decider) }).intent({ message }, AbortSignal.timeout(5000))
     return { ...r, thresholds: providerOf(decider).thresholds }
   }
   return { w, dir, route, classify, events, records, executed, jevAsked, laya }
@@ -232,6 +244,7 @@ test('the heading, the strip and the live lines of a Laya Auto run name Laya, wi
   const a = adapter.jevAdapter({ ctx: chatCtx(), route: x.route, classify: x.classify, auxModel: { provider: 'x', model: 'y' }, agents: async () => AGENTS })
   const { reasoning, reply } = await send(a, 'fix the parser')
   const r = x.records[0]
+  assert.ok(r, `the Laya Auto row routed the message: ${reply}`)
   assert.equal(r.routing.decider, 'laya')
   assert.equal(r.routing.model, LABEL, 'the model is the Laya client\'s own label')
   assert.equal(r.finalStatus, 'accepted')
@@ -259,6 +272,7 @@ test('a Laya call that does not answer: the decider-error line, the rules decide
   const a = adapter.jevAdapter({ ctx: chatCtx(), route: x.route, classify: x.classify, auxModel: { provider: 'x', model: 'y' }, agents: async () => AGENTS })
   const { reasoning, reply } = await send(a, 'fix the parser')
   const r = x.records[0]
+  assert.ok(r, `the Laya Auto row routed the message: ${reply}`)
   assert.ok(Array.isArray(r.routing.deciderErrors) && r.routing.deciderErrors.length >= 1, 'the failed calls are on the routing record')
   assert.ok(r.routing.deciderErrors.every((e) => e.phase === 'route' && /^timed out after 42 s \(\d+ questions on the CPU\)$/.test(e.reason)), JSON.stringify(r.routing.deciderErrors))
   assert.match(reasoning, /^Laya route failed after \d+ ms: timed out after 42 s \(\d+ questions on the CPU\); routing rules decide those domains$/m)
@@ -271,7 +285,8 @@ test('a Laya call that does not answer: the decider-error line, the rules decide
   const y = wire({ laya: layaClient({ fail: ['review'] }) })
   const b = adapter.jevAdapter({ ctx: chatCtx(), route: y.route, classify: y.classify, auxModel: { provider: 'x', model: 'y' }, agents: async () => AGENTS })
   const late = await send(b, 'fix the parser')
-  assert.match(late.reasoning, /^Review: accept\. fallback policy \(Laya unavailable \(timed out after 42 s \(9 questions on the CPU\)\); using the deterministic fallback\)$/m)
+  assert.match(late.reasoning, /^Review: accept\. fallback policy \(Laya unavailable \(timed out after 42 s\); using the deterministic fallback\)$/m)
+  assert.match(late.reasoning, /^Laya review failed after \d+ ms: timed out after 42 s \(9 questions on the CPU\)$/m)
   assert.match(late.reply, /^- Laya did not answer: review: timed out after 42 s \(9 questions on the CPU\)$/m)
   assert.deepEqual(y.jevAsked, [])
 })
@@ -339,6 +354,7 @@ test('a local effort under Laya Auto is a manual run that Laya reviews', async (
   const a = adapter.jevAdapter({ ctx: chatCtx(), route: x.route, classify: x.classify, auxModel: { provider: 'x', model: 'y' }, agents: async () => AGENTS })
   const { reply } = await send(a, 'fix the parser', { reasoningEffort: 'local-low' })
   const r = x.records[0]
+  assert.ok(r, `the Laya Auto row ran the message: ${reply}`)
   assert.deepEqual([r.routing.mode, r.routing.decider, r.routing.primaryAgent], ['manual', 'laya', 'qwen-local'])
   assert.equal(reply.split('\n')[0], '**Laya router** · MANUAL /qwen-local')
   assert.equal(r.assessments[0].mode, 'laya', 'Laya reviews the forced run')
@@ -366,6 +382,34 @@ test('Laya Auto is on the menu only while it is offered, and says what a task co
   // Always a known id, so a saved selection resolves to Laya Auto, never to Jev.
   const resolved = await adapter.jevAdapter({ ctx: chatCtx(), route: async () => '', auxModel: { provider: 'x', model: 'y' } }).resolveModel('jev', 'laya-auto')
   assert.deepEqual([resolved.id, resolved.name], ['laya-auto', 'Laya Auto'])
+})
+
+test('a route Laya answered all flat: the task-group line names exactly the fields the report says the rules filled, and the second opinion only on the judgments call', async () => {
+  const x = wire({ laya: layaClient({ flat: (_name, phase) => phase === 'route' }) })
+  const a = adapter.jevAdapter({ ctx: chatCtx(), route: x.route, classify: x.classify, auxModel: { provider: 'x', model: 'y' }, agents: async () => AGENTS })
+  const { reasoning, reply } = await send(a, 'fix the parser')
+  const FILLED = "- Filled by the routing rules (Laya's answers were too flat to use): "
+  const reported = reply.split('\n').find((l) => l.startsWith(FILLED))
+  assert.ok(reported, reply)
+  const namesOf = (l) => /too flat to use \((.*)\); the routing rules filled/.exec(l)[1].split(', ').sort()
+  const lines = reasoning.split('\n').filter((l) => /^Laya route: \d+ answers? too flat to use/.test(l))
+  const taskLine = lines.find((l) => namesOf(l).includes('taskType'))
+  assert.ok(taskLine, reasoning)
+  assert.deepEqual(namesOf(taskLine), reported.slice(FILLED.length).split(', ').sort(), 'the live line and the report name the same fields')
+  assert.ok(!namesOf(taskLine).includes('secondOpinion'), 'the profile keeps its flat second opinion as answered')
+  const judgments = lines.filter((l) => l !== taskLine)
+  assert.equal(judgments.length, 1, reasoning)
+  assert.ok(namesOf(judgments[0]).includes('secondOpinion'), 'the rules answer the second_opinion domain in its place')
+})
+
+test('the Laya Auto row says what this PC measured in every state that is not stopped or failed, and a failed update of a stopped Laya reads as not running', () => {
+  const costs = { device: 'cuda', routeMs: 1400, reviewMs: 900, lastStartMs: 41_000 }
+  const MEASURED = 'Measured on this PC, on the GPU: about 1.4 s to route a task and 0.9 s to review each attempt.'
+  assert.equal(typeof adapter.layaRowSentence, 'function', 'adapter.js says what the Laya Auto row costs')
+  for (const state of ['ready', 'starting', 'restarting', 'stopping', 'installing']) assert.equal(adapter.layaRowSentence({ state, ...costs }), MEASURED, state)
+  assert.equal(adapter.layaRowSentence({ state: 'restarting', device: 'cuda', routeMs: null, reviewMs: null }), 'Not measured on this PC yet.')
+  // The old install is still there, and the first message starts it.
+  assert.equal(adapter.layaRowSentence({ state: 'install_failed', ...costs }), 'Laya is not running; the first message starts it (the last start took 41 s).')
 })
 
 test('stream() shows a refusal from layaUnavailable as its reply, before anything is sorted or run, and only in Laya Auto', async () => {

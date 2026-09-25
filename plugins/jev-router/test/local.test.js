@@ -1360,6 +1360,54 @@ test('the loaded engine registers in the shared residency as llama, held, and le
   await local.dispose()
 })
 
+test('an engine that exits on its own leaves the shared residency, and a late exit never clears a newer engine', async () => {
+  const res = residencyStub()
+  const eng = fakeEngine()
+  let healthy = true
+  const fetch = async () => (healthy ? eng.fetch() : { ok: false })
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch, residency: res })
+  await local.start('big')
+  assert.ok(res.get('llama'), 'the setting: resident once ready')
+  // A CUDA error, an access violation or a kill from Task Manager: nobody stopped it.
+  const crashed = eng.started[0].child
+  crashed.exitCode = 3221225477
+  crashed.emit('exit', 3221225477)
+  await new Promise((r) => setImmediate(r))
+  assert.equal((await local.status()).engine.running, false)
+  assert.equal(res.get('llama'), null, 'a dead engine holds no RAM or VRAM in the budget beside Laya')
+  assert.deepEqual([res.othersRamGB('laya'), res.othersVramGB('laya'), res.othersNames('laya')], [0, 0, []])
+
+  // An engine that fails while it is still loading (Node's 'error': it could not be killed, say)
+  // and whose process only exits later, once a newer engine is ready: that exit leaves the newer
+  // engine where it is, since the one that failed was never resident.
+  healthy = false
+  const loading = local.start('big').catch((err) => err)
+  await waitFor('the second engine is spawned', () => eng.started.length, (n) => n === 2, { timeoutMs: 10_000 })
+  const failed = eng.started[1].child
+  failed.emit('error', new Error('kill EPERM'))
+  assert.match(String((await loading)?.message), /llama-server exited: .*kill EPERM/)
+  healthy = true
+  await local.start('big')
+  const newer = res.get('llama')
+  assert.ok(newer && eng.started.length === 3, 'the setting: the third engine is resident')
+  failed.exitCode = 1
+  failed.emit('exit', 1)
+  await new Promise((r) => setImmediate(r))
+  assert.equal(res.get('llama'), newer, 'the late exit of an engine that never became ready clears nothing')
+  assert.equal((await local.status()).engine.running, true)
+  // And a late exit of one that was ready clears only its own entry: the newer one stays.
+  const third = eng.started[2].child
+  third.kill = () => {}
+  await local.stop()
+  await local.start('big')
+  const fourth = res.get('llama')
+  third.exitCode = 0
+  third.emit('exit', 0)
+  await new Promise((r) => setImmediate(r))
+  assert.equal(res.get('llama'), fourth)
+  await local.dispose()
+})
+
 test('a local model start first unloads a Laya nothing holds; the plan counts only a held Laya against the RAM budget, and never unloads', async () => {
   const wideOf = async (local) => (await local.status()).modules.find((m) => m.id === 'wide')
   // What Wide gets with no Laya at all: under 5 GB it takes its whole 32k, and under the 1.7 GB a

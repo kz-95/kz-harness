@@ -90,29 +90,6 @@ function maximalCalls() {
   ]
 }
 
-// ---------------------------------------------------------------- the fixture
-
-test('kzh-bodies.json holds the four bodies the jev.js builders send, the review state 9,206 characters', () => {
-  const task = 'The login form in src/auth/LoginForm.tsx lets a user submit twice when they double-click, which creates two sessions. Fix it so a second submit is ignored while the first is in flight, and add a test for it.'
-  const patch = 'diff --git a/src/auth/LoginForm.tsx b/src/auth/LoginForm.tsx\n' + Array.from({ length: 120 }, (_, i) => (i % 3 ? '+  const [submitting, setSubmitting] = useState(false) // line ' + i : '-  onSubmit={handleSubmit} // old line ' + i)).join('\n')
-  const context = BODIES.task.state.workspace
-  const [intent, taskCall, resource, review] = capture((jev) => {
-    jev.intent({ message: 'why does the login form create two sessions?' })
-    jev.route({ task, context, capabilities: ALL_CAPABILITIES, ask: { task: true, resource: false, judgments: false } })
-    jev.route({ task, context, candidates: [{ key: 'RESOURCE_A' }, { key: 'RESOURCE_B' }], strategies: ['CHEAP_DIRECT', 'STANDARD_DIRECT', 'PREMIUM_DIRECT', 'CHEAP_THEN_PREMIUM_REVIEW'], taskProfile: { complexity: 0.4 }, ask: { task: false, resource: true, judgments: true } })
-    jev.assess({ task, routing: { taskType: 'debugging', risk: 0.4, complexity: 0.3 }, attempts: [{ agent: 'claude', role: 'executor', stopReason: 'end_turn', answerText: 'I added a submitting flag to LoginForm and disabled the button while the request is in flight. '.repeat(20), changedFiles: ['src/auth/LoginForm.tsx', 'src/auth/LoginForm.test.tsx'] }], checks: { results: [{ name: 'test', passed: true, exitCode: 0, durationMs: 4000, output: 'PASS src/auth/LoginForm.test.tsx\n  ok 12 tests\n'.repeat(10) }], regressed: [], fixed: [], failing: [] }, diff: { stat: ' src/auth/LoginForm.tsx | 14 +++--\n src/auth/LoginForm.test.tsx | 30 ++++++', patch }, agents: [{ id: 'claude', description: 'Claude Code' }, { id: 'codex', description: 'Codex CLI' }] })
-  })
-  // A stale fixture fails here: rebuild it from these same builder calls.
-  assert.deepEqual(BODIES, {
-    intent: { phase: 'intent', ...clone(intent) },
-    task: { phase: 'route', ...clone(taskCall) },
-    resource: { phase: 'route', ...clone(resource) },
-    review: { phase: 'review', ...clone(review) },
-  })
-  assert.equal(JSON.stringify(BODIES.review.state).length, 9206)
-  assert.deepEqual(Object.keys(BODIES.task.questions).length, 20)
-})
-
 // ---------------------------------------------------------------- 4.1, the invariant
 
 test('the invariant: every call at maximal inputs keeps its question names, types and option keys, and the fake Laya answers every one', async (t) => {

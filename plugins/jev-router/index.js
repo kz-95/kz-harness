@@ -44,9 +44,9 @@ import { LOCAL_PROVIDER, buildCatalog, createConnectivity, createLocalModels, de
 import { JEV_THRESHOLDS, LAYA_SCHEMA, MINIMUM_REVIEW_KEYS, resolveProviders, thresholdsSchema } from './providers.js'
 import { createResidency } from './residency.js'
 import { LAYA_TEXT, LayaUnavailable, createLayaSidecar } from './laya-sidecar.js'
-import { createLayaInstaller, readPins, torchIndexes } from './laya-install.js'
+import { createLayaInstaller, installOffer, readPins } from './laya-install.js'
 import { createLayaClient } from './laya-client.js'
-import { createProbe, runSelfTest, selfTestCalls } from './laya-selfcheck.js'
+import { createProbe, runSelfTest, selfTestCalls, taskCalls } from './laya-selfcheck.js'
 import { estimateRequestTokens, renderForLaya } from './laya-questions.js'
 import { createShadow, jevHostOf } from './shadow.js'
 
@@ -1301,7 +1301,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // background, and nothing else of the shadow reaches the live stream (3.3).
     const withShadowNote = (e) => (e.type === 'routed' && !laya && client && shadowOn() ? { ...e, shadow: sidecar.isReady() ? 'answering' : 'not_running' } : e)
     // Each step also goes to the server log, which the Kz-harness app shows in its log window.
-    const onEvent = (event) => { const e = withShadowNote(event); entry.events.push({ ...e, text: line(e) }); emit?.(e); process.stdout.write(`[jev] ${redactLine(line(e))}\n`) }
+    const onEvent = (event) => { const e = withShadowNote(event); entry.events.push({ ...e, text: line(e) }); emit?.(e); logStep(line(e)) }
     try {
       const onTrace = (trace) => onEvent({ type: 'jev', at: Date.now(), trace })
       // A call that did not answer is a line of its own, and never a usage row (2.4, 3.3).
@@ -1719,7 +1719,8 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   /**
    * The Laya Auto row's state (docs/laya-auto.md 3.1), or null while the row is not offered: Laya
    * not installed, switched off, its settings invalid, or adaptive routing off. What a task costs
-   * is said only once the device it runs on has measured every phase.
+   * is said once the device it runs on, or would start on, has measured every phase, whatever the
+   * state: a restart, an update or a start under way changes nothing this PC measured.
    */
   async function layaRow() {
     if (!layaAskable() || config.routing?.enabled === false) return null
@@ -1727,26 +1728,23 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     const { measured, device: wanted } = sidecar.readSettings()
     // Where it runs, else where it would start.
     const device = s.running?.device ?? nextDevice(s, wanted)
-    return { state: s.state, device: s.running?.device ?? null, ...(s.running ? layaCosts(measured[device]?.msPerToken) : {}), lastStartMs: measured[device]?.loadMs?.at(-1) ?? null }
+    return { state: s.state, device, ...layaCosts(measured[device]?.msPerToken), lastStartMs: measured[device]?.loadMs?.at(-1) ?? null }
   }
   // The device Laya would start on: the GPU where PyTorch has CUDA and the CPU was not picked.
   const nextDevice = (s, wanted) => (s.installed?.cuda && wanted !== 'cpu' ? 'cuda' : 'cpu')
 
   // What an install would get on this PC (7.2): PyTorch for the GPU where the driver runs one of
-  // the pinned CUDA builds, else for the CPU.
-  async function layaOffer() {
-    const sp = await specs().catch(() => null)
-    const gpu = sp?.gpus?.find((g) => g.vendor === 'nvidia')
-    const cuda = pins && gpu && torchIndexes(pins.torch.cuda, sp.cuda).length ? sp.cuda : null
-    return { gpu: cuda ? { name: gpu.name, cuda } : null, python: pins?.python ?? null }
-  }
+  // the pinned CUDA builds, else for the CPU, and the disk and downloads it takes.
+  const layaOffer = async () => installOffer(pins, await specs().catch(() => null))
 
   /**
    * GET /jev-router/laya (8.4): the sidecar's status, the shadow's counters, and what the card
    * reads beside them: what recover() did at start, the last check for a newer model, where Laya
    * lives, what it would take at its next start, what a task costs it where it runs, until it is
-   * installed, what an install would get, and why the pins could not be read (`pinsError`), which
-   * the supervisor's `configError` carries too, so Laya reads as off for a reason of its own.
+   * installed, what an install would get, and the two reasons Laya can be off apart, since each has
+   * its own remedy: an error in the laya block of cordis.patch.yml (`configError`), and the harness's
+   * own pins that could not be read (`pinsError`), which its update puts back. The supervisor holds
+   * either as its `configError`, so Laya reads as off for both.
    */
   async function layaStatus() {
     const s = sidecar.status()
@@ -1757,6 +1755,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       running: s.running ? { ...s.running, ...layaCosts(measured[s.running.device]?.msPerToken) } : null,
       shadow: shadow.counters(),
       recovered: installer?.status().message ?? null,
+      configError: layaError ?? null,
       pinsError,
       weights: job?.kind === 'weights' && job.weights ? job.weights : null,
       paths: { engine: sidecar.paths.engine, models: sidecar.paths.models },
@@ -1808,7 +1807,11 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
         const identity = url.searchParams.get('identity') ?? 'current'
         if (days !== 'all' && !(Number.isInteger(Number(days)) && Number(days) > 0)) return send(400, { error: "days: a whole number of days, or 'all'" })
         if (identity !== 'current' && identity !== 'all') return send(400, { error: "identity: 'current' or 'all'" })
-        return send(200, await shadow.compare({ days: days === 'all' ? 'all' : Number(days), identity }))
+        const c = await shadow.compare({ days: days === 'all' ? 'all' : Number(days), identity })
+        // A PC where Laya cannot be asked and nothing was ever compared has nothing to put side by
+        // side: the Router tab shows no card, rather than a table of nothing (5.6).
+        if (!layaAskable() && !comparedAnything(c)) return send(404, { error: 'Laya cannot be asked on this PC, and nothing has been compared' })
+        return send(200, c)
       }
       return send(404, { error: 'not found' })
     }
@@ -2273,21 +2276,30 @@ export const layaReason = (err) => ({
   failed: `Laya stopped after an error (${err?.detail ?? 'unknown'})`,
 })[err?.reason] ?? String(err?.message ?? err)
 
-// The input tokens of Test Laya's own intent, route and review, rendered as the Laya client renders
-// them: the sizes the picker's figures are worked out over. Built once, on first use.
+// The input tokens of what routing one task sends (its intent, its task group and its resource and
+// judgments call) and of Test Laya's review, rendered as the Laya client renders them: the sizes the
+// picker's figures are worked out over. Built once, on first use.
 let layaCallTokens = null
 const callTokens = () => {
   if (layaCallTokens) return layaCallTokens
-  const { protocol } = selfTestCalls()
-  const tokens = (name) => renderForLaya(protocol.find((c) => c.name === name), { role: 'act' }).reduce((n, r) => n + estimateRequestTokens(r), 0)
-  layaCallTokens = { intent: tokens('intent.task'), route: tokens('route'), review: tokens('review') }
+  const tokens = (c) => renderForLaya(c, { role: 'act' }).reduce((n, r) => n + estimateRequestTokens(r), 0)
+  const of = (phase) => taskCalls().filter((c) => c.phase === phase).reduce((n, c) => n + tokens(c), 0)
+  layaCallTokens = { intent: of('intent'), route: of('route'), review: tokens(selfTestCalls().protocol.find((c) => c.name === 'review')) }
   return layaCallTokens
+}
+
+/** Whether a comparison (8.4) holds anything: a Jev call Laya answered, skipped or failed in the background, or a run Laya decided. */
+function comparedAnything(c) {
+  const k = c?.skips ?? {}
+  const rows = (k.answered ?? 0) + (k.partial ?? 0) + (k.failed ?? 0) + Object.values(k.skipped ?? {}).reduce((a, n) => a + (n ?? 0), 0)
+  return rows > 0 || (c?.domains ?? []).some((d) => (d.layaAutoRuns?.runs ?? 0) > 0)
 }
 
 /**
  * What a task and a review cost Laya on one device (docs/laya-auto.md 3.1): the measured ms per
- * token of each phase (4.5) over Test Laya's intent and route for a task, and its review for each
- * attempt. `{}` until the device has a figure for every phase, which its first start measures.
+ * token of each phase (4.5) over what routing a task sends (its intent, its task group and its
+ * resource and judgments call), and over Test Laya's review for each attempt. `{}` until the device
+ * has a figure for every phase, which its first start measures.
  * @param {{ intent?: number|null, route?: number|null, review?: number|null }} [msPerToken]
  * @returns {{ routeMs?: number, reviewMs?: number }}
  */
@@ -2301,6 +2313,14 @@ export function layaCosts(msPerToken) {
 // Model text can quote anything; mask key-shaped strings before they reach the log.
 // One redaction rule for the log and the export, so a provider added to one covers both.
 const redactLine = redactSecrets
+
+/**
+ * One step of a run to the server log. A step can be several lines (a Laya call with its device and
+ * flat answers, a routed step with the shadow's note), and the Kz-harness app reads the log line by
+ * line, filing a line as the router's only by its own `[jev] ` prefix (app/main.js levelOf), so
+ * every line carries it.
+ */
+const logStep = (text) => { for (const l of redactLine(text).split('\n')) process.stdout.write(`[jev] ${l}\n`) }
 
 // Writes must declare a JSON body: a cross-site form cannot send one without a CORS preflight.
 export const isJsonRequest = (req) => String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase() === 'application/json'

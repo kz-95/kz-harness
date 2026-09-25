@@ -141,6 +141,28 @@ export const LAYA_SCHEMA = Schema.object({
 // Laya's own temperature buckets: the answer type, then the option count.
 const BUCKET = /^(choice|score|noul):(2|3-5|6-10|11\+)$/
 
+/**
+ * Checks what Laya Auto probes to learn whether cloud agents can run: an http or https address on
+ * a host that is not TypeSafe's (typesafe.ai or any name under it, or the host TYPESAFE_BASE_URL
+ * sends Jev to), because nothing in a Laya Auto session contacts TypeSafe (docs/laya-auto.md 6.9,
+ * invariant 5). Anything else would fail every probe, and every Laya Auto run would be narrowed to
+ * the local agents as if this PC were offline. Throws naming the key.
+ * @param {string} value  laya.connectivityUrl
+ * @param {object} env    the environment TYPESAFE_BASE_URL is read from
+ */
+function checkConnectivityUrl(value, env) {
+  const fail = (what) => { throw new Error(`providers: laya.connectivityUrl: ${what}`) }
+  let url = null
+  try { url = new URL(value) } catch { /* not a URL: refused below */ }
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:') || !url.hostname) fail(`'${value}' is not an http or https address`)
+  const host = url.hostname.replace(/\.$/, '')
+  let jevHost = null
+  try { jevHost = new URL(String(env?.TYPESAFE_BASE_URL ?? '').trim()).host } catch { /* unset or not a URL: Jev calls go to api.typesafe.ai */ }
+  if (host === 'typesafe.ai' || host.endsWith('.typesafe.ai') || url.host === jevHost) {
+    fail(`${url.host} is a TypeSafe address, and a Laya Auto session never contacts TypeSafe; name another, such as the default ${LAYA_SCHEMA({}).connectivityUrl}`)
+  }
+}
+
 /** Where a provider's thresholds live in the config, for messages the person can act on. */
 const pathOf = (id, key) => `${id === 'jev' ? (MINIMUM_REVIEW_KEYS.includes(key) ? 'routing.minimumReview' : 'thresholds') : `${id}.thresholds`}.${key}`
 
@@ -217,17 +239,18 @@ export const DEFAULT_JEV = jevRecord({ model: JEV_MODEL, timeoutMs: JEV_TIMEOUT_
  * Jev's is built from the keys that exist today (`jevModel`, `jevTimeoutMs`, `thresholds`, and
  * `routing.minimumReview` through the resolved policy), so no existing config changes meaning; a
  * bad Jev value throws, as a bad Jev threshold always has. Laya's comes from the `laya` block,
- * and any error in it, a type or a range as much as an ordering, is caught: Jev's record stands,
- * `laya` is null and `layaError` says what is wrong, so Laya Auto leaves the picker and the shadow
- * stops while Jev Auto runs on.
+ * and any error in it, a type or a range as much as an ordering or a connectivity address Laya
+ * Auto may not probe, is caught: Jev's record stands, `laya` is null and `layaError` says what is
+ * wrong, so Laya Auto leaves the picker and the shadow stops while Jev Auto runs on.
  *
  * `layaSettings` is the validated `laya` block (deadlines, shadow, corrections and the rest, every
  * default filled), which the sidecar and the Laya client read; null when `layaError` is set.
  * @param {object} config  the jev-router Config
- * @param {{ policy: object }} o  resolvePolicy(config.routing)
+ * @param {{ policy: object, env?: object }} o  resolvePolicy(config.routing), and the environment
+ *   TYPESAFE_BASE_URL is read from (process.env), so laya.connectivityUrl never names Jev's host
  * @returns {{ jev: object, laya: object | null, layaError: string | null, layaSettings: object | null }}
  */
-export function resolveProviders(config = {}, { policy } = {}) {
+export function resolveProviders(config = {}, { policy, env = process.env } = {}) {
   let own
   try { own = thresholdsSchema(JEV_THRESHOLDS, { omit: MINIMUM_REVIEW_KEYS })(config.thresholds ?? {}) } catch (err) { throw schemaError(err, 'thresholds') }
   const minimumReview = Object.fromEntries(MINIMUM_REVIEW_KEYS.map((k) => [k, policy?.minimumReview?.[k]]))
@@ -238,6 +261,7 @@ export function resolveProviders(config = {}, { policy } = {}) {
   try {
     let block
     try { block = LAYA_SCHEMA(config.laya ?? {}) } catch (err) { throw schemaError(err, 'laya') }
+    checkConnectivityUrl(block.connectivityUrl, env)
     for (const key of Object.keys(block.temperatureCorrections)) {
       if (!BUCKET.test(key)) throw new Error(`providers: laya.temperatureCorrections: '${key}' is not one of Laya's buckets (choice, score or noul, then 2, 3-5, 6-10 or 11+, as in choice:11+)`)
     }

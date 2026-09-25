@@ -15,8 +15,11 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { layaPaths, readPins, recordWeights, snapshotDir } from '../laya-install.js'
 import { createProbe } from '../laya-selfcheck.js'
+import { createLayaClient } from '../laya-client.js'
+import { createJev } from '../jev.js'
+import { resolveProviders } from '../providers.js'
 import { createResidency } from '../residency.js'
-import { defaultThreads } from '../local.js'
+import { defaultThreads, killTree } from '../local.js'
 import { startFakeLaya } from './fixtures/fake-laya-serve.mjs'
 import { waitFor } from './wait-for.js'
 
@@ -123,8 +126,8 @@ test('Laya\'s own lines: the three device lines, the reason under the second, th
 })
 
 test('laya.serve is started as the official entry point, from an empty folder, with its environment and none of the person\'s secrets', async (t) => {
-  const saved = Object.fromEntries(['TYPESAFE_API_KEY', 'TYPESAFE_BASE_URL', 'HF_TOKEN'].map((k) => [k, process.env[k]]))
-  Object.assign(process.env, { TYPESAFE_API_KEY: 'tsk_the_persons_own_secret', TYPESAFE_BASE_URL: 'https://jev.example', HF_TOKEN: 'hf_secret' })
+  const saved = Object.fromEntries(['TYPESAFE_API_KEY', 'TYPESAFE_BASE_URL', 'HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN'].map((k) => [k, process.env[k]]))
+  Object.assign(process.env, { TYPESAFE_API_KEY: 'tsk_the_persons_own_secret', TYPESAFE_BASE_URL: 'https://jev.example', HF_TOKEN: 'hf_secret', HUGGING_FACE_HUB_TOKEN: 'hf_secret_older_name' })
   t.after(() => { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v } })
   const h = await harness()
   let budget = { maxCores: null }
@@ -145,7 +148,7 @@ test('laya.serve is started as the official entry point, from an empty folder, w
     { LAYA_HOST: '127.0.0.1', LAYA_MODELS: 'english', LAYA_PRELOAD: '1', LAYA_DEVICE: 'cpu', LAYA_AUTO_TASK: '0', LAYA_LOG_LEVEL: 'warning', HF_HOME: h.paths.hf, HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', HF_HUB_DISABLE_TELEMETRY: '1', TOKENIZERS_PARALLELISM: 'false' },
   )
   assert.match(env.LAYA_API_KEY, HEX48)
-  assert.deepEqual(Object.keys(env).filter((k) => /^TYPESAFE_/i.test(k) || k === 'HF_TOKEN'), [], 'no TypeSafe setting and no Hugging Face token reaches the child')
+  assert.deepEqual(Object.keys(env).filter((k) => /^TYPESAFE_/i.test(k) || k === 'HF_TOKEN' || k === 'HUGGING_FACE_HUB_TOKEN'), [], 'no TypeSafe setting and no Hugging Face token, under either name, reaches the child')
   assert.equal(env.LAYA_THREADS, String(defaultThreads(SPECS.cpu)), 'no core budget: the thread default local.js uses for llama')
   assert.deepEqual(conn, { url: `http://127.0.0.1:${env.LAYA_PORT}`, key: env.LAYA_API_KEY, device: 'cpu', pid: first.child.pid })
   assert.deepEqual(sidecar.connection(), conn)
@@ -320,6 +323,41 @@ test('stopped: ensureReady starts it and waits, with the starting line every few
   assert.equal(fake.spawned.length, 3)
 })
 
+test('a wait says what it waits for: a stop under way, then the load of the new process timed from its launch; the pause before a restart, never a load', async (t) => {
+  // A stop that takes a moment (an idle stop, a yield), as a message arrives.
+  const h = await harness()
+  const fake = interpreter()
+  const slowKill = (pid) => { setTimeout(() => killTree(pid), 700) }
+  const { sidecar } = await sidecarFor(t, h, { spawn: fake.spawn, killTree: slowKill, timing: { waitLineMs: 100 } })
+  await sidecar.start()
+  const idle = sidecar.stop({ reason: 'idle' })
+  const lines = []
+  await sidecar.ensureReady({ onWait: (l) => lines.push(l) })
+  await idle
+  const stopping = lines.filter((l) => l === 'Waiting for Laya to finish stopping, then starting it…')
+  assert.ok(stopping.length >= 3, lines.join('\n'))
+  assert.deepEqual(lines.slice(0, stopping.length), stopping, 'first the stop, and nothing of a load')
+  const loading = lines.slice(stopping.length, -1)
+  assert.ok(loading.every((l) => /^Starting Laya on this PC: loading the model on the CPU \(\d+ s; the last start took \d+ s\)…$/.test(l)), loading.join('\n'))
+  assert.ok(loading.every((l) => Number(/\((\d+) s;/.exec(l)[1]) <= 1), `the load is timed from this start's launch, not the stopped process's: ${loading.join(' | ')}`)
+  assert.match(lines.at(-1), /^Laya is ready on the CPU/)
+
+  // A crash, and a message during the pause before the restart.
+  const h2 = await harness()
+  const fake2 = interpreter()
+  const { sidecar: second } = await sidecarFor(t, h2, { spawn: fake2.spawn, timing: { waitLineMs: 100, backoffMs: [1200, 1200, 1200] } })
+  await second.start()
+  fake2.spawned[0].child.kill('SIGKILL')
+  await waitFor('restarting', () => second.status().state, (s) => s === 'restarting')
+  const again = []
+  await second.ensureReady({ onWait: (l) => again.push(l) })
+  const pausing = again.filter((l) => l.startsWith('Laya stopped unexpectedly'))
+  assert.ok(pausing.length >= 3, again.join('\n'))
+  assert.ok(pausing.every((l) => /^Laya stopped unexpectedly \(signal SIGKILL\); restarting it in [12] s \(attempt 1 of 3\)…$/.test(l)), pausing.join('\n'))
+  assert.deepEqual(again.slice(0, pausing.length), pausing, 'the pause first, and no load said while nothing loads')
+  assert.match(again.at(-1), /^Laya is ready on the CPU/)
+})
+
 test('starting: ensureReady joins the start and warm() adds nothing; Stop stops it, unless a Laya Auto run holds it', async (t) => {
   const h = await harness()
   const fake = interpreter({ env: () => ({ FAKE_LAYA_LOAD_MS: '1200' }) })
@@ -438,6 +476,51 @@ test('a start that fails is failed until Start, with its reason and last lines, 
   assert.equal(fake.spawned.length, 2)
 })
 
+test('a Stop or an exit while the warm-up takes its last readings ends the start: never ready over a Laya that is gone, and nothing left in the residency', async (t) => {
+  /** A start whose working-set reading, the warm-up's last step, waits until the test lets it go. */
+  async function heldAtTheReading() {
+    const h = await harness()
+    const fake = interpreter()
+    const residency = createResidency()
+    let reading = null
+    let release
+    const gate = new Promise((r) => { release = r })
+    const { sidecar, logs } = await sidecarFor(t, h, {
+      spawn: fake.spawn, residency,
+      readWorkingSet: async () => { reading = true; await gate; return 1.9 * 1024 ** 3 },
+    })
+    const started = sidecar.start()
+    started.catch(() => {})
+    await waitFor('the warm-up reads the working set', () => reading, (r) => r === true, { timeoutMs: 20_000 })
+    return { sidecar, logs, fake, residency, started, release }
+  }
+
+  // Stop pressed while the working set is read.
+  const a = await heldAtTheReading()
+  const stopped = a.sidecar.stop()
+  a.release()
+  await stopped
+  await assert.rejects(a.started, { message: 'it was stopped' })
+  assert.equal(a.sidecar.status().state, 'stopped')
+  assert.equal(a.sidecar.status().running, null)
+  assert.equal(a.sidecar.isReady(), false)
+  assert.equal(a.residency.get('laya'), null, 'no Laya left in the residency for a local model to be sized around')
+  assert.ok(!a.logs.some((l) => l.startsWith('laya: ready')), a.logs.join('\n'))
+  assert.equal(a.fake.spawned.length, 1)
+
+  // The interpreter dies while the working set is read.
+  const b = await heldAtTheReading()
+  const child = b.fake.spawned[0].child
+  child.kill('SIGKILL')
+  await waitFor('the interpreter is gone', () => exited(child), (x) => x === true)
+  b.release()
+  await assert.rejects(b.started, { message: 'laya.serve exited before it was ready (signal SIGKILL)' })
+  assert.deepEqual([b.sidecar.status().state, b.sidecar.status().why], ['failed', 'laya.serve exited before it was ready (signal SIGKILL)'])
+  assert.equal(b.sidecar.connection(), null, 'no call is handed the dead connection')
+  assert.equal(b.residency.get('laya'), null)
+  await assert.rejects(b.sidecar.ensureReady(), { message: LAYA_TEXT.failed('laya.serve exited before it was ready (signal SIGKILL)') })
+})
+
 test('a ready Laya that exits is restarted at once, then after a pause, then a longer one, and failed at the fourth exit within ten minutes', async (t) => {
   const h = await harness()
   const fake = interpreter()
@@ -454,6 +537,41 @@ test('a ready Laya that exits is restarted at once, then after a pause, then a l
   await new Promise((r) => setTimeout(r, 300))
   assert.equal(fake.spawned.length, 4, 'no fifth start')
   await assert.rejects(sidecar.ensureReady(), { message: LAYA_TEXT.failed(sidecar.status().why) })
+})
+
+test('a call an exit cut off says the exit and whether Laya is restarting: restarting after the first three, stopped until Start after the fourth', async (t) => {
+  const h = await harness()
+  const fake = interpreter({ env: () => ({ FAKE_LAYA_MS_PER_ROW: '300' }) })
+  let client = null
+  const { sidecar } = await sidecarFor(t, h, { spawn: fake.spawn, isBusy: () => client?.busy() ?? false, timing: { backoffMs: [0, 100, 200] } })
+  client = createLayaClient({ sidecar, settings: { deadlines: { floorMs: 30_000, ceilingMs: 60_000, hardMs: 60_000 } } })
+  t.after(() => client.dispose())
+  const jev = createJev({ provider: resolveProviders({}, {}).laya, client: client.client('act') })
+  const said = []
+  for (let n = 1; n <= 4; n++) {
+    const call = jev.intent({ message: 'Fix the failing test in the parser' })
+    call.catch(() => {})
+    await waitFor(`call ${n} on the wire`, () => client.busy(), (b) => b === true, { timeoutMs: 20_000 })
+    fake.spawned.at(-1).child.kill('SIGKILL')
+    said.push(await call.then(() => 'answered', (err) => err.message))
+  }
+  assert.deepEqual(said, [
+    ...Array(3).fill('Laya stopped while answering (signal SIGKILL); it is restarting'),
+    'Laya stopped while answering and will not restart until Start is pressed: laya.serve exited 4 times in 10 minutes (last: signal SIGKILL)',
+  ])
+  assert.equal(sidecar.status().state, 'failed')
+  assert.deepEqual(fake.spawned.length, 4, 'and nothing restarted it')
+})
+
+test('the exit the supervisor restarted Laya from is kept in status() with its code and signal', async (t) => {
+  const h = await harness()
+  const fake = interpreter()
+  const { sidecar } = await sidecarFor(t, h, { spawn: fake.spawn })
+  await sidecar.start()
+  fake.spawned[0].child.kill('SIGKILL')
+  await waitFor('restarted after the exit', () => [fake.spawned.length, sidecar.status().state], ([n, st]) => n === 2 && st === 'ready', { timeoutMs: 20_000 })
+  const { kind, why, code, signal } = sidecar.status().lastRestart
+  assert.deepEqual({ kind, why, code, signal }, { kind: 'exit', why: 'signal SIGKILL', code: null, signal: 'SIGKILL' })
 })
 
 test('the device: the GPU when it has room, else the CPU with the numbers; Restart on the GPU with no room refuses and leaves the CPU instance running', async (t) => {
@@ -485,7 +603,7 @@ test('the device: the GPU when it has room, else the CPU with the numbers; Resta
   budget = {}
   g.free = 900
   await sidecar.setSettings({ device: 'gpu' })
-  await assert.rejects(sidecar.ensureReady(), { message: LAYA_TEXT.couldNotStart(`Laya is set to run on the GPU, and ${why}`) })
+  await assert.rejects(sidecar.ensureReady(), { message: LAYA_TEXT.refused(`Laya is set to run on the GPU, and ${why}`) })
 })
 
 test('a request busy past hardMs restarts it, with that said', async (t) => {
@@ -495,6 +613,22 @@ test('a request busy past hardMs restarts it, with that said', async (t) => {
   await sidecar.start()
   await waitFor('restarted', () => fake.spawned.length, (n) => n >= 2, { timeoutMs: 20_000 })
   assert.ok(logs.includes('laya: Laya spent over 1 s on one request and was restarted.'), logs.join('\n'))
+})
+
+test('the Laya client\'s restart of a request past hardMs is said as the supervisor\'s own, even while a Laya Auto run holds Laya', async (t) => {
+  const h = await harness()
+  const fake = interpreter()
+  const { sidecar, logs } = await sidecarFor(t, h, { spawn: fake.spawn, config: { deadlines: { hardMs: 270_000 } } })
+  await sidecar.start()
+  sidecar.hold('run-7')
+  // What the client does when its hard ceiling fires, as laya-client.js classify() asks it.
+  await sidecar.restart({ reason: 'hung' })
+  await waitFor('running again', () => sidecar.status().state, (s) => s === 'ready', { timeoutMs: 20_000 })
+  assert.equal(fake.spawned.length, 2, 'it was restarted')
+  const { kind, why } = sidecar.status().lastRestart ?? {}
+  assert.deepEqual([kind, why], ['hung', 'Laya spent over 270 s on one request and was restarted.'], 'and the card can say why (7.5)')
+  assert.ok(logs.includes('laya: Laya spent over 270 s on one request and was restarted.'), logs.join('\n'))
+  assert.deepEqual(sidecar.status().running.held, ['run:run-7'])
 })
 
 test('two HTTP 500s in a row restart it; one, or two apart, do not', async (t) => {
@@ -735,6 +869,55 @@ test('Laya\'s GPU memory spilling into system memory is said when an acting GPU 
   assert.equal(sidecar.status().running.spilling, false)
 })
 
+test('status() says where each running figure comes from: the working set the budget reads, else what the first start measured', async (t) => {
+  const h = await harness({ cuda: true })
+  const g = gpu()
+  // nvidia-smi, as the start reads it: the room first, then the memory before the load, then after it.
+  let reads = 0
+  const run = async (cmd, args) => { if (cmd === 'nvidia-smi' && ++reads >= 3) g.used = 2900; return g.run(cmd, args) }
+  const residency = createResidency()
+  const { sidecar } = await sidecarFor(t, h, { spawn: interpreter().spawn, run, residency, readWorkingSet: async () => 1.9 * 1024 ** 3 })
+  await sidecar.start()
+  let r = sidecar.status().running
+  assert.deepEqual([r.device, r.vramGB, r.vramSource, r.ramGB, r.ramSource], ['cuda', 2.25, 'first start', 1.9, 'first start'])
+  // A RAM budget set, the watchdog reads the working set, and the RAM figure is that reading.
+  residency.get('laya').workingSetGB = 2.1
+  r = sidecar.status().running
+  assert.deepEqual([r.ramGB, r.ramSource, r.vramSource], [2.1, 'working set', 'first start'])
+  // On the CPU there is no GPU figure, and so no source for one.
+  const hc = await harness()
+  const { sidecar: onCpu } = await sidecarFor(t, hc, { spawn: interpreter().spawn })
+  await onCpu.start()
+  assert.deepEqual([onCpu.status().running.vramGB, onCpu.status().running.vramSource], [null, null])
+})
+
+test('a spill goes on being said while it lasts: a spilled request is never folded into the figure the next one is judged against', async (t) => {
+  const h = await harness({ cuda: true })
+  const g = gpu()
+  const fake = interpreter()
+  const { sidecar } = await sidecarFor(t, h, { spawn: fake.spawn, run: g.run })
+  await sidecar.start()
+  assert.equal(sidecar.status().running.device, 'cuda')
+  const figure = sidecar.readSettings().measured.cuda.msPerToken.route
+  assert.ok(figure > 0, 'the warm-up measured the route')
+  // Dedicated memory all but full, and every acting route at four times the unspilled figure.
+  g.used = 3900
+  g.free = 196
+  const said = []
+  for (let n = 0; n < 4; n++) said.push(await sidecar.noteResult({ status: 200, ms: figure * 4 * 1000, tokens: 1000, phase: 'route', role: 'act' }))
+  // A comparison in the background, as slow, moves the figure no more than an acting request.
+  await sidecar.noteResult({ status: 200, ms: figure * 4 * 1000, tokens: 1000, phase: 'route', role: 'shadow' })
+  assert.deepEqual(said.map((r) => r.spilling), [true, true, true, true], 'every spilled call says so, in its run\'s lines')
+  assert.ok(said.every((r) => r.line === LAYA_TEXT.spilling))
+  assert.deepEqual([sidecar.status().running.spilling, sidecar.status().running.spills], [true, 4], 'and the card goes on saying it')
+  assert.equal(sidecar.readSettings().measured.cuda.msPerToken.route, figure, 'the figure is Laya\'s unspilled speed')
+  await waitFor('laya.json keeps it', () => JSON.parse(readFileSync(h.paths.settings, 'utf8')).measured.cuda.msPerToken.route, (x) => x === figure)
+  // Back under three times the unspilled figure: the spill is over, and that request is folded in.
+  assert.deepEqual(await sidecar.noteResult({ status: 200, ms: figure * 2 * 1000, tokens: 1000, phase: 'route', role: 'act' }), { spilling: false })
+  assert.equal(sidecar.status().running.spilling, false)
+  assert.ok(sidecar.readSettings().measured.cuda.msPerToken.route > figure)
+})
+
 test('the settings: each field checked with its own message, a refused patch saves nothing, unknown fields refused', async (t) => {
   const h = await harness()
   const { sidecar } = await sidecarFor(t, h, {})
@@ -815,7 +998,7 @@ test('a start the RAM budget or a GPU with no room turns down is refused, not fa
   const fake = interpreter()
   const { sidecar } = await sidecarFor(t, h, { spawn: fake.spawn, residency: res, readBudget: async () => ({ maxRamGB: 8 }) })
   const refusal = 'Laya needs about 3.3 GB of RAM; the budget leaves 2 GB beside qwen3-8b. Stop the local model or raise the RAM budget.'
-  await assert.rejects(sidecar.ensureReady(), { message: LAYA_TEXT.couldNotStart(refusal) })
+  await assert.rejects(sidecar.ensureReady(), { message: LAYA_TEXT.refused(refusal) })
   assert.deepEqual([sidecar.status().state, sidecar.status().why, fake.spawned.length], ['stopped', refusal, 0], 'the 7.4 table sets failed only for a start that ran and did not come up')
   // The local model is unloaded: the next message starts Laya, with no Start pressed.
   res.clear('llama', llama)
@@ -829,11 +1012,42 @@ test('a start the RAM budget or a GPU with no room turns down is refused, not fa
   const { sidecar: onGpu } = await sidecarFor(t, hg, { spawn: fg.spawn, run: g.run })
   await onGpu.setSettings({ device: 'gpu' })
   const noRoom = 'Laya is set to run on the GPU, and the GPU had 0.9 GB free and Laya needs about 2.5 GB'
-  await assert.rejects(onGpu.ensureReady(), { message: LAYA_TEXT.couldNotStart(noRoom) })
+  await assert.rejects(onGpu.ensureReady(), { message: LAYA_TEXT.refused(noRoom) })
   assert.deepEqual([onGpu.status().state, onGpu.status().why], ['stopped', noRoom])
   g.free = 3500
   await assert.doesNotReject(onGpu.ensureReady())
   assert.equal(onGpu.status().running.device, 'cuda')
+})
+
+test('a start the budget or the GPU turned down is refused with its own reason: no Start to press and no log to read, and no reason ends twice', async (t) => {
+  const h = await harness()
+  const res = createResidency()
+  res.set('llama', { pid: 1, startedAt: 1, name: 'qwen3-8b', held: () => true, busy: () => false, ramGB: 6, unload: async () => {} })
+  const fake = interpreter()
+  const { sidecar } = await sidecarFor(t, h, { spawn: fake.spawn, residency: res, readBudget: async () => ({ maxRamGB: 8 }) })
+  await assert.rejects(sidecar.ensureReady(), {
+    message: 'Laya Auto did not run this: Laya needs about 3.3 GB of RAM; the budget leaves 2 GB beside qwen3-8b. Stop the local model or raise the RAM budget. Nothing was run.',
+    reason: 'refused',
+  })
+  // A call of a run already under way says only the reason.
+  const client = createLayaClient({ sidecar })
+  t.after(() => client.dispose())
+  await assert.rejects(createJev({ provider: resolveProviders({}, {}).laya, client: client.client('act') }).intent({ message: 'Fix the parser' }), {
+    message: 'Laya needs about 3.3 GB of RAM; the budget leaves 2 GB beside qwen3-8b. Stop the local model or raise the RAM budget',
+  })
+  assert.equal(fake.spawned.length, 0)
+
+  const hg = await harness({ cuda: true })
+  const g = gpu({ free: 900, used: 3196 })
+  const { sidecar: onGpu } = await sidecarFor(t, hg, { spawn: interpreter().spawn, run: g.run })
+  await onGpu.setSettings({ device: 'gpu' })
+  await assert.rejects(onGpu.ensureReady(), { message: 'Laya Auto did not run this: Laya is set to run on the GPU, and the GPU had 0.9 GB free and Laya needs about 2.5 GB. Nothing was run.' })
+
+  // A start that ran and failed still says where the log is, with the reason's own period once.
+  const hw = await harness()
+  const { sidecar: broken } = await sidecarFor(t, hw, { spawn: interpreter().spawn })
+  rmSync(join(snapshotDir(hw.paths.hf, PINS.weights.repo, COMMIT), 'model.safetensors'))
+  await assert.rejects(broken.ensureReady(), { message: "Laya Auto did not run this: Laya could not start (Laya's model files are not complete on this PC (model.safetensors is missing). Choose Repair, or copy models/laya/hf from another PC). Press Start in Settings → Jev setup → Laya decision model, where the log is. Nothing was run." })
 })
 
 test('why the supervisor restarted Laya stays in status() once it is ready again, until the person presses Start or Stop', async (t) => {
@@ -944,6 +1158,72 @@ test('an install check is recorded in sidecar.json while it runs, and the engine
   const r = await checking
   assert.equal(r.ok, false)
   assert.ok(await settle(() => !existsSync(h.paths.sidecarJson), (x) => x), 'nothing recorded once it has gone')
+})
+
+test('nothing starts Laya once its supervisor is disposed: not a start chained on a stop, not a restart, not a call waiting out a crash backoff', async (t) => {
+  // A message arrives while an idle stop is under way, and the plugin is disposed before the stop ends.
+  const h = await harness()
+  const fake = interpreter()
+  const { sidecar, logs } = await sidecarFor(t, h, { spawn: fake.spawn })
+  await sidecar.start()
+  sidecar.stop({ reason: 'idle' }).catch(() => {})
+  const waiting = sidecar.ensureReady({})
+  waiting.catch(() => {})
+  await sidecar.dispose()
+  await assert.rejects(waiting, { message: 'Laya was stopped with KzH' })
+  await assert.rejects(sidecar.start({ reason: 'update' }), { message: 'Laya was stopped with KzH' }, 'nor the installer starting it again')
+  sidecar.warm()
+  await new Promise((r) => setTimeout(r, 300))
+  assert.equal(fake.spawned.length, 1, `one laya.serve only: ${logs.join(' | ')}`)
+  await waitFor('the stopped one has exited', () => exited(fake.spawned[0].child), (x) => x === true)
+  assert.equal((await sidecar.checkStart({ venv: h.paths.venv })).ok, false, 'and no install check')
+  assert.equal(fake.spawned.length, 1)
+
+  // A crash, and a call waiting out the backoff: it hears at once, and the backoff starts nothing.
+  const h2 = await harness()
+  const fake2 = interpreter()
+  const { sidecar: second } = await sidecarFor(t, h2, { spawn: fake2.spawn, timing: { backoffMs: [1500, 1500, 1500] } })
+  await second.start()
+  fake2.spawned[0].child.kill('SIGKILL')
+  await waitFor('restarting', () => second.status().state, (s) => s === 'restarting')
+  const t0 = Date.now()
+  const pending = second.ensureReady({})
+  pending.catch(() => {})
+  await second.dispose()
+  await assert.rejects(pending, { message: 'Laya was stopped with KzH' })
+  assert.ok(Date.now() - t0 < 1000, 'at once, not after the backoff or the start bound')
+  await new Promise((r) => setTimeout(r, 1800))
+  assert.equal(fake2.spawned.length, 1, 'the backoff ended with the supervisor')
+})
+
+test('a disposed supervisor leaves nothing that keeps the engine\'s process alive: it can exit at once', async (t) => {
+  const h = await harness()
+  const url = (f) => new URL(f, import.meta.url).href
+  // The engine, as a process of its own: Laya started on the fake with the real timings, then disposed.
+  const script = `
+    import { spawn } from 'node:child_process'
+    import { createLayaSidecar } from ${JSON.stringify(url('../laya-sidecar.js'))}
+    import { createProbe } from ${JSON.stringify(url('../laya-selfcheck.js'))}
+    import { readPins } from ${JSON.stringify(url('../laya-install.js'))}
+    const [harnessDir, dataDir, port] = process.argv.slice(1)
+    const sidecar = createLayaSidecar({
+      harnessDir, dataDir, pins: readPins(${JSON.stringify(REPO)}), config: { port: Number(port) },
+      specs: async () => (${JSON.stringify(SPECS)}), probe: (c) => createProbe(c), run: async () => null,
+      spawn: (cmd, args, opts) => spawn(process.execPath, [${JSON.stringify(FAKE)}, ...args], opts),
+    })
+    await sidecar.start()
+    await sidecar.dispose()
+    process.stdout.write('disposed\\n')
+  `
+  const child = nodeSpawn(process.execPath, ['--input-type=module', '-e', script, h.harnessDir, h.dataDir, String(await basePort())], { stdio: ['ignore', 'pipe', 'inherit'] })
+  t.after(() => { if (!exited(child)) child.kill('SIGKILL') })
+  let disposedAt = null
+  child.stdout.on('data', (d) => { if (String(d).includes('disposed')) disposedAt ??= Date.now() })
+  const code = await new Promise((r) => child.once('exit', (c) => r(c)))
+  assert.equal(code, 0)
+  assert.ok(disposedAt, 'the engine disposed its supervisor')
+  const lived = Date.now() - disposedAt
+  assert.ok(lived < 3000, `it exited ${lived} ms after dispose, not after the 15 s bound of a stop`)
 })
 
 test('dispose kills an install check under way', async (t) => {

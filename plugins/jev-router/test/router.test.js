@@ -9,7 +9,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { compareAnswers, formatReport, runRouted } from '../router.js'
 import { NO_CANDIDATES } from '../decision.js'
-import { layaError } from '../laya-client.js'
 
 const config = {
   agents: [
@@ -1698,6 +1697,7 @@ test('decider: the Laya client\'s own timeout reads in the report with its quest
   // Built by the client's own constructor: the message names the deadline, and the call's size and
   // device ride beside it (docs/laya-auto.md 3.5, 4.5). A call never sent keeps its message alone.
   const { laya } = await records()
+  const { layaError } = await import('../laya-client.js')
   const failing = {
     provider: laya,
     route: async () => { throw layaError('LAYA_TIMEOUT', 'timed out after 42 s', { questions: 20, device: 'cpu' }) },

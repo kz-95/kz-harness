@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { performance } from 'node:perf_hooks'
+import { monitorEventLoopDelay, performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
 import { createDecisionEngine } from '../decision.js'
 import { createJev } from '../jev.js'
@@ -108,7 +108,11 @@ const sidecarOn = (fake) => {
   }
 }
 
-const tmp = (name) => mkdtempSync(join(tmpdir(), `kz-shadow-${name}-`))
+// Every folder a test here makes goes when the file is done: the cap test alone writes 50 MB, and a
+// suite run many times over would fill the disk.
+const made = []
+process.on('exit', () => { for (const dir of made) rmSync(dir, { recursive: true, force: true }) })
+const tmp = (name) => { const dir = mkdtempSync(join(tmpdir(), `kz-shadow-${name}-`)); made.push(dir); return dir }
 const rowsIn = (file) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [])
 
 // Calls as jev.js builds them, with a tool whose description and option keys the person wrote.
@@ -149,7 +153,7 @@ function freshRepo(dir) {
   g('init', '-q'); g('add', '-A'); g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init')
 }
 
-/** Two consecutive Jev Auto runs through the real router, decision engine and createJev. */
+/** Two consecutive Jev Auto runs through the real router, decision engine and createJev, each timed. */
 async function twoRuns(dir, { onCall } = {}) {
   freshRepo(dir)
   const policy = resolvePolicy()
@@ -159,6 +163,7 @@ async function twoRuns(dir, { onCall } = {}) {
   const snapshots = snapshotResources({ agents: AGENTS, usage: {}, ready, config: {}, now: NOW, modelOf, policy })
   const client = fakeJev()
   const records = []
+  const ms = []
   for (const task of ['make the test pass', 'now tidy the fix']) {
     const jev = createJev({ provider: JEV, apiKey: 'k', client, ...(onCall ? { onCall } : {}) })
     const deps = {
@@ -167,9 +172,11 @@ async function twoRuns(dir, { onCall } = {}) {
       history: { recent: async () => [], records: async () => [], append: async () => {} },
       decide: (args) => engine.decide({ ...args, snapshots }),
     }
+    const t0 = performance.now()
     records.push(await runRouted({ task, cwd: dir, config: CONFIG, deps }))
+    ms.push(performance.now() - t0)
   }
-  return { records, bodies: client.bodies }
+  return { records, bodies: client.bodies, ms }
 }
 
 /** A record with what differs between any two runs removed: its id, its times and its durations. */
@@ -217,6 +224,10 @@ test('a Jev Auto run is the same run with the shadow on, whatever Laya does, and
       assert.equal(spent.length, 2 * off.bodies.length, `${name}: every Jev call was offered and settled`)
       const total = spent.reduce((a, b) => a + b, 0)
       assert.ok(total < 50, `${name}: the shadow spent ${total.toFixed(1)} ms on the run's thread`)
+      // A run is its Jev calls plus the router's own git work and review, so it is timed against
+      // the same run with the shadow off; a tenth of one Laya chunk (4 x 1250 ms) is the noise
+      // allowed, so a run that waited half a second on Laya fails here, long before any answer.
+      on.ms.forEach((ms, i) => assert.ok(ms < off.ms[i] + 500, `${name}: run ${i + 1} took ${ms.toFixed(0)} ms, against ${off.ms[i].toFixed(0)} ms with the shadow off`))
       if (name === 'answers after 5 s' || name === 'hangs') {
         assert.ok(fake.requests.length >= 1, `${name}: Laya was being asked`)
         assert.ok(fake.requests.every((r) => r.finishedAt == null), `${name}: both runs ended before Laya answered anything`)
@@ -415,6 +426,29 @@ test('with learning off, the shadow asks Laya nothing and writes nothing', async
   assert.equal(laya.offers.size, 1, 'the switch is read on every call')
 })
 
+test('a row the disk refuses is said in the log and kept in memory, the Jev call answers as usual, and the next row is written once the disk takes it', async () => {
+  const dir = tmp('unwritable')
+  // Where the shadow's folder should be there is a file: every write fails, as on a full disk or a
+  // file another program holds.
+  const blocker = join(dir, 'not-a-folder')
+  writeFileSync(blocker, '')
+  const file = join(blocker, 'laya-shadow.jsonl')
+  const lines = []
+  const shadow = createShadow({ file, laya: stubLaya({ drop: 'not_running' }), providers: PROVIDERS, log: (m) => lines.push(m) })
+  const jev = createJev({ provider: JEV, apiKey: 'k', client: fakeJev({ latencyMs: 1 }), onCall: shadow.offerer({ runId: 'r' }) })
+  const answered = await jev.intent({ message: 'hello' })
+  assert.equal(answered.kind, 'task', 'the Jev call answered')
+  await shadow.flush()
+  assert.equal(lines.filter((l) => l.startsWith('laya shadow: row not saved: ')).length, 1, lines.join('\n'))
+  assert.deepEqual(shadow.read({}).map((r) => [r.status, r.reason]), [['skipped', 'not_running']], 'the row is still in memory for the inspector')
+  // The disk takes rows again: the one that failed stays lost, and nothing waits on it.
+  rmSync(blocker)
+  await jev.intent({ message: 'hello again' })
+  await shadow.flush()
+  assert.equal(rowsIn(file).length, 1)
+  assert.equal(shadow.read({}).length, 2)
+})
+
 // ---------------------------------------------------------------- the file
 
 /** A route row of about the real size: twenty questions with their probabilities. */
@@ -450,7 +484,35 @@ test('on a file at the cap, the rows of a run are read from memory in well under
   assert.equal(existsSync(`${file}.tmp`), false)
 })
 
-test('the comparison is computed off the main thread and reused for a minute or a hundred rows', async () => {
+/** The longest `work` held the event loop up, in ms: how long a run streaming on this thread would have stalled. */
+async function heldUp(work) {
+  const h = monitorEventLoopDelay({ resolution: 1 })
+  h.enable()
+  // A hold-up is recorded on the loop's next turn, so the loop is given one before the reading.
+  try { await work(); await sleep(20) } finally { h.disable() }
+  return h.max / 1e6
+}
+
+test('on a file at the cap, comparing it and compacting it leave the main thread free: its event loop is never held up 100 ms', async () => {
+  const file = join(tmp('thread'), 'laya-shadow.jsonl')
+  writeFileSync(file, Array.from({ length: SHADOW_CAP }, (_, i) => `${JSON.stringify(bigRow(i))}\n`).join(''))
+  const laya = stubLaya({ drop: 'not_running' })
+  const shadow = createShadow({ file, laya, providers: PROVIDERS, now: () => NOW, slack: 1 })
+  // Not timed: the newest rows read at start reach this thread as objects, which costs it about
+  // what parsing them here would, once, as the plugin loads.
+  await shadow.loaded()
+  let compared
+  const comparing = await heldUp(async () => { compared = await shadow.compare({ days: 'all', identity: 'all' }) })
+  assert.equal(compared.skips.answered, SHADOW_CAP, 'the setting: every row of the file was read')
+  assert.ok(comparing < 100, `comparing held the event loop up for ${comparing.toFixed(0)} ms`)
+  // Three more rows push the file past its cap, and it is rewritten with its newest 10,000.
+  const jev = createJev({ provider: JEV, apiKey: 'k', client: fakeJev({ latencyMs: 1 }), onCall: shadow.offerer({ runId: 'late' }) })
+  const compacting = await heldUp(async () => { for (let i = 0; i < 3; i++) await jev.intent({ message: `late ${i}` }); await shadow.flush() })
+  assert.equal(rowsIn(file)[0].id, 'row-3', 'the setting: the file was compacted')
+  assert.ok(compacting < 100, `compacting held the event loop up for ${compacting.toFixed(0)} ms`)
+})
+
+test('the comparison is reused for a minute or a hundred rows, and computed again after either', async () => {
   let now = NOW
   const laya = stubLaya({ drop: 'starting' })
   const file = join(tmp('cmp'), 'laya-shadow.jsonl')

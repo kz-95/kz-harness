@@ -20,7 +20,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, readlink, rename, rm, writeFile } from 'node:fs/promises'
 import { constants as osConstants, cpus, setPriority as osSetPriority } from 'node:os'
 import { resolve, sep } from 'node:path'
-import { createRotatingLog, execText, isAlive as pidAlive, layaPaths, sizeOf, verifyWeights } from './laya-install.js'
+import { createRotatingLog, execText, isAlive as pidAlive, layaPaths, sizeOf, verifyWeights, withoutSecrets } from './laya-install.js'
 import { ADAPTER_VERSION } from './laya-questions.js'
 import { defaultThreads, freePort, killTree as defaultKillTree, workingSetOf } from './local.js'
 
@@ -32,15 +32,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b }); promise.catch(() => {}); return { promise, resolve, reject } }
 
 const WHERE = 'Settings → Jev setup → Laya decision model'
+/** A reason as the inside of a sentence: its own closing period goes, so a reply never reads `budget.).` */
+const clause = (reason) => String(reason ?? '').trim().replace(/\.$/, '')
 
 /** What the person reads when Laya cannot be asked, word for word (3.5), and the sidecar's own lines. */
 export const LAYA_TEXT = Object.freeze({
   notInstalled: `Laya Auto did not run this: Laya is not installed on this PC. Install it in ${WHERE}, or pick Jev Auto. Nothing was run.`,
   disabled: 'Laya Auto did not run this: Laya is switched off in the configuration (jev-router laya.enabled). Nothing was run.',
   invalid: (message) => `Laya Auto did not run this: Laya's settings are invalid (${message}). Nothing was run.`,
-  failed: (reason) => `Laya Auto did not run this: Laya stopped after an error (${reason}). Press Start in ${WHERE}, where the log is. Nothing was run.`,
+  failed: (reason) => `Laya Auto did not run this: Laya stopped after an error (${clause(reason)}). Press Start in ${WHERE}, where the log is. Nothing was run.`,
   stillStarting: (s) => `Laya Auto did not run this: Laya was still starting after ${s} s. Nothing was run. Send it again once ${WHERE} says Running.`,
-  couldNotStart: (reason) => `Laya Auto did not run this: Laya could not start (${reason}). Press Start in ${WHERE}, where the log is. Nothing was run.`,
+  couldNotStart: (reason) => `Laya Auto did not run this: Laya could not start (${clause(reason)}). Press Start in ${WHERE}, where the log is. Nothing was run.`,
+  // A start the RAM budget or a GPU with no room turned down ran nothing and logged nothing, and
+  // Start is turned down the same way: the reason says what to do (7.7).
+  refused: (reason) => `Laya Auto did not run this: ${clause(reason)}. Nothing was run.`,
   stopWhileHeld: 'Laya is deciding for an open Laya Auto run; stop that run first.',
   orphan: (pid, gb) => `Stopped a Laya left running by an earlier session (pid ${pid}, ${gb ?? '?'} GB RAM).`,
   spilling: "Laya's GPU memory is spilling into system memory, so it and the local models are slow. Stop the local model, or pick CPU for Laya.",
@@ -51,8 +56,9 @@ export const LAYA_TEXT = Object.freeze({
 
 /**
  * Laya cannot be asked. `message` is the reply the person reads (3.5); `reason` says which case
- * (`not_installed`, `disabled`, `invalid`, `failed`, `start_timeout`, `start_failed`) and `detail`
- * the inner reason, so a caller mid-run can word it as a failed call instead of a refused run.
+ * (`not_installed`, `disabled`, `invalid`, `failed`, `start_timeout`, `start_failed`, `refused`,
+ * `disposed`) and `detail` the inner reason, so a caller mid-run can word it as a failed call
+ * instead of a refused run.
  */
 export class LayaUnavailable extends Error {
   constructor(message, { reason, detail = null } = {}) {
@@ -78,6 +84,11 @@ export const startingLine = ({ device, elapsedMs = 0, lastMs = null }) =>
   `Starting Laya on this PC: loading the model on the ${where(device)} (${Math.round(elapsedMs / 1000)} s${lastMs ? `; the last start took ${Math.round(lastMs / 1000)} s` : ''})…`
 /** The live line once it has loaded. */
 export const readyLine = ({ device, loadMs }) => `Laya is ready on the ${where(device)} (loaded in ${Math.round((loadMs ?? 0) / 1000)} s)`
+/** The live line while a run waits for a stop under way (an idle stop, a yield, the budget) to end, before Laya starts again (3.5). */
+export const stoppingLine = () => 'Waiting for Laya to finish stopping, then starting it…'
+/** The live line while a run waits out the pause before a restart after Laya stopped unexpectedly (3.5, 7.5). */
+export const restartingLine = ({ why, inMs, attempt, of }) =>
+  `Laya stopped unexpectedly (${why}); restarting it in ${Math.max(1, Math.ceil(inMs / 1000))} s (attempt ${attempt} of ${of})…`
 
 /**
  * What one line of laya.serve's output says, or null. Laya prints three device lines of its own,
@@ -198,7 +209,7 @@ export function createLayaSidecar({
   // --- what is on disk, cached: status() answers at once ---
   let installedInfo = null
   let weightsInfo = null
-  let diskBytes = null
+  let folderBytes = null // { engine, models }: what each of Laya's folders holds on disk
   function reloadInstalled() {
     installedInfo = existsSync(paths.pythonOf(paths.venv)) ? readJsonSync(paths.installed) : null
     weightsInfo = readJsonSync(paths.weights)
@@ -229,7 +240,8 @@ export function createLayaSidecar({
   let why = null
   let orphanStopped = null
   let restartInfo = null
-  let lastRestart = null // { kind, why, at }: the last restart the supervisor made on its own (7.5)
+  let restartAt = null // when the pending restart after an unexpected exit begins
+  let lastRestart = null // { kind, why, at }, and an exit's code and signal: the last restart the supervisor made on its own (7.5)
   const warnings = []
   const holds = new Set(settings.keepLoaded ? ['keepLoaded'] : [])
   let crashes = []
@@ -239,6 +251,8 @@ export function createLayaSidecar({
   let currentStart = null
   let suspended = null
   let install = null
+  // Set for good by dispose(): nothing starts or restarts Laya afterwards, however it was chained.
+  let disposed = false
   let priority = 'normal'
   let priorityWarned = false
   let fails500 = 0
@@ -263,6 +277,7 @@ export function createLayaSidecar({
   const lastLoadMs = (device) => measured[device]?.loadMs?.at(-1) ?? null
 
   function unavailable() {
+    if (disposed) return new LayaUnavailable('Laya was stopped with KzH', { reason: 'disposed' })
     if (!installedInfo) return new LayaUnavailable(LAYA_TEXT.notInstalled, { reason: 'not_installed' })
     if (!enabled) return new LayaUnavailable(LAYA_TEXT.disabled, { reason: 'disabled' })
     if (configError) return new LayaUnavailable(LAYA_TEXT.invalid(configError), { reason: 'invalid', detail: configError })
@@ -391,11 +406,9 @@ export function createLayaSidecar({
 
   // --- one laya.serve process ---
 
-  /** Every TYPESAFE_* variable and HF_TOKEN go: nothing of the person's secrets reaches the child. */
+  /** Every TYPESAFE_* variable and the Hugging Face token go: nothing of the person's secrets reaches the child. */
   function childEnv({ port, key, device, threads }) {
-    const env = { ...process.env }
-    for (const k of Object.keys(env)) if (/^TYPESAFE_/i.test(k) || k.toUpperCase() === 'HF_TOKEN') delete env[k]
-    return Object.assign(env, {
+    return Object.assign(withoutSecrets(), {
       LAYA_HOST: '127.0.0.1', LAYA_PORT: String(port), LAYA_API_KEY: key, LAYA_MODELS: 'english', LAYA_PRELOAD: '1',
       LAYA_DEVICE: device, LAYA_THREADS: String(threads), LAYA_AUTO_TASK: '0', LAYA_LOG_LEVEL: 'warning',
       HF_HOME: paths.hf, HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', HF_HUB_DISABLE_TELEMETRY: '1',
@@ -442,7 +455,11 @@ export function createLayaSidecar({
     p.expected = true
     killTree(p.pid)
     if (p.interpreterPid !== p.pid) killTree(p.interpreterPid)
-    await Promise.race([p.exit, sleep(T.exitWaitMs)])
+    // The bound goes once the process has exited: a timer left behind would hold a stopping
+    // engine's process open for exitWaitMs after every stop, restart and dispose.
+    let bound
+    await Promise.race([p.exit, new Promise((r) => { bound = setTimeout(r, T.exitWaitMs) })])
+    clearTimeout(bound)
     for (const deadline = Date.now() + T.exitWaitMs; p.interpreterPid !== p.pid && isAlive(p.interpreterPid) && Date.now() < deadline;) await sleep(100)
   }
 
@@ -572,6 +589,8 @@ export function createLayaSidecar({
       for (let attempt = 0; ; attempt++) {
         if (me.cancelled) throw new StartFailed('it was stopped', { stopped: true })
         const port = await reservePort()
+        // Stopped or disposed while the port was found: nothing is launched.
+        if (me.cancelled) { freePortReservation(port); throw new StartFailed('it was stopped', { stopped: true }) }
         const p = await launch({ venv: paths.venv, port, device: dev.device, threads, main: true })
         mine = p
         p.deviceWhy = dev.why
@@ -584,6 +603,11 @@ export function createLayaSidecar({
         try {
           const warm = await untilReady(p, { boundMs: startWaitMs, confirm: (conn) => warmUp(p, conn, vramBefore), cancelled: () => me.cancelled })
           await writeSidecarJson()
+          // The warm-up's last readings (the working set, the GPU's memory) and that write take a
+          // moment after the last answer, and a Stop or an exit in it is this start's to report:
+          // the exit handler leaves a start in progress alone. Nothing awaits between here and ready.
+          if (me.cancelled || p.expected) throw new StartFailed('it was stopped', { stopped: true })
+          if (p.exited) throw new StartFailed(`laya.serve exited before it was ready (${describeExit(p.exited)})`, { lines: p.lines.slice(-20) })
           ready(p, warm)
           return connOf(p)
         } catch (err) {
@@ -620,6 +644,8 @@ export function createLayaSidecar({
   }
 
   function ready(p, warm) {
+    // The intervals armed below replace any an earlier start left, never run beside them.
+    clearTimers()
     p.loadMs = now() - p.startedAt
     p.measuring = false
     const m = measured[p.device]
@@ -650,7 +676,7 @@ export function createLayaSidecar({
 
   function onExit(p) {
     if (p.resident) residency?.clear('laya', p.resident)
-    if (p !== proc || p.expected) return
+    if (disposed || p !== proc || p.expected) return
     if (state !== 'ready') return // a start in progress reports its own failure
     proc = null
     clearTimers()
@@ -666,11 +692,14 @@ export function createLayaSidecar({
     const n = crashes.length
     restartInfo = { attempt: n, of: RESTARTS, code: p.exited.code ?? null, signal: p.exited.signal ?? null }
     why = what
-    lastRestart = { kind: 'exit', why: what, at }
+    // The exit itself rides along: a call it cut off says which, after the backoff has ended too.
+    lastRestart = { kind: 'exit', why: what, at, code: restartInfo.code, signal: restartInfo.signal }
     restartPending = deferred()
     setState('restarting')
     log(`laya: exited (${p.exited.code != null ? `code ${p.exited.code}` : what}); restarting (${n} of ${RESTARTS})`)
-    timers.restart = setTimeout(runRestart, T.backoffMs[n - 1] ?? T.backoffMs.at(-1))
+    const pause = T.backoffMs[n - 1] ?? T.backoffMs.at(-1)
+    restartAt = at + pause
+    timers.restart = setTimeout(runRestart, pause)
   }
 
   function runRestart() {
@@ -837,21 +866,25 @@ export function createLayaSidecar({
     if (!p || status !== 200 || !(tokens > 0) || !(ms >= 0) || !PHASES.includes(phase)) return { spilling: p?.spilling ?? false }
     const before = measured[p.device].msPerToken[phase]
     const perToken = ms / tokens
-    fold(p.device, phase, perToken)
-    persist()
-    if (role !== 'act' || p.device !== 'cuda' || before == null) return { spilling: p.spilling }
-    if (perToken <= 3 * before) {
-      if (p.spilling) { p.spilling = false; changed() }
-      return { spilling: false }
-    }
-    // Over three times the device's own figure: spilling when dedicated memory is all but full.
-    const smi = await gpuMemory()
-    if (smi && smi.totalGB - smi.usedGB <= 0.3 && proc === p) {
+    // Over three times the device's own figure on the GPU: spilling when dedicated memory is all but
+    // full. Judged before the request is folded in, and a spilled one never is: it is not Laya's
+    // speed on this device, and folded in, it would raise the figure the next request is judged
+    // against, so the warning would clear on the next call while the spill went on (7.7).
+    const slow = p.device === 'cuda' && before != null && perToken > 3 * before
+    const smi = slow ? await gpuMemory() : null
+    const spilled = !!smi && smi.totalGB - smi.usedGB <= 0.3
+    if (!spilled) { fold(p.device, phase, perToken); persist() }
+    // Only an acting request of the process still running says so.
+    if (role !== 'act' || p.device !== 'cuda' || before == null || proc !== p) return { spilling: p.spilling }
+    if (spilled) {
       spills++
       if (!p.spilling) { p.spilling = true; log(`laya: ${LAYA_TEXT.spilling}`); changed() }
       return { spilling: true, line: LAYA_TEXT.spilling }
     }
-    return { spilling: p.spilling }
+    // The spill is over once an acting request is back under three times the unspilled figure; a
+    // slow one with room on the GPU leaves the state as it was.
+    if (!slow && p.spilling) { p.spilling = false; changed() }
+    return { spilling: slow && p.spilling }
   }
 
   // --- orphans (7.5) ---
@@ -901,6 +934,8 @@ export function createLayaSidecar({
     let resident = null
     let registered = false
     try {
+      // A disposed supervisor has no exit hook to take a check's laya.serve with the engine.
+      if (disposed) throw new StartFailed('Laya was stopped with KzH')
       await checkRam(device)
       if (device === 'cuda') {
         const room = await gpuRoom({ torchCuda: true })
@@ -946,12 +981,25 @@ export function createLayaSidecar({
 
   // --- waiting for it (3.5) ---
 
+  /**
+   * The live lines of a wait for Laya, every waitLineMs, each saying what is happening now: a stop
+   * under way to wait out first, the pause before a restart, or the load, timed from when this
+   * start's process was launched. In `starting`, `proc` is only ever the process this start launched;
+   * in `stopping` it is the one going away, whose age is no load time.
+   */
   function waitLines(onWait) {
     if (!onWait) return { ready() {}, stop() {} }
     const expected = () => proc?.device ?? (settings.device === 'cpu' || !installedInfo?.cuda ? 'cpu' : 'cuda')
-    const emit = () => {
+    const text = () => {
+      if (state === 'stopping') return stoppingLine()
+      if (state === 'restarting' && restartInfo) return restartingLine({ why: why ?? 'it ended', inMs: (restartAt ?? now()) - now(), attempt: restartInfo.attempt, of: restartInfo.of })
       const device = expected()
-      try { onWait(startingLine({ device, elapsedMs: proc ? now() - proc.startedAt : 0, lastMs: lastLoadMs(device) })) } catch { /* the caller's line */ }
+      return startingLine({ device, elapsedMs: state === 'starting' && proc ? now() - proc.startedAt : 0, lastMs: lastLoadMs(device) })
+    }
+    const emit = () => {
+      // Ready by now: the ready line follows.
+      if (state === 'ready') return
+      try { onWait(text()) } catch { /* the caller's line */ }
     }
     emit()
     const t = setInterval(emit, T.waitLineMs)
@@ -965,8 +1013,8 @@ export function createLayaSidecar({
   /**
    * Before every acting request (and classify): the connection, starting Laya and waiting for it
    * when it is stopped, starting, restarting or stopping, bounded by startWaitMs and the caller's
-   * signal, with the loading line every 5 s through `onWait`. Throws LayaUnavailable with the 3.5
-   * text when it cannot be asked.
+   * signal, with the line of what it waits for every 5 s through `onWait`. Throws LayaUnavailable
+   * with the 3.5 text when it cannot be asked.
    */
   async function ensureReady({ signal, onWait } = {}) {
     const refuse = unavailable()
@@ -991,6 +1039,7 @@ export function createLayaSidecar({
       return conn
     } catch (err) {
       if (err instanceof LayaUnavailable || (signal?.aborted && err === signal.reason)) throw err
+      if (err?.refused) throw new LayaUnavailable(LAYA_TEXT.refused(err.message), { reason: 'refused', detail: err.message })
       throw new LayaUnavailable(LAYA_TEXT.couldNotStart(err.message), { reason: 'start_failed', detail: err.message })
     } finally {
       clearTimeout(timer)
@@ -1023,17 +1072,27 @@ export function createLayaSidecar({
     return {
       state: s,
       why: state === 'failed' ? failure?.reason ?? why : why,
-      install: install ? { step: install.step, of: install.of ?? 8, name: install.name, received: install.received ?? 0, total: install.total ?? 0, error: install.error ?? null, kind: install.kind, failedStep: install.failedStep ?? null, offerCpu: !!install.offerCpu, notes: install.notes ?? [] } : null,
+      // The job's device, so Try again installs for the one that failed, and when its step began,
+      // for the minutes of a step with nothing to download.
+      install: install ? { step: install.step, of: install.of ?? 8, name: install.name, received: install.received ?? 0, total: install.total ?? 0, error: install.error ?? null, kind: install.kind, device: install.device ?? null, stepStartedAt: install.stepStartedAt ?? null, failedStep: install.failedStep ?? null, offerCpu: !!install.offerCpu, notes: install.notes ?? [] } : null,
       installed: installedInfo ? {
         laya: installedInfo.laya, torch: installedInfo.torch, cuda: !!installedInfo.cuda, gpu: installedInfo.gpu ?? null, python: installedInfo.python ?? null,
         weights: weightsInfo?.commit ? { commit: weightsInfo.commit, bytes: Object.values(weightsInfo.files ?? {}).reduce((a, f) => a + (f.size ?? 0), 0), downloadedAt: weightsInfo.downloadedAt ?? null } : null,
-        diskBytes,
+        // Both folders together, and each one, which the remove dialog names (8.3).
+        diskBytes: folderBytes ? folderBytes.engine + folderBytes.models : null,
+        bytes: folderBytes ? { ...folderBytes } : null,
       } : null,
       expected: { laya: pins.laya, torch: pins.torch?.version ?? null },
       running: p && ['starting', 'ready', 'stopping'].includes(state) ? {
         port: p.port, pid: p.pid, interpreterPid: p.interpreterPid, device: p.device, deviceWhy: p.deviceWhy, spilling: p.spilling, spills, threads: p.threads,
         loadMs: p.loadMs, startedAt: p.startedAt, measuring: p.measuring, lastLoadMs: lastLoadMs(p.device), gpu: p.gpu ?? null,
-        ramGB: p.resident?.workingSetGB ?? m?.ramGB ?? null, vramGB: p.device === 'cuda' ? m?.vramGB ?? null : null,
+        // Where each figure comes from: the working set the budget watchdog reads while a RAM budget
+        // is set, else what the first full warm-up on this device measured (7.5), which the GPU's
+        // is always, since the GPU memory of one process is not read while it runs.
+        ramGB: p.resident?.workingSetGB ?? m?.ramGB ?? null,
+        ramSource: p.resident?.workingSetGB != null ? 'working set' : m?.ramGB != null ? 'first start' : null,
+        vramGB: p.device === 'cuda' ? m?.vramGB ?? null : null,
+        vramSource: p.device === 'cuda' && m?.vramGB != null ? 'first start' : null,
         msPerToken: { ...m.msPerToken }, busy: !!isBusy(), held: [...holds], lastCallMs,
         // A local model request in flight shares the cores with an acting Laya call on the CPU.
         localBusy: !!isLocalBusy(),
@@ -1056,7 +1115,7 @@ export function createLayaSidecar({
   process.on('exit', onProcessExit)
 
   async function measureDisk() {
-    diskBytes = installedInfo ? (await sizeOf(paths.engine)) + (await sizeOf(paths.models)) : null
+    folderBytes = installedInfo ? { engine: await sizeOf(paths.engine), models: await sizeOf(paths.models) } : null
   }
   if (installedInfo) measureDisk().catch(() => {})
 
@@ -1068,6 +1127,9 @@ export function createLayaSidecar({
     start,
     stop,
     async restart({ reason = 'user', device } = {}) {
+      // The Laya client's own restart of a request past hardMs, which it sees before the health
+      // check would: a restart the supervisor makes on its own, so the card says why (7.5).
+      if (reason === 'hung') return restartFor('hung', LAYA_TEXT.hung(Math.round(hardMs / 1000)))
       if (reason === 'user' && runHeld()) throw new Error(LAYA_TEXT.stopWhileHeld)
       // Restart on the GPU: the room is checked before the running instance is stopped, and when
       // there is none, it says so with the numbers and leaves Laya running where it is.
@@ -1115,9 +1177,13 @@ export function createLayaSidecar({
     setSettings,
     logTail: (n = 200) => tail.slice(-n).map((l) => l.text),
     async dispose() {
+      disposed = true
       process.off('exit', onProcessExit)
       clearTimers()
       if (currentStart) currentStart.cancelled = true
+      // A call waiting out a crash backoff hears at once that nothing will start Laya now.
+      restartPending?.reject(unavailable())
+      restartPending = null
       const p = proc
       proc = null
       if (p && !p.exited) { if (p.resident) residency?.clear('laya', p.resident); await kill(p) }

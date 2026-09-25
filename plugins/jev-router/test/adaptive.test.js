@@ -116,7 +116,9 @@ function stack({ policy = testPolicy(), root = mkdtempSync(join(tmpdir(), 'kz-st
   const profiles = createCapabilityRegistry({ file: join(root, 'evidence.jsonl'), priors: PRIORS, policy })
   const store = createTrainingStore({ file: join(root, 'samples.jsonl') })
   const domains = learn ? createDomainRegistry({ policy, store, artifactsDir: join(root, 'classifiers'), stateDir: root }) : null
-  const engine = createDecisionEngine({ policy, domains, profiles, priors: PRIORS, store })
+  // The engine reads the clock the snapshots were taken at: its scarcity and job costs count the
+  // time left to each window's reset, and the real clock would move those resets closer every day.
+  const engine = createDecisionEngine({ policy, domains, profiles, priors: PRIORS, store, now: () => NOW })
   const snapshots = snapshotResources({ agents: AGENTS, usage, ready, config: {}, now: NOW, modelOf, policy })
   return { policy, root, profiles, store, domains, engine, snapshots }
 }

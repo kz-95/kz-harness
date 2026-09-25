@@ -66,6 +66,9 @@ function hardTimeout(err) {
   return false
 }
 
+/** A reason as the inside of a sentence, without its own closing period. */
+const clause = (reason) => String(reason ?? '').trim().replace(/\.$/, '')
+
 /** Why a caller cannot ask Laya, in words that fit a failed call rather than a refused run (3.5). */
 function unavailableReason(err) {
   const detail = err?.detail
@@ -73,8 +76,10 @@ function unavailableReason(err) {
     case 'not_installed': return 'Laya is not installed on this PC'
     case 'disabled': return 'Laya is switched off in the configuration'
     case 'invalid': return `Laya's settings are invalid (${detail})`
-    case 'failed': return `Laya stopped after an error (${detail ?? 'unknown'})`
-    case 'start_failed': return `Laya could not start (${detail ?? 'unknown'})`
+    case 'failed': return `Laya stopped after an error (${clause(detail ?? 'unknown')})`
+    case 'start_failed': return `Laya could not start (${clause(detail ?? 'unknown')})`
+    // The budget or the GPU's room turned the start down: the reason is the whole of it.
+    case 'refused': return clause(detail ?? 'unknown')
     default: return String(err?.message ?? err)
   }
 }
@@ -108,6 +113,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
   const shadowById = new Map()
   let waitingShadow = 0 // shadow jobs not started yet: the ones maxQueue counts
   let slot = null // what holds the wire: { kind: 'act' | 'shadow', predictedEndAt }
+  let turns = 0 // how many times a request has taken the slot
   let onWire = 0
   let pollTimer = null
   let level = null
@@ -244,8 +250,13 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
           : because === 'idle' ? 'it was idle' : null
       return layaError('LAYA_EXITED', `Laya was stopped while answering${why ? ` (${why})` : ''}`, { cause: err, skip: because === 'yielded' ? 'yielded' : 'not_running' })
     }
-    const code = s?.restart?.code ?? s?.lastRestart?.code
-    const what = code != null ? `exit code ${code}` : s?.state && s.state !== 'ready' ? 'the process ended' : `the connection closed: ${err?.cause?.message ?? err?.message ?? err}`
+    // A fourth exit in ten minutes, or a restart that could not start it: nothing restarts it now.
+    if (s?.state === 'failed') return layaError('LAYA_EXITED', `Laya stopped while answering and will not restart until Start is pressed: ${s.why ?? 'the process ended'}`, { cause: err })
+    // The exit the supervisor is restarting from: while it waits out the backoff, and once the
+    // restart has begun, which after a first exit is at once.
+    const exit = s?.restart ?? (s?.lastRestart?.kind === 'exit' ? s.lastRestart : null)
+    const what = exit?.code != null ? `exit code ${exit.code}` : exit?.signal ? `signal ${exit.signal}`
+      : s?.state && s.state !== 'ready' ? 'the process ended' : `the connection closed: ${err?.cause?.message ?? err?.message ?? err}`
     return layaError('LAYA_EXITED', `Laya stopped while answering (${what}); it is restarting`, { cause: err })
   }
 
@@ -312,6 +323,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
       const job = {
         kind: 'act', phase, state, questions, requests, predicted, totalMs, deadlineMs, rows, device, line,
         enqueuedAt: now(), startedAt: null, abandoned: false, settled: false, gone: new AbortController(), timers: {},
+        ...queuedBehind(),
       }
       const cleanup = () => {
         clearTimeout(job.timers.deadline)
@@ -356,9 +368,10 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
   }
 
   async function runAct(job) {
-    job.startedAt = now()
+    begin(job)
     clearTimeout(job.timers.wait)
     slot = { kind: 'act', predictedEndAt: now() + job.totalMs }
+    turns++
     const parts = []
     let failure = null
     let spillLine = null
@@ -392,11 +405,25 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
     if (failure) { job.reject(failure); return }
     try {
       if (spillLine) job.line(spillLine)
-      job.resolve(answerOf(job, parts, { waitedMs: job.startedAt - job.enqueuedAt, extra: { predictedMs: Math.round(job.totalMs), deadlineMs: job.deadlineMs } }))
+      job.resolve(answerOf(job, parts, { waitedMs: waitedMs(job, job.enqueuedAt), extra: { predictedMs: Math.round(job.totalMs), deadlineMs: job.deadlineMs } }))
     } catch (err) {
       job.reject(err)
     }
   }
+
+  /**
+   * Where a job stood when it was queued, for its wait: whether a request held the slot, and how many
+   * had taken it by then.
+   */
+  const queuedBehind = () => ({ slotTaken: !!slot, turnAtQueue: turns })
+  /** A job's first request takes the slot: when, and whether an earlier request held it or went first. */
+  const begin = (job) => { job.startedAt = now(); job.behind = job.slotTaken || turns > job.turnAtQueue }
+  /**
+   * How long a job waited for an earlier Laya answer (3.3): from its queueing to its start when it
+   * was behind one, else 0. A job that went straight out waited for nothing, whatever the clock read
+   * between its queueing and its start.
+   */
+  const waitedMs = (job, queuedAt) => (job.behind ? job.startedAt - queuedAt : 0)
 
   /**
    * The Answer of one call from the responses of its requests: merged, checked, normalised, and
@@ -459,7 +486,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
   function stopShadow(job, reason) {
     if (job.parts.length && reason === 'too_old') {
       try {
-        return finishShadow(job, { status: 'partial', reason, answer: answerOf(job, job.parts, { waitedMs: job.startedAt - job.queuedAt, partial: true }) })
+        return finishShadow(job, { status: 'partial', reason, answer: answerOf(job, job.parts, { waitedMs: waitedMs(job, job.queuedAt), partial: true }) })
       } catch (err) {
         return finishShadow(job, { status: 'failed', reason: err.code ?? 'error', error: err })
       }
@@ -469,8 +496,9 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
 
   async function runShadowChunk(job, conn) {
     const request = job.requests[job.next++]
+    if (!job.startedAt) { begin(job); waitingShadow-- }
     slot = { kind: 'shadow', predictedEndAt: now() + predictMs(request, conn.device ?? 'cpu', job.phase) }
-    if (!job.startedAt) { job.startedAt = now(); waitingShadow-- }
+    turns++
     setLevel('below_normal')
     let failure = null
     try {
@@ -489,7 +517,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
     if (failure) { finishShadow(job, { status: 'failed', reason: failure.code === 'LAYA_TIMEOUT' ? 'timeout' : failure.code ?? 'error', error: failure }); return }
     if (job.next < job.requests.length) return
     try {
-      finishShadow(job, { status: 'answered', reason: null, answer: answerOf(job, job.parts, { waitedMs: job.startedAt - job.queuedAt }) })
+      finishShadow(job, { status: 'answered', reason: null, answer: answerOf(job, job.parts, { waitedMs: waitedMs(job, job.queuedAt) }) })
     } catch (err) {
       finishShadow(job, { status: 'failed', reason: err.code ?? 'error', error: err })
     }
@@ -558,6 +586,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
     const job = {
       kind: 'shadow', callId, runId, phase, state, questions, context, onDone,
       queuedAt: now(), startedAt: null, requests: null, next: 0, parts: [], withdrawn: null, finished: false,
+      ...queuedBehind(),
     }
     shadowQueue.push(job)
     if (callId != null) shadowById.set(callId, job)

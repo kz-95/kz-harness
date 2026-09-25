@@ -282,19 +282,27 @@ test('the sources are never pooled: an always-yes Laya on second_opinion gets no
   // Laya Auto: its own runs, a person's word on them and their failures, kept apart.
   const layaSamples = [
     layaSample('task_classification', 'la1', 'debugging', { labelSource: 'human', label: 'debugging' }),
-    layaSample('task_classification', 'la2', 'refactor', { labelSource: 'verified_negative', negativeLabel: 'refactor' }),
+    layaSample('task_classification', 'la2', 'refactor', null),
     layaSample('task_classification', 'la3', 'testing', null),
-    layaSample('task_classification', 'la4', 'other', { labelSource: 'verified_negative', negativeLabel: 'other' }, { informative: false }),
+    layaSample('task_classification', 'la4', 'other', { labelSource: 'human', label: null, negativeLabel: 'other' }, { informative: false }),
     layaSample('task_classification', 'la5', 'review', { labelSource: 'human', label: 'review' }, { identity: 'laya-0.3.24|english|ffffffffffff|adapter-1|corr:choice:11+=3.27|margin:0.1' }),
+    // A strategy a run's outcome can prove wrong, and one it did not.
+    layaSample('execution_strategy', 'la2', 'CHEAP_DIRECT', { labelSource: 'verified_negative', negativeLabel: 'CHEAP_DIRECT' }),
+    layaSample('execution_strategy', 'la3', 'STANDARD_DIRECT', null),
+    layaSample('execution_strategy', 'la4', 'CHEAP_DIRECT', { labelSource: 'verified_negative', negativeLabel: 'CHEAP_DIRECT' }, { informative: false }),
   ]
-  const tc = standingOf(standing({ shadowRows: tcRows, jevSamples: said, layaSamples, identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW }), 'task_classification')
+  const byLaya = standing({ shadowRows: tcRows, jevSamples: said, layaSamples, identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW })
+  const tc = standingOf(byLaya, 'task_classification')
   assert.deepEqual(tc.laya.personSaid, { n: 3, right: 3 }, 'p1 and p2 in the shadow, la1 in Laya Auto')
   assert.deepEqual(tc.jev.personSaid, { n: 3, right: 1 })
-  assert.deepEqual(tc.laya.layaAutoFailed, { runs: 3, failed: 1 })
+  assert.deepEqual(tc.laya.layaAutoFailed, { runs: 3, failed: null }, 'no outcome of a run says a task type failed: only a person does')
   assert.deepEqual(tc.laya.whereJevWasContradicted, { n: 0, right: 0 })
-  const cd = domainOf(compare({ shadowRows: tcRows, jevSamples: said, layaSamples, identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW }), 'task_classification')
+  assert.deepEqual(standingOf(byLaya, 'execution_strategy').laya.layaAutoFailed, { runs: 2, failed: 1 })
+  const both = compare({ shadowRows: tcRows, jevSamples: said, layaSamples, identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW })
+  const cd = domainOf(both, 'task_classification')
   assert.deepEqual(cd.personSaid, { n: 2, jevRight: 1, layaRight: 2 })
-  assert.deepEqual(cd.layaAutoRuns, { runs: 3, failed: 1 })
+  assert.deepEqual(cd.layaAutoRuns, { runs: 3, failed: null })
+  assert.deepEqual(domainOf(both, 'execution_strategy').layaAutoRuns, { runs: 2, failed: 1 })
 })
 
 test('the runs Laya decided are counted apart: what Laya answered, and its informative share, are the shadow\'s', () => {
@@ -322,7 +330,53 @@ test('the runs Laya decided are counted apart: what Laya answered, and its infor
   const cmp = compare({ shadowRows, layaSamples, identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW })
   assert.equal(domainOf(cmp, 'outcome_disposition').layaAnswered, 2)
   assert.equal(domainOf(cmp, 'task_classification').layaAnswered, 0)
-  assert.deepEqual(domainOf(cmp, 'task_classification').layaAutoRuns, { runs: 1, failed: 0 })
+  assert.deepEqual(domainOf(cmp, 'task_classification').layaAutoRuns, { runs: 1, failed: null })
+})
+
+test('a Laya Auto run counts as failed only on what can judge its pick: never on the label its own review gives, and never where no outcome can', async () => {
+  const { labelFromRun } = await import('../training.js')
+  const work = (agent, role = 'primary', stopReason = 'completed') => ({ agent, role, stopReason })
+  // Each run as history.jsonl keeps it, and each sample labelled by training.js as learnFrom labels it.
+  const runs = [
+    // Laya's disposition asked for a frontier review, its nouls accepted, and nobody said a word.
+    { runId: 'frontier', disposition: 'FRONTIER_REVIEW', finalStatus: 'accepted', attempts: [work('claude')] },
+    { runId: 'second', disposition: 'SECOND_OPINION', finalStatus: 'accepted', attempts: [work('claude')] },
+    // Laya accepted, and the person disliked the answer.
+    { runId: 'disliked', disposition: 'PASS', finalStatus: 'accepted', attempts: [work('claude')] },
+    // Laya accepted, the routing asked for a second opinion, and another agent's review did not accept.
+    { runId: 'overruled', disposition: 'PASS', finalStatus: 'accepted', attempts: [work('claude'), work('codex', 'review'), work('codex', 'retry')] },
+    // Nobody could finish it: a person must.
+    { runId: 'stuck', disposition: 'HUMAN', finalStatus: 'needs_human', attempts: [work('claude', 'primary', 'error')], taskType: 'debugging', skill: 'debugging', strategy: 'CHEAP_DIRECT' },
+  ]
+  const history = runs.map(({ runId, finalStatus, attempts }) => ({ runId, finalStatus, attempts }))
+  const feedback = [{ ts: iso(1), sessionId: 's', messageId: 'm-disliked', runId: 'disliked', verdict: 'dislike' }]
+  const labelled = (domain, run, label, extra) => {
+    const s = layaSample(domain, run.runId, label, null, { extra })
+    const outcome = labelFromRun(domain, s, history.find((h) => h.runId === run.runId), { feedback })
+    return { ...s, outcome }
+  }
+  const layaSamples = runs.map((r) => labelled('outcome_disposition', r, r.disposition, { decidedAt: 0 }))
+  const stuck = runs.at(-1)
+  layaSamples.push(labelled('task_classification', stuck, stuck.taskType), labelled('skill_selection', stuck, stuck.skill), labelled('execution_strategy', stuck, stuck.strategy))
+  const outcomeOf = (runId, domain = 'outcome_disposition') => layaSamples.find((s) => s.runId === runId && s.domain === domain).outcome
+  // The setting: training.js labels an accepted run's disposition by the review's own action, and
+  // gives a task type or a skill no label at all when a run fails.
+  assert.deepEqual([outcomeOf('frontier')?.labelSource, outcomeOf('frontier')?.label], ['verified_outcome', 'PASS'])
+  assert.equal(outcomeOf('disliked'), null, 'an accept confirms nothing of Laya\'s')
+  assert.equal(outcomeOf('stuck', 'task_classification'), null)
+  assert.equal(outcomeOf('stuck', 'skill_selection'), null)
+  assert.equal(outcomeOf('stuck', 'execution_strategy')?.labelSource, 'verified_negative')
+
+  const cmp = compare({ layaSamples, history, feedback, identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW })
+  // The two accepted runs no one faulted are not failures because Laya's disposition differed from
+  // the accept its own nouls gave; the disliked accept and the overruled one are.
+  assert.deepEqual(domainOf(cmp, 'outcome_disposition').layaAutoRuns, { runs: 5, failed: 2 })
+  assert.deepEqual(domainOf(cmp, 'execution_strategy').layaAutoRuns, { runs: 1, failed: 1 })
+  for (const d of ['task_classification', 'skill_selection']) assert.deepEqual(domainOf(cmp, d).layaAutoRuns, { runs: 1, failed: null }, `${d}: not measured, never 0 failed`)
+  const od = standingOf(cmp.standing, 'outcome_disposition')
+  assert.deepEqual(od.laya.layaAutoFailed, { runs: 5, failed: 2 })
+  assert.deepEqual(od.laya.personSaid, { n: 1, right: 0 }, 'the dislike is also what a person said')
+  assert.deepEqual(standingOf(cmp.standing, 'task_classification').laya.layaAutoFailed, { runs: 1, failed: null })
 })
 
 test('a domain with no Laya Auto runs has { n: 0 } there, as every source with no rows', () => {
@@ -399,7 +453,7 @@ test('identity, thresholds and Jev host are kept apart', () => {
 const DESIGN_8_4 = {
   identity: 'x', thresholds: { jev: 'x', laya: 'x' }, jevHost: 'x', days: 7,
   questions: [{ name: 'taskType', type: 'choice', options: 12, corrected: 40, compared: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, inTopTwo: 33, meanDifference: null, atBar: null, flat: 11, layaMedianMs: 950 }],
-  domains: [{ domain: 'task_classification', question: 'taskType', layaAnswered: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, personSaid: { n: 4, jevRight: 3, layaRight: 2 }, whereJevWasContradicted: { n: 3, layaRight: 1 }, layaAutoRuns: { runs: 12, failed: 2 }, fieldAgreement: { risk: 0.64 } }],
+  domains: [{ domain: 'task_classification', question: 'taskType', layaAnswered: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, personSaid: { n: 4, jevRight: 3, layaRight: 2 }, whereJevWasContradicted: { n: 3, layaRight: 1 }, layaAutoRuns: { runs: 12, failed: null }, fieldAgreement: { risk: 0.64 } }],
   actions: { wouldHaveActedSame: [{ what: 'review_action', n: 20, same: 11 }], review: { jev: { accept: 12, second_review: 3, human: 1, retry: 4, belowAcceptBar: 3 }, laya: { accept: 5, second_review: 10, human: 1, retry: 4, belowAcceptBar: 10 } } },
   skips: { answered: 120, partial: 2, failed: 1, skipped: { not_running: 3, starting: 1, queue_full: 0, too_old: 0, jev_failed: 1, yielded: 2 }, atContextLimit: 0 },
   latency: { jev: { intent: 110, route: 900, review: 800 }, laya: { intent: 300, route: 950, review: 600 } },
@@ -471,5 +525,5 @@ test('no text reaches laya-standing.jsonl or the comparison: a marker in a task,
   assert.equal(JSON.stringify(cmp).includes(MARKER), false)
   // Both files were read: the shadow row is what Laya answered, the Laya Auto run is counted apart.
   assert.equal(domainOf(cmp, 'task_classification').layaAnswered, 1)
-  assert.deepEqual(domainOf(cmp, 'task_classification').layaAutoRuns, { runs: 1, failed: 0 })
+  assert.deepEqual(domainOf(cmp, 'task_classification').layaAutoRuns, { runs: 1, failed: null })
 })

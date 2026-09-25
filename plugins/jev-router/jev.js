@@ -118,12 +118,6 @@ export const DISPOSITION_CRITERIA = deepFreeze({
 })
 
 /**
- * The criteria above that are not exported on their own, in one frozen object, so a reader can
- * see they are frozen before any call has touched them.
- */
-export const CRITERIA = Object.freeze({ COMPLEXITY_LEVELS, RISK_LEVELS, REQUIREMENT_LEVELS, TIERS })
-
-/**
  * Mask key-shaped strings on anything that goes to Jev, with the same scrubber the
  * Markdown export uses. A key pasted into the chat was already masked in the log and
  * in the export; sending it verbatim to a third party was the one path that missed.
@@ -444,7 +438,7 @@ function traceOf(phase, questions, res, ms, used, { callId, provider }) {
     usage: res.usage,
     callId,
     provider,
-    ...(res.meta !== undefined ? { meta: res.meta } : {}),
+    ...metaOf(res.meta),
     questions: Object.entries(questions).map(([name, q]) => {
       // A question the response left out stays in the trace, with no answer and unused.
       const a = res.answers[name]
@@ -466,6 +460,14 @@ function traceOf(phase, questions, res, ms, used, { callId, provider }) {
 // What a provider may mark on an answer: too flat to use, re-tempered, and the confidence it
 // served before KzH read the top probability instead (docs/laya-auto.md 4.3). Jev marks none.
 const ANSWER_MARKS = ['informative', 'corrected', 'servedConfidence']
+
+/**
+ * The client's own word about the call (the Laya client's identity, script and device), handed
+ * back as the trace keeps it, so whoever records the answer can say which model gave it: an
+ * answer's samples name the identity they are read under (docs/laya-auto.md 6.2). Read
+ * generically, whoever sets it; Jev's client sets none, and its answers carry no `meta`.
+ */
+const metaOf = (meta) => (meta !== undefined ? { meta } : {})
 
 /**
  * The names of the answers the provider marked too flat to mean anything. Read generically,
@@ -532,8 +534,15 @@ function quietly(fn, arg) {
   } catch { return undefined }
 }
 
-/** What a failed call was, in fields a log line and the inspector can show. */
-const errorOf = (err) => ({ class: err?.constructor?.name ?? typeof err, code: err?.code ?? null, status: err?.status ?? null, message: String(err?.message ?? err) })
+/**
+ * What a failed call was, in fields a log line and the inspector can show: with how many questions
+ * it asked and where, when the provider's error says (the Laya client's timeout does).
+ */
+const errorOf = (err) => ({
+  class: err?.constructor?.name ?? typeof err, code: err?.code ?? null, status: err?.status ?? null, message: String(err?.message ?? err),
+  ...(Number.isInteger(err?.questions) ? { questions: err.questions } : {}),
+  ...(typeof err?.device === 'string' ? { device: err.device } : {}),
+})
 
 /**
  * The typed-question client of one decision provider.
@@ -775,7 +784,7 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
       if (!Object.keys(questions).length) throw new Error('jev.route: nothing to ask')
       // Per-tool fits/params are speculative; only the handler's pick is used.
       const used = (name, ans) => !name.includes('.') || name.startsWith('req.') || name.startsWith(`${ans.handler?.choice}.`)
-      const { answers, model: usedModel } = await ask('route', state, questions, signal, used)
+      const { answers, model: usedModel, meta } = await ask('route', state, questions, signal, used)
       const handler = answers.handler?.choice ?? 'agent'
       const params = handler === 'agent' ? [] : Object.keys(tools.find((t) => t.id === handler)?.params ?? {})
       const profile = askTask ? profileFromAnswers(answers, P.thresholds) : null
@@ -784,6 +793,7 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
         // The only way a caller learns that an answer outside the profile was flat: `strategy`
         // and `secondOpinion` carry no flag of their own. decision.js reads it.
         uninformative: flatNames(answers),
+        ...metaOf(meta),
         ...(askAgent ? {
           primaryAgent: answers.agent.choice,
           agentConfidence: answers.agent.confidence,
@@ -826,7 +836,7 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
      * instant), and Jev is the one that decides when it is worth waking a bigger model.
      */
     async intent({ message }, signal) {
-      const { answers } = await ask('intent', { message: scrub(message) }, {
+      const { answers, meta } = await ask('intent', { message: scrub(message) }, {
         kind: choice(
           { question: 'What does `message` ask for?', focus: 'Only work that reads or changes the project counts as a task. Questions about tools, accounts, concepts or this app are questions.' },
           {
@@ -855,6 +865,7 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
         alsoWork: answers.alsoWork?.noul,
         // `depth` flat here means the caller keeps the cheap default, as when it is missing.
         uninformative: flatNames(answers),
+        ...metaOf(meta),
       }
     },
 
@@ -917,7 +928,7 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
       // One snap judgment per question: atomic Nouls (yes = the thing named) decide
       // in jev-review; the broad verdict and the disposition are kept as displayed signals and
       // as the outcome domain's teacher label.
-      const { answers, model: usedModel } = await ask('review', state, {
+      const { answers, model: usedModel, meta } = await ask('review', state, {
         verdict: choice(
           {
             question: 'Given the latest entry in `attempts`, `verification`, and `diff`, what should happen next for `task`?',
@@ -961,6 +972,7 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
         model: usedModel,
         // jev-review reads `disposition`, `reviewAgent` and `retryAgent` here.
         uninformative: flatNames(answers),
+        ...metaOf(meta),
         verdict: answers.verdict.choice,
         verdictConfidence: answers.verdict.confidence,
         verdictProbabilities: answers.verdict.probabilities,

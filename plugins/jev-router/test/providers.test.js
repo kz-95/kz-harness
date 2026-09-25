@@ -226,6 +226,37 @@ test('a bad Laya block yields layaError and leaves Jev intact: a type, a range o
   assert.throws(() => resolve({ ...LEGACY, thresholds: { ...LEGACY.thresholds, accept: { low: 1.5, medium: 0.7, high: 0.85 } } }), { message: /^providers: thresholds\.accept\.low expected number <= 1/ })
 })
 
+test('laya.connectivityUrl is an http or https address on no TypeSafe host, or Laya is off with an error that names the key', () => {
+  const good = resolve(LEGACY)
+  const at = (connectivityUrl, env = {}) => resolveProviders({ ...LEGACY, laya: { connectivityUrl } }, { policy: policyOf(LEGACY), env })
+  const typesafe = (host) => `providers: laya.connectivityUrl: ${host} is a TypeSafe address, and a Laya Auto session never contacts TypeSafe; name another, such as the default http://www.msftconnecttest.com/connecttest.txt`
+  const refused = {
+    // Probed before every Laya Auto route, chat-model pick and title: each probe would reach TypeSafe.
+    'Jev\'s own host': ['https://api.typesafe.ai', {}, typesafe('api.typesafe.ai')],
+    'the bare domain': ['http://typesafe.ai/', {}, typesafe('typesafe.ai')],
+    'any name under it': ['https://Console.TypeSafe.ai./keys', {}, typesafe('console.typesafe.ai.')],
+    'where TYPESAFE_BASE_URL sends Jev': ['http://10.0.0.7:8443/health', { TYPESAFE_BASE_URL: 'http://10.0.0.7:8443/v1' }, typesafe('10.0.0.7:8443')],
+    // Every probe would fail, and every Laya Auto run would be narrowed to the local agents.
+    'not a URL': ['foo', {}, "providers: laya.connectivityUrl: 'foo' is not an http or https address"],
+    'another scheme': ['ftp://example.com/', {}, "providers: laya.connectivityUrl: 'ftp://example.com/' is not an http or https address"],
+    'empty': ['', {}, "providers: laya.connectivityUrl: '' is not an http or https address"],
+  }
+  for (const [what, [url, env, message]] of Object.entries(refused)) {
+    const r = at(url, env)
+    assert.equal(r.layaError, message, what)
+    assert.deepEqual([r.laya, r.layaSettings], [null, null], what)
+    assert.deepEqual(r.jev, good.jev, `${what}: Jev is untouched`)
+  }
+  // Any other address is Laya's to probe: a name that only ends like TypeSafe's, and Jev's host on
+  // another port, included.
+  for (const [url, env] of [['https://example.com/generate_204', {}], ['http://nottypesafe.ai/', {}], ['http://10.0.0.7:9000/', { TYPESAFE_BASE_URL: 'http://10.0.0.7:8443' }], ['https://api.typesafe.ai.example.com/', {}]]) {
+    const r = at(url, env)
+    assert.equal(r.layaError, null, url)
+    assert.equal(r.layaSettings.connectivityUrl, url)
+  }
+  assert.equal(good.layaSettings.connectivityUrl, 'http://www.msftconnecttest.com/connecttest.txt', 'the default is probed as it stands')
+})
+
 test('LAYA_SCHEMA and thresholdsSchema fill every default from an empty block', () => {
   const block = LAYA_SCHEMA({})
   assert.deepEqual(block.thresholds, { ...LAYA_THRESHOLDS })

@@ -25,8 +25,26 @@
 // export of an existing module through a namespace import or a dynamic import() inside the test;
 // a new module's own test file may fail to load, on that module.
 //
-// Exits 0 when every new test failed at the base by an accepted kind, 1 naming each one that did
-// not, 2 on a usage error. The worktree is removed on the way out.
+// A new test that failed at the base in a way that proves nothing there (a module or a file this
+// change adds was missing, say) gets one more run, on the base with every file this change adds put
+// in place and none it edits:
+//
+//   4. copies in every file the working tree has and the base lacks, and runs those files again.
+//
+// There it counts only when it fails by an assertion or a missing export: then the old code of the
+// files the change edits is what fails it. One that passes there tested only what the change adds,
+// and belongs in that module's own test file.
+//
+// One test file is the exception: test/fixtures.test.js, named for the plugin's test/fixtures
+// folder, tests that shared test code (a fake server, captured request bodies), which step 3 copies
+// into the base with every test file. Its tests test no code of the plugin, so they cannot fail on
+// the old code, and are not asked to: each new one must pass at the base instead, which shows it
+// tests only the fixtures, and is listed as such. One that fails there tests the code under test,
+// and belongs in that code's own test file, where it counts as a new test.
+//
+// Exits 0 when every new test failed at the base by an accepted kind and every new test of the
+// fixtures passed there, 1 naming each one that did not, 2 on a usage error. The worktree is
+// removed on the way out.
 import { execFileSync, spawnSync } from 'node:child_process'
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -78,7 +96,9 @@ const files = given.map((g) => {
   if (rel.startsWith('..')) usage(`${g} is outside ${root}`)
   if (basename(dirname(abs)) !== 'test' || !existsSync(join(dirname(dirname(abs)), 'package.json'))) usage(`${g} is not in a plugin's test folder`)
   const plugin = relative(root, dirname(dirname(abs)))
-  return { rel, plugin, inPlugin: gitPath(relative(join(root, plugin), abs)), existed: atBase(rel) }
+  // The fixtures' own test file, which tests the shared test code rather than the plugin.
+  const fixtures = basename(abs) === 'fixtures.test.js' && existsSync(join(dirname(abs), 'fixtures'))
+  return { rel, plugin, inPlugin: gitPath(relative(join(root, plugin), abs)), existed: atBase(rel), fixtures }
 })
 
 // --- reading node --test's TAP ------------------------------------------------------------------
@@ -189,8 +209,12 @@ function kindOfLoad(comments) {
   return { kind: 'load error', detail: comments.find((l) => /Error/.test(l)) ?? 'the file did not load' }
 }
 
-/** The module a test file is named for, repo-relative and without its extension: test/<m>.test.js tests <m>.js. */
-const ownModule = (f) => join(f.plugin, basename(f.rel).replace(/\.test\.[cm]?js$/, ''))
+/**
+ * The modules a test file is named for, repo-relative and without their extension: test/<m>.test.js
+ * tests the plugin's <m>.js, or the repository's scripts/<m>.mjs, whose tests live in the plugin's
+ * test folder beside the others (red-check.test.js tests this file).
+ */
+const ownModules = (f) => { const m = basename(f.rel).replace(/\.test\.[cm]?js$/, ''); return [join(f.plugin, m), join('scripts', m)] }
 
 /** Why a failure of a test in file `f` at the base does not count, or null when it does. */
 function refused(k, wt, f) {
@@ -202,13 +226,24 @@ function refused(k, wt, f) {
     // Only a new module's own tests may fail on its absence. Anywhere else a test that merely
     // imports a module this change adds would fail at the base whatever it asserts.
     if (f.existed) return `a missing module (${gitPath(rel)}) in a file the base already has, where only an assertion or a missing export counts`
-    if (rel.replace(/\.[cm]?js$/, '') !== ownModule(f)) return `a missing module (${gitPath(rel)}) that ${basename(f.rel)} is not named for: only a new module's own test file (test/<m>.test.js for <m>.js) may fail on the module's absence, and it imports that module first`
+    if (!ownModules(f).includes(rel.replace(/\.[cm]?js$/, ''))) return `a missing module (${gitPath(rel)}) that ${basename(f.rel)} is not named for: only a new module's own test file (test/<m>.test.js for <m>.js) may fail on the module's absence, and it imports that module first`
     return null
   }
   return `${k.kind}${k.detail ? ` (${String(k.detail).split('\n')[0]})` : ''}, which is not one of assertion, missing module or missing export`
 }
 
 const describe = (k, wt) => (k.kind === 'missing module' ? `missing module ${gitPath(moduleIn(k.path, wt) ?? k.path)}` : k.kind)
+
+/**
+ * Every file this change adds, repo-relative: in the working tree now and not at the base, whether
+ * committed, staged or untracked (never an ignored one, such as node_modules).
+ */
+function addedFiles() {
+  const list = (argv) => run('git', argv, root).split('\0').filter(Boolean)
+  const tracked = list(['diff', '--name-only', '--no-renames', '--diff-filter=A', '-z', sha])
+  const untracked = list(['ls-files', '--others', '--exclude-standard', '-z'])
+  return [...new Set([...tracked, ...untracked])].filter((rel) => existsSync(join(root, rel)) && statSync(join(root, rel)).isFile())
+}
 
 // --- the run ------------------------------------------------------------------------------------
 
@@ -268,23 +303,41 @@ try {
   }
 
   let total = 0
+  let ofFixtures = 0
+  // New tests that failed at the base in a way that proves nothing there, each with why, for the
+  // second run below.
+  const again = []
   for (const f of files) {
     if (f.old?.loadFailed) problem(f, null, "the base's own version does not load, so it cannot say which tests are old")
     const oldKeys = new Set(f.old?.tests.map((t) => t.key) ?? [])
     const fresh = f.now.filter((t) => !oldKeys.has(t.key))
-    total += fresh.length
-    console.log(`\n${f.rel}${f.existed ? '' : ' (new file)'}: ${fresh.length} new of ${f.now.length} tests`)
+    if (f.fixtures) ofFixtures += fresh.length
+    else total += fresh.length
+    console.log(`\n${f.rel}${f.existed ? '' : ' (new file)'}: ${fresh.length} new of ${f.now.length} tests${f.fixtures ? ', of the fixtures, which must pass at the base' : ''}`)
     if (!fresh.length) { console.log('  no new tests'); continue }
     const then = runFile(f.inPlugin, join(wt, f.plugin))
     const byKey = new Map(then.tests.map((t) => [t.key, t]))
     const load = then.loadFailed ? kindOfLoad(then.comments) : null
+    if (f.fixtures) {
+      if (load) { problem(f, null, `does not load at the base (${describe(load, wt)}), so it needs code this change adds: move the tests that do to that code's own test file`); continue }
+      for (const t of fresh) {
+        const at = byKey.get(t.key)
+        if (!at) problem(f, t.name, 'did not run at the base')
+        else if (at.directive) problem(f, t.name, `was marked ${at.directive} at the base`)
+        else if (at.ok) console.log(`  passes at the base, as a test of the fixtures does: ${t.name}`)
+        else problem(f, t.name, `fails at the base (${describe(kindOfTest(at), wt)}), so it tests the code under test rather than the fixtures: move it to that code's own test file, where it counts as a new test`)
+      }
+      continue
+    }
     for (const t of fresh) {
       const at = then.loadFailed ? null : byKey.get(t.key)
       if (load) {
-        const why = f.existed
-          ? `the file does not load at the base (${describe(load, wt)}), so none of its tests ran there; import a new export through a namespace import or a dynamic import() inside the test`
-          : refused(load, wt, f)
-        if (why) problem(f, t.name, why)
+        if (f.existed) {
+          problem(f, t.name, `the file does not load at the base (${describe(load, wt)}), so none of its tests ran there; import a new export through a namespace import or a dynamic import() inside the test`)
+          continue
+        }
+        const why = refused(load, wt, f)
+        if (why) again.push({ f, t, first: why })
         else console.log(`  fails at the base, ${describe(load, wt)}: ${t.name}`)
         continue
       }
@@ -292,8 +345,41 @@ try {
       if (at.ok) { problem(f, t.name, at.directive ? `was marked ${at.directive} at the base` : 'passed at the base'); continue }
       const k = kindOfTest(at)
       const why = refused(k, wt, f)
-      if (why) problem(f, t.name, `failed at the base by ${why}`)
+      if (why) again.push({ f, t, first: `failed at the base by ${why}` })
       else console.log(`  fails at the base, ${describe(k, wt)}: ${t.name}`)
+    }
+  }
+
+  // The second run: the base with every file this change adds put in place beside the code, never a
+  // file it edits, for the tests that failed there only in a way that proves nothing. A test that
+  // then fails by an assertion or a missing export fails on the old code of the files the change
+  // edits; one that passes tested only what the change adds, and belongs in that module's own file.
+  if (again.length) {
+    // The test files given are in place already.
+    const given = new Set(files.map((f) => gitPath(f.rel)))
+    const added = addedFiles().filter((rel) => !given.has(gitPath(rel)))
+    for (const rel of added) {
+      mkdirSync(dirname(join(wt, rel)), { recursive: true })
+      cpSync(join(root, rel), join(wt, rel))
+    }
+    console.log(`\nWith the ${added.length} files this change adds in place at the base, and none it edits:`)
+    for (const f of files) {
+      const mine = again.filter((a) => a.f === f)
+      if (!mine.length) continue
+      console.log(`\n${f.rel}: ${mine.length} run again`)
+      const then = runFile(f.inPlugin, join(wt, f.plugin))
+      const byKey = new Map(then.tests.map((t) => [t.key, t]))
+      const load = then.loadFailed ? kindOfLoad(then.comments) : null
+      for (const { t, first } of mine) {
+        const at = load ? null : byKey.get(t.key)
+        const k = load ?? (at && !at.ok ? kindOfTest(at) : null)
+        const but = `${first}; and with the files this change adds in place`
+        if (load) problem(f, t.name, `${but} the file does not load (${describe(load, wt)})`)
+        else if (!at) problem(f, t.name, `${but} it did not run`)
+        else if (at.ok) problem(f, t.name, `${but} it passes, so it tests only what the change adds: move it to that module's own test file, or make it disprove the old code of a file the change edits`)
+        else if (k.kind === 'assertion' || k.kind === 'missing export') console.log(`  fails at the base with them, ${describe(k, wt)}: ${t.name}`)
+        else problem(f, t.name, `${but} by ${k.kind}${k.detail ? ` (${String(k.detail).split('\n')[0]})` : k.path ? ` (${k.path})` : ''}, which is neither an assertion nor a missing export`)
+      }
     }
   }
 
@@ -301,7 +387,7 @@ try {
     console.error(`\nred-check: ${problems.length} problem${problems.length === 1 ? '' : 's'}:`)
     for (const p of problems) console.error(`  ${p}`)
     process.exitCode = 1
-  } else console.log(`\nred-check: all ${total} new tests fail at the base by an accepted kind.`)
+  } else console.log(`\nred-check: all ${total} new tests fail at the base by an accepted kind${ofFixtures ? `, and the ${ofFixtures} new tests of the fixtures pass there` : ''}.`)
 } finally {
   cleanUp()
 }

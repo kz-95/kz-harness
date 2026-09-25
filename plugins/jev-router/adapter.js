@@ -237,13 +237,24 @@ export function decidedBy(domains, { detail = true } = {}) {
 /** Where a provider on this PC ran a call, in the words the lines and the card use. */
 export const deviceName = (device) => ({ cuda: 'GPU', gpu: 'GPU', cpu: 'CPU' })[device] ?? String(device)
 
+/**
+ * How big a Laya call that timed out was and where it ran, ` (20 questions on the CPU)`, from its
+ * error or from what jev.js kept of it (errorOf); empty for any other failure (docs/laya-auto.md 3.3).
+ */
+export const timeoutSize = (err) => (err?.code === 'LAYA_TIMEOUT' && Number.isInteger(err.questions) && err.device ? ` (${err.questions} questions on the ${deviceName(err.device)})` : '')
+
 // A route answer too flat to act on that the routing rules stand in for (docs/laya-auto.md 4.3):
-// a score or a choice of the task profile, the strategy, and the second-opinion yes/no, which the
-// code rule answers instead. Nothing else is filled: a flat tool pick and its arguments are kept
-// as answered, as is every other flat yes/no, and simply fall under their bars, so none of them
-// is said to be filled.
-const FILLED_BY_RULES = new Set(['taskType', 'complexity', 'risk', 'skill', 'minimumCapability', 'preferredCapability', 'capability', 'strategy', 'secondOpinion'])
-const filledByRules = (q) => q.used && q.informative === false && (FILLED_BY_RULES.has(q.name) || q.name.startsWith('req.'))
+// a score or a choice of the task profile, the strategy, and the second-opinion yes/no of the
+// judgments call, which the code rule answers instead. Nothing else is filled: a flat tool pick and
+// its arguments are kept as answered, as is every other flat yes/no, and simply fall under their
+// bars, so none of them is said to be filled. The second opinion a task-group call carries is the
+// profile's, which keeps a flat yes/no as answered (jev.js profileFromAnswers), so there it is not.
+const FILLED_BY_RULES = new Set(['taskType', 'complexity', 'risk', 'skill', 'minimumCapability', 'preferredCapability', 'capability', 'strategy'])
+// The questions of the resource and judgments call; any other one makes it a task-group call, as
+// shadow.js groupsOf reads it.
+const RESOURCE_CALL = new Set(['strategy', 'secondOpinion'])
+const filledByRules = (q, taskGroup) => q.used && q.informative === false
+  && (FILLED_BY_RULES.has(q.name) || q.name.startsWith('req.') || (q.name === 'secondOpinion' && !taskGroup))
 
 // What the shadow of Jev Auto says once per run, at the routed event, and nothing else of it
 // reaches the live stream (docs/laya-auto.md 3.3). Whoever wires the shadow sets `shadow` on the
@@ -273,7 +284,8 @@ export function line(e) {
       const where = t.meta?.device ? ` on the ${deviceName(t.meta.device)}` : ''
       const waited = t.meta?.waitedMs > 0 ? ` (waited ${Math.round(t.meta.waitedMs)} ms for an earlier ${who} answer)` : ''
       const out = [`${who} ${t.phase}: ${t.questions.filter((q) => q.used).length}/${t.questions.length} questions in ${t.ms} ms${where}${waited}`]
-      const flat = t.phase === 'route' ? t.questions.filter(filledByRules).map((q) => q.name) : []
+      const taskGroup = t.questions.some((q) => !RESOURCE_CALL.has(q.name))
+      const flat = t.phase === 'route' ? t.questions.filter((q) => filledByRules(q, taskGroup)).map((q) => q.name) : []
       if (flat.length) out.push(`${who} route: ${flat.length} answer${flat.length === 1 ? '' : 's'} too flat to use (${flat.join(', ')}); the routing rules filled ${flat.length === 1 ? 'it' : 'them'}`)
       const cut = t.meta?.atContextLimit ?? 0
       if (cut > 0) out.push(`${who} ${t.phase}: ${cut} of ${t.meta.requests ?? cut} request${(t.meta.requests ?? cut) === 1 ? '' : 's'} reached the 512-token limit, so part of the evidence was cut`)
@@ -286,12 +298,13 @@ export function line(e) {
     // Laya would pass its deadline reads as docs/laya-auto.md 3.5 writes it, the prediction alone.
     case 'decider-error': {
       const x = e.error ?? {}
+      // A field of the error as jev.js kept it, else of the payload, else of the event.
+      const of = (k) => x.error?.[k] ?? x[k] ?? e[k]
       const provider = x.provider ?? e.provider ?? TEACHER
       const phase = x.phase ?? e.phase ?? 'call'
-      const message = x.error?.message ?? x.message ?? e.message ?? 'no reason given'
-      const predicted = (x.error?.code ?? x.code ?? e.code) === 'LAYA_PREDICTED_OVER'
-      const rules = provider !== TEACHER && phase === 'route' && !predicted ? '; routing rules decide those domains' : ''
-      return `${providerName(provider)} ${phase} failed after ${Math.round(x.ms ?? e.ms ?? 0)} ms: ${message}${rules}`
+      const code = of('code')
+      const rules = provider !== TEACHER && phase === 'route' && code !== 'LAYA_PREDICTED_OVER' ? '; routing rules decide those domains' : ''
+      return `${providerName(provider)} ${phase} failed after ${Math.round(x.ms ?? e.ms ?? 0)} ms: ${of('message') ?? 'no reason given'}${timeoutSize({ code, questions: of('questions'), device: of('device') })}${rules}`
     }
     case 'routed': {
       const note = SHADOW_NOTE[e.shadow] ? `\n${SHADOW_NOTE[e.shadow]}` : ''
@@ -340,14 +353,15 @@ const seconds = (ms) => { const s = ms / 1000; return String(s >= 10 ? Math.roun
  * The sentence the Laya Auto row adds to its description, by Laya's state on this PC
  * (docs/laya-auto.md 3.1), so the menu says what a task costs before it is picked.
  * @param {object} row  what `layaRow` answers: `state` (the sidecar's, 7.4), `device` ('cuda' or
- *   'cpu'), `routeMs` (the measured intent, task group and resource and judgments calls together),
- *   `reviewMs` (one measured review call) and `lastStartMs` (how long the last start took), each
- *   null when unknown
+ *   'cpu', where it runs or would start), `routeMs` (the measured intent, task group and resource
+ *   and judgments calls together, on that device), `reviewMs` (one measured review call) and
+ *   `lastStartMs` (how long the last start took), each null when unknown
  * @returns {string}
  */
 export function layaRowSentence(row) {
   if (row?.state === 'failed') return 'Laya could not start: press Start in Settings → Jev setup → Laya decision model.'
-  if (row?.state === 'stopped') return `Laya is not running; the first message starts it${typeof row.lastStartMs === 'number' ? ` (the last start took ${seconds(row.lastStartMs)} s)` : ''}.`
+  // An update that failed over a stopped Laya leaves the old install, which the first message starts.
+  if (row?.state === 'stopped' || row?.state === 'install_failed') return `Laya is not running; the first message starts it${typeof row.lastStartMs === 'number' ? ` (the last start took ${seconds(row.lastStartMs)} s)` : ''}.`
   if (row?.device && typeof row.routeMs === 'number' && typeof row.reviewMs === 'number') {
     return `Measured on this PC, on the ${deviceName(row.device)}: about ${seconds(row.routeMs)} s to route a task and ${seconds(row.reviewMs)} s to review each attempt.`
   }

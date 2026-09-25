@@ -658,14 +658,24 @@ test('a Laya call reads as Laya: the device, the wait, answers too flat to use, 
   const trace = { phase: 'route', ms: 950, provider: 'laya', model: 'laya-english/0.3.20@1a2b3c4', questions, meta: { device: 'cuda', waitedMs: 4200, requests: 2, atContextLimit: 0 } }
   assert.equal(line({ type: 'jev', trace }), [
     'Laya route: 5/6 questions in 950 ms on the GPU (waited 4200 ms for an earlier Laya answer)',
-    // A flat yes/no the rules do not fill (humanReview) is kept as answered, and an unused
-    // speculative question is not said at all.
-    'Laya route: 3 answers too flat to use (risk, req.planning, secondOpinion); the routing rules filled them',
+    // A flat yes/no the rules do not fill (humanReview, and the second opinion a task-group call
+    // carries for the profile) is kept as answered, and an unused speculative question is not said.
+    'Laya route: 2 answers too flat to use (risk, req.planning); the routing rules filled them',
   ].join('\n'))
   const review = { phase: 'review', ms: 9000, provider: 'laya', questions: [q('addressed', { type: 'noul' })], meta: { device: 'cpu', waitedMs: 0, requests: 4, atContextLimit: 1 } }
   assert.equal(line({ type: 'jev', trace: review }), 'Laya review: 1/1 questions in 9000 ms on the CPU\nLaya review: 1 of 4 requests reached the 512-token limit, so part of the evidence was cut')
   // Jev's line is today's: no device, no marks.
   assert.equal(line({ type: 'jev', trace: { phase: 'route', ms: 120, provider: 'jev', questions: [q('a'), q('b', { used: false })] } }), 'Jev route: 1/2 questions in 120 ms')
+})
+
+test('the second opinion is filled by the routing rules only on the call that asks it for its own domain, never on the task-group call that carries it for the profile', () => {
+  const q = (name, over = {}) => ({ name, type: 'noul', used: true, informative: false, ...over })
+  const call = (questions) => line({ type: 'jev', trace: { phase: 'route', ms: 900, provider: 'laya', questions, meta: { device: 'cpu', waitedMs: 0 } } }).split('\n').slice(1)
+  // The task-group call: its flat second opinion stays in the profile as answered (jev.js).
+  assert.deepEqual(call([q('taskType', { type: 'choice' }), q('risk', { type: 'score' }), q('secondOpinion')]), ['Laya route: 2 answers too flat to use (taskType, risk); the routing rules filled them'])
+  // The resource and judgments call: the second_opinion domain's rule answers in its place.
+  assert.deepEqual(call([q('strategy', { type: 'choice' }), q('secondOpinion')]), ['Laya route: 2 answers too flat to use (strategy, secondOpinion); the routing rules filled them'])
+  assert.deepEqual(call([q('secondOpinion')]), ['Laya route: 1 answer too flat to use (secondOpinion); the routing rules filled it'])
 })
 
 test('a call that did not answer is a line of its own: who, which call, how long, and why', () => {
@@ -674,6 +684,15 @@ test('a call that did not answer is a line of its own: who, which call, how long
   assert.equal(line(failed('laya', 'route', 42000, 'timed out (20 questions on the CPU)')), 'Laya route failed after 42000 ms: timed out (20 questions on the CPU); routing rules decide those domains')
   assert.equal(line(failed('laya', 'review', 40000, 'timed out after 40 s')), 'Laya review failed after 40000 ms: timed out after 40 s')
   assert.equal(line(failed('jev', 'route', 900, '503 Service Unavailable')), 'Jev route failed after 900 ms: 503 Service Unavailable')
+})
+
+test('a Laya call that timed out says how many questions it asked and where, from what jev.js kept of the error', () => {
+  // The Laya client's timeout names only its deadline; its size and device ride beside the message.
+  const late = (phase, ms, error) => ({ type: 'decider-error', at: 1, error: { phase, callId: 'c1', provider: 'laya', ms, error: { class: 'Error', status: null, message: 'timed out after 40 s', ...error } } })
+  assert.equal(line(late('route', 42000, { code: 'LAYA_TIMEOUT', questions: 20, device: 'cpu' })), 'Laya route failed after 42000 ms: timed out after 40 s (20 questions on the CPU); routing rules decide those domains')
+  assert.equal(line(late('review', 41000, { code: 'LAYA_TIMEOUT', questions: 9, device: 'cuda' })), 'Laya review failed after 41000 ms: timed out after 40 s (9 questions on the GPU)')
+  // Any other failure says its message alone.
+  assert.equal(line(late('route', 0, { code: 'LAYA_PREDICTED_OVER', questions: 20, device: 'cpu', message: 'Laya would need about 150 s for this call on the CPU, over its 120 s deadline' })), 'Laya route failed after 0 ms: Laya would need about 150 s for this call on the CPU, over its 120 s deadline')
 })
 
 test('a queued task Laya decides says Laya picks, with the reason it was queued as a task', () => {

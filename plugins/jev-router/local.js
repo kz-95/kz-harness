@@ -1138,7 +1138,15 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     }
     child.stdout.on('data', onLine)
     child.stderr.on('data', onLine)
-    const exited = new Promise((r) => child.once('exit', r)).then((code) => { if (engine === e) engine = null; return code })
+    // An engine that exits on its own (a CUDA error, an access violation, a kill from Task Manager)
+    // leaves the shared residency with it, or the RAM and VRAM of a dead process would stay counted
+    // against the budget beside Laya until the next local model starts. Only its own entry: a late
+    // exit never clears one a newer engine registered, and one that never became ready has none.
+    const exited = new Promise((r) => child.once('exit', r)).then((code) => {
+      if (engine === e) engine = null
+      if (e.resident) residency.clear('llama', e.resident)
+      return code
+    })
     child.once('error', (err) => { e.tail.push(err.message); if (engine === e) engine = null })
     engine = e
     log(`local: engine starting ${m.id} on 127.0.0.1:${port} (ctx ${ctx}, GPU layers ${gpuLayers}, ${limits.threads} threads, ${limits.fitTargetMiB} MiB kept free on the GPU${vision ? ', vision' : ''})`)

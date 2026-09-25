@@ -802,19 +802,20 @@ test('the ranking trusts a candidate over the dimensions the deciding provider c
 
 /**
  * A fake Laya: jev.route's shape as createJev returns it over the Laya client, with the model the
- * client relabels and the names of the answers Laya gave too flat to use, per call (`flat.task`,
- * `flat.resource`), as jev.js lists them in `uninformative`. Nothing more: createJev keeps the
- * client's `meta` on the trace and returns none from route() (docs/laya-auto.md 2.3).
+ * client relabels, the client's `meta` (the identity and the script of what Laya read), and the
+ * names of the answers Laya gave too flat to use, per call (`flat.task`, `flat.resource`), as
+ * jev.js lists them in `uninformative` (docs/laya-auto.md 2.3).
  */
-function fakeLaya({ profile = profileOf(), strategy = 'STANDARD_DIRECT', secondOpinion = 0.2, flat = {} } = {}) {
+const LAYA_IDENTITY = 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1'
+function fakeLaya({ profile = profileOf(), strategy = 'STANDARD_DIRECT', secondOpinion = 0.2, flat = {}, tool = { handler: 'agent' } } = {}) {
   const calls = []
   return {
     calls,
     route: async (args) => {
       calls.push(args)
       const task = args.ask?.task !== false
-      const out = { model: 'laya-english/0.3.20@1a2b3c4', uninformative: [...(task ? flat.task ?? [] : flat.resource ?? [])] }
-      if (task) { out.profile = profile; Object.assign(out, { taskType: profile.taskType, complexity: profile.complexity, risk: profile.risk, handler: 'agent' }) }
+      const out = { model: 'laya-english/0.3.20@1a2b3c4', meta: { provider: 'laya', identity: LAYA_IDENTITY, lang: 'latin' }, uninformative: [...(task ? flat.task ?? [] : flat.resource ?? [])] }
+      if (task) { out.profile = profile; Object.assign(out, { taskType: profile.taskType, complexity: profile.complexity, risk: profile.risk, ...tool }) }
       if (args.candidates && args.ask?.resource !== false) out.strategy = { choice: strategy, confidence: 0.4, probabilities: { [strategy]: 0.4 } }
       if (args.candidates && args.ask?.judgments !== false) out.secondOpinion = secondOpinion
       return out
@@ -893,7 +894,7 @@ test('a Laya run: Laya decides every domain it is asked, the rules keep theirs, 
   }
   const task = rows.find((r) => r.domain === 'task_classification')
   assert.deepEqual([task.provider.label, task.provider.model], ['implementation', 'laya-english/0.3.20@1a2b3c4'])
-  assert.deepEqual([task.provider.identity, task.provider.lang], [null, null], 'route() hands over no meta, so nothing makes up an identity or a script')
+  for (const r of rows.filter((x) => x.provider)) assert.deepEqual([r.provider.identity, r.provider.lang], [LAYA_IDENTITY, 'latin'], `${r.domain}: the identity and script of the call that answered`)
   assert.equal(task.extra.profile, undefined, 'no class average can read Laya\'s numbers')
   assert.equal(task.extra.providerProfile.risk, 0.2)
   // A Jev run with the same wiring is Jev's, in Jev's store, as it always was, even when it is
@@ -939,6 +940,23 @@ test('a Laya run: what Laya answered too flat to use is filled by the rules, fie
     assert.equal(rows.find((r) => r.domain === domain).provider.informative, false, domain)
   }
   assert.equal(rows.find((r) => r.domain === 'skill_selection').provider.informative, true)
+})
+
+test('a Laya run: a task type too flat to use leaves the tool Laya picked, with its numbers, as answered', async () => {
+  const { laya } = await records()
+  const { e, sink } = layaEngine()
+  const tools = [{ id: 'lint', description: 'runs the linter', params: { path: ['src', 'test'] } }]
+  const pick = { handler: 'lint', handlerConfidence: 0.9, toolFits: 0.95, toolArgConfidence: 0.9, toolArgs: { path: 'src' } }
+  const toolOf = (r) => ({ handler: r.handler, handlerConfidence: r.handlerConfidence, toolFits: r.toolFits, toolArgConfidence: r.toolArgConfidence, toolArgs: r.toolArgs })
+  const answered = await decide(e, undefined, { decider: fakeLaya({ tool: pick }), provider: laya, sink, tools })
+  assert.deepEqual(toolOf(answered.routing), pick, 'the setting: an informative task type keeps Laya\'s tool')
+  // Only the type falls to the rules (4.3): the handler, its fits noul and its parameters are
+  // other answers of the same call, and a flat type says nothing about them.
+  const profile = profileOf({ taskType: undefined, taskTypeConfidence: undefined, filledByRules: ['taskType'] })
+  const d = await decide(e, undefined, { decider: fakeLaya({ profile, tool: pick, flat: { task: ['taskType'] } }), provider: laya, sink, tools })
+  assert.equal(d.domains.task_classification.authority, 'fallback', 'the type is the rules\'')
+  assert.equal(d.profile.risk, 0.2, 'the profile keeps what Laya answered')
+  assert.deepEqual(toolOf(d.routing), pick, 'and so does the routing: the tool Laya picked is not dropped for an agent')
 })
 
 test('the cut-offs are the deciding provider\'s, read from its record through the per-run policy', async () => {
@@ -988,7 +1006,7 @@ test('a Laya run asks Laya every question whatever rung Jev\'s ladder holds a do
   assert.deepEqual(jev.calls.map((c) => c.ask), [{ task: true, resource: false, judgments: false }, { task: false, resource: true, judgments: false }])
 })
 
-test('a Jev run reads rows 20 and 21 from routing.minimumReview whichever Jev record it is handed, the router\'s default one included', async () => {
+test('a Jev run reads rows 20 and 21 from routing.minimumReview whichever Jev record it is handed, the router\'s default one included, and a Laya run from its own record', async () => {
   const { DEFAULT_JEV, resolveProviders } = await import('../providers.js')
   const raised = resolvePolicy({ minimumReview: { riskForReview: 0.4, riskForFrontierReview: 0.45 } })
   const e = createDecisionEngine({ policy: raised, domains: undefined, profiles: createCapabilityRegistry({ priors: PRIORS, policy: raised }), priors: PRIORS, now: () => now })
@@ -999,6 +1017,14 @@ test('a Jev run reads rows 20 and 21 from routing.minimumReview whichever Jev re
     const { secondOpinion, frontierReview } = (await decide(e, undefined, over)).routing.decision.judgments
     assert.deepEqual([secondOpinion, frontierReview], [1, cuts.risky], name)
   }
+  // Laya's record, built from the same policy, keeps its own rows 20 and 21 (0.45 and 0.7): the same
+  // risk 0.5 is at its review bar and under its frontier bar, whatever routing.minimumReview says.
+  const { laya } = resolveProviders({}, { policy: raised })
+  assert.deepEqual([laya.thresholds.riskForReview, laya.thresholds.riskForFrontierReview], [0.45, 0.7], 'the setting: Laya\'s own bars')
+  const down = { route: async () => { throw new Error('timed out after 42 s') } }
+  const { secondOpinion, frontierReview } = (await decide(e, undefined, { decider: down, provider: laya, sink: layaEngine().sink })).routing.decision.judgments
+  assert.equal(secondOpinion, 1)
+  assert.notEqual(frontierReview, cuts.risky, 'a risk under Laya\'s own frontier bar is no risky frontier review')
 })
 
 test('a Laya run stores as Laya\'s numbers only what Laya answered, and nothing when it gave no answer', async () => {
@@ -1007,6 +1033,7 @@ test('a Laya run stores as Laya\'s numbers only what Laya answered, and nothing 
   const down = { route: async () => { throw new Error('timed out after 42 s') } }
   await decide(e, undefined, { decider: down, provider: laya, sink, runId: 'run-down' })
   const row = (await sink.list({ domain: 'task_classification' }))[0]
+  assert.ok(row, 'the run\'s sample went to Laya\'s store')
   assert.deepEqual([row.authority, row.provider], ['fallback', null], 'the setting: Laya gave nothing, and the rules decided')
   assert.equal(row.extra?.providerProfile, undefined, 'the rules\' profile is never stored as Laya\'s numbers')
   assert.equal(row.extra?.profile, undefined, 'nor as a teacher\'s')
@@ -1015,6 +1042,7 @@ test('a Laya run stores as Laya\'s numbers only what Laya answered, and nothing 
   const profile = profileOf({ taskType: undefined, taskTypeConfidence: undefined, filledByRules: ['taskType'] })
   await decide(flat.e, undefined, { decider: fakeLaya({ profile, flat: { task: ['taskType'] } }), provider: laya, sink: flat.sink })
   const given = (await flat.sink.list({ domain: 'task_classification' }))[0]
+  assert.ok(given, 'the run\'s sample went to Laya\'s store')
   assert.equal(given.authority, 'fallback')
   assert.equal(given.extra.providerProfile.risk, 0.2, 'Laya\'s risk, not the heuristic\'s 0.5')
 })

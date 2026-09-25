@@ -268,6 +268,22 @@ test('an acting request that has waited 2 s says so, and priority is raised for 
   assert.ok(raised.at < fake.requests[0].finishedAt, 'raised while the shadow chunk was still computing')
 })
 
+test('a call that went straight out waited for nothing, however the clock moved while it was queued, and one behind another says how long', async (t) => {
+  // A clock that moves 1 ms each time it is read: queueing a lone call and starting it read it
+  // several times, as a real millisecond can tick between the two.
+  let clock = 1_000_000
+  const { client } = await rig(t, { fake: { msPerRow: 5 }, now: () => clock++ })
+  const act = client.client('act')
+  assert.equal((await act.systemOne(INTENT, { phase: 'intent' })).meta.waitedMs, 0, 'nothing was ahead of it')
+  const [first, second] = await Promise.all([act.systemOne(INTENT, { phase: 'intent' }), act.systemOne(intentOf('Explain the parser'), { phase: 'intent' })])
+  assert.equal(first.meta.waitedMs, 0)
+  assert.ok(second.meta.waitedMs > 0, `the second waited for the first (${second.meta.waitedMs} ms)`)
+  // The shadow's jobs likewise: alone, it waited for no earlier answer.
+  const alone = await shadowOf(client, INTENT, { phase: 'intent' }).done
+  assert.equal(alone.status, 'answered')
+  assert.equal(alone.answer.meta.waitedMs, 0)
+})
+
 test('priority: below normal for shadow work, normal for acting requests, lowered after them', async (t) => {
   const { fake, sidecar, client } = await rig(t, { fake: { msPerRow: 60 } })
   const shadow = shadowOf(client, INTENT, { phase: 'intent' })

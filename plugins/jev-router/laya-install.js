@@ -240,6 +240,18 @@ export function createRotatingLog(file, { maxBytes = 5 * 1024 * 1024 } = {}) {
   }
 }
 
+/**
+ * The environment a process Laya's installer or sidecar starts gets, as a copy of `env`: every
+ * TYPESAFE_* variable and the Hugging Face token (HF_TOKEN, and HUGGING_FACE_HUB_TOKEN, its older
+ * name) removed, so nothing of the person's secrets reaches uv, Python, Laya's loader or laya.serve.
+ * Laya's weights are public, and none of them talks to TypeSafe.
+ */
+export function withoutSecrets(env = process.env) {
+  const out = { ...env }
+  for (const k of Object.keys(out)) if (/^TYPESAFE_/i.test(k) || ['HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN'].includes(k.toUpperCase())) delete out[k]
+  return out
+}
+
 /** A command's stdout, or null when it fails or does not start. Ten seconds at most. */
 export function execText(cmd, args, { timeoutMs = 10_000, spawn = nodeSpawn } = {}) {
   return new Promise((done) => {
@@ -301,8 +313,29 @@ export function stepNames(pins) {
 
 /** Free disk while installing, estimates until the desktop install measures its peak. */
 const DISK_NEED_GB = { gpu: 8, cpu: 3 }
-/** What the torch download is expected to weigh, for the step's progress only. */
+/** What the torch download is expected to weigh, for the step's progress and the install dialog. */
 const TORCH_BYTES = { gpu: 2.5 * GB, cpu: 120 * 1024 ** 2 }
+
+/**
+ * What an install would get on this PC (7.2), for the card and its install dialog before anything
+ * is installed (8.2, 8.3): PyTorch for the GPU where the driver runs one of the pinned CUDA builds
+ * (`gpu`, else null, and the install is for the CPU), the Python it fetches, and for each device the
+ * free disk an install needs and what PyTorch weighs and where it comes from: the same estimates
+ * the install itself works with, until the desktop install measures them.
+ * @param {object|null} pins   readPins(), null when they could not be read
+ * @param {object|null} specs  detectSpecs() for this PC, null when unknown
+ */
+export function installOffer(pins, specs) {
+  const nvidia = specs?.gpus?.find((g) => g.vendor === 'nvidia')
+  const cuda = pins && nvidia && torchIndexes(pins.torch.cuda, specs.cuda).length ? specs.cuda : null
+  return {
+    gpu: cuda ? { name: nvidia.name, cuda } : null,
+    python: pins?.python ?? null,
+    disk: { gpu: { installingGB: DISK_NEED_GB.gpu }, cpu: { installingGB: DISK_NEED_GB.cpu } },
+    torch: pins ? { gpu: { bytes: TORCH_BYTES.gpu, source: new URL(pins.torch.indexBase).host }, cpu: { bytes: TORCH_BYTES.cpu, source: 'PyPI' } } : null,
+  }
+}
+
 /** uv's words when an index has no wheel for this platform, or says 404. */
 const NO_WHEEL = /\b404\b|not found|no matching distribution|no solution|no version of torch/i
 
@@ -310,6 +343,9 @@ const NO_WHEEL = /\b404\b|not found|no matching distribution|no solution|no vers
 class StepError extends Error {
   constructor(message, extra = {}) { super(message); Object.assign(this, extra) }
 }
+
+/** Why a job that would stop or replace the running Laya is refused while a Laya Auto run needs it (7.4, 7.10). */
+const RUN_OPEN = 'Laya is deciding for an open Laya Auto run; stop that run first.'
 
 /**
  * @param {object} p
@@ -339,7 +375,7 @@ export function createLayaInstaller({
   let abort = null
   let message = null // the recover() message, for the card
   const uvEnv = () => ({
-    ...process.env,
+    ...withoutSecrets(),
     UV_PYTHON_INSTALL_DIR: paths.python,
     UV_CACHE_DIR: paths.cache,
     UV_NO_CONFIG: '1',
@@ -347,6 +383,8 @@ export function createLayaInstaller({
 
   const installLog = createRotatingLog(paths.installLog)
   const told = () => { try { sidecar?.noteInstall?.(job ? { ...job } : null) } catch (err) { log(`laya install: ${err.message}`) } }
+  /** An open Laya Auto run holds the running Laya by its run id (2.4). */
+  const runOpen = () => (sidecar?.held?.() ?? []).some((k) => k.startsWith('run:'))
   const say = (line) => {
     log(`laya install: ${line}`)
     installLog.append(`${new Date(now()).toISOString()} ${line}\n`)
@@ -357,7 +395,7 @@ export function createLayaInstaller({
    * Run one command of a step. Output lines and the growth of `progress()` (bytes) are progress;
    * `noProgressMs` without either kills it and fails the step. Resolves `{ code, output }`.
    */
-  function command(cmd, args, { env = process.env, cwd, progress } = {}) {
+  function command(cmd, args, { env = withoutSecrets(), cwd, progress } = {}) {
     return new Promise((resolve, reject) => {
       const step = job?.name ?? 'installing'
       let child
@@ -410,7 +448,7 @@ export function createLayaInstaller({
   }
   const step = (n, name = NAMES[n], total = 0) => {
     if (abort?.signal.aborted) throw new StepError('Install cancelled.', { cancelled: true })
-    Object.assign(job, { step: n, name, received: 0, total })
+    Object.assign(job, { step: n, name, received: 0, total, stepStartedAt: now() })
     say(`step ${n} of 8: ${name}`)
   }
 
@@ -532,7 +570,7 @@ export function createLayaInstaller({
     if (got.laya !== pins.laya) throw new StepError(`Laya ${got.laya} was installed, not ${pins.laya}.`)
     if (device === 'gpu' && !got.cuda) {
       const driver = (await specs().catch(() => null))?.cuda ?? 'unknown'
-      const note = `Installed for the CPU: PyTorch reports no usable CUDA (driver CUDA ${driver}). Update the NVIDIA driver, then choose Reinstall.`
+      const note = `Installed for the CPU: PyTorch reports no usable CUDA (driver CUDA ${driver}). Update the NVIDIA driver, then choose Remove and Install Laya again.`
       job.notes.push(note)
       say(note)
     }
@@ -547,7 +585,7 @@ export function createLayaInstaller({
     const py = paths.pythonOf(venv)
     job.total = pins.weights.approxBytes
     const base = {
-      ...process.env,
+      ...withoutSecrets(),
       HF_HOME: hf, HF_HUB_DISABLE_TELEMETRY: '1', HF_HUB_DISABLE_SYMLINKS_WARNING: '1',
       // Without it huggingface_hub fetches Xet-backed files from Xet hosts step 1 never probed,
       // and loses the classic resumable `.incomplete` download.
@@ -610,6 +648,9 @@ export function createLayaInstaller({
    * 'cpu'; `skipWeights` and `torchIndex: 'pypi'` are for the cloud end-to-end test only.
    */
   async function build({ device, update, skipWeights = false, torchIndex = null }) {
+    // Step 7 of an update is refused while a Laya Auto run is open, so the update is refused before
+    // it downloads anything it could not use (about 2.5 GB of PyTorch for the GPU): nothing is run.
+    if (update && runOpen()) throw new StepError(RUN_OPEN)
     const release = await takeInstallLock(paths, { pid, alive })
     const wasRunning = !!sidecar?.isReady?.()
     let stoppedForCheck = false
@@ -632,8 +673,9 @@ export function createLayaInstaller({
       step(7)
       if (sidecar) {
         // A second Laya beside the running one would test the wrong device on a 4 GB GPU. Not while
-        // a Laya Auto run is deciding, though: that run needs the one it has.
-        if ((sidecar.held?.() ?? []).some((k) => k.startsWith('run:'))) throw new StepError('Laya is deciding for an open Laya Auto run; stop that run first.')
+        // a Laya Auto run is deciding, though: that run needs the one it has, whether it was open
+        // when the update began or opened during the download.
+        if (runOpen()) throw new StepError(RUN_OPEN)
         sidecar.suspend?.()
         if (sidecar.isReady?.() || ['starting', 'restarting'].includes(sidecar.status?.().state)) { await sidecar.stop({ reason: 'update' }); stoppedForCheck = true }
         if (!skipWeights || existsSync(paths.weights)) {
@@ -753,7 +795,7 @@ export function createLayaInstaller({
   async function removeAll() {
     const release = await takeInstallLock(paths, { pid, alive })
     try {
-      if ((sidecar?.held?.() ?? []).some((k) => k.startsWith('run:'))) throw new StepError('Laya is deciding for an open Laya Auto run; stop that run first.')
+      if (runOpen()) throw new StepError(RUN_OPEN)
       const freed = await sizeOf(paths.engine) + await sizeOf(paths.models)
       await sidecar?.stop?.({ reason: 'remove' })
       await rmRetry(paths.engine, { sleep, remove })
@@ -807,7 +849,7 @@ export function createLayaInstaller({
     try {
       step(6, 'Switching to the newer Laya model')
       if (!existsSync(paths.hfStaging)) throw new StepError('No newer model has been downloaded; choose Check for a newer model first.')
-      if ((sidecar?.held?.() ?? []).some((k) => k.startsWith('run:'))) throw new StepError('Laya is deciding for an open Laya Auto run; stop that run first.')
+      if (runOpen()) throw new StepError(RUN_OPEN)
       const got = await fetchWeights(paths.venv, { hf: paths.hfStaging, record: false })
       sidecar?.suspend?.()
       await sidecar?.stop?.({ reason: 'update' })

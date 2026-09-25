@@ -222,6 +222,36 @@ test('an install for the GPU: every step in order with its exact command, uv pip
   assert.match(log, /Installed Laya 0\.3\.20\.$/m)
 })
 
+test('the card is told each step\'s start and the device the install is for, and what an install takes before there is one', async () => {
+  const h = harness()
+  withUv(h)
+  let clock = 1_000_000
+  const sidecar = sidecarStub()
+  const told = []
+  sidecar.noteInstall = (j) => { if (j) told.push({ step: j.step, device: j.device, stepStartedAt: j.stepStartedAt }) }
+  const { installer } = installerFor(h, machine(h), { sidecar, now: () => (clock += 1000) })
+  await installer.install({ device: 'gpu' })
+  const steps = told.filter((j) => j.step >= 1)
+  assert.ok(steps.length >= 8 && steps.every((j) => j.device === 'gpu'), JSON.stringify(told))
+  assert.ok(steps.every((j) => typeof j.stepStartedAt === 'number'), 'every step says when it began')
+  const byStep = new Map()
+  for (const j of steps) byStep.set(j.step, [...(byStep.get(j.step) ?? []), j.stepStartedAt])
+  assert.ok([...byStep.values()].every((v) => new Set(v).size === 1), 'the same in every report of one step')
+  const began = [...byStep.values()].map((v) => v[0])
+  assert.equal(new Set(began).size, 8, 'each step its own start')
+  assert.deepEqual(began, [...began].sort((a, b) => a - b), 'in order')
+  // Before anything is installed: the GPU where the driver runs a pinned CUDA build, and the figures.
+  const { installOffer } = await import('../laya-install.js')
+  assert.equal(typeof installOffer, 'function')
+  assert.deepEqual(installOffer(PINS, { cuda: 12.8, gpus: [{ name: GPU, vendor: 'nvidia' }] }), {
+    gpu: { name: GPU, cuda: 12.8 }, python: '3.12',
+    disk: { gpu: { installingGB: 8 }, cpu: { installingGB: 3 } },
+    torch: { gpu: { bytes: 2.5 * GB, source: 'download.pytorch.org' }, cpu: { bytes: 120 * 1024 ** 2, source: 'PyPI' } },
+  })
+  assert.equal(installOffer(PINS, { cuda: 12.4, gpus: [{ name: GPU, vendor: 'nvidia' }] }).gpu, null, 'a driver older than every pinned build: the CPU')
+  assert.equal(installOffer(null, null).torch, null, 'pins that could not be read name no download')
+})
+
 test('a log of Laya\'s own is rotated past its size, keeping two older files', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'laya-log-'))
   const file = join(dir, 'install.log')
@@ -318,7 +348,7 @@ test('the CPU: no NVIDIA driver means the CPU wheel from PyPI, and PyTorch repor
   const m2 = machine(h2, { imported: { torch: '2.14.0+cu128', cuda: false, gpu: null } })
   const { installer: second } = installerFor(h2, m2, { driver: 12.8 })
   const got2 = await second.install({ device: 'gpu' })
-  assert.ok(second.status().job.notes.includes('Installed for the CPU: PyTorch reports no usable CUDA (driver CUDA 12.8). Update the NVIDIA driver, then choose Reinstall.'))
+  assert.ok(second.status().job.notes.includes('Installed for the CPU: PyTorch reports no usable CUDA (driver CUDA 12.8). Update the NVIDIA driver, then choose Remove and Install Laya again.'))
   assert.equal(got2.cuda, false)
   assert.equal(m2.uvCalls().filter((a) => a.includes('torch==2.14.0')).length, 1, 'nothing is retried silently')
 
@@ -468,11 +498,52 @@ test('an update builds beside the running Laya, stops it for step 7, and starts 
   assert.deepEqual(ok.calls, ['suspend', 'stop:update', 'check:cuda:venv.new', 'stop:update', 'resume', 'start:update'], 'the new one runs once swapped in')
   assert.ok(!existsSync(join(h.paths.venv, 'old-install.txt')))
 
-  const held = sidecarStub({ ready: true, held: ['run:42', 'keepLoaded'], installed: { laya: '0.3.20' } })
-  const { installer: refused } = installerFor(h, machine(h), { sidecar: held })
+  // A Laya Auto run that opens while the update downloads is still refused at step 7.
+  const holds = ['keepLoaded']
+  const held = sidecarStub({ ready: true, held: holds, installed: { laya: '0.3.20' } })
+  const opens = machine(h, { answer: (c) => { if (c.cmd === h.paths.uv && c.args[0] === 'pip' && c.args[1] === 'install') holds.push('run:42') } })
+  const { installer: refused } = installerFor(h, opens, { sidecar: held })
   await assert.rejects(refused.update(), { message: 'Laya is deciding for an open Laya Auto run; stop that run first.' })
   assert.ok(!held.calls.some((c) => c.startsWith('stop')), 'the open run keeps its Laya')
   assert.equal(refused.status().job.failedStep, 7)
+})
+
+test('an update is refused before it downloads anything while a Laya Auto run holds Laya: nothing is run, stopped or started, and the job says why', async () => {
+  const h = harness()
+  withUv(h)
+  installedBefore(h, '0.3.20')
+  const held = sidecarStub({ ready: true, held: ['run:42', 'keepLoaded'], installed: { laya: '0.3.20' } })
+  const m = machine(h)
+  const { installer, probes } = installerFor(h, m, { sidecar: held })
+  await assert.rejects(installer.update(), { message: 'Laya is deciding for an open Laya Auto run; stop that run first.' })
+  assert.deepEqual(m.calls.map((c) => [c.cmd, ...c.args].join(' ')), [], 'no command ran: nothing was downloaded or built')
+  assert.deepEqual(probes, [], 'and no host was probed')
+  assert.deepEqual(held.calls, [], 'the running Laya was neither stopped nor started')
+  const { job } = installer.status()
+  assert.deepEqual([job.kind, job.step, job.failedStep, job.error], ['update', 0, null, 'Laya is deciding for an open Laya Auto run; stop that run first.'])
+  assert.ok(job.lines.includes('Laya is deciding for an open Laya Auto run; stop that run first.'), 'the install log says why')
+  assert.ok(existsSync(join(h.paths.venv, 'old-install.txt')), 'the running install is untouched')
+})
+
+test('no command the installer runs gets the person\'s secrets: no TypeSafe setting and no Hugging Face token reaches uv, Python or Laya\'s loader', async (t) => {
+  const planted = { TYPESAFE_API_KEY: 'tsk_PROBE_SECRET_123456789', TYPESAFE_BASE_URL: 'https://jev.example', typesafe_org: 'lowercase-too', HF_TOKEN: 'hf_PROBE_SECRET', HUGGING_FACE_HUB_TOKEN: 'hf_PROBE_OLD_NAME' }
+  const saved = Object.fromEntries(Object.keys(planted).map((k) => [k, process.env[k]]))
+  Object.assign(process.env, planted)
+  t.after(() => { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v } })
+  const h = harness()
+  withUv(h)
+  const m = machine(h)
+  const { installer } = installerFor(h, m)
+  await installer.install({ device: 'gpu' })
+  await installer.repair()
+  const ran = (c) => [basename(c.cmd), ...c.args.slice(0, 2)].join(' ')
+  assert.ok(m.calls.length >= 10, `the install and the repair ran their commands: ${m.calls.map(ran).join(', ')}`)
+  assert.ok(m.calls.some((c) => c.args.includes(h.paths.fetchWeights) && c.env.HF_HUB_OFFLINE !== '1'), 'Laya\'s loader among them, online')
+  for (const c of m.calls) {
+    assert.deepEqual(Object.keys(c.env).filter((k) => k in planted), [], `${ran(c)}: none of the secrets`)
+    assert.ok(!Object.values(c.env).some((v) => /PROBE|lowercase-too/.test(String(v))), `${ran(c)}: nor their values under any name`)
+  }
+  assert.equal(process.env.TYPESAFE_API_KEY, planted.TYPESAFE_API_KEY, 'the harness\'s own environment keeps them')
 })
 
 test('the weights: offline first with Xet off, online only when that fails, and recorded only after a load; Repair of a copied cache needs no network', async () => {

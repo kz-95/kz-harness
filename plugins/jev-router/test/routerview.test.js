@@ -81,7 +81,8 @@ const COMPARE = {
     { name: 'alsoWork', type: 'noul', options: 2, corrected: 0, compared: 12, agree: { all: { n: 12, agree: 9 }, informative: { n: 0, agree: 0 } }, inTopTwo: null, meanDifference: 0.12, atBar: { n: 12, agree: 10 }, flat: 12, layaMedianMs: 300 },
   ],
   domains: [
-    { domain: 'task_classification', question: 'taskType', layaAnswered: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, personSaid: { n: 4, jevRight: 3, layaRight: 2 }, whereJevWasContradicted: { n: 3, layaRight: 1 }, layaAutoRuns: { runs: 12, failed: 2 }, fieldAgreement: { risk: 0.64 } },
+    { domain: 'task_classification', question: 'taskType', layaAnswered: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, personSaid: { n: 4, jevRight: 3, layaRight: 2 }, whereJevWasContradicted: { n: 3, layaRight: 1 }, layaAutoRuns: { runs: 12, failed: null }, fieldAgreement: { risk: 0.64 } },
+    { domain: 'execution_strategy', question: 'strategy', layaAnswered: 40, agree: { all: { n: 40, agree: 30 }, informative: { n: 20, agree: 16 } }, personSaid: { n: 0 }, whereJevWasContradicted: { n: 0 }, layaAutoRuns: { runs: 12, failed: 2 }, fieldAgreement: null },
     { domain: 'second_opinion', question: 'secondOpinion', layaAnswered: 0, agree: { all: { n: 0, agree: 0 }, informative: { n: 0, agree: 0 } }, personSaid: { n: 0 }, whereJevWasContradicted: { n: 0 }, layaAutoRuns: { runs: 0 }, fieldAgreement: null },
   ],
   actions: {
@@ -106,11 +107,14 @@ test('the Router tab\'s side-by-side card reads the comparison by its own names,
   const rows = (t) => nodes(t).filter((n) => n.type === 'tr' && n.children.some((c) => c?.props?.scope === 'row')).map((tr) => tr.children.map(textOf))
   assert.deepEqual(heads(domains), ['Domain', 'Laya answered', 'Agrees with Jev (informative only)', 'A person said (Jev right / Laya right)', "Where Jev's pick was contradicted (Laya had it right)", 'Laya Auto runs that failed'])
   assert.deepEqual(rows(domains), [
-    ['task classification', '41', '19 of 30 (63%)', '3 / 2 of 4', '1 of 3', '2 of 12'],
+    // No outcome of a run can fault a task type: the count is not measured, never 0 failed.
+    ['task classification', '41', '19 of 30 (63%)', '3 / 2 of 4', '1 of 3', 'not measured (12 runs)'],
+    ['execution strategy', '40', '16 of 20 (80%)', 'none yet', 'none yet', '2 of 12'],
     ['second opinion', '0', 'none yet', 'none yet', 'none yet', 'none yet'],
   ], 'a source with no rows says so, and shows no rate')
   // The sources are kept apart, and each says what it can show.
   assert.ok(whys.some((w) => w.startsWith('A person said: the rows a person labelled, the least biased.') && w.includes("never Laya's accuracy") && w.includes('never an accuracy')))
+  assert.ok(whys.some((w) => w.includes('a review counts as failed only when the person disliked what it accepted or another agent\'s review did not accept it, and a task type or a skill is judged only by what a person said, so it is not measured there.')))
   assert.ok(whys.includes('task classification, profile fields that agree with Jev: risk 64.0%'))
   assert.deepEqual(heads(questions), ['Question', 'Compared', 'Agree', 'Agree, informative only', 'Mean difference', 'Laya median ms'])
   assert.deepEqual(rows(questions), [
@@ -233,4 +237,52 @@ test('the Router tab shows the side-by-side card under the routing domains, read
   await settle()
   assert.equal(minute().length, 0)
   view.unmount()
+})
+
+test('the Router tab shows no side-by-side card on a PC with nothing to compare, and says why when the comparison could not be read', async () => {
+  const { RouterView, LayaCompare } = renderPlugin()
+  assert.equal(typeof RouterView, 'function', 'the Router view can be rendered')
+  const data = { enabled: true, learning: true, domains: {}, resources: [], profiles: [] }
+  // Handed a failure, the view says it where the card would be.
+  const failed = RouterView({ data, error: '', busy: false, onRefresh() {}, laya: { data: null, error: 'the comparison worker exited with code 1' } })
+  const alert = nodes(failed).find((n) => n.props?.role === 'alert')
+  assert.ok(alert, 'the failure is shown')
+  assert.equal(textOf(alert), 'The comparison could not be read: the comparison worker exited with code 1')
+  assert.ok(nodes(failed).some((n) => n.props?.className === 'label' && textOf(n) === 'Jev and Laya, side by side'), 'where the card would be')
+  assert.ok(!nodes(RouterView({ data, error: '', busy: false, onRefresh() {}, laya: { data: null, error: '' } })).some((n) => n.props?.role === 'alert'))
+
+  // The inspector behind its routes: the comparison answers 404 on a PC where Laya cannot be asked
+  // and nothing was compared, and 500 when it could not be worked out.
+  const mountWith = async (compare) => {
+    let busy = 0
+    const fetch = async (path) => {
+      busy++
+      try {
+        const [status, body] = path === '/jev-router/laya/compare?days=7&identity=current' ? compare
+          : [200, path === '/jev-router/routing' ? data : path === '/jev-router/tasks' ? { tasks: [] } : path === '/jev-router/setup' ? { agents: [] } : path.startsWith('/jev-router/log?') ? [] : {}]
+        const text = JSON.stringify(body)
+        return { ok: status === 200, status, json: async () => JSON.parse(text) }
+      } finally { busy-- }
+    }
+    const globals = {
+      fetch, document: { hidden: false, getElementById: () => ({}), head: { appendChild() {} } },
+      setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
+    }
+    const { React, mount } = statefulReact()
+    let registration
+    const window = { __ModuleLoader__: { load: (r) => { registration = r } } }
+    new Function('window', ...Object.keys(globals), readFileSync(new URL('../client.js', import.meta.url), 'utf8'))(window, ...Object.values(globals))
+    const plugin = registration.factory((id) => { if (id === 'react') return React; throw new Error(`unexpected require: ${id}`) }).__test
+    const view = mount(plugin.InspectorBody, { sessionId: 's1', useTabInfo: () => ({ tab: { visible: true } }), useSessions: () => undefined })
+    const settle = async () => { for (let quiet = 0; quiet < 2; quiet = !busy && !view.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+    await settle()
+    nodes(view.tree).find((n) => n.type === 'button' && n.props.role === 'tab' && textOf(n) === 'Router').props.onClick()
+    await settle()
+    const shown = nodes(view.tree).find((n) => n.type === plugin.RouterView).props.laya
+    view.unmount()
+    return shown
+  }
+  assert.deepEqual(await mountWith([404, { error: 'Laya cannot be asked on this PC, and nothing has been compared' }]), { data: null, error: '' }, 'nothing to compare is no failure')
+  assert.deepEqual(await mountWith([500, { error: 'the comparison worker exited with code 1' }]), { data: null, error: 'the comparison worker exited with code 1' })
+  assert.equal(LayaCompare({ data: null }), null)
 })

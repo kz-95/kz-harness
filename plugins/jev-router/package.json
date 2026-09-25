@@ -6,7 +6,8 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "test:e2e": "node test/e2e/laya.e2e.mjs"
   },
   "engines": {
     "node": ">=22.19"

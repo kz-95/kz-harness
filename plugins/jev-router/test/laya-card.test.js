@@ -15,6 +15,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { waitFor } from './wait-for.js'
 
 const client = readFileSync(fileURLToPath(new URL('../client.js', import.meta.url)), 'utf8')
 const REPO = fileURLToPath(new URL('../../../', import.meta.url))
@@ -43,7 +44,7 @@ function status(over = {}) {
     install: null,
     installed: {
       laya: '0.3.20', torch: '2.14.0+cu128', cuda: true, gpu: GPU, python: '3.12.11',
-      weights: { commit: COMMIT, bytes: 842609220, downloadedAt: '2026-09-20T09:30:00.000Z' }, diskBytes: 4.1 * GB,
+      weights: { commit: COMMIT, bytes: 842609220, downloadedAt: '2026-09-20T09:30:00.000Z' }, diskBytes: 4.1 * GB, bytes: { engine: 3.3 * GB, models: 0.8 * GB },
     },
     expected: { laya: '0.3.20', torch: '2.14.0' },
     running: null,
@@ -67,12 +68,12 @@ const running = (over = {}) => ({
   msPerToken: { intent: 0.2, route: 0.3, review: 0.2 }, busy: false, held: [], lastCallMs: 950, localBusy: false,
   routeMs: 1400, reviewMs: 900, ...over,
 })
-/** The figures an install needs before anything is installed, and where Laya lives. */
+/** The figures an install needs before anything is installed, as laya-install.js installOffer gives them on a PC with an RTX 3050, and where Laya lives. */
 const OFFER = {
-  python: '3.12',
   gpu: { name: GPU, cuda: 12.8 },
-  disk: { gpu: { installingGB: 8, afterGB: 4.4 }, cpu: { installingGB: 3, afterGB: 2 } },
-  torch: { gpu: { size: 'about 2.5 GB', source: 'download.pytorch.org' }, cpu: { size: 'about 120 MB', source: 'PyPI' } },
+  python: '3.12',
+  disk: { gpu: { installingGB: 8 }, cpu: { installingGB: 3 } },
+  torch: { gpu: { bytes: 2.5 * GB, source: 'download.pytorch.org' }, cpu: { bytes: 120 * 1024 ** 2, source: 'PyPI' } },
 }
 const PATHS = { engine: 'C:\\Harness\\engine\\laya', models: 'C:\\Harness\\models\\laya' }
 
@@ -85,11 +86,11 @@ test('every state has its own words and buttons, before and during an install', 
   // Not installed, on a PC with a usable NVIDIA GPU, and on one without.
   const bare = { installed: null, state: 'not_installed', offer: OFFER, paths: PATHS }
   assert.deepEqual(seen(h, status(bare)), {
-    lines: ['Not installed. Needs about 8 GB of free disk while installing and 4.4 GB after, and the internet once.', `PyTorch with CUDA will be installed for your ${GPU}.`],
+    lines: ['Not installed. Needs about 8 GB of free disk while installing, and the internet once.', `PyTorch with CUDA will be installed for your ${GPU}.`],
     buttons: ['Install Laya…'], log: [],
   })
   assert.deepEqual(seen(h, status({ ...bare, offer: { ...OFFER, gpu: null } })).lines, [
-    'Not installed. Needs about 3 GB of free disk while installing and 2 GB after, and the internet once.',
+    'Not installed. Needs about 3 GB of free disk while installing, and the internet once.',
     'No usable NVIDIA GPU found: Laya will run on the CPU. On a 4-core test machine that took about 20 s to route a task and about 10 s to review each attempt; this PC is not measured yet.',
   ])
   // A server that does not say what an install takes: the card says less, and guesses nothing.
@@ -102,7 +103,7 @@ test('every state has its own words and buttons, before and during an install', 
     lines: ['Installing, step 4 of 8: Installing PyTorch 2.14.0 for the GPU (CUDA 12.8) (1.2 GB of about 2.5 GB).', 'PyTorch 2.14.0 has no Windows wheel for cu130; trying cu128.'],
     buttons: ['Cancel'], log: [],
   })
-  assert.equal(seen(h, status({ installed: null, state: 'installing', install: { ...step4, step: 3, name: 'Getting Python 3.12', received: 0, total: 0, notes: [], startedAt: NOW - 3 * 60_000 } })).lines[0], 'Installing, step 3 of 8: Getting Python 3.12 (3 min).')
+  assert.equal(seen(h, status({ installed: null, state: 'installing', install: { ...step4, step: 3, name: 'Getting Python 3.12', received: 0, total: 0, notes: [], stepStartedAt: NOW - 3 * 60_000 } })).lines[0], 'Installing, step 3 of 8: Getting Python 3.12 (3 min).')
 
   // Failed: at which step and why, and the CPU is offered only when the GPU's PyTorch step failed.
   const failed4 = { ...step4, error: 'PyTorch 2.14.0 has no Windows wheel for cu130, cu128, cu126; the driver supports CUDA 12.8.', failedStep: 4, offerCpu: true, notes: [] }
@@ -117,6 +118,16 @@ test('every state has its own words and buttons, before and during an install', 
   assert.ok(seen(h, status({ state: 'ready', running: running(), install: update })).lines.includes('Update failed at step 5 (Installing Laya 0.3.24); still on Laya 0.3.20.'), 'and while the old Laya runs')
 })
 
+test('an install or update refused before its first step says why, never a step it did not reach', () => {
+  const h = helpers()
+  const refused = { step: 0, of: 8, name: null, received: 0, total: 0, error: 'Laya is deciding for an open Laya Auto run; stop that run first.', kind: 'update', failedStep: null, offerCpu: false, notes: [] }
+  const said = 'The update did not start: Laya is deciding for an open Laya Auto run; stop that run first.'
+  assert.deepEqual(seen(h, status({ state: 'ready', running: running({ held: ['run:42'] }), install: refused })).lines.slice(1), [said], 'beside the Laya that keeps running')
+  assert.deepEqual(seen(h, status({ state: 'install_failed', install: refused })).lines, [said])
+  const locked = { ...refused, kind: 'install', error: 'Another Laya install is running (pid 4242).' }
+  assert.deepEqual(seen(h, status({ installed: null, state: 'install_failed', install: locked })).lines, ['The install did not start: Another Laya install is running (pid 4242).'])
+})
+
 test('every state of an installed Laya has its own words and buttons: stopped, starting, running, restarting, failed, off', () => {
   const h = helpers()
   assert.deepEqual(seen(h, status()), {
@@ -126,9 +137,10 @@ test('every state of an installed Laya has its own words and buttons: stopped, s
   const cpu = status({ installed: { ...status().installed, torch: '2.14.0+cpu', cuda: false, gpu: null } })
   assert.equal(seen(h, cpu).lines[0], 'Installed, not running. Laya 0.3.20, English checkpoint 1a2b3c4, PyTorch 2.14.0+cpu (for the CPU).')
   // Why it stopped: the idle time, the resource budget, or a local model it gave its memory to.
-  assert.deepEqual(seen(h, status({ stoppedBecause: 'idle' })), { lines: ['Stopped after 30 min without a Laya Auto request. It starts again when Laya Auto needs it; the Jev Auto comparisons never start it.'], buttons: ['Start'], log: [] })
-  assert.deepEqual(seen(h, status({ stoppedBecause: 'budget', why: 'the RAM budget of 8 GB was over for 30 s with qwen3-8b and Laya loaded.' })), { lines: ['Stopped by the resource budget: the RAM budget of 8 GB was over for 30 s with qwen3-8b and Laya loaded.'], buttons: ['Start'], log: [] })
-  assert.deepEqual(seen(h, status({ stoppedBecause: 'yielded', why: 'qwen3-8b' })), { lines: ['Unloaded so qwen3-8b could have the GPU and RAM; it starts again when Laya Auto needs it.'], buttons: ['Start'], log: [] })
+  const STOPPED = ['Start', 'Test Laya', 'Remove…']
+  assert.deepEqual(seen(h, status({ stoppedBecause: 'idle' })), { lines: ['Stopped after 30 min without a Laya Auto request. It starts again when Laya Auto needs it; the Jev Auto comparisons never start it.'], buttons: STOPPED, log: [] })
+  assert.deepEqual(seen(h, status({ stoppedBecause: 'budget', why: 'the RAM budget of 8 GB was over for 30 s with qwen3-8b and Laya loaded.' })), { lines: ['Stopped by the resource budget: the RAM budget of 8 GB was over for 30 s with qwen3-8b and Laya loaded.'], buttons: STOPPED, log: [] })
+  assert.deepEqual(seen(h, status({ stoppedBecause: 'yielded', why: 'qwen3-8b' })), { lines: ['Unloaded so qwen3-8b could have the GPU and RAM; it starts again when Laya Auto needs it.'], buttons: STOPPED, log: [] })
   // A Laya an earlier session left running, stopped at start: said above the state's own line.
   assert.deepEqual(seen(h, status({ orphanStopped: { pid: 4321, ramGB: 3.1 } })).lines, [
     'Stopped a Laya left running by an earlier session (pid 4321, 3.1 GB RAM).',
@@ -171,6 +183,9 @@ test('every state of an installed Laya has its own words and buttons: stopped, s
   assert.deepEqual(seen(h, status({ state: 'restarting', why: 'exit code 3221225477', restart: { attempt: 1, of: 3, code: 3221225477, signal: null } })), {
     lines: ['Laya stopped unexpectedly (exit code 3221225477) and is restarting (attempt 1 of 3).'], buttons: ['Stop'], log: [],
   })
+  // Killed by a signal: named as a signal, never as an exit code.
+  assert.deepEqual(seen(h, status({ state: 'restarting', why: 'signal SIGKILL', restart: { attempt: 2, of: 3, code: null, signal: 'SIGKILL' } })).lines,
+    ['Laya stopped unexpectedly (signal SIGKILL) and is restarting (attempt 2 of 3).'])
   // Failed: the reason, the last log lines, Start and the log.
   assert.deepEqual(seen(h, status({ state: 'failed', why: 'laya.serve exited 4 times in 10 minutes (last: exit code 1)', logTail: ['Traceback (most recent call last):', 'RuntimeError: CUDA error'] })), {
     lines: ['Stopped after an error: laya.serve exited 4 times in 10 minutes (last: exit code 1). Laya Auto refuses messages until you press Start.'],
@@ -239,6 +254,49 @@ test('the words come from the real status() of a Laya sidecar, by the names stat
   assert.deepEqual(h.layaVersions(bad), [], 'and nothing else of Laya is offered')
 })
 
+test('pins that cannot be read send the person to Update-Harness.ps1, never to cordis.patch.yml, and a settings error beside them keeps its own remedy', () => {
+  const h = helpers()
+  const ENOENT = "ENOENT: no such file or directory, open 'C:\\Harness\\config\\laya.json'"
+  const pins = `Laya's pinned versions could not be read (${ENOENT}); run Update-Harness.ps1. Laya Auto is off until then.`
+  // As GET /jev-router/laya answers it: the pins apart from any error in the laya block (index.js).
+  const unread = status({ state: 'disabled', configError: null, pinsError: ENOENT })
+  assert.deepEqual(seen(h, unread), { lines: [pins], buttons: [], log: [] })
+  assert.equal(h.layaState(unread, NOW).lines[0].tone, 'err')
+  assert.deepEqual([h.layaNotes(unread, null), h.layaVersions(unread)], [[], []], 'and nothing else of Laya is offered')
+  const both = status({ state: 'disabled', configError: 'providers: laya.minTopMargin: 1.5 is above 1', pinsError: ENOENT })
+  assert.deepEqual(seen(h, both).lines, ['Laya settings error: providers: laya.minTopMargin: 1.5 is above 1. Fix jev-router laya in cordis.patch.yml; Laya Auto is off until then.', pins])
+})
+
+test('the card reads what the server really sends: what an install takes, from the installer; a step\'s minutes and each folder\'s size, from the real status()', async () => {
+  const h = helpers()
+  const { installOffer, layaPaths, readPins } = await import('../laya-install.js')
+  assert.equal(typeof installOffer, 'function', 'the installer says what an install takes')
+  // On a PC with an RTX 3050 whose driver runs CUDA 12.8: the shape the card is fed above.
+  const offer = installOffer(readPins(REPO), { gpus: [{ vendor: 'nvidia', name: GPU }], cuda: 12.8 })
+  assert.deepEqual(offer, OFFER)
+  const bare = status({ installed: null, state: 'not_installed', offer, paths: PATHS })
+  assert.equal(seen(h, bare).lines[0], 'Not installed. Needs about 8 GB of free disk while installing, and the internet once.')
+  assert.deepEqual(h.layaInstallDialog(bare, 'gpu').lines.slice(1), [
+    "Downloads once, then works offline: Python 3.12 (about 30 MB, GitHub), PyTorch 2.14.0 (about 2.5 GB, download.pytorch.org), Laya 0.3.20 and its libraries (about 100 MB, PyPI), and Laya's English model (0.8 to 1.7 GB, Hugging Face).",
+    'Needs about 8 GB of free disk while installing.',
+  ])
+  assert.equal(installOffer(readPins(REPO), null).gpu, null, 'with no NVIDIA GPU it installs for the CPU')
+  // A step with nothing to download says how long it has taken, from when the installer began it.
+  const sidecar = await layaSidecar(mkdtempSync(join(tmpdir(), 'laya-card-')))
+  sidecar.noteInstall({ kind: 'install', device: 'cpu', step: 5, of: 8, name: 'Installing Laya 0.3.20', received: 0, total: 0, error: null, lines: [], notes: [], startedAt: NOW - 9 * 60_000, stepStartedAt: NOW - 3 * 60_000, done: false })
+  assert.equal(seen(h, sidecar.status()).lines[0], 'Installing, step 5 of 8: Installing Laya 0.3.20 (3 min).')
+  await sidecar.dispose()
+  // Installed: the remove dialog names each folder's size.
+  const harnessDir = await installedLaya()
+  const paths = layaPaths({ harnessDir, dataDir: join(harnessDir, 'data') })
+  writeFileSync(join(paths.venv, 'torch.bin'), Buffer.alloc(3 * 1024 ** 2))
+  writeFileSync(join(paths.models, 'more.bin'), Buffer.alloc(2 * 1024 ** 2))
+  const installed = await layaSidecar(harnessDir)
+  const st = await waitFor('the folders are measured', () => installed.status(), (x) => typeof x.installed?.diskBytes === 'number')
+  await installed.dispose()
+  assert.equal(h.layaRemoveDialog({ ...st, paths: PATHS }).body, 'Stops Laya and deletes C:\\Harness\\engine\\laya (3 MB) and C:\\Harness\\models\\laya (2 MB). Your recorded comparisons and Laya samples are kept. Laya Auto leaves the model menu.')
+})
+
 test('a start the RAM budget or a GPU with no room turned down says so on the card, with its numbers, from the real status()', async () => {
   const h = helpers()
   const { readPins } = await import('../laya-install.js')
@@ -284,6 +342,24 @@ test('a start that has not launched Laya yet says it is getting ready, and names
   await sidecar.dispose()
   // Once launched, the device it loads on is named, as before.
   assert.equal(seen(h, status({ state: 'starting', running: running() })).lines[0], 'Starting: loading the model on the GPU (12 s; the last start took 41 s)…')
+})
+
+test('a Laya stopped for a reason, or under an update that failed, still offers Test Laya and Remove, and a failed update offers Start', async () => {
+  const h = helpers()
+  // The idle stop is the usual way Laya ends up stopped, and its reason stays until the next start.
+  for (const stoppedBecause of ['idle', 'budget', 'yielded']) assert.deepEqual(seen(h, status({ stoppedBecause, why: 'qwen3-8b' })).buttons, ['Start', 'Test Laya', 'Remove…'], stoppedBecause)
+  // The real status() of an update that failed while Laya was stopped: the old install is there.
+  const sidecar = await layaSidecar(await installedLaya())
+  const name = 'Installing Laya 0.3.24'
+  sidecar.noteInstall({ kind: 'update', step: 5, of: 8, name, received: 0, total: 0, error: 'uv pip install failed: no solution', failedStep: 5, failedName: name, offerCpu: false, lines: [], notes: [], startedAt: NOW, stepStartedAt: NOW, finishedAt: NOW, done: false })
+  const st = sidecar.status()
+  await sidecar.dispose()
+  assert.equal(st.state, 'install_failed')
+  assert.deepEqual(seen(h, st), { lines: ['Update failed at step 5 (Installing Laya 0.3.24); still on Laya 0.3.20.'], buttons: ['Try again', 'Show log', 'Start', 'Test Laya', 'Remove…'], log: [] })
+  assert.deepEqual(h.layaNotes(st, null).map((n) => n.text), ['Laya is not running, so Jev Auto records no comparisons now. Press Start, or turn on Start Laya when KzH starts and Keep Laya loaded.'])
+  // A failed first install has nothing to start.
+  const first = status({ installed: null, state: 'install_failed', install: { step: 6, of: 8, name: 'Downloading the Laya model from Hugging Face', error: 'No progress for 5 minutes.', kind: 'install', failedStep: 6, offerCpu: false, notes: [] } })
+  assert.deepEqual(seen(h, first).buttons, ['Try again', 'Show log'])
 })
 
 test('a Laya its warm-up measured is never called unmeasured when the server gives no time for a task', () => {
@@ -396,7 +472,7 @@ test('the switches say what they do and what Laya then holds, and the dialogs sa
     lines: [
       'Where: C:\\Harness\\engine\\laya (Python and PyTorch) and C:\\Harness\\models\\laya (the model).',
       "Downloads once, then works offline: Python 3.12 (about 30 MB, GitHub), PyTorch 2.14.0 (about 2.5 GB, download.pytorch.org), Laya 0.3.20 and its libraries (about 100 MB, PyPI), and Laya's English model (0.8 to 1.7 GB, Hugging Face).",
-      'Needs about 8 GB of free disk while installing and 4.4 GB after.',
+      'Needs about 8 GB of free disk while installing.',
     ],
     choices: [
       { value: 'gpu', label: `GPU: ${GPU} with CUDA 12.8 (speed not measured on this PC yet; Test Laya measures it after the install)` },
@@ -405,7 +481,7 @@ test('the switches say what they do and what Laya then holds, and the dialogs sa
   })
   assert.deepEqual(h.layaInstallDialog(bare, 'cpu').lines.slice(1), [
     "Downloads once, then works offline: Python 3.12 (about 30 MB, GitHub), PyTorch 2.14.0 (about 120 MB, PyPI), Laya 0.3.20 and its libraries (about 100 MB, PyPI), and Laya's English model (0.8 to 1.7 GB, Hugging Face).",
-    'Needs about 3 GB of free disk while installing and 2 GB after.',
+    'Needs about 3 GB of free disk while installing.',
   ])
   assert.deepEqual(h.layaInstallDialog({ ...bare, offer: { ...OFFER, gpu: null } }, 'cpu').choices.map((c) => c.value), ['cpu'], 'no GPU choice without a usable GPU')
   // A server that does not say what the PC has: both, and the installer falls back to the CPU itself.
@@ -488,12 +564,17 @@ function statefulReact() {
   return { React, mount }
 }
 
+/** A reply function's answer with a status code of its own, where a plain return is the body of a 200. */
+const answer = (code, body) => ({ answer: true, code, body })
+
 /**
  * The Laya card behind the routes of 8.4: GET /jev-router/laya answers `page.status`, the comparison
  * and the log answer what they are given, and every POST is recorded and answered by `replies`
- * (by path: a status code and a body, or a function run before answering). The polls never run by
- * themselves: `page.polls()` says how often each one the card has set would run, and
- * `page.poll(ms)` runs those set for every `ms` once.
+ * (by path: a status code and a body, or a function run before answering, which may return the body
+ * or `answer(code, body)`). The polls never run by themselves: `page.polls()` says how often each one
+ * the card has set would run, and `page.poll(ms)` runs those set for every `ms` once. `page.pressing`
+ * presses a button whose request stays on its way, and `{ inFlight }` lets the card settle with that
+ * many requests still unanswered.
  */
 async function card(st, { compare = null, replies = {}, logLines = [] } = {}) {
   const page = { status: st, posts: [], gets: [], asked: [] }
@@ -509,14 +590,19 @@ async function card(st, { compare = null, replies = {}, logLines = [] } = {}) {
       if (method === 'GET') {
         page.gets.push(path)
         if (path === '/jev-router/laya') body = page.status
-        else if (path === '/jev-router/laya/compare?days=7&identity=current') { body = compare ?? { error: 'not set up' }; code = compare ? 200 : 404 }
+        else if (path === '/jev-router/laya/compare?days=7&identity=current') {
+          if (compare?.answer === true) { code = compare.code; body = compare.body } else { body = compare ?? { error: 'not set up' }; code = compare ? 200 : 404 }
+        }
         else if (path === '/jev-router/laya/log?lines=200') body = { lines: logLines }
         else code = 404
       } else {
         const sent = JSON.parse(init.body)
         page.posts.push([path, sent])
         const r = replies[path]
-        if (typeof r === 'function') body = await r(sent) ?? { ok: true }
+        if (typeof r === 'function') {
+          const got = await r(sent)
+          if (got?.answer === true) { code = got.code; body = got.body } else body = got ?? { ok: true }
+        }
         else if (r) { code = r.code ?? 200; body = r.body ?? { ok: true } }
         else body = { ok: true }
       }
@@ -530,8 +616,8 @@ async function card(st, { compare = null, replies = {}, logLines = [] } = {}) {
   const { LayaCard } = loadPlugin(React, { fetch, document: { hidden: false }, setInterval, clearInterval }).__test
   assert.equal(typeof LayaCard, 'function', 'client.js has the Laya card')
   const view = mount(LayaCard, { ask: (c) => page.asked.push(c) })
-  page.settle = async () => {
-    for (let quiet = 0, until = Date.now() + 10_000; quiet < 2; quiet = !busy && !view.queued ? quiet + 1 : 0) {
+  page.settle = async ({ inFlight = 0 } = {}) => {
+    for (let quiet = 0, until = Date.now() + 10_000; quiet < 2; quiet = busy <= inFlight && !view.queued ? quiet + 1 : 0) {
       if (Date.now() > until) throw new Error('the card never settled')
       await new Promise((r) => setImmediate(r))
     }
@@ -546,9 +632,16 @@ async function card(st, { compare = null, replies = {}, logLines = [] } = {}) {
     await b.props.onClick()
     await page.settle()
   }
+  page.pressing = async (label, { inFlight = 1 } = {}) => {
+    const b = page.all().find((n) => n.type === 'button' && textOf(n) === label)
+    assert.ok(b, `a ${label} button (have: ${page.buttons().join(', ')})`)
+    b.props.onClick()
+    await page.settle({ inFlight })
+  }
+  page.button = (label) => page.all().find((n) => n.type === 'button' && textOf(n) === label)
   page.alerts = () => page.all().filter((n) => n.props.role === 'alert').map(textOf)
   page.polls = () => [...intervals.values()].map((t) => t.ms).sort((a, b) => a - b)
-  page.poll = async (ms) => { for (const t of [...intervals.values()]) if (t.ms === ms) t.f(); await page.settle() }
+  page.poll = async (ms, { inFlight = 0 } = {}) => { for (const t of [...intervals.values()]) if (t.ms === ms) t.f(); await page.settle({ inFlight }) }
   page.input = (id) => page.all().find((n) => (n.type === 'input' || n.type === 'select') && n.props.id === id)
   page.close = () => view.unmount()
   return page
@@ -680,33 +773,33 @@ test('the switches save what they say, the idle time only while Laya is not kept
   strict.close()
 })
 
-test('Try again after a failed install asks for the device again when the status does not say which the install was for, and never guesses the GPU', async () => {
-  // The real status() of a failed first install the person started for the CPU: the job knew its
-  // device, and the status carries none.
+test('Try again after a failed install installs again for the device the real status says it was for, and asks when a status does not say, never guessing the GPU', async () => {
+  // The real status() of a failed first install the person started for the CPU carries its device.
   const sidecar = await layaSidecar(mkdtempSync(join(tmpdir(), 'laya-card-')))
   const name = 'Downloading the Laya model from Hugging Face'
-  sidecar.noteInstall({ kind: 'install', device: 'cpu', step: 6, of: 8, name, received: 0, total: 0, error: `No progress for 5 minutes while ${name}.`, failedStep: 6, failedName: name, offerCpu: false, lines: [], notes: [], startedAt: NOW, finishedAt: NOW, done: false })
+  sidecar.noteInstall({ kind: 'install', device: 'cpu', step: 6, of: 8, name, received: 0, total: 0, error: `No progress for 5 minutes while ${name}.`, failedStep: 6, failedName: name, offerCpu: false, lines: [], notes: [], startedAt: NOW, stepStartedAt: NOW, finishedAt: NOW, done: false })
   const st = sidecar.status()
   await sidecar.dispose()
   assert.equal(st.state, 'install_failed')
-  for (const offer of [undefined, OFFER]) {
-    const page = await card({ ...st, offer })
-    await page.press('Try again')
-    assert.deepEqual(page.posts, [], 'nothing is installed for a device nobody chose')
-    const dialog = page.all().find((n) => n.props.role === 'dialog')
-    assert.ok(dialog, 'the install dialog asks again')
-    nodes(dialog).find((n) => n.type === 'input' && n.props.value === 'cpu').props.onChange()
-    await page.settle()
-    await page.press('Install')
-    assert.deepEqual(page.posts, [['/jev-router/laya/install', { device: 'cpu' }]], 'for the one the person picks')
-    page.close()
-  }
-  // A status that says which device the install was for is tried again for that one, at once.
-  const page = await card({ ...st, install: { ...st.install, device: 'cpu' }, offer: OFFER })
+  assert.equal(st.install.device, 'cpu')
+  const page = await card({ ...st, offer: OFFER })
   await page.press('Try again')
   assert.deepEqual(page.posts, [['/jev-router/laya/install', { device: 'cpu' }]])
   assert.ok(!page.all().some((n) => n.props.role === 'dialog'))
   page.close()
+  // A status that does not say which device (as from a server before it did) asks again.
+  for (const offer of [undefined, OFFER]) {
+    const asked = await card({ ...st, install: { ...st.install, device: null }, offer })
+    await asked.press('Try again')
+    assert.deepEqual(asked.posts, [], 'nothing is installed for a device nobody chose')
+    const dialog = asked.all().find((n) => n.props.role === 'dialog')
+    assert.ok(dialog, 'the install dialog asks again')
+    nodes(dialog).find((n) => n.type === 'input' && n.props.value === 'cpu').props.onChange()
+    await asked.settle()
+    await asked.press('Install')
+    assert.deepEqual(asked.posts, [['/jev-router/laya/install', { device: 'cpu' }]], 'for the one the person picks')
+    asked.close()
+  }
 })
 
 test('the status is read every 5 s, every 1.5 s while Laya moves, and a read never puts the saved idle time back over one being typed', async () => {
@@ -761,6 +854,48 @@ test('the status is read every 5 s, every 1.5 s while Laya moves, and a read nev
   assert.deepEqual(strict.alerts(), ['Unload after idle: whole minutes 1-240'])
   assert.equal(strict.input('jevi-laya-idle').props.value, '30')
   strict.close()
+})
+
+test('a comparison the server could not work out is said under the switches, and one there is none of says nothing', async () => {
+  const failing = await card(status({ state: 'ready', running: running() }), { compare: answer(500, { error: 'the comparison worker exited with code 1' }) })
+  assert.ok(failing.text().includes('The comparisons could not be read: the comparison worker exited with code 1.'), failing.text())
+  failing.close()
+  const none = await card(status({ state: 'ready', running: running() }), { compare: answer(404, { error: 'Laya cannot be asked on this PC, and nothing has been compared' }) })
+  assert.ok(!none.text().includes('could not be read'), none.text())
+  none.close()
+})
+
+test('Stop stays pressable while a start from the card loads the model, the card follows the start at once, and the start Stop ended is no error of its own', async () => {
+  let startAnswered
+  const page = await card(status(), {
+    replies: {
+      // The server answers Start once the model has loaded, which can take minutes.
+      '/jev-router/laya/start': () => new Promise((r) => { startAnswered = r }),
+      // Stop ends the start, which the server then answers as stopped.
+      '/jev-router/laya/stop': () => { page.status = status(); startAnswered(answer(400, { error: 'it was stopped' })) },
+    },
+  })
+  assert.deepEqual(page.polls(), [5000, 60_000])
+  await page.pressing('Start')
+  assert.deepEqual(page.polls(), [1500, 60_000], 'the status is read every 1.5 s while the start is on its way')
+  page.status = status({ state: 'starting', running: running() })
+  await page.poll(1500, { inFlight: 1 })
+  assert.ok(page.text().includes('Starting: loading the model on the GPU'), page.text())
+  assert.equal(page.button('Stop').props.disabled, false, 'Stop can end the start')
+  assert.equal(page.button('Repair').props.disabled, true, 'while nothing else can be pressed')
+  await page.press('Stop')
+  assert.deepEqual(page.posts, [['/jev-router/laya/start', {}], ['/jev-router/laya/stop', {}]])
+  assert.deepEqual(page.alerts(), [], 'the start that Stop ended says nothing of its own')
+  assert.deepEqual(page.buttons(), ['Start', 'Test Laya', 'Remove…', 'Check for a newer model', 'Repair'])
+  assert.ok(page.all().filter((n) => n.type === 'button').every((b) => !b.props.disabled), 'and every button can be pressed again')
+  assert.deepEqual(page.polls(), [5000, 60_000])
+  // Test Laya on a stopped Laya starts it too, and Stop can end that start the same way.
+  const tested = await card(status(), { replies: { '/jev-router/laya/selftest': () => new Promise(() => {}) } })
+  await tested.pressing('Test Laya')
+  tested.status = status({ state: 'starting', running: running() })
+  await tested.poll(1500, { inFlight: 1 })
+  assert.equal(tested.button('Stop').props.disabled, false)
+  page.close(); tested.close()
 })
 
 test('the Jev router card says where Jev calls go, and when TYPESAFE_BASE_URL sends them elsewhere', async () => {

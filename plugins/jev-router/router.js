@@ -13,7 +13,7 @@ import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { createReview } from '../jev-review/index.js'
 import { kindOf, marginalCostOf } from './accounts.js'
-import { decidedBy, deviceName } from './adapter.js'
+import { decidedBy, deviceName, timeoutSize } from './adapter.js'
 import { CHARS_PER_TOKEN, eligible, rank } from './capabilities.js'
 import { NO_CANDIDATES, contextEstimate } from './decision.js'
 import { effortFamily, toAgentEffort } from './effort.js'
@@ -527,8 +527,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   let deciderMs = 0
   // The Laya client's timeout names only its deadline in the message and carries the call's size
   // and device beside it (docs/laya-auto.md 3.5, 4.5); the report says all three, as 3.3 writes it.
-  const sizeOf = (err) => (err?.code === 'LAYA_TIMEOUT' && Number.isInteger(err.questions) && err.device ? ` (${err.questions} questions on the ${deviceName(err.device)})` : '')
-  const reasonOf = (err) => redactSecrets(`${String(err?.message ?? err)}${sizeOf(err)}`).slice(0, 300)
+  const reasonOf = (err) => redactSecrets(`${String(err?.message ?? err)}${timeoutSize(err)}`).slice(0, 300)
   const watch = (d) => ({
     ...d,
     route: async (...args) => {

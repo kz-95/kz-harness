@@ -13,6 +13,7 @@
 // `runSelfTest(systemOne)` runs Test Laya over any client of that shape, the real Laya client
 // included. The result gates nothing; it is shown on the Laya card.
 import { TypeSafeClient } from '@typesafe-ai/sdk'
+import { eligibleStrategies } from './broker.js'
 import { CAPABILITIES } from './capabilities.js'
 import { createJev } from './jev.js'
 import { LAYA_MODEL, mergeLaya, normalizeLayaAnswers, renderForLaya } from './laya-questions.js'
@@ -106,6 +107,23 @@ const route = ({ task, context = CONTEXT, handoff, tools }) => built('route', (j
 }))
 
 const intent = (message) => built('intent', (jev) => jev.intent({ message }))
+
+/**
+ * The resource and judgments call a task's routing sends once its pool exists (decision.js
+ * askJev('resource')): the strategy over what the review's three candidates can run, and the second
+ * opinion, with the task's profile as the numbers decision.js hands over.
+ */
+const resource = ({ task, taskProfile }) => built('route', (jev) => jev.route({
+  task, taskProfile, candidates: DECISION.candidates, strategies: eligibleStrategies({ candidates: DECISION.candidates }),
+  ask: { task: false, resource: true, judgments: true },
+}))
+
+/** The numbers of the rename's profile, as decision.js profileNumbers hands them to the resource call. */
+const RENAME_PROFILE = {
+  complexity: 0.25, risk: 0.25, needsSecondOpinion: 0.2, needsHumanReview: 0.1, needsTests: 0.8,
+  req_general_reasoning: 0.25, req_architecture: 0, req_planning: 0, req_explanation: 0, req_coding: 0.75,
+  req_debugging: 0, req_security_review: 0, req_code_review: 0.25, req_testing: 0.5, req_long_context: 0,
+}
 
 /** One question of a built call, alone, with the call's full state. */
 const only = (call, name) => ({ phase: call.phase, state: call.state, questions: { [name]: call.questions[name] } })
@@ -206,15 +224,35 @@ function maximalCalls() {
   ]
 }
 
+/**
+ * The calls one routed task sends, in the order decision.js sends them: the intent, the task group
+ * and the resource and judgments call. Test Laya sends the first two among its protocol calls, and
+ * never the third, which only a pool of candidates asks.
+ */
+function taskCallsOf(protocol) {
+  const of = (name) => protocol.find((c) => c.name === name)
+  return [of('intent.task'), of('route'), { name: 'route.resource', ...resource({ task: RENAME, taskProfile: RENAME_PROFILE }) }]
+}
+
 let cache = null
 /** Every fixed call, built once on first use: importing this module builds nothing. */
 function calls() {
-  cache ??= { protocol: protocolCalls(), pairs: pairCalls(), maximal: maximalCalls() }
+  if (!cache) {
+    const protocol = protocolCalls()
+    cache = { protocol, pairs: pairCalls(), maximal: maximalCalls(), task: taskCallsOf(protocol) }
+  }
   return cache
 }
 
 /** Test Laya's calls: the protocol calls and the seven yes/no pairs. */
 export const selfTestCalls = () => ({ protocol: calls().protocol, pairs: calls().pairs })
+
+/**
+ * What routing one task sends Laya: its intent, its task group and its resource and judgments call,
+ * each `{ name, phase, state, questions }`. The picker's figure for routing a task is their measured
+ * cost together (docs/laya-auto.md 3.1).
+ */
+export const taskCalls = () => calls().task
 
 /**
  * What a fresh start sends before it counts as ready (7.5): always Test Laya's two intent probes,

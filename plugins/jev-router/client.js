@@ -45,10 +45,11 @@ window.__ModuleLoader__.load({
     let workspaceFiles
 
     // ---------- helpers ----------
+    // A refusal carries the route's status, so a caller can tell "nothing here" (404) from a failure.
     const api = async (path, init) => {
       const r = await fetch(path, { credentials: 'same-origin', ...init, headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) } })
       const body = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error(body.error ?? `HTTP ${r.status}`)
+      if (!r.ok) throw Object.assign(new Error(body.error ?? `HTTP ${r.status}`), { status: r.status })
       return body
     }
     const ms = (n) => (n == null ? '-' : n < 1000 ? `${Math.round(n)} ms` : `${(n / 1000).toFixed(1)} s`)
@@ -1231,10 +1232,13 @@ window.__ModuleLoader__.load({
       const attempts = starts.map((s) => ({ ...s, end: ends.find((x) => x.index === s.index)?.attempt, review: reviews.find((x) => x.index === s.index)?.assessment }))
       const toolMs = attempts.filter((a) => a.role === 'tool').reduce((t, a) => t + (a.end?.durationMs ?? 0), 0)
       const agentMs = attempts.filter((a) => a.role !== 'tool').reduce((t, a) => t + (a.end?.durationMs ?? 0), 0)
-      const jevMs = traces.reduce((t, x) => t + x.ms, 0)
+      // The decider's time is every call's, those that failed included: a call that timed out
+      // spent its whole deadline, and leaving it out would read as the decider taking no time.
+      const failedCalls = calls.filter((c) => c.failed)
+      const jevMs = traces.reduce((t, x) => t + x.ms, 0) + failedCalls.reduce((t, c) => t + (c.failed.error?.ms ?? c.failed.ms ?? 0), 0)
       const q = traces.flatMap((t) => t.questions)
       return {
-        running, final, error, routed, traces, calls, attempts, jevMs, toolMs, agentMs,
+        running, final, error, routed, traces, calls, attempts, jevMs, failedCalls: failedCalls.length, toolMs, agentMs,
         // Who answered this run's routing and review questions: its routing says, else its first call.
         decider: routed?.routing ? deciderOf(routed.routing) : traces[0]?.provider ?? calls[0]?.failed?.error?.provider ?? 'jev',
         endedAt: running ? null : last?.at ?? first,
@@ -1249,7 +1253,7 @@ window.__ModuleLoader__.load({
     function Stats({ s }) {
       const tile = (label, value, sub) => h('div', { className: 'stat' }, h('small', null, label), h('b', null, value), sub ? h('small', null, sub) : null)
       return h('div', { className: 'stats' },
-        tile(deciderName(s.decider), ms(s.jevMs)),
+        tile(deciderName(s.decider), ms(s.jevMs), s.failedCalls ? `${s.failedCalls} call${s.failedCalls === 1 ? '' : 's'} failed` : null),
         s.toolMs ? tile('Tool', ms(s.toolMs)) : tile('Agents', ms(s.agentMs)),
         tile('Total', ms(s.total), s.running ? 'running…' : null),
         tile('Questions', `${s.used}/${s.questions}`, `${s.tokIn} in / ${s.tokOut} out tok`))
@@ -1271,11 +1275,13 @@ window.__ModuleLoader__.load({
       // A run Laya decided names Laya (3.2), and offline Laya still decides, over the local agents.
       const decider = deciderOf(R)
       const who = deciderName(decider)
-      const picked = R.mode === 'jev' || (R.mode === 'local' && decider !== 'jev')
-      const pickLine = decider === 'jev' ? `Jev picked ${movesOf(R)[0]?.from ?? R.primaryAgent} (confidence ${pct(R.agentConfidence)})` : `${who} picked ${movesOf(R)[0]?.from ?? R.primaryAgent} (confidence ${pct(R.agentConfidence)})`
+      // A decider picked over the whole pool ('jev') or over the local agents alone ('local': Jev
+      // Auto · Local, or Laya Auto offline); only the offline fixed rule, the fallback and a forced
+      // agent picked without one.
+      const picked = R.mode === 'jev' || R.mode === 'local'
       const line = s.routed.tool
         ? `${who} picked tool ${s.routed.tool} (fits ${pct(R.toolFits)}, args ${pct(R.toolArgConfidence)}); no LLM needed`
-        : picked ? pickLine
+        : picked ? `${who} picked ${movesOf(R)[0]?.from ?? R.primaryAgent} (confidence ${pct(R.agentConfidence)})`
           : R.mode === 'manual' ? `You forced ${R.primaryAgent}` : `${who} unavailable (${R.reason}); default agent ${movesOf(R)[0]?.from ?? R.primaryAgent}`
       const rows = []
       if (picked) {
@@ -1395,19 +1401,24 @@ window.__ModuleLoader__.load({
     // as adapter.js FILLED_BY_RULES names them for its live line (the page cannot import it), and
     // the review's agent picks (pickOther) and the intent's depth (the cheap default). Every other
     // flat answer is kept as answered and simply falls under its bar: a yes/no, the disposition, a
-    // tool pick and its arguments.
-    const FILLED_BY_RULES = new Set(['taskType', 'complexity', 'risk', 'skill', 'minimumCapability', 'preferredCapability', 'capability', 'strategy', 'secondOpinion', 'reviewAgent', 'retryAgent', 'depth'])
+    // tool pick and its arguments. The second opinion is filled only on the judgments call, which
+    // asks it for its own domain; the one a task-group call carries is the profile's, kept as answered.
+    const FILLED_BY_RULES = new Set(['taskType', 'complexity', 'risk', 'skill', 'minimumCapability', 'preferredCapability', 'capability', 'strategy', 'reviewAgent', 'retryAgent', 'depth'])
+    // The questions of the resource and judgments call; any other one makes a route call a task-group call.
+    const RESOURCE_CALL = new Set(['strategy', 'secondOpinion'])
+    /** Whether a route call asked the task group, as adapter.js and shadow.js groupsOf read it. */
+    const taskGroupCall = (t) => t?.phase === 'route' && (t.questions ?? []).some((q) => !RESOURCE_CALL.has(q.name))
     /**
      * The pills an answer carries by its own marks, never by its question's name: Laya picks the
      * temperature bucket by option count, so any question asked with that many options can be
      * re-tempered, and none other is (4.3). A flat answer says whether the rules filled it or it
-     * was kept as answered.
+     * was kept as answered; `taskGroup` says the answer's call was a task-group route call.
      */
-    const answerPills = (q) => {
+    const answerPills = (q, { taskGroup = false } = {}) => {
       const out = []
       if (q?.corrected === true) out.push(['warn', `uncalibrated (${Object.keys(q.probabilities ?? q.options ?? {}).length} options)`])
       if (q?.informative === false) {
-        const filled = FILLED_BY_RULES.has(q.name) || String(q.name).startsWith('req.')
+        const filled = FILLED_BY_RULES.has(q.name) || String(q.name).startsWith('req.') || (q.name === 'secondOpinion' && !taskGroup)
         out.push(['warn', filled ? 'too flat, filled by rules' : 'too flat, kept as answered'])
       }
       return out
@@ -1440,14 +1451,19 @@ window.__ModuleLoader__.load({
      * A call that did not answer (the live event `'decider-error'`): who, which call, how long and
      * why, and no questions. Its `error` is what createJev hands onError, `{ phase, callId, provider,
      * ms, error }`; the same fields on the event itself are read too, as adapter.js line() reads them.
+     * A Laya call that timed out also says how many questions it asked and where, as the live line
+     * and the report do (3.3).
      */
     const failedCall = (e) => {
       const x = e?.error ?? {}
+      const of = (k) => x.error?.[k] ?? x[k] ?? e?.[k]
       const provider = x.provider ?? e?.provider ?? 'jev'
       const phase = x.phase ?? e?.phase ?? 'call'
+      const questions = of('questions')
+      const size = of('code') === 'LAYA_TIMEOUT' && Number.isInteger(questions) && of('device') ? ` (${questions} questions on the ${deviceWord(of('device'))})` : ''
       return {
         head: `${deciderName(provider)} · ${PHASE_WORDS[phase] ?? phase}`,
-        text: `failed after ${Math.round(x.ms ?? e?.ms ?? 0)} ms: ${x.error?.message ?? x.message ?? e?.message ?? 'no reason given'}`,
+        text: `failed after ${Math.round(x.ms ?? e?.ms ?? 0)} ms: ${of('message') ?? 'no reason given'}${size}`,
       }
     }
 
@@ -1462,25 +1478,34 @@ window.__ModuleLoader__.load({
     }
     /** Whether two answers agree, by the comparison's own rule (shadow-stats.js): the same pick, the same side of 0.5, the same level. */
     const shadowAgrees = (type, j, l) => (type === 'choice' ? j === l : type === 'noul' ? (j >= 0.5) === (l >= 0.5) : type === 'score' ? Math.round(j) === Math.round(l) : false)
-    /** Laya's answer as the column shows it: the pick and its probability, P(true) for a yes/no. */
-    const shadowAnswer = (l) => (l.type === 'noul' ? pct(l.answer)
-      : l.type === 'score' ? `${Number(l.answer).toFixed(2)} of ${(l.p?.length ?? 1) - 1} (${pct(l.confidence)})`
-        : `${l.answer ?? 'no answer'} (${pct(l.confidence)})`)
+    /**
+     * Laya's answer as the column shows it: the pick and its probability, P(true) for a yes/no. A
+     * tool parameter's pick is recorded as its option's index (`#1`, 5.3), and is shown as the option
+     * it names, read through the question's own option keys (`keys`, in the order it asked them).
+     */
+    const shadowAnswer = (l, keys = null) => {
+      if (l.type === 'noul') return pct(l.answer)
+      if (l.type === 'score') return `${Number(l.answer).toFixed(2)} of ${(l.p?.length ?? 1) - 1} (${pct(l.confidence)})`
+      const index = /^#(\d+)$/.exec(String(l.answer ?? ''))
+      const pick = index && keys?.[Number(index[1])] !== undefined ? keys[Number(index[1])] : l.answer
+      return `${pick ?? 'no answer'} (${pct(l.confidence)})`
+    }
     const shadowMarkOf = (row) => (row.status === 'skipped' ? SHADOW_SKIPS[row.reason] ?? `skipped: ${String(row.reason).replace(/_/g, ' ')}` : 'failed')
     /**
      * The Laya column of one question of a Jev call (5.6): Laya's answer beside Jev's, and whether
      * the two agree, from the shadow row of that call (5.3), which holds both sides as recorded.
      * No row yet is `waiting for Laya` only while one can still land (`waiting`); otherwise the
      * question has no Laya column at all. A row that was skipped or failed marks every question.
+     * `keys` are the question's option keys, for a tool parameter recorded by index.
      */
-    const shadowCell = (name, row, { waiting = false } = {}) => {
+    const shadowCell = (name, row, { waiting = false, keys = null } = {}) => {
       if (!row) return waiting ? { text: null, mark: 'waiting for Laya' } : null
       if (row.status === 'skipped' || row.status === 'failed') return { text: null, mark: shadowMarkOf(row) }
       const l = row.laya?.questions?.[name]
       // A partial row is one whose remaining chunks waited too long behind acting calls.
       if (!l) return { text: null, mark: row.status === 'partial' ? SHADOW_SKIPS.too_old : 'failed' }
       const j = row.jev?.questions?.[name]
-      return { text: shadowAnswer(l), mark: j && j.type === l.type ? (shadowAgrees(l.type, j.answer, l.answer) ? 'agrees' : 'differs') : null, flat: l.informative === false }
+      return { text: shadowAnswer(l, keys), mark: j && j.type === l.type ? (shadowAgrees(l.type, j.answer, l.answer) ? 'agrees' : 'differs') : null, flat: l.informative === false }
     }
     /**
      * The shadow's header on a Jev call's card (5.6): how many of its questions Laya answered and
@@ -1648,8 +1673,8 @@ window.__ModuleLoader__.load({
     /**
      * The comparison of Jev and Laya over the last 7 days, for the current Laya identity (8.4):
      * computed on the server in a worker and cached there for a minute, so it is read once a minute
-     * while the Router tab is open. A server with Laya not set up answers with an error, and the
-     * card then shows nothing.
+     * while the Router tab is open. A PC where Laya cannot be asked and nothing was ever compared
+     * answers 404, and the card then shows nothing; any other failure is said where the card would be.
      */
     function useLayaCompare(visible, every = 60_000) {
       const [state, setState] = useState({ data: null, error: '' })
@@ -1658,7 +1683,7 @@ window.__ModuleLoader__.load({
         let stop = false
         let timer
         const tick = async () => {
-          try { const d = await api('/jev-router/laya/compare?days=7&identity=current'); if (!stop) setState({ data: d, error: '' }) } catch (e) { if (!stop) setState({ data: null, error: e.message }) }
+          try { const d = await api('/jev-router/laya/compare?days=7&identity=current'); if (!stop) setState({ data: d, error: '' }) } catch (e) { if (!stop) setState({ data: null, error: e.status === 404 ? '' : e.message }) }
           if (!stop) timer = setTimeout(tick, every)
         }
         tick()
@@ -1681,7 +1706,8 @@ window.__ModuleLoader__.load({
       const cell = (x) => h('td', null, x)
       const person = (p) => (p?.n ? `${p.jevRight} / ${p.layaRight} of ${p.n}` : 'none yet')
       const contradicted = (c) => (c?.n ? `${c.layaRight} of ${c.n}` : 'none yet')
-      const failedRuns = (r) => (r?.runs ? `${r.failed} of ${r.runs}` : 'none yet')
+      // A domain no outcome of a run can fault (the task type, the skill) says so, never 0 failed.
+      const failedRuns = (r) => (!r?.runs ? 'none yet' : r.failed == null ? `not measured (${r.runs} ${r.runs === 1 ? 'run' : 'runs'})` : `${r.failed} of ${r.runs}`)
       const domains = (data.domains ?? []).map((d) => h('tr', { key: d.domain },
         h('th', { scope: 'row' }, cmpWords(d.domain)), cell(String(d.layaAnswered ?? 0)), cell(cmpAgree(d.agree?.informative)),
         cell(person(d.personSaid)), cell(contradicted(d.whereJevWasContradicted)), cell(failedRuns(d.layaAutoRuns))))
@@ -1694,7 +1720,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'label', id: 'jevi-cmp-h' }, 'Jev and Laya, side by side'),
         h('div', { className: 'why', style: { margin: '0 0 8px' } }, `From the calls Laya answered in the background in Jev Auto, and the runs Laya decided in Laya Auto. ${identityWords(data.identity)} Agreement is not accuracy, and outcomes are counted only where they can judge: see each column.`),
         table(['Domain', 'Laya answered', 'Agrees with Jev (informative only)', 'A person said (Jev right / Laya right)', "Where Jev's pick was contradicted (Laya had it right)", 'Laya Auto runs that failed'], domains),
-        h('div', { className: 'why', style: { marginTop: 4 } }, "A person said: the rows a person labelled, the least biased. Where Jev's pick was contradicted: rows that exist only because Jev's pick went wrong, so they say how often Laya would have had it right there, never Laya's accuracy. Laya Auto runs that failed: a failure rate of the runs Laya decided, never an accuracy."),
+        h('div', { className: 'why', style: { marginTop: 4 } }, "A person said: the rows a person labelled, the least biased. Where Jev's pick was contradicted: rows that exist only because Jev's pick went wrong, so they say how often Laya would have had it right there, never Laya's accuracy. Laya Auto runs that failed: a failure rate of the runs Laya decided, never an accuracy; a review counts as failed only when the person disliked what it accepted or another agent's review did not accept it, and a task type or a skill is judged only by what a person said, so it is not measured there."),
         ...fields.map((d) => h('div', { className: 'why', key: `f${d.domain}` }, `${cmpWords(d.domain)}, profile fields that agree with Jev: ${Object.entries(d.fieldAgreement).map(([k, v]) => `${k} ${pct(v)}`).join(', ')}`)),
         table(['Question', 'Compared', 'Agree', 'Agree, informative only', 'Mean difference', 'Laya median ms'], questions),
         h('div', { className: 'label', style: { margin: '10px 0 4px' } }, 'Would it have acted the same'),
@@ -1766,7 +1792,9 @@ window.__ModuleLoader__.load({
           h('div', { className: 'label', style: { margin: 0 } }, data.learning ? 'The router is learning from every routed task' : 'Learning is switched off: Jev and the rules in code decide, and nothing is recorded'),
           h('button', { onClick: onRefresh, disabled: busy }, busy ? 'Reading…' : 'Refresh')),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'Routing domains'), ...domains),
-        h(LayaCompare, { data: laya?.data ?? null }),
+        laya?.error
+          ? h('div', { className: 'card' }, h('div', { className: 'label' }, 'Jev and Laya, side by side'), h('div', { className: 'err', role: 'alert' }, `The comparison could not be read: ${laya.error}`))
+          : h(LayaCompare, { data: laya?.data ?? null }),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'Resources, as the provider adapters report them'), h('ul', { className: 'plain' }, ...resources)),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'What each resource is believed to be good at'),
           h('div', { className: 'why', style: { margin: '4px 0 8px' } }, 'Priors are the owner\'s starting observations. Recorded runs, reviews and feedback move them; an unknown dimension stays unknown.'),
@@ -1774,7 +1802,7 @@ window.__ModuleLoader__.load({
     }
 
     /** One answer of a call. `shadow` is Laya's answer to the same question in Jev Auto (shadowCell), or null. */
-    function Question({ q, shadow = null }) {
+    function Question({ q, shadow = null, taskGroup = false }) {
       const probs = q.probabilities ?? {}
       const opts = q.type === 'noul'
         ? [['yes', 'Probability the answer is yes', q.answer]]
@@ -1784,7 +1812,7 @@ window.__ModuleLoader__.load({
       return h('details', { className: cx('q', !q.used && 'unused') },
         h('summary', null,
           h('div', null, h('span', { className: 'pill' }, q.type), h('code', { style: { marginLeft: 6 } }, q.name), q.used ? h('span', { className: 'pill ok' }, 'used') : null,
-            ...answerPills(q).map(([tone, text]) => h('span', { className: cx('pill', tone), key: text }, text))),
+            ...answerPills(q, { taskGroup }).map(([tone, text]) => h('span', { className: cx('pill', tone), key: text }, text))),
           h('div', { className: 'ans' }, '→ ', answer, q.type === 'choice' && q.options?.[q.answer] ? h('span', { className: 'muted', style: { fontWeight: 400 } }, ` ${q.options[q.answer]}`) : null),
           shadow ? h('div', { className: 'why shadow' }, 'Laya: ', shadow.text ?? '', shadow.flat ? ' (too flat to use)' : '',
             shadow.mark ? h('span', { className: cx('pill', markTone(shadow.mark)) }, shadow.mark) : null) : null),
@@ -1825,7 +1853,7 @@ window.__ModuleLoader__.load({
           ...card.notes.map((n, k) => h('div', { className: 'warnline', key: `n${k}` }, n)),
           ...(compared ? shadowHeader(t.questions.map((q) => q.name), row, { waiting }) : []).map((line, k) => h('div', { className: 'why', key: `s${k}` }, line)),
           h('div', { style: { marginTop: 8 } }),
-          ...qs.map((q) => h(Question, { key: q.name, q, shadow: compared ? shadowCell(q.name, row, { waiting }) : null })))
+          ...qs.map((q) => h(Question, { key: q.name, q, taskGroup: taskGroupCall(t), shadow: compared ? shadowCell(q.name, row, { waiting, keys: Object.keys(q.options ?? q.probabilities ?? {}) }) : null })))
       }))
     }
 
@@ -2094,7 +2122,9 @@ window.__ModuleLoader__.load({
         return {
           key: `r${r.id}`, at: r.startedAt ?? 0, status, title: r.task, kind: deciderName(s.decider),
           meta: [cur ? `${cur.agent} (${cur.role})` : s.routed?.routing?.primaryAgent ?? 'routing…', s.final ? STATUS[s.final.status]?.[1] ?? s.final.status : null, ms(s.total)].filter(Boolean).join(' · '),
-          body: h('div', { className: 'answer-text', 'aria-live': status === 'running' ? 'polite' : undefined }, r.events.map((e) => e.text ?? e.type).join('\n')),
+          // The run's own lines: Laya's shadow rows in the same log (5.3) are for the Decisions tab,
+          // and nothing else of the shadow reaches the live stream (3.3).
+          body: h('div', { className: 'answer-text', 'aria-live': status === 'running' ? 'polite' : undefined }, r.events.filter((e) => e.type !== 'shadow').map((e) => e.text ?? e.type).join('\n')),
           stop: status === 'running' && { what: r.task, run: () => post('/jev-router/runs/stop', { runId: r.id }) },
         }
       })
@@ -3330,8 +3360,9 @@ window.__ModuleLoader__.load({
       // A run Laya decided names Laya (3.2), offline too; an old record without `decider` was Jev's.
       const decider = deciderOf(R)
       const conf = Number.isFinite(R.agentConfidence) ? ` (confidence ${pct(R.agentConfidence)})` : ''
-      const line = R.mode === 'jev' || (R.mode === 'local' && decider !== 'jev')
-        ? (decider === 'jev' ? `Jev picked ${movesOf(R)[0]?.from ?? R.primaryAgent ?? '?'}${conf}` : `${deciderName(decider)} picked ${movesOf(R)[0]?.from ?? R.primaryAgent ?? '?'}${conf}`)
+      // As the live run says it (WhatHappened): a decider picked over the whole pool or the local agents.
+      const line = R.mode === 'jev' || R.mode === 'local'
+        ? `${deciderName(decider)} picked ${movesOf(R)[0]?.from ?? R.primaryAgent ?? '?'}${conf}`
         : R.mode === 'manual' ? `You forced ${R.primaryAgent ?? '?'}` : `Mode ${R.mode ?? '?'}`
       return h('div', { className: 'card' },
         h('div', { className: 'label' }, 'Stored run record'),
@@ -3483,6 +3514,8 @@ window.__ModuleLoader__.load({
       start: 'Start', stop: 'Stop', restart: 'Restart', gpu: 'Restart on the GPU', test: 'Test Laya', remove: 'Remove…',
       weightsCheck: 'Check for a newer model', weightsApply: 'Use the newer model', repair: 'Repair', update: 'Update Laya',
     }
+    /** The buttons that end what is under way, pressable while another action waits on the server. */
+    const LAYA_ENDS = new Set(['stop', 'cancel'])
     const layaDevice = (device) => (device === 'cuda' || device === 'gpu' ? 'GPU' : 'CPU')
     /** Seconds as the model menu says them (adapter.js): one decimal under ten, whole above. */
     const layaSeconds = (ms) => { const s = ms / 1000; return String(s >= 10 ? Math.round(s) : Math.round(s * 10) / 10) }
@@ -3492,6 +3525,11 @@ window.__ModuleLoader__.load({
     const torchCuda = (torch) => { const m = /\+cu(\d+)(\d)$/.exec(String(torch ?? '')); return m ? `${m[1]}.${m[2]}` : null }
     const commit7 = (c) => (c ? String(c).slice(0, 7) : 'unknown')
     const sentence = (t) => String(t ?? '').trim().replace(/\.$/, '')
+    /**
+     * An install or update refused before its first step (a Laya Auto run open, another install
+     * under way) ran nothing: it says why, and never names a step it did not reach (7.10).
+     */
+    const notStarted = (job) => `The ${job.kind === 'update' ? 'update' : 'install'} did not start: ${sentence(job.error)}.`
     /**
      * What a task costs Laya on this PC, as the model menu says it (3.1), or that it is not measured
      * yet while the device has no per-phase figure (`msPerToken`). Measured, with no figure for a
@@ -3513,15 +3551,19 @@ window.__ModuleLoader__.load({
     /**
      * The status lines and buttons for the state Laya is in (8.2), each line `{ text, tone }`
      * (tone '' for the state itself, 'why', 'warn' or 'err'), and the last log lines of a failure.
-     * A settings error outranks every state, since Laya Auto is off until it is fixed; a Laya left
-     * running by an earlier session and stopped at start is said above the state's own line.
+     * A settings error and pins that could not be read outrank every state, since Laya Auto is off
+     * until they are put right, each with its own remedy: the laya block is the person's
+     * cordis.patch.yml, and the pins are the harness's own config/laya.json, which its update puts
+     * back. A Laya left running by an earlier session and stopped at start is said above the state's
+     * own line.
      */
     function layaState(st, now = Date.now()) {
       const out = { lines: [], buttons: [], log: [] }
       if (!st) return out
       const line = (text, tone = '') => out.lines.push({ text, tone })
-      if (st.configError) {
-        line(`Laya settings error: ${sentence(st.configError)}. Fix jev-router laya in cordis.patch.yml; Laya Auto is off until then.`, 'err')
+      if (st.configError || st.pinsError) {
+        if (st.configError) line(`Laya settings error: ${sentence(st.configError)}. Fix jev-router laya in cordis.patch.yml; Laya Auto is off until then.`, 'err')
+        if (st.pinsError) line(`Laya's pinned versions could not be read (${sentence(st.pinsError)}); run Update-Harness.ps1. Laya Auto is off until then.`, 'err')
         return out
       }
       // The sweep could not always read the orphan's working set (ramGB null): then no figure is said.
@@ -3534,8 +3576,10 @@ window.__ModuleLoader__.load({
       switch (st.state) {
         case 'not_installed': {
           const o = st.offer
+          // What installing takes on disk is an estimate the install itself works with; what Laya
+          // takes after it is not known until an install has measured it, so it is not said.
           const disk = o?.disk?.[o.gpu ? 'gpu' : 'cpu']
-          line(disk ? `Not installed. Needs about ${disk.installingGB} GB of free disk while installing and ${disk.afterGB} GB after, and the internet once.` : 'Not installed. Installing it needs free disk and the internet once.')
+          line(disk ? `Not installed. Needs about ${disk.installingGB} GB of free disk while installing, and the internet once.` : 'Not installed. Installing it needs free disk and the internet once.')
           if (o) line(o.gpu ? `PyTorch with CUDA will be installed for your ${o.gpu.name}.` : 'No usable NVIDIA GPU found: Laya will run on the CPU. On a 4-core test machine that took about 20 s to route a task and about 10 s to review each attempt; this PC is not measured yet.', 'why')
           out.buttons = ['install']
           break
@@ -3543,23 +3587,27 @@ window.__ModuleLoader__.load({
         case 'installing': {
           const verb = { update: 'Updating', repair: 'Repairing' }[job.kind] ?? 'Installing'
           const progress = job.total > 0 ? ` (${layaBytes(job.received)} of about ${layaBytes(job.total)})`
-            : typeof job.startedAt === 'number' ? ` (${Math.max(0, Math.round((now - job.startedAt) / 60_000))} min)` : ''
+            : typeof job.stepStartedAt === 'number' ? ` (${Math.max(0, Math.round((now - job.stepStartedAt) / 60_000))} min)` : ''
           line(job.step ? `${verb}, step ${job.step} of ${job.of ?? 8}: ${job.name}${progress}.` : `${verb}: getting ready.`)
           out.buttons = ['cancel']
           break
         }
         case 'install_failed': {
           const step = job.failedStep ?? job.step
-          if (job.kind === 'update' && i) line(`Update failed at step ${step} (${job.name}); still on Laya ${i.laya}.`, 'err')
+          if (!step) line(notStarted(job), 'err')
+          else if (job.kind === 'update' && i) line(`Update failed at step ${step} (${job.name}); still on Laya ${i.laya}.`, 'err')
           else line(`Install failed at step ${step} (${job.name}): ${sentence(job.error)}. The previous install, if any, is untouched.`, 'err')
-          out.buttons = ['retry', 'log', ...(job.offerCpu ? ['cpu'] : [])]
+          // The Laya that was there is untouched and stopped (7.10), so what a stopped Laya offers
+          // is offered too: Laya Auto starts it on demand anyway, and pressing Start clears the error.
+          out.buttons = ['retry', 'log', ...(job.offerCpu ? ['cpu'] : []), ...(i ? ['start', 'test', 'remove'] : [])]
           break
         }
         case 'stopped': {
           if (st.stoppedBecause === 'idle') line(`Stopped after ${st.settings?.idleMinutes ?? '?'} min without a Laya Auto request. It starts again when Laya Auto needs it; the Jev Auto comparisons never start it.`)
           else if (st.stoppedBecause === 'budget') line(`Stopped by the resource budget: ${sentence(st.why)}.`)
           else if (st.stoppedBecause === 'yielded') line(`Unloaded so ${st.why ?? 'a local model'} could have the GPU and RAM; it starts again when Laya Auto needs it.`)
-          if (st.stoppedBecause) { out.buttons = ['start']; break }
+          // Why it stopped is said until it starts again, and a stopped Laya offers what any does.
+          if (st.stoppedBecause) { out.buttons = ['start', 'test', 'remove']; break }
           // A start the RAM budget or a GPU with no room turned down leaves it stopped with the
           // reason and no stoppedBecause (7.7): the reason names the numbers, above the usual line.
           if (st.why) line(`Not started: ${sentence(st.why)}.`, 'warn')
@@ -3599,7 +3647,9 @@ window.__ModuleLoader__.load({
         }
         case 'restarting': {
           const x = st.restart ?? {}
-          line(`Laya stopped unexpectedly (exit code ${x.code ?? x.signal ?? 'unknown'}) and is restarting (attempt ${x.attempt ?? '?'} of ${x.of ?? 3}).`, 'warn')
+          // An exit by a signal is named as one, as the sidecar's own lines name it (describeExit).
+          const how = x.code != null ? `exit code ${x.code}` : x.signal ? `signal ${x.signal}` : 'reason unknown'
+          line(`Laya stopped unexpectedly (${how}) and is restarting (attempt ${x.attempt ?? '?'} of ${x.of ?? 3}).`, 'warn')
           // Stop ends the backoff (7.4), so a crash loop can be ended from here.
           out.buttons = ['stop']
           break
@@ -3617,7 +3667,7 @@ window.__ModuleLoader__.load({
       // A failed update leaves the old Laya running (7.10); a failed repair, removal or model check
       // leaves Laya as it was. Either says so while Laya goes on.
       if (job.error && st.state !== 'install_failed') {
-        if (job.kind === 'update' && i) line(`Update failed at step ${job.failedStep ?? job.step} (${job.name}); still on Laya ${i.laya}.`, 'err')
+        if (job.kind === 'update' && i) line(job.failedStep ?? job.step ? `Update failed at step ${job.failedStep ?? job.step} (${job.name}); still on Laya ${i.laya}.` : notStarted(job), 'err')
         else if (job.kind !== 'install') line(`${{ repair: 'Repair', remove: 'Removing Laya', weights: 'The model check' }[job.kind] ?? 'Laya'} failed: ${sentence(job.error)}.`, 'err')
       }
       // What the installer had to say: each CUDA tag it tried, and why it installed for the CPU (7.2).
@@ -3684,14 +3734,15 @@ window.__ModuleLoader__.load({
      */
     function layaNotes(st, compare) {
       const out = []
-      if (!st?.installed || st.configError || st.state === 'disabled') return out
+      if (!st?.installed || st.configError || st.pinsError || st.state === 'disabled') return out
       const s = st.settings ?? {}
       if (st.install?.kind === 'install' && !st.install.error && st.state !== 'installing' && !(s.startWithKzh && s.keepLoaded)) {
         out.push({ text: 'To test Jev and Laya together, turn on Start Laya when KzH starts and Keep Laya loaded.', tone: 'note' })
       }
-      if (s.shadow && ['stopped', 'failed'].includes(st.state)) out.push({ text: 'Laya is not running, so Jev Auto records no comparisons now. Press Start, or turn on Start Laya when KzH starts and Keep Laya loaded.', tone: 'warn' })
+      if (s.shadow && ['stopped', 'failed', 'install_failed'].includes(st.state)) out.push({ text: 'Laya is not running, so Jev Auto records no comparisons now. Press Start, or turn on Start Laya when KzH starts and Keep Laya loaded.', tone: 'warn' })
       const counters = layaCounters(compare)
       if (counters) out.push({ text: counters, tone: 'why' })
+      if (compare?.error) out.push({ text: `The comparisons could not be read: ${sentence(compare.error)}.`, tone: 'warn' })
       if (st.selfTest) out.push({ text: selfTestLine(st.selfTest), tone: 'why' })
       for (const w of st.warnings ?? []) out.push({ text: w?.text ?? String(w), tone: 'warn' })
       return out
@@ -3704,7 +3755,7 @@ window.__ModuleLoader__.load({
      */
     function layaVersions(st) {
       const i = st?.installed
-      if (!i || st.configError || st.state === 'disabled') return []
+      if (!i || st.configError || st.pinsError || st.state === 'disabled') return []
       const want = st.expected ?? {}
       const pinned = want.laya && i.laya !== want.laya ? `This KzH version pins Laya ${want.laya}; ${i.laya} is installed.`
         : want.torch && i.torch && !String(i.torch).startsWith(want.torch) ? `This KzH version pins PyTorch ${want.torch}; ${i.torch} is installed.` : null
@@ -3753,8 +3804,8 @@ window.__ModuleLoader__.load({
         title: 'Install Laya',
         lines: [
           ...(st?.paths ? [`Where: ${st.paths.engine} (Python and PyTorch) and ${st.paths.models} (the model).`] : []),
-          `Downloads once, then works offline: Python${o.python ? ` ${o.python}` : ''} (about 30 MB, GitHub), PyTorch ${want.torch}${torch ? ` (${torch.size}, ${torch.source})` : ''}, Laya ${want.laya} and its libraries (about 100 MB, PyPI), and Laya's English model (0.8 to 1.7 GB, Hugging Face).`,
-          ...(disk ? [`Needs about ${disk.installingGB} GB of free disk while installing and ${disk.afterGB} GB after.`] : []),
+          `Downloads once, then works offline: Python${o.python ? ` ${o.python}` : ''} (about 30 MB, GitHub), PyTorch ${want.torch}${torch ? ` (about ${layaBytes(torch.bytes)}, ${torch.source})` : ''}, Laya ${want.laya} and its libraries (about 100 MB, PyPI), and Laya's English model (0.8 to 1.7 GB, Hugging Face).`,
+          ...(disk ? [`Needs about ${disk.installingGB} GB of free disk while installing.`] : []),
         ],
         // The GPU is offered where there is a usable one, and where the server does not say: the
         // installer itself falls back to the CPU wheel when the driver has no CUDA to offer (7.2).
@@ -3781,9 +3832,10 @@ window.__ModuleLoader__.load({
 
     /**
      * Laya's status, GET /jev-router/laya, polled while shown: every 1.5 s while it installs, starts,
-     * stops or restarts, else every 5 s. Only the newest read is applied, as the local models card does.
+     * stops or restarts, or while `fast` (an action of the card waits on the server), else every 5 s.
+     * Only the newest read is applied, as the local models card does.
      */
-    function useLaya(active) {
+    function useLaya(active, fast = false) {
       const [data, setData] = useState(null)
       const [error, setError] = useState('')
       const seq = useRef(0)
@@ -3791,7 +3843,7 @@ window.__ModuleLoader__.load({
         const n = ++seq.current
         try { const d = await api('/jev-router/laya'); if (n === seq.current) { setData(d); setError('') } } catch (e) { if (n === seq.current) setError(e.message) }
       }, [])
-      const moving = ['installing', 'starting', 'stopping', 'restarting'].includes(data?.state)
+      const moving = fast || ['installing', 'starting', 'stopping', 'restarting'].includes(data?.state)
       useEffect(() => {
         if (!active) return
         load()
@@ -3826,10 +3878,14 @@ window.__ModuleLoader__.load({
      * setting out of range) is shown as the server words it.
      */
     function LayaCard({ ask }) {
-      const { data: st, error, load } = useLaya(true)
+      const [busy, setBusy] = useState('')
+      // A start or a Test Laya from the card waits on the server while the model loads, for minutes
+      // on a first start: the status is read as often as while Laya moves, so the card follows it.
+      const { data: st, error, load } = useLaya(true, !!busy)
       const [compare, setCompare] = useState(null)
       const [msg, setMsg] = useState('')
-      const [busy, setBusy] = useState('')
+      // How many times Stop or Cancel was pressed: an action one of them ended says nothing of its own.
+      const ended = useRef(0)
       const [shownLog, setShownLog] = useState(null)
       const [installing, setInstalling] = useState(null)
       // The idle time as typed, until it is saved: the field shows it over the saved value, so a
@@ -3839,13 +3895,21 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!installed) return
         let stop = false
-        const read = () => api('/jev-router/laya/compare?days=7&identity=current').then((d) => { if (!stop) setCompare(d) }, () => {})
+        // A comparison that could not be read is said under the switches, never dropped in silence.
+        const read = () => api('/jev-router/laya/compare?days=7&identity=current').then((d) => { if (!stop) setCompare(d) }, (e) => { if (!stop) setCompare(e.status === 404 ? null : { error: e.message }) })
         read()
         const t = setInterval(read, 60_000)
         return () => { stop = true; clearInterval(t) }
       }, [installed])
       if (!st) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Laya decision model'), h('div', { className: error ? 'err' : 'muted' }, error || 'Loading…'))
-      const act = async (id, fn) => { setMsg(''); setBusy(id); try { await fn(); await load() } catch (e) { setMsg(e.message) } finally { setBusy('') } }
+      // Stop and Cancel end what is under way, so they stay pressable while another action waits on
+      // the server, and the action they end (a start that was loading) does not report its own end
+      // as a failure: the person asked for it. Each action clears only its own busy mark.
+      const act = async (id, fn) => {
+        const mine = LAYA_ENDS.has(id) ? ++ended.current : ended.current
+        setMsg(''); setBusy(id)
+        try { await fn(); await load() } catch (e) { if (ended.current === mine) setMsg(e.message) } finally { setBusy((b) => (b === id ? '' : b)) }
+      }
       // The dialog's first choice: the GPU, unless the server says there is no usable one.
       const device = st.offer && !st.offer.gpu ? 'cpu' : 'gpu'
       const save = (patch) => act('settings', () => post('/jev-router/laya/settings', patch))
@@ -3879,12 +3943,12 @@ window.__ModuleLoader__.load({
         repair: () => act('repair', () => post('/jev-router/laya/repair', {})),
         update: () => act('update', () => post('/jev-router/laya/update', {})),
       }
-      const button = (id) => h('button', { key: id, className: cx('btn', id === 'install' && 'primary', id === 'remove' && 'danger'), disabled: !!busy, onClick: press[id] }, busy === id && id === 'test' ? 'Testing…' : LAYA_BUTTONS[id])
+      const button = (id) => h('button', { key: id, className: cx('btn', id === 'install' && 'primary', id === 'remove' && 'danger'), disabled: !!busy && !LAYA_ENDS.has(id), onClick: press[id] }, busy === id && id === 'test' ? 'Testing…' : LAYA_BUTTONS[id])
       const tone = (t) => ({ why: 'why', warn: 'warnline', err: 'err', note: 'note' })[t] ?? undefined
       const view = layaState(st)
       const s = st.settings ?? {}
       const help = layaHelp(st)
-      const switchable = installed && !st.configError && st.state !== 'disabled'
+      const switchable = installed && !st.configError && !st.pinsError && st.state !== 'disabled'
       const toggle = (id, label, key, text) => [
         h('dt', { key: `${id}t` }, label),
         h('dd', { key: `${id}d` },
@@ -4236,8 +4300,9 @@ window.__ModuleLoader__.load({
      * response carries as `laya` (null or absent when Laya is not installed): what it takes now while
      * it runs, else what it would take at its next start (`need`), on the device it runs or would
      * run on. A held Laya (Keep Laya loaded, or an open Laya Auto run) keeps its memory beside a
-     * local model; any other gives it up when a local model starts, so the two are never counted
-     * together. Null when Laya is not installed.
+     * local model; any other gives it up when a local model starts, but one that started after the
+     * model loaded stays beside it until it is stopped, so while both are loaded they count together.
+     * Null when Laya is not installed.
      */
     const layaShare = (laya) => {
       if (!laya?.installed) return null
@@ -4245,35 +4310,53 @@ window.__ModuleLoader__.load({
       const held = (r?.held ?? []).length > 0 || !!laya.settings?.keepLoaded
       const device = r ? r.device : laya.need?.device ?? null
       const from = r ?? (device ? { vramGB: laya.need?.cuda?.vramGB, ramGB: laya.need?.[device]?.ramGB } : {})
-      return { running: !!r, held, device, vramGB: device === 'cuda' ? from.vramGB ?? null : null, ramGB: from.ramGB ?? null }
+      return {
+        running: !!r, held, device, vramGB: device === 'cuda' ? from.vramGB ?? null : null, ramGB: from.ramGB ?? null,
+        source: { vramGB: r?.vramSource ?? null, ramGB: r?.ramSource ?? null },
+      }
     }
     const sumGB = (a, b) => Math.round(((a ?? 0) + (b ?? 0)) * 100) / 100
     const layaOn = (l) => (l.device === 'cuda' ? 'the GPU' : 'the CPU')
+    /**
+     * Where a running Laya's figure comes from (7.7), as a Now cell's note says it and its title
+     * explains it, the way llama.cpp's say `load report` or `working set`: its working set while a
+     * RAM budget is set, else what its first start on that device measured, which is never read again.
+     */
+    const layaFigure = (laya, side) => (laya.source?.[side] === 'working set'
+      ? { note: 'working set', says: `its real memory use on ${layaOn(laya)}, read every 5 seconds while a RAM budget is set` }
+      : { note: 'at its first start', says: `what it took on ${layaOn(laya)} when its first start there measured it; ${side === 'ramGB' ? 'its real use is read only while a RAM budget is set' : 'the GPU memory it holds is not read again while it runs'}` })
     /** A Now cell with Laya in it while Laya runs: the two together, and each one's share (7.7). */
     const withLayaNow = (cell, llama, laya, side) => {
       const mine = laya?.running ? laya[side] : null
       if (typeof mine !== 'number') return cell
+      const { note, says } = layaFigure(laya, side)
       return {
         text: gbText(sumGB(llama, mine)),
-        note: `Laya ${gbText(mine)}, llama.cpp ${typeof llama === 'number' ? gbText(llama) : 'not loaded'}`,
-        title: `${typeof llama === 'number' ? `llama.cpp: ${String(cell.title).replace(/\.$/, '')}. ` : ''}Laya: what it takes now on ${layaOn(laya)}.`,
+        note: `Laya ${gbText(mine)} ${note}, llama.cpp ${typeof llama === 'number' ? gbText(llama) : 'not loaded'}`,
+        title: `${typeof llama === 'number' ? `llama.cpp: ${String(cell.title).replace(/\.$/, '')}. ` : ''}Laya: ${says}.`,
       }
     }
     /**
      * An Estimated peak cell with Laya in it: added when Laya is held, else the larger of the two
-     * (7.7). With no local model the budget lets load, the peak is Laya's, and the note says so.
+     * (7.7), and never less than what Laya and the model loaded now take together (`loadedNow`, the
+     * model's figure in the Now cell), since a Laya that started after the model stays beside it.
+     * With no local model the budget lets load, the peak is Laya's, and the note says so.
      */
-    const withLayaPeak = (cell, llama, laya, side) => {
+    const withLayaPeak = (cell, llama, laya, side, loadedNow = null) => {
       const mine = laya?.[side]
       if (typeof mine !== 'number') return cell
       const hasModel = typeof llama === 'number'
-      const figure = laya.running ? `what it takes now on ${layaOn(laya)}` : `what it would take at its next start, on ${layaOn(laya)}`
+      const figure = laya.running ? layaFigure(laya, side).says : `what it would take at its next start, on ${layaOn(laya)}`
       const model = hasModel ? `llama.cpp: ${cell.title} ` : ''
-      const note = !hasModel ? `Laya ${gbText(mine)}; no local model the budget lets load`
-        : laya.held ? `Laya ${gbText(mine)}, llama.cpp ${gbText(llama)}` : `the larger of Laya ${gbText(mine)} and llama.cpp ${gbText(llama)}`
-      return laya.held
-        ? { text: gbText(sumGB(llama, mine)), note, title: `${model}Laya: ${figure}. Laya is held (Keep Laya loaded, or a Laya Auto run), so it keeps its memory beside a local model, and the two are counted together.` }
-        : { text: gbText(Math.max(llama ?? 0, mine)), note, title: `${model}Laya: ${figure}. Laya is not held, so it gives its memory up when a local model starts, and the two are never counted together.` }
+      if (laya.held) {
+        const note = hasModel ? `Laya ${gbText(mine)}, llama.cpp ${gbText(llama)}` : `Laya ${gbText(mine)}; no local model the budget lets load`
+        return { text: gbText(sumGB(llama, mine)), note, title: `${model}Laya: ${figure}. Laya is held (Keep Laya loaded, or a Laya Auto run), so it keeps its memory beside a local model, and the two are counted together.` }
+      }
+      const together = laya.running && typeof loadedNow === 'number' ? sumGB(loadedNow, mine) : null
+      const larger = Math.max(llama ?? 0, mine)
+      const note = together != null && together >= larger ? `Laya ${gbText(mine)} and llama.cpp ${gbText(loadedNow)}, loaded together now`
+        : !hasModel ? `Laya ${gbText(mine)}; no local model the budget lets load` : `the larger of Laya ${gbText(mine)} and llama.cpp ${gbText(llama)}`
+      return { text: gbText(Math.max(together ?? 0, larger)), note, title: `${model}Laya: ${figure}. Laya is not held, so it gives its memory up when a local model starts; while both are loaded they are counted together.` }
     }
     /** What a held Laya on the GPU costs the local models, said on the Laya card and under this table (7.7). */
     const layaHeldNote = (vramGB) => `While Laya is held (Keep Laya loaded, or a Laya Auto run), the VRAM budget holds Laya and the chat model together${typeof vramGB === 'number' ? `, and on a 4 GB GPU local models get about ${Math.round(vramGB * 10) / 10} GB less` : ''}. Otherwise Laya gives the GPU up when a local model starts.`
@@ -4313,8 +4396,8 @@ window.__ModuleLoader__.load({
       }
       const laya = layaShare(status?.laya)
       const cells = {
-        maxVramGB: { now: withLayaNow(loaded ? { text: gbText(loaded.vramGB), note: 'load report', title: report } : NO_FIGURE, llama.now.vramGB, laya, 'vramGB'), peak: withLayaPeak(peak('vramGB'), llama.peak('vramGB'), laya, 'vramGB') },
-        maxRamGB: { now: withLayaNow(ramNow, llama.now.ramGB, laya, 'ramGB'), peak: withLayaPeak(peak('ramGB'), llama.peak('ramGB'), laya, 'ramGB') },
+        maxVramGB: { now: withLayaNow(loaded ? { text: gbText(loaded.vramGB), note: 'load report', title: report } : NO_FIGURE, llama.now.vramGB, laya, 'vramGB'), peak: withLayaPeak(peak('vramGB'), llama.peak('vramGB'), laya, 'vramGB', llama.now.vramGB) },
+        maxRamGB: { now: withLayaNow(ramNow, llama.now.ramGB, laya, 'ramGB'), peak: withLayaPeak(peak('ramGB'), llama.peak('ramGB'), laya, 'ramGB', llama.now.ramGB) },
         maxCores: {
           now: e.running && e.threads ? { text: threadsText(e.threads), note: null, title: 'Threads the loaded model runs on' } : NO_FIGURE,
           // A core budget above what this PC has gives it every processor there is, and no more.

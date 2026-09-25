@@ -13,7 +13,9 @@
 //     determined;
 //   - Where Jev's pick was contradicted: rows that exist only because Jev's pick went wrong, so they
 //     say how often Laya would have had it right there, never how often Laya is right;
-//   - Laya Auto runs that failed: a failure rate of the runs Laya decided, never an accuracy.
+//   - Laya Auto runs that failed: a failure rate of the runs Laya decided, never an accuracy; in the
+//     review only evidence independent of that review counts, and for the task type and the skill,
+//     which no outcome of a run labels, it is not measured (null) rather than a rate of 0.
 // Pooled, one figure would measure the mix of modes: on second_opinion, where Jev mostly says no,
 // the contradicted rows are rescues labelled yes, and a Laya that always says yes would score 1.0.
 // No figure here is built from any text: rows, samples and history hold ids, labels and numbers,
@@ -51,6 +53,10 @@ export const isYesNo = (group) => {
 }
 // The two groups the acting review's own action labels: only evidence independent of it judges them.
 const REVIEW_GROUPS = new Set(['outcome_disposition', 'review_action'])
+// The domains no outcome of a run labels as failed: training.js labelClassification gives a task type
+// or a skill a label only from a person's tag or the teacher's own confirmation, which never comes
+// for Laya, so a Laya Auto run of theirs is judged by what a person said and never counted failed.
+const NO_RUN_FAILURE = new Set(['task_classification', 'skill_selection'])
 const ACCEPTS = new Set(['accept', 'PASS'])
 const REVIEW_NOULS = ['addressed', 'complete', 'unrelatedChanges', 'regressionRisk', 'needsPerson']
 const WORK_ROLES = new Set(['primary', 'retry'])
@@ -304,17 +310,27 @@ function groupFigures(group, rows, idx, T) {
   // They are no answer beside Jev's, so `answered` and the informative share stay the shadow's:
   // counting the informative ones there and leaving the flat ones out would inflate the share.
   if (DOMAIN_QUESTIONS[group]) {
+    if (NO_RUN_FAILURE.has(group)) f.layaAuto.failed = null
     for (const s of idx.laya) {
       if (s.domain !== group || s.authority !== 'laya' || !s.provider || s.provider.informative === false) continue
       if (s.runId) f.layaAuto.runs.add(s.runId)
       const o = s.outcome
-      if (s.runId && (o?.labelSource === 'verified_outcome' || o?.labelSource === 'verified_negative')) f.layaAuto.failed.add(s.runId)
-      const evidence = o?.labelSource === 'human' ? [{ outcome: o }] : []
-      if (group === 'outcome_disposition') evidence.push(...independentEvidence(s.runId, s.extra?.decidedAt, idx).filter((e) => e.source === 'person'))
+      const evidence = o?.labelSource === 'human' ? [{ source: 'person', outcome: o }] : []
+      if (REVIEW_GROUPS.has(group)) evidence.push(...independentEvidence(s.runId, s.extra?.decidedAt, idx))
       for (const e of evidence) {
+        if (e.source !== 'person') continue
         const lr = judge(s.provider.label, e.outcome, group)
         if (lr !== 'undetermined') { f.personLaya.n++; if (lr === 'right') f.personLaya.right++ }
       }
+      if (!s.runId || !f.layaAuto.failed) continue
+      // A review's own action labels its outcome_disposition sample (a run Laya's nouls accepted is
+      // labelled PASS against whatever disposition Laya gave), so there only evidence independent of
+      // that review says the run failed (5.5): a dislike of an answer it accepted, or a later review
+      // by another agent that did not accept it. Elsewhere it is the outcome's own verdict on the pick.
+      const failed = REVIEW_GROUPS.has(group)
+        ? evidence.some((e) => judge(s.provider.label, e.outcome, group) === 'wrong')
+        : o?.labelSource === 'verified_outcome' || o?.labelSource === 'verified_negative'
+      if (failed) f.layaAuto.failed.add(s.runId)
     }
   }
   if (group === 'task_classification') f.fields = fieldAgreement(rows)
@@ -509,7 +525,7 @@ export function standing({ shadowRows = [], jevSamples = [], layaSamples = [], f
         agreementWithJev: f.agree,
         personSaid: f.personLaya,
         whereJevWasContradicted: f.contradicted,
-        layaAutoFailed: { runs: f.layaAuto.runs.size, failed: f.layaAuto.failed.size },
+        layaAutoFailed: { runs: f.layaAuto.runs.size, failed: f.layaAuto.failed?.size ?? null },
         ...(f.fields ? { fieldAgreement: f.fields } : {}),
       },
       jev: { acted: f.jevActed, personSaid: f.personJev },
@@ -542,7 +558,7 @@ export function compare({ shadowRows = [], jevSamples = [], layaSamples = [], fe
       agree: f.agree,
       personSaid: f.paired.n ? f.paired : { n: 0 },
       whereJevWasContradicted: f.contradicted.n ? { n: f.contradicted.n, layaRight: f.contradicted.right } : { n: 0 },
-      layaAutoRuns: f.layaAuto.runs.size ? { runs: f.layaAuto.runs.size, failed: f.layaAuto.failed.size } : { n: 0 },
+      layaAutoRuns: f.layaAuto.runs.size ? { runs: f.layaAuto.runs.size, failed: f.layaAuto.failed?.size ?? null } : { n: 0 },
       fieldAgreement: f.fields,
     }
   })

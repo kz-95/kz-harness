@@ -854,6 +854,17 @@ test('a failed call goes to onError with its class, never to onTrace, and the ca
   assert.deepEqual(errors[1].error, { class: 'TypeError', code: null, status: null, message: 'fetch failed' })
 })
 
+test('a Laya timeout reaches onError with how many questions it asked and where, which its message leaves out', async (t) => {
+  noRealClient(t)
+  // As the Laya client rejects a call past its deadline (laya-client.js): the reason in the message,
+  // the call's size and device beside it.
+  const late = Object.assign(new Error('timed out after 40 s'), { code: 'LAYA_TIMEOUT', questions: 20, device: 'cpu' })
+  const errors = []
+  const jev = createJev({ provider: LAYA_RECORD, apiKey: 'k', client: fakeClient({ fail: late }), onError: (e) => errors.push(e) })
+  await assert.rejects(jev.route({ task: 't', ask: { task: true } }), (e) => e === late)
+  assert.deepEqual(errors[0].error, { class: 'Error', code: 'LAYA_TIMEOUT', status: null, message: 'timed out after 40 s', questions: 20, device: 'cpu' })
+})
+
 test('an answered call always settles: an answer the response left out is traced without one, and a response with no answers fails the call', async (t) => {
   // Every question answered but alsoWork.
   const partial = ({ questions }) => ({ model: 'm', usage: { input_tokens: 5, output_tokens: 0 }, answers: Object.fromEntries(Object.entries(questions).filter(([n]) => n !== 'alsoWork').map(([n, q]) => [n, byType(n, q)])) })
@@ -907,8 +918,8 @@ test('onCall sees each call once before it is sent, with the state as sent and t
   assert.deepEqual(seen.map((c) => c.phase), ['route', 'intent', 'review'])
   for (const [i, c] of seen.entries()) {
     assert.equal(c.sentBefore, i, `${c.phase}: seen before it was sent`)
-    assert.equal(c.state, client.calls[i].body.state, `${c.phase}: the very state that is sent, not a rendering of it`)
-    assert.equal(c.questions, client.calls[i].body.questions, `${c.phase}: the very questions, never a copy`)
+    assert.deepEqual(c.state, client.calls[i].body.state, `${c.phase}: the state as it is sent, not a rendering of it`)
+    assert.deepEqual(c.questions, client.calls[i].body.questions, `${c.phase}: the questions as they are sent`)
     assert.ok(deepFrozen(c.questions), `${c.phase}: the questions are frozen all the way down`)
     assert.match(c.callId, /^[0-9a-f-]{36}$/)
     assert.equal(typeof c.used, 'function')
@@ -917,8 +928,7 @@ test('onCall sees each call once before it is sent, with the state as sent and t
   // assess's third argument is the review's context; the other calls have none.
   assert.deepEqual(seen.map((c) => c.context), [null, null, context])
   assert.ok(!JSON.stringify(client.calls[2].body).includes('blockAccept'), 'the context never goes out with the call')
-  // The constants a question points to are shared with every later request, so they cannot be changed.
-  assert.equal(seen[0].questions.taskType.criteria, TASK_TYPES)
+  // Nothing a watcher does to them reaches this request or a later one.
   assert.throws(() => { seen[0].questions.taskType.criteria.debugging = 'anything' }, TypeError)
   assert.throws(() => { seen[2].questions.verdict.criteria.accept.what = 'anything' }, TypeError)
   assert.throws(() => { seen[0].questions.complexity.criteria.push('Beyond extreme') }, TypeError)
@@ -982,30 +992,43 @@ test('a trace carries its call id, its provider, the client\'s meta, and the mar
   assert.ok(jevTraces[0].questions.every((x) => !('informative' in x)))
 })
 
-test('the criteria constants, exported or not, are frozen from the moment jev.js loads, and a question points to them', async (t) => {
-  // A fresh copy of the module: no call has touched its constants yet, so nothing but the module
-  // itself can have frozen them.
-  const fresh = await import('../jev.js?criteria-frozen-at-load')
-  assert.ok(fresh.CRITERIA, 'the constants that are not exported on their own are reachable')
-  const all = { TASK_TYPES: fresh.TASK_TYPES, VERDICTS: fresh.VERDICTS, DISPOSITION_CRITERIA: fresh.DISPOSITION_CRITERIA, ...fresh.CRITERIA }
-  assert.deepEqual(Object.keys(all).sort(), ['COMPLEXITY_LEVELS', 'DISPOSITION_CRITERIA', 'REQUIREMENT_LEVELS', 'RISK_LEVELS', 'TASK_TYPES', 'TIERS', 'VERDICTS'])
-  for (const [name, c] of Object.entries(all)) assert.ok(deepFrozen(c), `${name} is frozen at load`)
-  assert.ok(Object.isFrozen(fresh.CRITERIA))
-  for (const c of [TASK_TYPES, VERDICTS, DISPOSITION_CRITERIA]) assert.ok(deepFrozen(c))
-  // The SDK keeps these very objects in the questions it builds.
-  const sent = []
-  t.mock.method(TypeSafeClient.prototype, 'systemOne', ({ questions }) => {
-    sent.push(questions)
-    return Promise.resolve({ model: 'jev-test', usage: {}, answers: Object.fromEntries(Object.entries(questions).map(([n, q]) => [n, byType(n, q)])) })
-  })
-  await fresh.createJev({ apiKey: 'tsk_test_key' }).route({ task: 't', ask: { task: true } })
-  const [q] = sent
-  assert.equal(q.taskType.criteria, fresh.TASK_TYPES)
-  assert.equal(q.complexity.criteria, fresh.CRITERIA.COMPLEXITY_LEVELS)
-  assert.equal(q.risk.criteria, fresh.CRITERIA.RISK_LEVELS)
-  assert.equal(q['req.coding'].criteria, fresh.CRITERIA.REQUIREMENT_LEVELS)
-  assert.equal(q.minimumCapability.criteria, fresh.CRITERIA.TIERS)
-  assert.equal(q.preferredCapability.criteria, fresh.CRITERIA.TIERS)
+test('no watcher can change what Jev is sent: a hook that rewrites every question and criterion it is handed leaves this request and every later one as it was', async (t) => {
+  noRealClient(t)
+  const context = Object.freeze({ attempt: 0, risk: 0.4, blockAccept: false, reviewed: false })
+  const calls = async (jev) => {
+    await jev.route({ task: 'fix the parser', candidates: TABLE, strategies: ['CHEAP_DIRECT', 'STANDARD_DIRECT'], ask: { task: true, resource: true, judgments: true } })
+    await jev.intent({ message: 'why does it fail?' })
+    await jev.assess(assessInput({ decision: DECISION }), undefined, context)
+  }
+  const bodies = (client) => client.calls.map((c) => JSON.stringify(c.body))
+  // What Jev is sent with no watcher at all.
+  const plain = fakeClient()
+  await calls(createJev({ provider: JEV_RECORD, apiKey: 'k', client: plain }))
+  // A watcher that tries to change everything it can reach, in place: every value, every list, and
+  // a key of its own on every object. Each attempt that is refused is refused out loud.
+  let seen = 0
+  let refused = 0
+  const rewrite = (v, done = new Set()) => {
+    if (!v || typeof v !== 'object' || done.has(v)) return
+    done.add(v)
+    for (const k of Object.keys(v)) {
+      rewrite(v[k], done)
+      try { v[k] = 'rewritten by a watcher' } catch { refused++ }
+    }
+    try { v.addedByAWatcher = true } catch { refused++ }
+    if (Array.isArray(v)) { try { v.push('added by a watcher') } catch { refused++ } }
+  }
+  const watched = fakeClient()
+  await calls(createJev({ provider: JEV_RECORD, apiKey: 'k', client: watched, onCall: ({ questions }) => { seen++; rewrite(questions) } }))
+  assert.equal(seen, 3, 'the watcher saw every call')
+  assert.ok(refused > 0, 'and was refused')
+  assert.deepEqual(bodies(watched), bodies(plain), 'the calls it watched went out as without it')
+  // And every later request, from any client, still asks what it asked before.
+  const later = fakeClient()
+  await calls(createJev({ provider: JEV_RECORD, apiKey: 'k', client: later }))
+  assert.deepEqual(bodies(later), bodies(plain))
+  // The criteria jev.js exports are frozen too, so no module that imports them can change a request either.
+  for (const [name, c] of Object.entries({ TASK_TYPES, VERDICTS, DISPOSITION_CRITERIA })) assert.ok(deepFrozen(c), name)
 })
 
 test("route(), intent() and assess() name the answers marked too flat, and Jev's list is always empty", async (t) => {
@@ -1030,6 +1053,18 @@ test("route(), intent() and assess() name the answers marked too flat, and Jev's
   assert.deepEqual((await jev.intent({ message: 'm' })).uninformative, [])
   assert.deepEqual((await jev.assess(assessInput({}))).uninformative, [])
   assert.ok(!('filledByRules' in jr.profile), 'a Jev profile never lists filled fields')
+})
+
+test('route(), intent() and assess() hand back the client\'s meta, so what records an answer can name the identity that gave it; Jev\'s carry none', async (t) => {
+  noRealClient(t)
+  const meta = { provider: 'laya', device: 'cpu', identity: 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1', lang: 'non-latin' }
+  const laya = createJev({ provider: LAYA_RECORD, apiKey: 'k', client: fakeClient({ meta }) })
+  const route = await laya.route({ task: 't', candidates: TABLE, strategies: ['CHEAP_DIRECT', 'STANDARD_DIRECT'], ask: { task: true, resource: true, judgments: true } })
+  assert.deepEqual(route.meta, meta)
+  assert.deepEqual((await laya.intent({ message: 'm' })).meta, meta)
+  assert.deepEqual((await laya.assess(assessInput({}))).meta, meta)
+  const jev = createJev({ provider: JEV_RECORD, apiKey: 'k', client: fakeClient() })
+  for (const r of [await jev.route({ task: 't', ask: { task: true } }), await jev.intent({ message: 'm' }), await jev.assess(assessInput({}))]) assert.ok(!('meta' in r))
 })
 
 test('profileFromAnswers reads the provider\'s supporting-skill and checks bars, leaves out flat scores and choices, and keeps flat nouls', () => {
