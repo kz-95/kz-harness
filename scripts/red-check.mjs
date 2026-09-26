@@ -313,7 +313,7 @@ try {
     const fresh = f.now.filter((t) => !oldKeys.has(t.key))
     if (f.fixtures) ofFixtures += fresh.length
     else total += fresh.length
-    console.log(`\n${f.rel}${f.existed ? '' : ' (new file)'}: ${fresh.length} new of ${f.now.length} tests${f.fixtures ? ', of the fixtures, which must pass at the base' : ''}`)
+    console.log(`\n${gitPath(f.rel)}${f.existed ? '' : ' (new file)'}: ${fresh.length} new of ${f.now.length} tests${f.fixtures ? ', of the fixtures, which must pass at the base' : ''}`)
     if (!fresh.length) { console.log('  no new tests'); continue }
     const then = runFile(f.inPlugin, join(wt, f.plugin))
     const byKey = new Map(then.tests.map((t) => [t.key, t]))

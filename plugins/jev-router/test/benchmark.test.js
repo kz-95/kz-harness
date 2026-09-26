@@ -210,11 +210,19 @@ test('a module that ends the process when a grade file imports it fails the grad
   assert.match(exited.reason, /only 1 of 3 checks ran to a pass/)
   const fine = await graded(exits, [{ path: 'src/m.js', text: 'export const ok = true\n' }])
   assert.equal(fine.passed, true, fine.reason)
-  for (const [kind, body] of [['skipped', "test('two', { skip: true }, () => {})"], ['todo', "test('two', { todo: true }, () => {})"], ['cancelled', "test('two', () => new Promise(() => {}))"]]) {
+  // A test that never settles is reported as cancelled by some versions of the runner and simply
+  // hangs on others - Node 24 hangs it - so the grade catches it by its own time limit instead.
+  // Either way the grade must not pass, which is the whole of what this asserts; the short limit
+  // is here because the default one would spend a minute of every suite run proving it.
+  for (const [kind, body, opts] of [
+    ['skipped', "test('two', { skip: true }, () => {})", {}],
+    ['todo', "test('two', { todo: true }, () => {})", {}],
+    ['never settles', "test('two', () => new Promise(() => {}))", { checksMs: 1500 }],
+  ]) {
     const t = ownTask({ grade: { 'grade/own.test.js': `import { test } from 'node:test'\ntest('one', () => {})\n${body}\n` }, count: 1 })
-    const r = await graded(t)
+    const r = await graded(t, [], opts)
     assert.equal(r.passed, false, kind)
-    assert.match(r.reason, /cancelled, skipped or left to do|failed/, kind)
+    assert.match(r.reason, /cancelled, skipped or left to do|failed|did not finish/, kind)
   }
 })
 
@@ -944,7 +952,16 @@ test('a scratch folder whose path holds the account name says that every task\'s
   const named = createBenchmark({ ...benchDeps(w), file: join(w.root, 'named.jsonl'), scratchRoot: withName, sessionAgent: () => ({ session: { header: { cwd: withName } } }) })
   const where = (await named.state({ session: 's1' })).where
   assert.deepEqual([where.state, where.accountText], ['scratch', `This path holds your ${process.platform === 'win32' ? 'Windows ' : ''}account name, and every task's prompt sends it to the agent.`])
-  assert.equal((await w.bench.state({ session: 's1' })).where.accountText, null, `${w.scratchRoot} does not hold ${user}`)
+  // The other way round, asked of the same folder: nothing is said when the name is not in it.
+  // The name is read through the seam rather than the path being chosen to avoid it, because on
+  // Windows there is no writable temporary folder outside the account's own to choose. The real
+  // scratch root is C:\kzh-scratch, which holds no name, so the quiet case is the ordinary one.
+  const other = createBenchmark({ ...benchDeps(w), file: join(w.root, 'other.jsonl'), scratchRoot: withName, sessionAgent: () => ({ session: { header: { cwd: withName } } }), accountName: () => 'somebody-else-entirely' })
+  assert.equal((await other.state({ session: 's1' })).where.accountText, null, `${withName} does not hold somebody-else-entirely`)
+  // And it matches a whole folder name, never a fragment of one: a user called `a` must not make
+  // every path on the machine look like a leak.
+  const fragment = createBenchmark({ ...benchDeps(w), file: join(w.root, 'frag.jsonl'), scratchRoot: withName, sessionAgent: () => ({ session: { header: { cwd: withName } } }), accountName: () => user.slice(0, 1) })
+  assert.equal((await fragment.state({ session: 's1' })).where.accountText, null, 'one letter of the name is not the name')
 })
 
 test('a scratch folder inside a git repository is refused, where an agent would take the repository for its project', async () => {

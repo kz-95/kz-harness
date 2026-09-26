@@ -977,6 +977,10 @@ export function createBenchmark({
   agents, readiness, quota, usage, usageLines, windowOf, subjectOf, capabilities, priors, policy, learn,
   runTask, sessionAgent, listed, speedRunning, loadModel, gateAt, excludedBy, peak = {}, rateNow = () => null, agentTimeoutMs,
   listCap = LIST_CAP, now = Date.now, log = () => {},
+  // Read through a seam so the rule below can be tested on a machine where it cannot be false:
+  // every writable temporary folder on Windows sits under the account's own, so a path without
+  // the name in it does not exist there to be tried.
+  accountName = () => { try { return userInfo().username } catch { return null } },
 }) {
   const root = resolve(scratchRoot)
   let current = null
@@ -1015,7 +1019,7 @@ export function createBenchmark({
   /** Where a chat stands (3.7, 3.11): whether the benchmark can run from it, and the words for why not. */
   async function where(session) {
     const out = { path: root, accountName: false, accountText: null }
-    const user = (() => { try { return userInfo().username } catch { return null } })()
+    const user = accountName()
     if (user && root.toLowerCase().split(/[\\/]+/).includes(user.toLowerCase())) {
       out.accountName = true
       out.accountText = `This path holds your ${process.platform === 'win32' ? 'Windows ' : ''}account name, and every task's prompt sends it to the agent.`

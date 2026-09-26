@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { layaPaths, readPins, recordWeights, snapshotDir } from '../laya-install.js'
 import { createProbe } from '../laya-selfcheck.js'
@@ -24,7 +24,7 @@ import { defaultThreads, killTree } from '../local.js'
 // The copy hint names a path the reader is meant to act on, so it is written the platform's own
 // way: `verifyWeights` in laya-install.js emits backslashes on win32. Built the same way here, so
 // this asserts the message rather than the platform the suite happens to run on.
-const COPY_HINT = process.platform === 'win32' ? 'models\laya\hf' : 'models/laya/hf'
+const COPY_HINT = ['models', 'laya', 'hf'].join(sep)
 import { startFakeLaya } from './fixtures/fake-laya-serve.mjs'
 import { waitFor } from './wait-for.js'
 
@@ -705,6 +705,9 @@ test('the idle stop: after idleMinutes without an acting request, never reset by
   await sidecar.start()
   // Background comparisons keep arriving: they never count as use.
   for (let i = 0; i < 5; i++) { clock += 12_000; await sidecar.noteResult({ status: 200, ms: 30, tokens: 900, phase: 'route', role: 'shadow' }); await settle() }
+  // Waited for rather than settled into: stopping is not instant, and a fixed delay only asks
+  // whether this machine finished it in 120 ms. It does on the machine this was written on.
+  await waitFor('the idle stop', () => sidecar.status().state, (x) => x === 'stopped')
   assert.equal(sidecar.status().state, 'stopped', 'a minute of background requests only')
   assert.equal(sidecar.status().stoppedBecause, 'idle')
 
