@@ -21,7 +21,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { appendFile, lstat, mkdir, open, readFile, readdir, rename as fsRename, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
-import { downloadVerified, sha256File } from './local.js'
+import { downloadVerified, renameRetry, sha256File } from './local.js'
 
 const GB = 1024 ** 3
 const r1 = (x) => Math.round(x * 10) / 10
@@ -184,22 +184,9 @@ export async function verifyWeights(paths, { platform = process.platform, log = 
 
 // ---------- small process and file helpers ----------
 
-/**
- * A rename that Windows may refuse for a while: a process that is exiting, or an antivirus scan
- * of the new DLLs, keeps a handle on the folder. Retried with backoff for up to `limitMs` on
- * EPERM, EACCES and EBUSY, as training.js retries its own rename.
- */
-export async function renameRetry(from, to, { rename = fsRename, sleep = sleepMs, limitMs = 30_000 } = {}) {
-  let waited = 0
-  for (let attempt = 0; ; attempt++) {
-    try { return await rename(from, to) } catch (err) {
-      if (!['EPERM', 'EACCES', 'EBUSY'].includes(err.code) || waited >= limitMs) throw err
-      const ms = Math.min(2000, 50 * 2 ** attempt)
-      await sleep(ms)
-      waited += ms
-    }
-  }
-}
+// renameRetry lives in local.js, beside the other file work every module here shares, and is
+// re-exported so nothing that reads it from this module has to move.
+export { renameRetry }
 
 /** Delete a folder, retried the same way. */
 export async function rmRetry(path, { sleep = sleepMs, limitMs = 30_000, remove = rm } = {}) {

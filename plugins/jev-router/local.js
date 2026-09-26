@@ -124,7 +124,8 @@ export async function downloadVerified({ url, dest, size, sha256, fetch = global
     await unlink(part).catch(() => {})
     throw new Error(`SHA256 mismatch (expected ${sha256}, got ${got}); the file was deleted`)
   }
-  await rename(part, dest)
+  // Retried: on Windows a scan of the file just written keeps a handle on it for a moment.
+  await renameRetry(part, dest)
   return { bytes: size, sha256: got }
 }
 
@@ -908,6 +909,23 @@ export function parseTasklistMemory(out) {
   return kb ? Number(kb) * 1024 : null
 }
 
+/**
+ * A rename that Windows may refuse for a while: a process that is exiting, or an antivirus scan
+ * of the new DLLs, keeps a handle on the folder. Retried with backoff for up to `limitMs` on
+ * EPERM, EACCES and EBUSY, as training.js retries its own rename.
+ */
+export async function renameRetry(from, to, { rename: doRename = rename, sleep: wait = sleep, limitMs = 30_000 } = {}) {
+  let waited = 0
+  for (let attempt = 0; ; attempt++) {
+    try { return await doRename(from, to) } catch (err) {
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(err.code) || waited >= limitMs) throw err
+      const ms = Math.min(2000, 50 * 2 ** attempt)
+      await wait(ms)
+      waited += ms
+    }
+  }
+}
+
 /** `ps -o rss= -p <pid>` -> bytes. ps reports RSS in KiB; anything but one number is no reading. */
 export function parsePsRss(out) {
   const kib = /^\s*(\d+)\s*$/.exec(String(out ?? ''))?.[1]
@@ -1080,7 +1098,9 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   async function save(s) {
     await mkdir(dirname(settingsFile), { recursive: true })
     await writeFile(`${settingsFile}.tmp`, JSON.stringify(s, null, 2))
-    await rename(`${settingsFile}.tmp`, settingsFile)
+    // Retried: this reached a person as `Could not load <model> again: EPERM` when something else
+    // on the machine held the file for the moment between writing it and putting it in place.
+    await renameRetry(`${settingsFile}.tmp`, settingsFile)
   }
 
   // One RAM watchdog over every resident local model process, llama and Laya together. It reads
@@ -1297,8 +1317,10 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
 
   function kill(child) {
     if (!child || child.exitCode !== null) return
-    if (process.platform === 'win32' && child.pid) killTree(child.pid)
-    else child.kill('SIGKILL')
+    // taskkill can fail - the process may be going already, or refuse the account - and with no
+    // fallback the engine would simply be left running, holding its port and its VRAM.
+    if (process.platform === 'win32' && child.pid && killTree(child.pid)) return
+    child.kill('SIGKILL')
   }
   const onExit = () => kill(engine?.child)
   process.on('exit', onExit)
