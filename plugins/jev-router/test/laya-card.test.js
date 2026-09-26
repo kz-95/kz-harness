@@ -105,6 +105,28 @@ test('every state has its own words and buttons, before and during an install', 
   })
   assert.equal(seen(h, status({ installed: null, state: 'installing', install: { ...step4, step: 3, name: 'Getting Python 3.12', received: 0, total: 0, notes: [], stepStartedAt: NOW - 3 * 60_000 } })).lines[0], 'Installing, step 3 of 8: Getting Python 3.12 (3 min).')
 
+  // The bar. Steps carry it and a step that reports bytes fills its own share, so the PyTorch
+  // step - most of the gigabytes, and most of the wait - moves instead of sitting still.
+  const bar = (st) => h.layaState(st, NOW).progress
+  assert.deepEqual(bar(status({ installed: null, state: 'installing', install: step4 })), { value: (3 + 1.2 / 2.5) / 8, label: 'Installing Laya' })
+  // A step that reports no bytes still stands at the steps done before it, never at nothing.
+  assert.equal(bar(status({ installed: null, state: 'installing', install: { ...step4, step: 3, received: 0, total: 0 } })).value, 2 / 8)
+  // Before the first step there is nothing to measure: the bar says working rather than zero.
+  assert.equal(bar(status({ installed: null, state: 'installing', install: { ...step4, step: null } })).value, null)
+  // An update says so on the bar too, since that is all a screen reader is given.
+  assert.equal(bar(status({ installed: null, state: 'installing', install: { ...step4, kind: 'update' } })).label, 'Updating Laya')
+  // Starting is not measurable - the model loads inside a process that says so only when done -
+  // so it is working with no figure, and every settled state has no bar at all.
+  assert.deepEqual(bar(status({ state: 'starting', running: running() })), { value: null, label: 'Starting Laya' })
+  for (const st of [status({ state: 'ready', running: running() }), status({ installed: null, state: 'not_installed', offer: OFFER, paths: PATHS })]) {
+    assert.equal(bar(st), null, 'nothing is happening, so nothing claims to be')
+  }
+
+  // And the card renders it. The panel is a browser file the runner cannot import, so this is the
+  // tripwire for a bar that is worked out and then never drawn.
+  assert.match(client, /view\.progress \? h\('div'/, 'the card draws the bar')
+  assert.match(client, /h\('progress', \{/, "as a plain `progress`, which reads as one to a screen reader")
+
   // Failed: at which step and why, and the CPU is offered only when the GPU's PyTorch step failed.
   const failed4 = { ...step4, error: 'PyTorch 2.14.0 has no Windows wheel for cu130, cu128, cu126; the driver supports CUDA 12.8.', failedStep: 4, offerCpu: true, notes: [] }
   assert.deepEqual(seen(h, status({ installed: null, state: 'install_failed', install: failed4 })), {

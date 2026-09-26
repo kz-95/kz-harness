@@ -3763,7 +3763,7 @@ window.__ModuleLoader__.load({
      * own line.
      */
     function layaState(st, now = Date.now()) {
-      const out = { lines: [], buttons: [], log: [] }
+      const out = { lines: [], buttons: [], log: [], progress: null }
       if (!st) return out
       const line = (text, tone = '') => out.lines.push({ text, tone })
       if (st.configError || st.pinsError) {
@@ -3794,6 +3794,13 @@ window.__ModuleLoader__.load({
           const progress = job.total > 0 ? ` (${layaBytes(job.received)} of about ${layaBytes(job.total)})`
             : typeof job.stepStartedAt === 'number' ? ` (${Math.max(0, Math.round((now - job.stepStartedAt) / 60_000))} min)` : ''
           line(job.step ? `${verb}, step ${job.step} of ${job.of ?? 8}: ${job.name}${progress}.` : `${verb}: getting ready.`)
+          // The steps carry the bar, and a step that reports its bytes fills its own share of it,
+          // so the longest step of the install - PyTorch, which is most of the gigabytes - moves
+          // rather than sitting still. Before the first step there is nothing to measure, and an
+          // install that reports no step is shown as working rather than as stuck at zero.
+          const of = job.of ?? 8
+          const within = job.total > 0 ? Math.min(1, job.received / job.total) : 0
+          out.progress = { value: job.step ? Math.min(1, (job.step - 1 + within) / of) : null, label: `${verb} Laya` }
           out.buttons = ['cancel']
           break
         }
@@ -3825,6 +3832,9 @@ window.__ModuleLoader__.load({
           out.buttons = ['stop']
           // Before the process is launched (an install's swap waited out, the orphan sweep, the
           // device and RAM checks, the weights) nothing is loading yet, on either device.
+          // Nothing here can be measured - the model is loading inside a process that says so
+          // only when it is done - so the bar says working, never a figure nobody has.
+          out.progress = { value: null, label: 'Starting Laya' }
           if (!st.running) { line('Starting: getting ready…'); break }
           const secs = typeof r.startedAt === 'number' ? Math.max(0, Math.round((now - r.startedAt) / 1000)) : 0
           const last = typeof r.lastLoadMs === 'number' ? `; the last start took ${Math.round(r.lastLoadMs / 1000)} s` : ''
@@ -4164,6 +4174,16 @@ window.__ModuleLoader__.load({
         h('div', { className: 'label', id: 'jevi-laya-h' }, 'Laya decision model'),
         h('p', { className: 'why', style: { margin: '0 0 8px' } }, LAYA_INTRO),
         ...view.lines.map((l, i) => h('div', { key: `l${i}`, className: tone(l.tone) }, l.text)),
+        // A plain `progress`: it reads as a bar to the eye and as a progress bar to a screen
+        // reader, and with no `value` it is the platform's own "working, length unknown".
+        view.progress ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, margin: '6px 0' } },
+          h('progress', {
+            max: 1,
+            ...(view.progress.value == null ? {} : { value: view.progress.value }),
+            'aria-label': view.progress.label,
+            style: { flex: 1, height: 6 },
+          }),
+          view.progress.value == null ? null : h('span', { className: 'why' }, `${Math.round(view.progress.value * 100)}%`)) : null,
         view.log.length ? h('div', { className: 'answer-text' }, view.log.join('\n')) : null,
         view.buttons.length ? h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 } }, ...view.buttons.map(button)) : null,
         msg ? h('div', { className: 'err', role: 'alert' }, msg) : null,
