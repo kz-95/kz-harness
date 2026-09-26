@@ -173,7 +173,7 @@ const AGENTS = [
  * the port and key it was handed, from this process, as `world.said` says; with `world.failStart`
  * the next start exits before it is ready, and `world.loadMs` is how long the model takes to load.
  */
-async function plugin(t, { installed = true, pins = true, laya = {}, settings, config = {}, jobs = false, supervisor = {}, local, dataDir: sharedData, harnessDir: sharedHarness, accounts, onSpawn } = {}) {
+async function plugin(t, { installed = true, pins = true, laya = {}, settings, config = {}, jobs = false, supervisor = {}, local, localModels = {}, dataDir: sharedData, harnessDir: sharedHarness, accounts, onSpawn } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'kz-laya-integration-'))
   const cleanup = cleanUp(t, root)
   const dataDir = sharedData ?? join(root, 'data')
@@ -281,6 +281,11 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
       ...seams,
     },
     local,
+    // No model of this machine's reaches these tests. Without this the manifest and the models
+    // folder of the real installation are read, so whatever the owner happens to have installed
+    // becomes an extra routing candidate and the answer depends on the PC the suite runs on. A
+    // model this harness wants is given through `config.agents`, as the local agent already is.
+    localModels: { modules: [], modelsDir: join(harnessDir, 'no-models'), ...localModels },
   })
 
   let closed = false
@@ -580,7 +585,13 @@ test('classify for Laya waits for a start with its line and never probes TypeSaf
   assert.match(r.reasoning, /Laya could not sort this message \(timed out: Laya was still starting after \d+ s\); treating it as a task\./, r.reasoning)
   assert.equal(slow.world.chat.length, 0, 'a message Laya could not sort is not handed to a chat model')
   // As a task, it waits for the same start, which fails at its own bound: the run is refused.
-  assert.ok(r.text.endsWith(TEXT.couldNotStart('laya.serve was not ready after 0 s')), r.text)
+  //
+  // Two bounds are running from the same moment: the wait for laya.serve to answer, and the wait
+  // for the model to finish loading. Which trips first is a race, and they refuse in different
+  // words - one says press Start, the other says send it again once it is Running. Both are the
+  // right answer, so both are named here; a third wording would still fail this.
+  const refusals = [TEXT.couldNotStart('laya.serve was not ready after 0 s'), TEXT.stillStarting(0)]
+  assert.ok(refusals.some((end) => r.text.endsWith(end)), r.text)
   assert.equal(slow.ran.length, 0)
   assert.deepEqual(net.seen.filter(typesafe), [])
 })
@@ -969,7 +980,15 @@ test('the orphan sweep runs first in apply(): a Laya an earlier session left run
     onSpawn: () => order.push('start'),
     supervisor: {
       isAlive: (pid) => pid === gone.pid && !order.includes(`kill ${pid}`),
-      run: async (cmd, args) => (cmd === 'ps' && args.includes(String(gone.pid)) ? `${venvPython} -I -u -X utf8 -m laya.serve\n` : null),
+      // Both ways of asking, because the platform decides which is used: `ps` on Linux, and
+      // PowerShell's Get-CimInstance on Windows, which answers `exe|command line` on one line.
+      // Stubbing only the first left the orphan unrecognised here and the sweep untested.
+      run: async (cmd, args) => {
+        const line = `${venvPython} -I -u -X utf8 -m laya.serve`
+        if (cmd === 'ps' && args.includes(String(gone.pid))) return `${line}\n`
+        if (/powershell/i.test(cmd) && args.some((a) => String(a).includes(`ProcessId=${gone.pid}`))) return `${venvPython}|${line}\n`
+        return null
+      },
       // The orphan is only noted; this session's own laya.serve is stopped for real.
       killTree: (pid) => {
         order.push(`kill ${pid}`)
