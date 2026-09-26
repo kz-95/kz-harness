@@ -501,11 +501,34 @@ function reviewPrompt(task, cwd, diff) {
  * run's routing call carries it to Jev, so each excerpt is scrubbed before it is cut: a key the
  * cut split would stay in the note as a piece too short for any scrubber to know it for a key.
  */
+/**
+ * The first line of a note the harness wrote, and the only way to tell one from an agent's. It is
+ * part of the file's own text on purpose: authorship has to survive a restart, and a fact held
+ * only in this process would be lost the moment the run that wrote it ended.
+ */
+const HARNESS_NOTE_HEAD = '# Handoff (written by Kz-harness from evidence'
+
+/** Did the harness write this note, rather than an agent? */
+export const isHarnessHandoff = (text) => String(text ?? '').startsWith(HARNESS_NOTE_HEAD)
+
+const EARLIER_HEAD = '\n## Earlier note\n'
+
+/**
+ * The agent's note that a harness note is carrying, or nothing. A harness note holds no evidence
+ * its replacement does not already have, so it is not kept below the new one - but the agent note
+ * inside it is the last thing anybody wrote by hand, and it has to survive every rewrite after it.
+ * Taken out and passed forward, so it is carried rather than wrapped one layer deeper each time.
+ */
+export const carriedHandoff = (text) => {
+  const i = String(text ?? '').indexOf(EARLIER_HEAD)
+  return i === -1 ? '' : text.slice(i + EARLIER_HEAD.length)
+}
+
 function harnessHandoff({ task, attempts, diff, checks, previous }) {
   const failing = checks.filter((c) => !c.passed)
   const lastAnswer = redactSecrets(attempts.findLast((a) => a.answerText)?.answerText ?? '')
   return [
-    '# Handoff (written by Kz-harness from evidence; the agent hit its usage limit before updating this note)',
+    `${HARNESS_NOTE_HEAD}; the agent hit its usage limit before updating this note)`,
     '',
     `Task: ${task}`,
     '',
@@ -1130,11 +1153,24 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   const requireChecks = routing.mode !== 'jev' || T.needsTests === 'always' || routing.needsTests >= T.needsTests
 
   // The agent's own note when it updated it during the attempt, else one written from evidence.
+  //
+  // Who wrote the note is read from the note, not from its timestamp. The clock cannot answer it:
+  // the window it was racing is the agent's own runtime, so every attempt lasting more than a
+  // second saw the harness's own note as the agent's, wrapped it under `## Earlier note` inside a
+  // fresh harness note, and the 2000-character clip then pushed the genuine earlier note out. Each
+  // retry nested it one deeper until nothing of the original was left.
+  //
+  // The timestamp still has one job, and only over a note an agent really wrote: a note from an
+  // earlier attempt is not this attempt's answer, so the harness writes fresh evidence and keeps
+  // that note below it. A harness note is not kept below the new one, because it holds no evidence
+  // the new one does not already have - but the agent note it was carrying is taken out and
+  // carried on, or the first rewrite would lose the last thing a person or an agent wrote by hand.
   const saveHandoff = async (since) => {
     const s = await stat(handoffFile).catch(() => null)
     const previous = s ? await readFile(handoffFile, 'utf8').catch(() => '') : ''
-    if (s && s.mtimeMs >= since - 1000) { emit('handoff', { path: HANDOFF, source: 'agent' }); return previous }
-    const text = harnessHandoff({ task, attempts, diff: await changedSince(cwd, startSnap, signal, gitOpts), checks: lastChecks, previous })
+    const ours = isHarnessHandoff(previous)
+    if (s && previous && !ours && s.mtimeMs >= since - 1000) { emit('handoff', { path: HANDOFF, source: 'agent' }); return previous }
+    const text = harnessHandoff({ task, attempts, diff: await changedSince(cwd, startSnap, signal, gitOpts), checks: lastChecks, previous: ours ? carriedHandoff(previous) : previous })
     await mkdir(dirname(handoffFile), { recursive: true })
     await writeFile(handoffFile, text)
     emit('handoff', { path: HANDOFF, source: 'harness' })

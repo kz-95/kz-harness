@@ -140,6 +140,33 @@ test('every agent at its limit: paused_limit with a harness handoff that stays',
   assert.match(formatReport(r), /PAUSED: agents at their limits, handoff saved in \.kz-harness\/handoff\.md \(earliest reset \d\d:\d\d\)/)
 })
 
+test('a harness note is replaced, never wrapped inside its own replacement, however long an attempt took', async () => {
+  // The bug this guards: authorship was inferred from the file being newer than a second before
+  // the attempt started, so any attempt lasting longer than that read the harness's own note as
+  // the agent's and wrapped it under `## Earlier note` inside a fresh one. Each rewrite nested it
+  // one deeper, and the 2000-character clip pushed the real earlier note out.
+  //
+  // Nothing here waits or measures: three rewrites in a row prove it whatever the machine's speed,
+  // which is the point - the old rule passed on a fast machine and failed on a slow one.
+  const dir = repo()
+  mkdirSync(join(dir, '.kz-harness'))
+  const file = join(dir, '.kz-harness', 'handoff.md')
+  writeFileSync(file, 'The lexer is done. The parser needs the operator table finishing.\n')
+  const hourAgo = new Date(Date.now() - 3_600_000)
+  utimesSync(file, hourAgo, hourAgo)
+  const rewrite = () => runRouted({ task: 'fix', cwd: dir, config, signal, deps: {
+    jev: null, execute: async () => ({ ...limitHit, answerText: 'ran out of allowance' }), history: history(),
+    isLimitError: () => ({ hit: true, until }),
+    onLimit: async () => ({ rotated: false }),
+  } })
+  for (let i = 0; i < 3; i++) await rewrite()
+  const note = readFileSync(file, 'utf8')
+  assert.equal((note.match(/## Earlier note/g) ?? []).length, 1, `one earlier note after three rewrites, not one per rewrite:\n${note}`)
+  assert.equal((note.match(/written by Kz-harness/g) ?? []).length, 1, 'and one harness note, not a harness note inside a harness note')
+  // The thing all of this exists to protect: what the last agent wrote by hand is still there.
+  assert.match(note, /The parser needs the operator table finishing/, 'the agent note survived every rewrite')
+})
+
 test('a key the harness note would cut in two is masked in it, so the next run sends Jev no piece of it', async (t) => {
   // The harness copies 2000 characters of the last answer and of the earlier note into its own.
   // A key that straddled that cut left its first half in the note, too short for the scrubber to
