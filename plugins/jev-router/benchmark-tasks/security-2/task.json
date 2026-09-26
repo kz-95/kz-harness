@@ -1,0 +1,16 @@
+{
+  "id": "security-2",
+  "skill": "security",
+  "level": 2,
+  "dimensions": ["security_review", "code_review"],
+  "folder": "session-cookie",
+  "prompt": "Review src/session.js for security problems and fix every one you find.\nValid sessions must keep working exactly as they do now.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/session.test.js": 10
+    }
+  }
+}

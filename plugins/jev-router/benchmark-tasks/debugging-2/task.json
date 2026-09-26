@@ -1,0 +1,16 @@
+{
+  "id": "debugging-2",
+  "skill": "debugging",
+  "level": 2,
+  "dimensions": ["debugging", "coding", "general_reasoning"],
+  "folder": "job-pool",
+  "prompt": "Sometimes runAll in src/pool.js stops starting jobs and never finishes; test/pool.test.js reproduces it.\nFind the cause and fix it without changing how results are reported.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/pool.test.js": 6
+    }
+  }
+}

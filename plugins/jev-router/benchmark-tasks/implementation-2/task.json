@@ -1,0 +1,16 @@
+{
+  "id": "implementation-2",
+  "skill": "implementation",
+  "level": 2,
+  "dimensions": ["coding", "instruction_following"],
+  "folder": "token-bucket",
+  "prompt": "Implement createLimiter({ capacity, refillPerSecond, now }) in src/limiter.js: a token bucket that starts full.\ntake(n = 1) removes n tokens and returns true when at least n are there, and otherwise removes nothing and returns false.\nTokens come back continuously at refillPerSecond, never above capacity, counted from the latest time now() has returned, in milliseconds; a clock that goes backwards adds nothing until it passes that latest time again.\nwaitMs(n = 1) returns the number of milliseconds, rounded up to a whole number, until take(n) would succeed: 0 when it would now, and Infinity when n is more than capacity.\ncreateLimiter throws a RangeError unless capacity and refillPerSecond are positive finite numbers.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/limiter.test.js": 20
+    }
+  }
+}

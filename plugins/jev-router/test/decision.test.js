@@ -5,7 +5,7 @@
 // incompatibility, and the owner's priors reaching routing as numbers rather than names.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,7 +14,7 @@ import { NO_CANDIDATES, candidateTier, classProfiles, createDecisionEngine, heur
 import { createDomainRegistry } from '../domains.js'
 import { createCapabilityRegistry, loadPriors, subjectOf } from '../profiles.js'
 import { snapshotResources } from '../resources.js'
-import { SKILLS, TASK_SKILLS, resolvePolicy } from '../routing-policy.js'
+import { SKILLS, TASK_SKILLS, mergePolicy, resolvePolicy } from '../routing-policy.js'
 import { attachOutcomes, createTrainingStore } from '../training.js'
 
 const PRIORS = loadPriors(fileURLToPath(new URL('../../../config/capability-priors.json', import.meta.url)))
@@ -228,16 +228,16 @@ test('a cold model version inherits a weak family prior and is marked cold in th
 /**
  * A domain registry whose controllers answer the way a real one does at the maturity named:
  * JEV_PRIMARY asks the teacher (falling back when there is none), LOCAL_ONLY returns the local
- * answer given. Every decision records a sample, so a test can see which samples the run would
- * label.
+ * answer given, unless the caller said the local classifier may not decide. Every decision records
+ * a sample, so a test can see which samples the run would label.
  */
 function fakeDomains({ local = {} } = {}) {
   const ctl = (id) => ({
     state: () => ({ maturity: local[id] ? 'LOCAL_ONLY' : 'JEV_PRIMARY' }),
-    decide: async ({ jev, fallback, codeAuthority }) => {
-      if (local[id]) return { ...local[id], authority: 'local', sampleId: `${id}#1` }
+    decide: async ({ jev, fallback, codeAuthority, localMayDecide = true }) => {
+      if (local[id] && localMayDecide) return { ...local[id], authority: 'local', sampleId: `${id}#1` }
       const t = jev ? await jev() : null
-      return { ...(t ?? fallback()), authority: t ? 'jev' : codeAuthority ? 'code' : 'fallback', teacher: t, sampleId: `${id}#1` }
+      return { ...(t ?? fallback()), authority: t ? 'jev' : codeAuthority ? 'code' : 'fallback', teacher: t, local: local[id] ?? null, sampleId: `${id}#1` }
     },
   })
   return { get: (id) => ctl(id) }
@@ -249,7 +249,9 @@ const scarce = () => snapshots(usageRows({ claudeWeekly: 88, claudeReset: 5 * 24
 test('conservation acts: easy work leaves the scarce strongest resource out of the pool, still available to review', async () => {
   const d = await decide(engine(), fakeJev(), { snapshots: scarce() })
   assert.notEqual(d.routing.primaryAgent, 'claude', 'the work is not on the resource whose allowance is pressing')
-  assert.deepEqual(d.routing.decision.conservation, { from: 'claude', to: d.routing.primaryAgent, confidence: 0.9, authority: 'code' })
+  // A hard limit in code, beside the weekly gate and the floor: it acts or it does not, so there is
+  // no probability behind it to report short of certain.
+  assert.deepEqual(d.routing.decision.conservation, { from: 'claude', to: d.routing.primaryAgent, confidence: 1, authority: 'code' })
   assert.equal(d.routing.conservedFrom, 'claude')
   assert.ok(d.excluded.some((e) => e.id === 'claude' && /conserved/.test(e.reason)), 'kept out of the work pool, and says why')
   assert.ok(!('claude' in d.routing.agentProbabilities), 'so no later re-read of the probabilities can hand the work straight back')
@@ -268,7 +270,7 @@ test('work that needs the extra capability conserves nothing, however pressing t
   const d = await decide(engine(), fakeJev({ profile }), { snapshots: scarce() })
   assert.equal(d.routing.decision.conservation, null)
   assert.ok(d.candidates.some((c) => c.id === 'claude'), 'the scarce resource is still a candidate for the work')
-  assert.equal(d.domains.conservation.label, 'no')
+  assert.equal(d.domains.conservation, undefined, 'and no conservation domain was asked: the limit is a rule, not a question')
 })
 
 test('conservation moves work only to a resource whose capability is known to meet the floor', async () => {
@@ -294,8 +296,25 @@ test('conserving a resource the ranking had already passed over leaves the pick 
   assert.equal(d.routing.decision.conservation?.from, 'claude', 'the setting: the scarce resource was conserved')
   const domainsLabelled = d.samples.map((x) => x.domain)
   assert.ok(domainsLabelled.includes('resource_selection'), 'the pick ran, so the run tests it')
-  assert.ok(domainsLabelled.includes('conservation'), 'and the conservation decision is tested too')
+  assert.ok(!domainsLabelled.includes('conservation'), 'the conservation limit is a rule and leaves nothing for the run to label')
   assert.equal(d.domains.resource_selection.movedBy, undefined, 'nothing moved the pick')
+})
+
+test('when the conservation limit moves the ranking\'s own pick, the record says so and the pick is not labelled', async () => {
+  // A task just easy enough to move off, on an allowance that has started to press: the ranking
+  // still spends the strongest resource on it, and the limit takes the work off it anyway. That is
+  // the case the limit exists for, since without it a mid-run hand-over could spend the capacity.
+  const two = AGENTS.filter((a) => a.id === 'claude' || a.id === 'deepseek')
+  const profile = profileOf({ complexity: 0.45, risk: 0.5 })
+  const d = await decide(engineWith(fakeDomains()), fakeJev({ profile }), { agents: two, snapshots: snapshots(usageRows({ claudeWeekly: 70, claudeReset: 5 * 24 * 60 })) })
+  const claude = d.routing.decision.reviewOnly.find((r) => r.id === 'claude')
+  assert.equal(d.domains.resource_selection.label, claude?.key, 'the setting: the ranking picked claude')
+  assert.equal(d.routing.primaryAgent, 'deepseek')
+  assert.equal(d.domains.resource_selection.movedBy, 'conservation')
+  // What put deepseek there is the limit, not the ranking's confidence in claude, and a limit is
+  // certain: the router's low-confidence tie-break must not read it as a coin flip and move it on.
+  assert.equal(d.routing.agentConfidence, 1)
+  assert.ok(!d.samples.some((x) => x.domain === 'resource_selection'), 'the run does not test a pick it did not run')
 })
 
 test('the selected skill is handed to the router in the plan, in the SKILLS vocabulary', async () => {
@@ -351,34 +370,39 @@ test('with no snapshot, the billing kind and the economics override set the cost
   assert.equal(d2.candidates.find((x) => x.id === 'acme').marginalCost, 'metered')
 })
 
-test('a healthy allowance is nothing to conserve, so a yes that could not act is never labelled by the run', async () => {
+test('a healthy allowance is nothing to conserve, and the pick it leaves alone is labelled by the run', async () => {
   // Nothing here is being used up: the governor calls every allowance healthy, so there is no
-  // capacity to spare and the question can decide nothing. A run that would have gone the same
-  // way either way must not be read back as confirming an answer that changed nothing.
+  // capacity to spare and the limit does nothing. The pick runs as the ranking made it.
   const d = await decide(engineWith(fakeDomains()), fakeJev())
   assert.equal(d.routing.decision.conservation, null)
-  assert.ok(!d.samples.some((x) => x.domain === 'conservation'), 'an answer that could not act stays teacher-only')
+  assert.ok(!d.samples.some((x) => x.domain === 'conservation'))
   assert.ok(d.samples.some((x) => x.domain === 'resource_selection'), 'the pick itself ran and is labelled')
 })
 
-test('the conservation sample is labelled only when the answer decided what the run tests', async () => {
-  const run = (profile) => decide(engineWith(fakeDomains()), fakeJev({ profile }), { snapshots: scarce() })
-  const conserved = await run(profileOf())
-  assert.ok(conserved.routing.decision.conservation)
-  assert.ok(conserved.samples.some((x) => x.domain === 'conservation'), 'a yes that kept the scarce resource back')
-  const no = await run(profileOf({ complexity: 0.9, risk: 0.9 }))
-  assert.equal(no.routing.decision.conservation, null)
-  assert.ok(no.samples.some((x) => x.domain === 'conservation'), 'a no where a yes would have acted')
-  // No measured target at all: a yes could not act either (see the planning-task test above).
-  const profile = profileOf({ taskType: 'architecture', requirements: { planning: 0.9, coding: 0.3 } })
-  const strongestPlanner = (cs) => cs.reduce((m, c) => (c.capabilities.planning?.score > (m.capabilities.planning?.score ?? 0) ? c : m))
+test('the conservation limit asks no domain and writes no sample, whether it moved the work or not', async () => {
+  // It used to be a routing domain, and its sample was pushed for labelling even where its answer
+  // changed nothing the run could test (a "no" beside a resource it never moved the work to). A
+  // hard limit has nothing for a run to confirm: it acts or it does not, and the record says which.
+  const asked = new Set()
+  const spy = () => { const inner = fakeDomains(); return { get: (id) => { asked.add(id); return inner.get(id) } } }
+  const run = (profile, over = {}) => decide(engineWith(spy()), fakeJev({ profile }), { snapshots: scarce(), ...over })
+  const moved = await run(profileOf())
+  assert.equal(moved.routing.decision.conservation?.from, 'claude', 'the setting: the limit moved the work')
+  const hard = await run(profileOf({ complexity: 0.9, risk: 0.9 }))
+  assert.equal(hard.routing.decision.conservation, null, 'the setting: hard work keeps the scarce resource')
+  // No measured target at all: nowhere to move the work (see the planning-task test above).
   const agents = AGENTS.filter((a) => a.id === 'codex' || a.id === 'deepseek')
-  const stuck = await decide(engineWith(fakeDomains()), fakeJev({ profile }), { agents, snapshots: snapshots(usageRows({ codexWeekly: 90 })) })
-  assert.equal(stuck.routing.decision.conservation, null)
-  assert.ok(!stuck.samples.some((x) => x.domain === 'conservation'), 'a yes with nowhere to move the work stays teacher-only')
+  const stuck = await run(profileOf({ taskType: 'architecture', requirements: { planning: 0.9, coding: 0.3 } }), { agents, snapshots: snapshots(usageRows({ codexWeekly: 90 })) })
+  assert.equal(stuck.routing.decision.conservation, null, 'the setting: nothing measured could take the work')
+  for (const d of [moved, hard, stuck]) {
+    assert.ok(!d.samples.some((x) => x.domain === 'conservation'), 'no conservation sample for the run to label')
+    assert.equal(d.domains.conservation, undefined, 'and no conservation row in the report')
+  }
+  assert.ok(asked.has('resource_selection'), 'the setting: the registry was consulted')
+  assert.ok(!asked.has('conservation'), 'but never for conservation')
 })
 
-test('end to end: a stronger resource rescuing a conserved run labels conservation no', async () => {
+test('end to end: a stronger resource rescuing a conserved run relabels the strategy that planned no second resource', async () => {
   const root = mkdtempSync(join(tmpdir(), 'kz-decision-'))
   const store = createTrainingStore({ file: join(root, 'samples.jsonl') })
   const domains = createDomainRegistry({ policy, store, artifactsDir: join(root, 'classifiers'), stateDir: root })
@@ -388,10 +412,15 @@ test('end to end: a stronger resource rescuing a conserved run labels conservati
   const d = await decide(e, fakeJev(), { agents, snapshots: scarce() })
   const { from, to } = d.routing.decision.conservation ?? {}
   assert.ok(from && to, 'conservation moved the work')
-  const ref = d.samples.find((x) => x.domain === 'conservation')
+  assert.ok(!d.samples.some((x) => x.domain === 'conservation'), 'the limit itself left no sample')
+  assert.equal((await store.list({ domain: 'conservation' })).length, 0, 'and the store holds none')
+  // The strategy is judged over the pool that really works, and labelled by what the run did; the
+  // tiers beside its sample still include the conserved resource, which is what lets a rescue by
+  // it be recognised as one.
+  const ref = d.samples.find((x) => x.domain === 'execution_strategy')
+  assert.ok(ref, 'the strategy ran as answered, so the run labels it')
   const stored = await store.get(ref.id)
   const tiers = Object.fromEntries((stored.extra?.candidates ?? []).map((c) => [c.id, c.tier]))
-  assert.ok(tiers[from] && tiers[to], 'the judgment sample carries the tiers the rescue rule compares')
   assert.deepEqual([tiers[from], tiers[to]], ['frontier', 'strong'], 'the setting: the work moved a tier down')
   assert.equal(JSON.stringify(stored.extra.candidates).includes('capabilities'), false, 'tiers only, no capability table')
   // The conserved resource had to come back and redo the work the cheaper one failed.
@@ -399,10 +428,11 @@ test('end to end: a stronger resource rescuing a conserved run labels conservati
     runId: 'r1', sessionId: 's1', ts: at(5), finalStatus: 'accepted', strategy: d.plan.strategy,
     attempts: [{ agent: to, role: 'primary', stopReason: 'error' }, { agent: from, role: 'retry', stopReason: 'completed' }],
   }
-  assert.match(record.strategy, /_DIRECT$/, 'the setting: a strategy that planned no second resource')
+  assert.equal(record.strategy, 'STANDARD_DIRECT', 'the setting: a strategy that planned no second resource')
   const out = await attachOutcomes(store, record, d.samples)
-  const cons = out.find((o) => o.domain === 'conservation')?.outcome
-  assert.deepEqual([cons?.label, cons?.negativeLabel, cons?.labelSource], ['no', 'yes', 'verified_outcome'], 'conserving was wrong, and the run proved it')
+  const strat = out.find((o) => o.domain === 'execution_strategy')?.outcome
+  assert.deepEqual([strat?.label, strat?.negativeLabel, strat?.labelSource], ['RETRY_DIFFERENT_RESOURCE', 'STANDARD_DIRECT', 'verified_outcome'], 'the direct run needed the resource it was kept off, and the run proved it')
+  assert.ok(!out.some((o) => o.domain === 'conservation'))
 })
 
 test('the strategies are eligible over the pool that does the work and the wider pool that reviews it', async () => {
@@ -485,61 +515,6 @@ test('versionOf reaches the subject, so the profile read is keyed the way eviden
   assert.deepEqual(claude, subjectOf(AGENTS[0], { modelOf, versionOf, priors: PRIORS }), 'the same subject profiles.js records against')
 })
 
-test('the resource call carries identities keyed like the anonymous table, with specific names only', async () => {
-  const jev = fakeJev()
-  const d = await decide(engine(), jev)
-  assert.equal(jev.calls[0].identities, undefined, 'the task call carries no candidate table, so no identities')
-  const call = jev.calls.find((c) => c.candidates)
-  const ids = call.identities
-  assert.ok(Array.isArray(ids) && ids.length === AGENTS.length, 'every agent, so an excluded one is masked too')
-  const tableKeys = new Set(call.candidates.map((c) => c.key))
-  for (const entry of ids) {
-    const inPool = d.routing.decision.candidates.find((c) => c.id === entry.id)
-    if (inPool) assert.equal(entry.key, inPool.key, `${entry.id} carries the key the table uses`)
-    if (entry.key) assert.ok(tableKeys.has(entry.key) || !inPool, `${entry.key} is a key the table offers`)
-    const a = AGENTS.find((x) => x.id === entry.id)
-    const own = new Set([a.id, a.name, a.provider, a.llm?.provider, a.llm?.model, modelOf(a)].filter(Boolean))
-    for (const n of entry.names) assert.ok(own.has(n), `${entry.id}: ${n} is its id, name, provider or model id`)
-  }
-  assert.ok(ids.find((x) => x.id === 'claude').names.includes('claude-opus-5'), 'the model id is named')
-  // Through the masker the call really uses: a generic token is never a name, so it is never
-  // masked inside values that have nothing to do with any agent ('free-local' stays), while a
-  // provider word that names one agent reads as that agent's key, as it does in the review call.
-  const { anonymity } = await import('../jev.js')
-  const anon = anonymity(ids)
-  const claudeKey = ids.find((x) => x.id === 'claude').key
-  assert.equal(anon.mask('free-local tier, spawned via spawn on local'), 'free-local tier, spawned via spawn on local')
-  assert.equal(anon.mask('claude-code timed out'), `${claudeKey} timed out`)
-})
-
-test('the routing call and the review call mask the same names', async () => {
-  // A provider word that names one agent (here a gateway nobody else uses) was masked in the
-  // review call and sent as typed in the routing call, next to the same anonymous table.
-  const { anonymity } = await import('../jev.js')
-  const agents = [...AGENTS, { id: 'gw', provider: 'spawn', description: 'e', enabled: true, kind: 'api', llm: { provider: 'openrouter', model: 'router-large-2' } }]
-  const jev = fakeJev()
-  await decide(engine(), jev, { agents })
-  const ids = jev.calls.find((c) => c.candidates).identities
-  const gw = ids.find((x) => x.id === 'gw')
-  assert.ok(gw.names.includes('openrouter'), JSON.stringify(gw))
-  assert.equal(anonymity(ids).mask('openrouter returned 502'), `${gw.key ?? '[resource]'} returned 502`)
-})
-
-test('a model ALIAS from a CLI setting is not an identity name; a model id is', async () => {
-  // Claude Code's model setting is often an alias. 'best' registered as a name would be masked
-  // inside every reason that says "the best fit"; 'opus' is a brand term and masked anyway.
-  for (const alias of ['best', 'default', 'opus', 'sonnet']) {
-    const jev = fakeJev()
-    await decide(engine(), jev, { modelOf: (a) => (a.provider === 'claude-code' ? alias : modelOf(a)) })
-    const claude = jev.calls.find((c) => c.candidates).identities.find((x) => x.id === 'claude')
-    assert.ok(!claude.names.includes(alias), `the alias ${alias} is not a name`)
-    assert.ok(claude.names.includes('claude'), 'the id still is')
-  }
-  const jev = fakeJev()
-  await decide(engine(), jev, { modelOf: (a) => (a.provider === 'codex' ? 'o3' : modelOf(a)) })
-  assert.ok(jev.calls.find((c) => c.candidates).identities.find((x) => x.id === 'codex').names.includes('o3'), 'a short model id is')
-})
-
 test('every domain decision a run makes carries its run id, so a later verdict can find the samples', async () => {
   const seen = []
   const inner = fakeDomains()
@@ -549,9 +524,9 @@ test('every domain decision a run makes carries its run id, so a later verdict c
   for (const [id, runId] of seen) assert.equal(runId, 'run-42', `${id} got the run id`)
 })
 
-test('a resource whose allowance is healthy is never conserved, however sure the judgment is', async () => {
-  // 20% of the week used: the governor says spend normally. A confident "conserve" from Jev or a
-  // matured classifier would otherwise send easy work to a second-best resource for no saving.
+test('a resource whose allowance is healthy is never conserved, however easy the work', async () => {
+  // 20% of the week used: the governor says spend normally. Moving easy work off it anyway would
+  // send it to a second-best resource for no saving.
   const d = await decide(engine(), fakeJev())
   assert.ok(byKey(d, 'claude').scarcity < 0.2, 'the setting: nothing is being used up')
   assert.equal(d.routing.primaryAgent, 'claude')
@@ -586,17 +561,6 @@ test('the capability the task needs is a hard fact applied before any judgment, 
   // A capability nothing here has refuses the run with the code the router stops on.
   const err = await decide(engine(), fakeJev({ profile: profileOf({ capability: 'web_research' }) }), { capableFor: () => new Set() }).then(() => null, (e) => e)
   assert.equal(err?.code, NO_CANDIDATES)
-})
-
-test('the resource call masks every configured agent, not only the ones in this pool', async () => {
-  const jev = fakeJev()
-  const pool = AGENTS.filter((a) => a.id !== 'codex')
-  await decide(engine(), jev, { agents: pool, everyAgent: AGENTS })
-  const ids = jev.calls.find((c) => c.candidates).identities
-  const codex = ids.find((x) => x.id === 'codex')
-  assert.ok(codex, 'an agent outside the pool is still named for the masker')
-  assert.equal(codex.key, undefined, 'with no key, so it masks to the neutral placeholder')
-  assert.ok(codex.names.includes('gpt-5.6'), 'and its model id is among the names masked')
 })
 
 test('the strategy domain is labelled only by a run that carries out its answer', async () => {
@@ -680,6 +644,90 @@ test('a gated resource the frontier exception does not keep is recorded as past 
   assert.deepEqual(d.routing.decision.reviewOnly.map((r) => r.id), ['deepseek'], 'and it is kept to review, with its numbers')
 })
 
+test('a local resource classifier at LOCAL_ONLY is recorded beside the ranking and never decides the pick', async () => {
+  // The owner's decision. Resource selection has no teacher, so its classifier learns only from
+  // runs that contradict the ranking: it can climb the ladder on a diet of failures and then
+  // disagree with arithmetic that is right. Here it is taught, on real samples of this very
+  // decision, that another resource should have done the work, and it earns LOCAL_ONLY on that.
+  const gate = {
+    shadowSamples: 10, guardedSamples: 20, localOnlySamples: 30, perClassSamples: 5, holdoutSamples: 3, recentWindow: 20,
+    guarded: { accuracy: 0.85, recentAccuracy: 0.85, macroF1: 0.8, maxEce: 0.3 },
+    localOnly: { accuracy: 0.85, recentAccuracy: 0.85, macroF1: 0.8, maxEce: 0.35 },
+    maxHighConfidenceError: 0.35, confidenceThreshold: 0.6, minOutcomeBacked: 0.5, maxTeacherOnly: 0.5,
+    rollback: { recentAccuracyFloor: 0.7, maxEce: 0.4, repromoteSamples: 5 },
+  }
+  const learning = resolvePolicy(mergePolicy({ gates: { MEDIUM: gate }, retrain: { minSamples: 8, everyNewSamples: 1, epochs: 300, learningRate: 0.3 }, minClassRecall: 0.4 }, {}))
+  const root = mkdtempSync(join(tmpdir(), 'kz-decision-'))
+  const store = createTrainingStore({ file: join(root, 'samples.jsonl') })
+  const domains = createDomainRegistry({ policy: learning, store, artifactsDir: join(root, 'classifiers'), stateDir: root, now: () => now })
+  const e = createDecisionEngine({ policy: learning, domains, profiles: createCapabilityRegistry({ priors: PRIORS, policy: learning }), priors: PRIORS, store, now: () => now })
+  let ranked = null
+  let other = null
+  for (let i = 0; i < 40; i++) {
+    const d = await decide(e, fakeJev())
+    ranked ??= d.routing.primaryAgent
+    const sample = await store.get(d.samples.find((x) => x.domain === 'resource_selection').id)
+    other ??= sample.input.candidates.find((c) => c.id !== ranked)
+    // What a rescue by another resource writes (training.js): the rescuer is the label, the pick
+    // the negative.
+    await store.resolveOutcome(sample.id, { chosenKey: other.key, negativeKey: sample.code.chosenKey, labelSource: 'verified_outcome', verified: true, details: { finalStatus: 'accepted', attempts: 2, escalated: true } })
+  }
+  const ctl = domains.get('resource_selection')
+  for (let i = 0; i < 6 && ctl.state().maturity !== 'LOCAL_ONLY'; i++) await ctl.evaluate()
+  assert.equal(ctl.state().maturity, 'LOCAL_ONLY', 'the setting: the classifier earned the top rung')
+
+  const d = await decide(e, fakeJev())
+  const report = d.domains.resource_selection
+  assert.equal(report.local?.label, other.key, `the setting: it answers ${other.id}, and confidently (${JSON.stringify(report.local)})`)
+  assert.ok(report.local.confidence >= report.requiredConfidence && !report.local.ood?.flag, 'enough to have decided, had it been allowed to')
+  assert.equal(d.routing.primaryAgent, ranked, 'the ranking still makes the pick')
+  assert.equal(report.authority, 'code')
+  assert.equal(report.maturity, 'LOCAL_ONLY', 'whatever rung the classifier holds')
+  // The sample says what really ran, so the run labels the ranking's pick, never the classifier's.
+  const stored = await store.get(report.sampleId)
+  assert.equal(stored.authority, 'code')
+  assert.equal(d.candidates.find((c) => c.key === stored.code.chosenKey)?.id, ranked)
+  assert.equal(stored.local.chosenKey, other.key, 'and the classifier\'s answer is kept beside it for comparison')
+})
+
+test('the frontier review is a rule in code at every rung: an answer Jev volunteers for it is never read', async () => {
+  // The domain says a rule teaches it (routing-policy.js DOMAINS), and the engine reads that, so
+  // the controller is handed no teacher and the Router tab can say the rule decides.
+  const root = mkdtempSync(join(tmpdir(), 'kz-decision-'))
+  const store = createTrainingStore({ file: join(root, 'samples.jsonl') })
+  const domains = createDomainRegistry({ policy, store, artifactsDir: join(root, 'classifiers'), stateDir: root, now: () => now })
+  const e = createDecisionEngine({ policy, domains, profiles: createCapabilityRegistry({ priors: PRIORS, policy }), priors: PRIORS, store, now: () => now })
+  const jev = fakeJev({ profile: profileOf({ risk: 0.1 }) })
+  const route = jev.route
+  jev.route = async (args) => ({ ...(await route(args)), frontierReview: 0.99 })
+  const d = await decide(e, jev)
+  const frontier = d.domains.frontier_escalation
+  assert.deepEqual([frontier.authority, frontier.label, frontier.jevCalled], ['code', 'no', false], 'the rule answers for low-risk work, not the 0.99 Jev volunteered')
+  assert.match(frontier.reason, /a rule in code decides/)
+  assert.equal(d.domains.second_opinion.authority, 'jev', 'a judgment Jev teaches is still put to Jev')
+
+  // With learning off there is no registry (index.js), and the engine alone keeps Jev out of it.
+  const bare = await decide(engine(), jev)
+  assert.deepEqual([bare.domains.frontier_escalation.authority, bare.domains.frontier_escalation.label], ['code', 'no'], 'no registry: the rule still answers')
+  assert.equal(bare.plan.frontierReview ?? false, false, 'and plans no frontier review Jev asked for')
+})
+
+test('with learning off, the report still says who answered each domain', async () => {
+  // No registry wires no controllers, and a domain without one used to be reported as 'none', so
+  // the run's "who decided" line left Jev out of a run whose task and strategy Jev chose.
+  const jev = fakeJev({ strategy: 'CHEAP_DIRECT' })
+  const d = await decide(engine(), jev)
+  assert.equal(d.domains.task_classification.authority, 'jev', 'Jev read the task')
+  assert.equal(d.domains.resource_selection.authority, 'code', 'the ranking made the pick')
+  assert.equal(d.domains.execution_strategy.authority, 'jev', 'Jev chose among the strategies')
+  assert.equal(d.domains.execution_strategy.label, d.plan.strategy)
+  // And with Jev down the heuristic stood in for the task and the strategy, and says so.
+  const down = { calls: [], route: async () => { throw new Error('Jev unreachable') } }
+  const off = await decide(engine(), down)
+  assert.equal(off.domains.task_classification.authority, 'fallback')
+  assert.equal(off.domains.resource_selection.authority, 'code')
+  assert.equal(off.domains.execution_strategy.authority, 'fallback')
+})
 
 // --- the ranking itself ------------------------------------------------------------------------
 // Who does the work is a comparison of numbers, so it is a rule here rather than a question to a
@@ -737,4 +785,264 @@ test('a near tie answers with a low confidence, and a clear winner with a high o
   const measured = { ...SCARCE_STRONG, id: 'known', key: 'RESOURCE_F', scarcity: 0, expectedCost: { total: 0.8 }, fit: 0.8, capabilities: rankCaps(0.8) }
   const r = rankCandidates({ candidates: [guessed, measured], profile: rankProfile({ complexity: 0.9, risk: 0.8 }), policy })
   assert.equal(r.chosenKey, 'RESOURCE_F', 'the lower but measured score wins over the higher guess')
+})
+
+test('the ranking trusts a candidate over the dimensions the deciding provider counts as wanted', () => {
+  // Trust is averaged over the wanted dimensions: a well-measured one alone, or with one nobody
+  // has measured beside it. Which of them is wanted is the provider's requirementWanted.
+  const c = { ...CHEAP_STANDARD, fit: 0.9, capabilities: { coding: { score: 0.9, confidence: 0.9, samples: 10 }, testing: { score: 0.9, confidence: 0.1, samples: 0 } } }
+  const profile = rankProfile({ requirements: { coding: 0.9, testing: 0.55 } })
+  const atJev = rankCandidates({ candidates: [c], profile, policy }).scores[c.key]
+  const atLaya = rankCandidates({ candidates: [c], profile, policy: { ...policy, requirementWanted: 0.6 } }).scores[c.key]
+  assert.ok(atLaya > atJev, `at 0.6 the unmeasured testing score is not wanted, so trust rises (${atLaya} against ${atJev})`)
+  assert.equal(rankCandidates({ candidates: [c], profile, policy: { ...policy, requirementWanted: 0.5 } }).scores[c.key], atJev, 'and Jev\'s 0.5 is the default')
+})
+
+// --- a run Laya decides (docs/laya-auto.md 2.5, 4.3, 6.3) ---------------------------------------
+
+/**
+ * A fake Laya: jev.route's shape as createJev returns it over the Laya client, with the model the
+ * client relabels, the client's `meta` (the identity and the script of what Laya read), and the
+ * names of the answers Laya gave too flat to use, per call (`flat.task`, `flat.resource`), as
+ * jev.js lists them in `uninformative` (docs/laya-auto.md 2.3).
+ */
+const LAYA_IDENTITY = 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1'
+function fakeLaya({ profile = profileOf(), strategy = 'STANDARD_DIRECT', secondOpinion = 0.2, flat = {}, tool = { handler: 'agent' } } = {}) {
+  const calls = []
+  return {
+    calls,
+    route: async (args) => {
+      calls.push(args)
+      const task = args.ask?.task !== false
+      const out = { model: 'laya-english/0.3.20@1a2b3c4', meta: { provider: 'laya', identity: LAYA_IDENTITY, lang: 'latin' }, uninformative: [...(task ? flat.task ?? [] : flat.resource ?? [])] }
+      if (task) { out.profile = profile; Object.assign(out, { taskType: profile.taskType, complexity: profile.complexity, risk: profile.risk, ...tool }) }
+      if (args.candidates && args.ask?.resource !== false) out.strategy = { choice: strategy, confidence: 0.4, probabilities: { [strategy]: 0.4 } }
+      if (args.candidates && args.ask?.judgments !== false) out.secondOpinion = secondOpinion
+      return out
+    },
+  }
+}
+/**
+ * An engine with a real domain registry over Jev's store, and Laya's store beside it. `ladder`
+ * puts domains of Jev's ladder at a rung, as their state files hold it, read back as at start-up;
+ * such a registry has no artifacts folder, since a missing artifact would take a local rung away
+ * at load.
+ */
+function layaEngine({ ladder = {} } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'kz-decision-'))
+  const stateDir = join(root, 'domains')
+  const store = createTrainingStore({ file: join(root, 'routing-samples.jsonl') })
+  const sink = createTrainingStore({ file: join(root, 'laya-samples.jsonl'), kind: 'laya' })
+  const artifactsDir = Object.keys(ladder).length ? undefined : join(root, 'classifiers')
+  const domains = createDomainRegistry({ policy, store, artifactsDir, stateDir, now: () => now })
+  if (Object.keys(ladder).length) {
+    mkdirSync(stateDir, { recursive: true })
+    for (const [id, maturity] of Object.entries(ladder)) writeFileSync(join(stateDir, `${id}.state.json`), JSON.stringify({ stateVersion: 3, maturity }))
+    domains.load()
+  }
+  const e = createDecisionEngine({ policy, domains, profiles: createCapabilityRegistry({ priors: PRIORS, policy }), priors: PRIORS, store, now: () => now })
+  return { e, store, sink, domains, stateDir }
+}
+const records = async () => (await import('../providers.js')).resolveProviders({}, { policy })
+
+test('fillFlat takes every field the provider answered, merges the requirements per dimension, and fills the tiers', async () => {
+  const { fillFlat } = await import('../decision.js')
+  assert.equal(typeof fillFlat, 'function', 'decision.js exports fillFlat')
+  const heuristic = heuristicProfile('fix the login bug')
+  assert.ok(Object.keys(heuristic.requirements).length >= 2, 'the setting: the heuristic wants some dimensions for this type')
+  const [kept, flat] = Object.keys(heuristic.requirements)
+  // As jev.js builds it: a flat score or choice is left out, and named in filledByRules.
+  const answered = {
+    taskType: 'debugging', taskTypeConfidence: 0.41, complexity: undefined, risk: 0.3,
+    requirements: { [kept]: 0.9, context_handling: 0.2 }, skills: { primary: 'debugging', supporting: [] },
+    minimumCapability: undefined, preferredCapability: undefined, capability: undefined,
+    verification: ['checks'], needsSecondOpinion: 0.5, needsHumanReview: 0.5, needsTests: 0.5,
+    filledByRules: ['complexity', 'minimumCapability', 'preferredCapability', 'capability', `req.${flat}`],
+  }
+  const p = fillFlat(heuristic, answered)
+  assert.deepEqual([p.taskType, p.taskTypeConfidence, p.risk, p.needsHumanReview], ['debugging', 0.41, 0.3, 0.5], 'what was answered is the provider\'s')
+  assert.equal(p.complexity, heuristic.complexity, 'a flat score is the rules\'')
+  assert.deepEqual(p.requirements, { ...heuristic.requirements, [kept]: 0.9, context_handling: 0.2 }, 'per dimension: a flat one is the heuristic\'s 0.7 where its type exercises it')
+  assert.equal(p.requirements[flat], 0.7)
+  assert.deepEqual([p.minimumCapability, p.preferredCapability], ['standard', 'strong'], 'flat tiers take the heuristic\'s fixed ones')
+  assert.equal(p.capability, undefined, 'a flat capability is no capability: no filter, no stop')
+  assert.equal('heuristic' in p, false, 'a profile that is mostly the provider\'s is not the heuristic\'s')
+  assert.deepEqual(p.filledByRules, answered.filledByRules, 'and it still says what the rules filled')
+  assert.equal(heuristic.heuristic, true, 'the heuristic it started from is left as it was')
+})
+
+test('a Laya run: Laya decides every domain it is asked, the rules keep theirs, and every sample goes to Laya\'s store', async () => {
+  const { laya } = await records()
+  const { e, store, sink } = layaEngine()
+  const decider = fakeLaya()
+  const d = await decide(e, undefined, { decider, provider: laya, sink, runId: 'run-laya' })
+  const authorities = Object.fromEntries(Object.entries(d.domains).map(([id, r]) => [id, r.authority]))
+  assert.deepEqual(authorities, { task_classification: 'laya', skill_selection: 'laya', resource_selection: 'code', execution_strategy: 'laya', second_opinion: 'laya', frontier_escalation: 'code' })
+  for (const [id, r] of Object.entries(d.domains)) assert.equal(r.maturity, null, `${id} reports no rung`)
+  assert.equal(d.routing.decision.decider, 'laya', 'the decision names who decided')
+  assert.equal(d.routing.decision.jevCalls, 2, 'and counts the calls made to it')
+  assert.equal(decider.calls.length, 2)
+  assert.ok(d.samples.length >= 4 && d.samples.every((s) => s.store === 'laya'), 'every sample the run labels is found in Laya\'s store')
+  assert.deepEqual(d.routing.decision.samples.map((s) => s.store), d.samples.map(() => 'laya'))
+  assert.equal((await store.list()).length, 0, 'the store Jev teaches from holds nothing of it')
+  const rows = await sink.list()
+  assert.ok(rows.length >= 6)
+  for (const r of rows) {
+    assert.equal(r.teacher, null)
+    assert.equal(r.runId, 'run-laya')
+    assert.ok(['laya', 'code'].includes(r.authority), `${r.domain}: ${r.authority}`)
+  }
+  const task = rows.find((r) => r.domain === 'task_classification')
+  assert.deepEqual([task.provider.label, task.provider.model], ['implementation', 'laya-english/0.3.20@1a2b3c4'])
+  for (const r of rows.filter((x) => x.provider)) assert.deepEqual([r.provider.identity, r.provider.lang], [LAYA_IDENTITY, 'latin'], `${r.domain}: the identity and script of the call that answered`)
+  assert.equal(task.extra.profile, undefined, 'no class average can read Laya\'s numbers')
+  assert.equal(task.extra.providerProfile.risk, 0.2)
+  // A Jev run with the same wiring is Jev's, in Jev's store, as it always was, even when it is
+  // handed Laya's store: that one would refuse Jev's rows, and they would be lost.
+  const { jev } = await records()
+  const j = await decide(e, fakeJev(), { provider: jev, sink })
+  assert.equal(j.domains.task_classification.authority, 'jev')
+  assert.equal(j.routing.decision.decider, 'jev')
+  assert.ok(j.samples.length >= 4 && j.samples.every((s) => s.store === 'jev'))
+  assert.equal((await store.list()).length, rows.length, 'every domain of the Jev run wrote its sample to Jev\'s store')
+  assert.ok((await store.list({ domain: 'task_classification' }))[0].extra.profile, 'and its numbers are Jev\'s profile')
+  assert.equal((await sink.list()).length, rows.length, 'and none to Laya\'s')
+})
+
+test('a Laya run: what Laya answered too flat to use is filled by the rules, field by field, and the rest stays Laya\'s', async () => {
+  const { laya } = await records()
+  const { e, sink } = layaEngine()
+  const task = 'implement the parser change'
+  const heuristic = heuristicProfile(task)
+  const taskFlat = ['taskType', 'complexity', 'minimumCapability', 'preferredCapability']
+  const profile = profileOf({ taskType: undefined, taskTypeConfidence: undefined, complexity: undefined, minimumCapability: undefined, preferredCapability: undefined, risk: 0.2, filledByRules: taskFlat })
+  const decider = fakeLaya({ profile, secondOpinion: 0.9, flat: { task: taskFlat, resource: ['strategy', 'secondOpinion'] } })
+  const d = await decide(e, undefined, { decider, provider: laya, sink, task })
+  const t = d.domains.task_classification
+  assert.deepEqual([t.authority, t.reason], ['fallback', 'Laya\'s answer was too flat to use'])
+  assert.equal(d.profile.taskType, heuristic.taskType, 'the rules gave the type')
+  assert.equal(d.profile.complexity, heuristic.complexity, 'and the score Laya left flat')
+  assert.equal(d.profile.risk, 0.2, 'while the risk Laya did answer is Laya\'s, not the heuristic\'s 0.5')
+  assert.deepEqual(d.profile.requirements, { ...heuristic.requirements, coding: 0.8, testing: 0.4 })
+  assert.deepEqual([d.profile.minimumCapability, d.profile.preferredCapability], ['standard', 'strong'])
+  assert.equal(d.profile.heuristic, undefined)
+  assert.deepEqual(d.profile.filledByRules, taskFlat, 'the report can say what the rules filled')
+  assert.equal(d.domains.skill_selection.authority, 'laya', 'the skill Laya did answer still decides')
+  assert.equal(d.plan.skill.authority, 'laya', 'and is not reported as the fallback')
+  // The resource call: a flat strategy and a flat second opinion take the rules.
+  const s = d.domains.execution_strategy
+  assert.deepEqual([s.authority, s.reason], ['fallback', 'Laya\'s answer was too flat to use'])
+  const so = d.domains.second_opinion
+  assert.deepEqual([so.authority, so.label], ['fallback', 'no'], 'the rule reads risk 0.2 against Laya\'s riskForReview 0.45, never Laya\'s flat yes')
+  // Each flat answer is kept on its sample, flagged, so a reading of Laya can leave it out.
+  const rows = await sink.list()
+  for (const domain of ['task_classification', 'execution_strategy', 'second_opinion']) {
+    assert.equal(rows.find((r) => r.domain === domain).provider.informative, false, domain)
+  }
+  assert.equal(rows.find((r) => r.domain === 'skill_selection').provider.informative, true)
+})
+
+test('a Laya run: a task type too flat to use leaves the tool Laya picked, with its numbers, as answered', async () => {
+  const { laya } = await records()
+  const { e, sink } = layaEngine()
+  const tools = [{ id: 'lint', description: 'runs the linter', params: { path: ['src', 'test'] } }]
+  const pick = { handler: 'lint', handlerConfidence: 0.9, toolFits: 0.95, toolArgConfidence: 0.9, toolArgs: { path: 'src' } }
+  const toolOf = (r) => ({ handler: r.handler, handlerConfidence: r.handlerConfidence, toolFits: r.toolFits, toolArgConfidence: r.toolArgConfidence, toolArgs: r.toolArgs })
+  const answered = await decide(e, undefined, { decider: fakeLaya({ tool: pick }), provider: laya, sink, tools })
+  assert.deepEqual(toolOf(answered.routing), pick, 'the setting: an informative task type keeps Laya\'s tool')
+  // Only the type falls to the rules (4.3): the handler, its fits noul and its parameters are
+  // other answers of the same call, and a flat type says nothing about them.
+  const profile = profileOf({ taskType: undefined, taskTypeConfidence: undefined, filledByRules: ['taskType'] })
+  const d = await decide(e, undefined, { decider: fakeLaya({ profile, tool: pick, flat: { task: ['taskType'] } }), provider: laya, sink, tools })
+  assert.equal(d.domains.task_classification.authority, 'fallback', 'the type is the rules\'')
+  assert.equal(d.profile.risk, 0.2, 'the profile keeps what Laya answered')
+  assert.deepEqual(toolOf(d.routing), pick, 'and so does the routing: the tool Laya picked is not dropped for an agent')
+})
+
+test('the cut-offs are the deciding provider\'s, read from its record through the per-run policy', async () => {
+  const { jev, laya } = await records()
+  // The second-opinion rule when nobody answers: the heuristic's risk 0.5 is under Jev's
+  // riskForReview 0.6 and at or over Laya's 0.45.
+  assert.equal((await decide(engine(), undefined, { provider: jev })).routing.decision.judgments.secondOpinion, 0)
+  assert.equal((await decide(engine(), undefined, { provider: laya })).routing.decision.judgments.secondOpinion, 1)
+  // Easy enough to move off a scarce resource: complexity 0.45 is, for Jev (0.5), and is not, for Laya (0.4).
+  const easyish = profileOf({ complexity: 0.45, risk: 0.1 })
+  assert.equal((await decide(engine(), undefined, { decider: fakeJev({ profile: easyish }), provider: jev, snapshots: scarce() })).routing.conservedFrom, 'claude')
+  assert.equal((await decide(engine(), undefined, { decider: fakeLaya({ profile: easyish }), provider: laya, snapshots: scarce() })).routing.conservedFrom, undefined)
+  // A requirement at 0.55 is wanted at Jev's requirementWanted 0.5 and not at Laya's 0.6.
+  const halfway = profileOf({ requirements: { coding: 0.55, testing: 0.8 } })
+  const shown = async (decider, provider) => Object.keys((await decide(engine(), undefined, { decider, provider })).routing.decision.candidates[0].capabilities)
+  assert.ok((await shown(fakeJev({ profile: halfway }), jev)).includes('coding'))
+  assert.ok(!(await shown(fakeLaya({ profile: halfway }), laya)).includes('coding'))
+  // A judgment's P(true) is read at the record's own judgmentYes.
+  const strict = (await import('../providers.js')).resolveProviders({ laya: { thresholds: { judgmentYes: 0.7 } } }, { policy }).laya
+  const yesAt = async (provider) => (await decide(engine(), undefined, { decider: fakeLaya({ secondOpinion: 0.6 }), provider })).domains.second_opinion
+  assert.deepEqual([(await yesAt(laya)).authority, (await yesAt(laya)).label], ['laya', 'yes'])
+  assert.equal((await yesAt(strict)).label, 'no')
+  // Without a record the run is Jev's, on the policy's own minimumReview, as before there were two.
+  const raised = resolvePolicy({ minimumReview: { riskForReview: 0.4 } })
+  const e = createDecisionEngine({ policy: raised, domains: undefined, profiles: createCapabilityRegistry({ priors: PRIORS, policy: raised }), priors: PRIORS, now: () => now })
+  assert.equal((await decide(e, undefined)).routing.decision.judgments.secondOpinion, 1)
+})
+
+test('a Laya run asks Laya every question whatever rung Jev\'s ladder holds a domain at, and leaves that ladder as it was', async () => {
+  const { laya } = await records()
+  // Jev's ladder has earned every domain Laya answers the top rung, and so costs Jev nothing there.
+  const ladder = { task_classification: 'LOCAL_ONLY', skill_selection: 'LOCAL_ONLY', execution_strategy: 'LOCAL_ONLY', second_opinion: 'LOCAL_ONLY' }
+  const { e, sink, domains, stateDir } = layaEngine({ ladder })
+  assert.equal(domains.get('second_opinion').state().maturity, 'LOCAL_ONLY', 'the setting: Jev\'s ladder holds the judgment at its top rung')
+  const files = () => Object.fromEntries(readdirSync(stateDir).map((f) => [f, readFileSync(join(stateDir, f), 'utf8')]))
+  const before = files()
+  const decider = fakeLaya({ secondOpinion: 0.9 })
+  const d = await decide(e, undefined, { decider, provider: laya, sink, runId: 'run-laya' })
+  assert.deepEqual(decider.calls.map((c) => c.ask), [{ task: true, resource: false, judgments: false }, { task: false, resource: true, judgments: true }], 'the judgment rides the resource call, as at JEV_PRIMARY')
+  const so = d.domains.second_opinion
+  assert.deepEqual([so.authority, so.label, so.maturity], ['laya', 'yes', null], `Laya decides it (${so.reason})`)
+  assert.deepEqual(Object.fromEntries(Object.entries(d.domains).map(([id, r]) => [id, r.authority])), { task_classification: 'laya', skill_selection: 'laya', resource_selection: 'code', execution_strategy: 'laya', second_opinion: 'laya', frontier_escalation: 'code' })
+  assert.deepEqual(files(), before, 'and Jev\'s ladder is exactly as it was')
+  // A Jev run on the same ladder still leaves out the group only mature domains would read.
+  const jev = fakeJev()
+  await decide(layaEngine({ ladder }).e, jev)
+  assert.deepEqual(jev.calls.map((c) => c.ask), [{ task: true, resource: false, judgments: false }, { task: false, resource: true, judgments: false }])
+})
+
+test('a Jev run reads rows 20 and 21 from routing.minimumReview whichever Jev record it is handed, the router\'s default one included, and a Laya run from its own record', async () => {
+  const { DEFAULT_JEV, resolveProviders } = await import('../providers.js')
+  const raised = resolvePolicy({ minimumReview: { riskForReview: 0.4, riskForFrontierReview: 0.45 } })
+  const e = createDecisionEngine({ policy: raised, domains: undefined, profiles: createCapabilityRegistry({ priors: PRIORS, policy: raised }), priors: PRIORS, now: () => now })
+  // Nobody answers, so the rules read the heuristic's risk 0.5: at or over the policy's 0.4 and
+  // 0.45, under the 0.6 and 0.8 the default record carries.
+  const cuts = raised.codeJudgments.frontierReview
+  for (const [name, over] of [['no record', {}], ['DEFAULT_JEV', { provider: DEFAULT_JEV }], ['Jev\'s record from this policy', { provider: resolveProviders({}, { policy: raised }).jev }]]) {
+    const { secondOpinion, frontierReview } = (await decide(e, undefined, over)).routing.decision.judgments
+    assert.deepEqual([secondOpinion, frontierReview], [1, cuts.risky], name)
+  }
+  // Laya's record, built from the same policy, keeps its own rows 20 and 21 (0.45 and 0.7): the same
+  // risk 0.5 is at its review bar and under its frontier bar, whatever routing.minimumReview says.
+  const { laya } = resolveProviders({}, { policy: raised })
+  assert.deepEqual([laya.thresholds.riskForReview, laya.thresholds.riskForFrontierReview], [0.45, 0.7], 'the setting: Laya\'s own bars')
+  const down = { route: async () => { throw new Error('timed out after 42 s') } }
+  const { secondOpinion, frontierReview } = (await decide(e, undefined, { decider: down, provider: laya, sink: layaEngine().sink })).routing.decision.judgments
+  assert.equal(secondOpinion, 1)
+  assert.notEqual(frontierReview, cuts.risky, 'a risk under Laya\'s own frontier bar is no risky frontier review')
+})
+
+test('a Laya run stores as Laya\'s numbers only what Laya answered, and nothing when it gave no answer', async () => {
+  const { laya } = await records()
+  const { e, sink } = layaEngine()
+  const down = { route: async () => { throw new Error('timed out after 42 s') } }
+  await decide(e, undefined, { decider: down, provider: laya, sink, runId: 'run-down' })
+  const row = (await sink.list({ domain: 'task_classification' }))[0]
+  assert.ok(row, 'the run\'s sample went to Laya\'s store')
+  assert.deepEqual([row.authority, row.provider], ['fallback', null], 'the setting: Laya gave nothing, and the rules decided')
+  assert.equal(row.extra?.providerProfile, undefined, 'the rules\' profile is never stored as Laya\'s numbers')
+  assert.equal(row.extra?.profile, undefined, 'nor as a teacher\'s')
+  // Only the type was too flat: the rules gave the type, and the numbers Laya did give are Laya's.
+  const flat = layaEngine()
+  const profile = profileOf({ taskType: undefined, taskTypeConfidence: undefined, filledByRules: ['taskType'] })
+  await decide(flat.e, undefined, { decider: fakeLaya({ profile, flat: { task: ['taskType'] } }), provider: laya, sink: flat.sink })
+  const given = (await flat.sink.list({ domain: 'task_classification' }))[0]
+  assert.ok(given, 'the run\'s sample went to Laya\'s store')
+  assert.equal(given.authority, 'fallback')
+  assert.equal(given.extra.providerProfile.risk, 0.2, 'Laya\'s risk, not the heuristic\'s 0.5')
 })

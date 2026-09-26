@@ -283,6 +283,105 @@ test('an unsure local pick with no subscription anywhere near it is left alone',
   assert.equal(r.routing.tiebrokeFrom, undefined)
 })
 
+// ---------------------------------------------------------------- a review Laya answers
+
+/**
+ * The review as a Laya run has it: Laya's record on the decider, Laya's thresholds, and the
+ * outcome domain deciding for Laya into Laya's own store (the facade index.js hands the router),
+ * or no outcome domain at all when `learning` is off.
+ */
+async function layaReview(answers, { risk = 0.1, over = {}, learning = true } = {}) {
+  const { resolveProviders } = await import('../providers.js')
+  const { resolvePolicy } = await import('../routing-policy.js')
+  const { createDomainController } = await import('../domains.js')
+  const { createTrainingStore } = await import('../training.js')
+  const { createReview } = await import('../../jev-review/index.js')
+  const { laya } = resolveProviders({}, { policy: resolvePolicy() })
+  const root = mkdtempSync(join(tmpdir(), 'kz-guards-'))
+  const store = createTrainingStore({ file: join(root, 'routing-samples.jsonl') })
+  const sink = createTrainingStore({ file: join(root, 'laya-samples.jsonl'), kind: 'laya' })
+  const ctl = createDomainController({ domain: 'outcome_disposition', store })
+  const outcome = { decide: (args) => ctl.decide({ ...args, answeredBy: 'laya', sink }) }
+  const decider = { provider: laya, assess: async () => answers }
+  const input = {
+    task: 't', routing: { risk }, attempts: [{ agent: 'a', stopReason: 'completed' }], checks: [], cmp: { regressed: [], failing: [] }, diff: {}, agents: [],
+    blockAccept: false, reviewed: false, touchedCode: true, pickOther: (_, avoid) => (avoid === 'a' ? 'b' : 'a'), ...over,
+  }
+  const a = await createReview(decider, laya.thresholds, 'x', { outcome: learning ? outcome : undefined })(input, signal)
+  return { a, store, sink }
+}
+// quality = min(addressed, complete, 1 - unrelated, 1 - regression) = q
+const layaAnswers = (q, over = {}) => ({
+  model: 'laya-english/0.3.20@1a2b3c4', uninformative: [], verdict: 'accept', verdictConfidence: 0.3, disposition: 'PASS', dispositionConfidence: 0.3, dispositionProbabilities: { PASS: 0.3 },
+  addressed: q, complete: 1, unrelatedChanges: 0, regressionRisk: 0, needsPerson: 0.1,
+  reviewAgent: 'c', reviewAgentProbabilities: { c: 0.4, b: 0.35 }, retryAgent: 'c', retryAgentProbabilities: { c: 0.4, b: 0.35 }, ...over,
+})
+
+test('a Laya review with the outcome domain wired runs on Laya\'s answers, and its sample is Laya\'s', async () => {
+  const { a, store, sink } = await layaReview(layaAnswers(0.9))
+  assert.equal(a.mode, 'laya', 'who answered comes from the decider, never from the assessment')
+  assert.equal(a.outcomeDomain.authority, 'laya')
+  assert.deepEqual([a.action, a.why], ['accept', 'quality 0.90 ≥ bar 0.65 (risk 0.10)'])
+  const row = await sink.get(a.outcomeDomain.sampleId)
+  assert.deepEqual([row.authority, row.teacher, row.provider.label, row.provider.model], ['laya', null, 'PASS', 'laya-english/0.3.20@1a2b3c4'])
+  assert.equal((await store.list()).length, 0)
+})
+
+test('a disposition Laya gave too flat to use leaves the review to its yes/no answers: under the bar it is a second review, never an accept', async () => {
+  const { a, sink } = await layaReview(layaAnswers(0.5, { uninformative: ['disposition'] }))
+  assert.equal(a.outcomeDomain.authority, 'laya', 'the flat disposition still decides the domain')
+  assert.equal(a.disposition, 'SECOND_OPINION', 'as a label only: the router is handed the disposition the action implies')
+  assert.deepEqual([a.action, a.why], ['second_review', 'quality 0.50 under Laya\'s accept bar 0.65 (risk 0.10); Laya\'s disposition was too flat to use, so the review action stands in for it'])
+  const row = await sink.get(a.outcomeDomain.sampleId)
+  assert.equal(row.provider.label, 'PASS', 'Laya\'s label is kept on the sample')
+  assert.equal(row.provider.informative, false, 'and its sample is flagged, so no reading of Laya counts it')
+})
+
+test('review and retry picks Laya answered too flat to use go to the peer rule, and the review says so', async () => {
+  const both = (await layaReview(layaAnswers(0.5, { uninformative: ['reviewAgent', 'retryAgent'] }))).a
+  assert.deepEqual([both.reviewAgent, both.retryAgent], ['b', 'b'], 'the deterministic peer pick the fallback path uses')
+  assert.equal(both.reviewAgentProbabilities, undefined, 'and the router ranks by nothing rather than by the flat distribution')
+  assert.equal(both.retryAgentProbabilities, undefined)
+  assert.match(both.why, /; Laya's review and retry picks were too flat to use, so the peer rule stands in for them$/)
+  const one = (await layaReview(layaAnswers(0.5, { uninformative: ['retryAgent'] }))).a
+  assert.deepEqual([one.reviewAgent, one.retryAgent], ['c', 'b'], 'an informative pick stands')
+  assert.deepEqual(one.reviewAgentProbabilities, { c: 0.4, b: 0.35 })
+  assert.match(one.why, /; Laya's retry pick was too flat to use, so the peer rule stands in for it$/)
+})
+
+test('a flat FRONTIER_REVIEW or RETRY_SAME_TIER from Laya never reaches the router, learning on or off, and an informative one does', async () => {
+  // The router sends a FRONTIER_REVIEW to the strongest agent and retries a RETRY_SAME_TIER on the
+  // same producer before any named agent, so a flat one would pick who reviews or retries on noise.
+  const flat = (disposition) => ({ uninformative: ['disposition'], disposition, dispositionConfidence: 0.19, dispositionProbabilities: { [disposition]: 0.19, PASS: 0.18, WRONG: 0.18 } })
+  for (const learning of [true, false]) {
+    const frontier = (await layaReview(layaAnswers(0.5, flat('FRONTIER_REVIEW')), { risk: 0.5, learning })).a
+    assert.equal(frontier.action, 'second_review', 'the setting: a quality under Laya\'s bar')
+    assert.equal(frontier.disposition, 'SECOND_OPINION', `learning ${learning}: a second review like any other`)
+    assert.equal(frontier.dispositionProbabilities, undefined, 'and its flat numbers go with it')
+    assert.equal(frontier.dispositionConfidence, undefined)
+    assert.ok(frontier.why.endsWith('; Laya\'s disposition was too flat to use, so the review action stands in for it'), frontier.why)
+    const same = (await layaReview(layaAnswers(0.2, flat('RETRY_SAME_TIER')), { learning })).a
+    assert.equal(same.action, 'retry', 'the setting: a quality at or under reject')
+    assert.equal('disposition' in same, false, `learning ${learning}: a retry names no disposition, so the router keeps the retry pick`)
+    assert.ok(same.why.endsWith('; Laya\'s disposition was too flat to use, so the review action stands in for it'), same.why)
+  }
+  const kept = (await layaReview(layaAnswers(0.5, { disposition: 'FRONTIER_REVIEW' }), { risk: 0.5 })).a
+  assert.equal(kept.disposition, 'FRONTIER_REVIEW', 'an informative disposition is Laya\'s to give')
+  assert.doesNotMatch(kept.why, /too flat/)
+})
+
+test('a review pick Laya answered too flat to use names no agent: the router picks the reviewer itself, from the judges', async () => {
+  // a produced the work, g is past its weekly gate (it may judge, not work), c is free. The
+  // router's own peer rule (router.js other()) gives c for a retry and g for a review, so the
+  // retry pool's pick named in the why would be an agent who never reviews.
+  const pickOther = (_, avoid, role = 'retry') => (role === 'review' ? 'g' : 'c')
+  const { a } = await layaReview(layaAnswers(0.5, { uninformative: ['reviewAgent'] }), { over: { pickOther } })
+  assert.equal(a.action, 'second_review', 'the setting: a review follows, and the router picks its reviewer')
+  const said = a.why.split('; ').at(-1)
+  assert.equal(said, 'Laya\'s review pick was too flat to use, so the peer rule stands in for it')
+  assert.doesNotMatch(said, /\b[acg]\b/, 'no agent is named for a pick the router makes')
+})
+
 // ---------------------------------------------------------------- dead config surface
 
 test('jev-review offers no config or service that nothing reads', async () => {

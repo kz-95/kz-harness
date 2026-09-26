@@ -1,0 +1,6 @@
+{
+  "name": "shop",
+  "server": { "port": 8080, "host": "localhost", "tls": { "enabled": false } },
+  "features": ["search"],
+  "limits": { "upload": 10 }
+}

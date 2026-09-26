@@ -53,6 +53,23 @@ test('auto follows complexity/risk and never picks ultra', () => {
   assert.equal(toAgentEffort(undefined, ds, { complexity: 0.1, risk: 0.1 }), 'high')
 })
 
+test('auto reads the bands of the provider that decided, and Jev\'s by default', () => {
+  // Wider bands than Jev's: the same task lands a rung lower.
+  const bands = { medium: 0.4, high: 0.8 }
+  assert.equal(autoLevel({ complexity: 0.3, risk: 0.2 }, bands), 'medium')
+  assert.equal(autoLevel({ complexity: 0.7, risk: 0.2 }, bands), 'high')
+  assert.equal(autoLevel({ complexity: 0.8, risk: 0.2 }, bands), 'xhigh')
+  assert.equal(autoLevel({}, bands), 'high', 'unknown is 0.5')
+  assert.equal(autoLevel({ complexity: 0.3, risk: 0.2 }), 'high')
+  assert.equal(autoLevel({ complexity: 0.7, risk: 0.2 }), 'xhigh')
+  // toAgentEffort hands them on for 'auto' only: a level or an override is not moved by them.
+  assert.equal(toAgentEffort('auto', claude, { complexity: 0.3, risk: 0.3, bands }), 'medium')
+  assert.equal(toAgentEffort(undefined, ds, { complexity: 0.7, risk: 0.1, bands }), 'high')
+  assert.equal(toAgentEffort('auto', claude, { complexity: 0.3, risk: 0.3 }), 'high')
+  assert.equal(toAgentEffort('xhigh', claude, { complexity: 0.1, risk: 0.1, bands }), 'xhigh')
+  assert.equal(toAgentEffort('auto', claude, { complexity: 0.1, override: 'max', bands }), 'max')
+})
+
 test('codex clamps to the model top effort; speed maps to the priority tier', () => {
   // gpt-5.5 tops out at xhigh today; nothing here may silently raise or lower that.
   assert.equal(toAgentEffort('ultra', codex, { model: 'gpt-5.5' }), 'xhigh')

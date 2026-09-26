@@ -21,12 +21,6 @@ const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x))
 const fitOf = (c) => num(c.fit, 0.5)
 const costOf = (c) => num(c.expectedCost?.total, 0.5)
 
-/** Strategies that make sense as an opening move; the rest are transitions the review reaches. */
-export const OPENING_STRATEGIES = Object.freeze([
-  'CHEAP_DIRECT', 'STANDARD_DIRECT', 'PREMIUM_DIRECT', 'LOCAL_FIRST',
-  'CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE', 'CHEAP_EXECUTE_FRONTIER_REVIEW', 'PARALLEL_SECOND_OPINION',
-])
-
 /** Strongest candidate: highest tier, then best fit, then cheaper. `except` ids are skipped. */
 export function strongestOf(candidates, { except = [] } = {}) {
   return [...candidates].filter((c) => !except.includes(c.id))
@@ -49,11 +43,14 @@ export function cheapestOf(candidates, { minimumTier = 'standard', except = [] }
 /**
  * How far a candidate's capability numbers may be believed: the mean, over the dimensions this
  * task depends on, of the recorded confidence discounted by how few verified runs stand behind
- * it. A score nobody has measured is a prior, and a prior must not outweigh a measured one.
+ * it. A score nobody has measured is a prior, and a prior must not outweigh a measured one. Which
+ * dimensions the task depends on is read at the deciding provider's `requirementWanted`, which a
+ * decision's per-run policy carries (decision.js), and at Jev's 0.5 without one.
  */
 function evidenceTrust(c, profile, policy) {
   const caps = c.capabilities ?? {}
-  const wanted = Object.entries(profile.requirements ?? {}).filter(([d, w]) => w >= 0.5 && caps[d]).map(([d]) => d)
+  const wantedAt = policy.requirementWanted ?? 0.5
+  const wanted = Object.entries(profile.requirements ?? {}).filter(([d, w]) => w >= wantedAt && caps[d]).map(([d]) => d)
   const dims = wanted.length ? wanted : Object.keys(caps)
   if (!dims.length) return 0
   const { evidenceRuns, evidenceFloor } = policy.ranking

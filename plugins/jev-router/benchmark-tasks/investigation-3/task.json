@@ -1,0 +1,17 @@
+{
+  "id": "investigation-3",
+  "skill": "investigation",
+  "level": 3,
+  "dimensions": ["general_reasoning"],
+  "folder": "catalog-api",
+  "prompt": "A client calls GET /api/items?limit=500 with no Authorization header.\nWhat is the largest number of items the response can hold, and which function sets that number last?\nWrite the answer to ANSWER.json as {\"maxItems\": <number>, \"function\": \"<name>\"}.\nDo not change any other file.",
+  "protect": [],
+  "onlyChanged": ["ANSWER.json"],
+  "grade": {
+    "kind": "answer",
+    "expect": {
+      "maxItems": 50,
+      "function": "anonymousCap"
+    }
+  }
+}

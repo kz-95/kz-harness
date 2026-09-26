@@ -1,0 +1,16 @@
+{
+  "id": "preflight",
+  "skill": null,
+  "level": 1,
+  "dimensions": [],
+  "folder": "hello",
+  "prompt": "Run node --version in this folder and write exactly what it prints to a new file named hello.txt in this folder.",
+  "protect": [],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/hello.test.js": 1
+    }
+  }
+}

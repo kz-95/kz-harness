@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createAccounts } from '../accounts.js'
-import { codexRpc, createUsage, creditPercent, detectLimit, longWindowPercent, stateOf } from '../usage.js'
+import { codexRpc, computeSavings, createUsage, creditPercent, detectLimit, longWindowPercent, stateOf } from '../usage.js'
 
 const sub = { handoffAtPercent: 85, stopAtPercent: 97 }
 const soon = () => new Date(Date.now() + 60_000).toISOString()
@@ -131,4 +131,48 @@ test('longWindowPercent: the rationed window, found by duration not by label', (
   assert.equal(longWindowPercent([w('weekly', 10080, 0)]), 0, 'a real zero is still zero')
   // Two long windows: the longer one wins.
   assert.equal(longWindowPercent([w('daily', 1440, 50), w('weekly', 10080, 10)]), 10)
+})
+
+// ---------------------------------------------------------------- one log for every decider
+
+test('logDecision writes a Jev row exactly as logJev does, and a Laya row at $0 that Jev\'s monthly spend never reads', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kz-decide-'))
+  const envFile = join(dir, '.env')
+  writeFileSync(envFile, '')
+  writeFileSync(join(dir, 'accounts.json'), JSON.stringify({ keys: { jev: [{ name: 'j1', active: true }] } }))
+  const accounts = createAccounts({ dataDir: dir, envFile, run: async () => ({ ok: true, out: '{}' }) })
+  const usage = createUsage({ dataDir: dir, accounts, fetch: async () => { throw new Error('no network in this test') }, home: dir })
+  assert.equal(typeof usage.logDecision, 'function', 'usage.js logs a decision by the provider that made it')
+  const { resolveProviders } = await import('../providers.js')
+  const { jev, laya } = resolveProviders({}, {})
+  const call = { runId: 'r1', account: 'j1', phase: 'route', ms: 900, model: 'jev-1.13.0', requestId: 'req_1', tokens: { input: 1_000_000, output: 5 } }
+  await usage.logJev(call)
+  await usage.logDecision({ provider: jev, ...call })
+  await usage.logDecision({ provider: laya, runId: 'r2', phase: 'route', ms: 950, model: 'laya-english/0.3.20@1a2b3c4', tokens: { input: 5610, output: 0 } })
+  const [viaJev, viaDecision, layaRow] = await usage.recent(3)
+  const { ts: _a, ...a } = viaJev
+  const { ts: _b, ...b } = viaDecision
+  assert.deepEqual(b, a, 'the Jev row is the row logJev has always written')
+  assert.equal(a.agent, 'jev')
+  assert.ok(Math.abs(a.costUsd - 0.042) < 1e-12)
+  assert.deepEqual(layaRow.tokens, { input: 5610, output: 0 })
+  assert.equal(layaRow.agent, 'laya')
+  assert.equal(layaRow.costUsd, 0)
+  assert.ok(!('provider' in layaRow) && !('thresholds' in layaRow), 'the record itself is never written')
+  const s = await usage.snapshot([])
+  assert.ok(Math.abs(s.jev.spentUsd - 0.084) < 1e-9, `Jev spent ${s.jev.spentUsd}: the Laya row must not count`)
+})
+
+test('computeSavings leaves the capability benchmark\'s attempts out of its agent median: a small task at a fixed effort says nothing of how long the person\'s own work takes', () => {
+  const now = Date.parse('2026-09-25T12:00:00.000Z')
+  const ts = '2026-09-25T10:00:00.000Z'
+  const own = [4000, 6000, 8000].map((durationMs) => ({ ts, agent: 'claude', role: 'primary', stopReason: 'completed', durationMs }))
+  const bench = [100, 200, 300, 400, 500].map((durationMs) => ({ ts, agent: 'claude', role: 'primary', stopReason: 'completed', durationMs, purpose: 'benchmark', benchmarkRunId: 'bench-1' }))
+  const answer = { ts, agent: 'chat', role: 'direct-answer', durationMs: 1000 }
+  const s = computeSavings([...own, ...bench, answer], [], {}, now)
+  assert.equal(s.assumptions.agentMedianMs, 6000, 'the median of the person\'s own attempts')
+  assert.equal(s.assumptions.agentMedianSamples, 3)
+  assert.equal(s.periods.today.savedMs, 6000 - 1000, 'what a direct answer saved is measured against it')
+  // With only the benchmark's attempts, there is no median of the person's own work.
+  assert.equal(computeSavings([...bench, answer], [], { agentMedianFallbackMs: 10_000 }, now).assumptions.agentMedianMs, 10_000)
 })

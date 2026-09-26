@@ -1,0 +1,15 @@
+{
+  "uv": { "version": "0.12.18", "source": "https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-pc-windows-msvc.zip",
+          "size": 17891221, "sha256": "cae6a3bc25239f83dffb467a4b180508d9da23986c04639ebfa44e43e6a84bff",
+          "linux": { "source": "https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-unknown-linux-gnu.tar.gz",
+                     "size": 19798687, "sha256": "89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16" } },
+  "python": "3.12",
+  "laya": "0.3.20",
+  "torch": { "version": "2.14.0",
+             "cuda": [ { "tag": "cu130", "minDriverCuda": 13.0 }, { "tag": "cu128", "minDriverCuda": 12.8 }, { "tag": "cu126", "minDriverCuda": 12.6 } ],
+             "indexBase": "https://download.pytorch.org/whl/" },
+  "lock": "config/laya/requirements.lock",
+  "weights": { "repo": "convaiinnovations/laya", "checkpoint": "english",
+               "allow": ["rl_agent_config.json", "model.safetensors", "tokenizer/*", "encoder/*"], "approxBytes": 842609220 },
+  "vramEstimateGB": 2.5, "ramEstimateGB": { "cpu": 3.3, "cuda": 1.5 }
+}

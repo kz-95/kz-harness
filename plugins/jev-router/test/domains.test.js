@@ -7,9 +7,10 @@
 // really is not: nothing here asserts on a number a stub handed it.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { saveArtifact, trainMulticlass } from '../classifier.js'
 import { STATE_VERSION, createDomainController, createDomainRegistry, jsDivergence, psi, splitRows } from '../domains.js'
 import { createTrainingStore } from '../training.js'
 import { mergePolicy, resolvePolicy } from '../routing-policy.js'
@@ -173,7 +174,9 @@ test('a resource ranker learns from the picks that worked, not from the ones run
   const ctl = controller({ domain, store, root })
   assert.equal(await climbTo(ctl, 'GUARDED_LOCAL'), 'GUARDED_LOCAL')
   const d = await ctl.decide({ features: { numeric: { risk: 0.2 }, categorical: {} }, candidates: set(2), jev: async () => ({ chosenKey: 'RESOURCE_A', probabilities: {}, confidence: 1 }), fallback: () => ({ chosenKey: 'RESOURCE_A', probabilities: {}, confidence: 0.5 }) })
-  assert.equal(d.chosenKey, 'RESOURCE_C', 'it picks the best fit, not the worst fit the teacher kept failing with')
+  // What it learned is read off its own answer: this domain's classifier never decides, at any
+  // rung (routing-policy.js), so the decision itself is somebody else's.
+  assert.equal(d.local?.chosenKey, 'RESOURCE_C', 'it picks the best fit, not the worst fit the teacher kept failing with')
 })
 
 test('scenario S: high accuracy with poor calibration does not promote past SHADOW', async () => {
@@ -447,11 +450,11 @@ test('scenario AA and AB: domains mature on their own, and a new resource touche
   await fill(store, 'task_classification', 100)
   const reg = createDomainRegistry({ policy: smallPolicy(), store, artifactsDir: join(root, 'classifiers'), stateDir: root, now: () => NOW })
   const task = reg.get('task_classification')
-  const security = reg.get('frontier_escalation')
+  const disposition = reg.get('outcome_disposition')
   await climbTo(task, 'LOCAL_ONLY')
   assert.equal(task.state().maturity, 'LOCAL_ONLY')
-  assert.equal(security.state().maturity, 'JEV_PRIMARY', 'a domain with no evidence of its own is still the teacher\'s')
-  const d = await security.decide({ features: highFeatures, jev: teacher('yes'), fallback: fallback('no') })
+  assert.equal(disposition.state().maturity, 'JEV_PRIMARY', 'a domain with no evidence of its own is still the teacher\'s')
+  const d = await disposition.decide({ features: highFeatures, jev: teacher('yes'), fallback: fallback('no') })
   assert.equal(d.authority, 'jev')
 
   // Scenario AB: a new resource is about the resource-ranking space, not about task types.
@@ -475,10 +478,140 @@ test('a resource ranker at LOCAL_ONLY steps down when a resource is added', asyn
   assert.equal(await climbTo(ctl, 'LOCAL_ONLY'), 'LOCAL_ONLY')
   const candidates = [0, 1, 2].map((k) => ({ key: `RESOURCE_${'ABC'[k]}`, features: { numeric: { fit: k === 1 ? 0.9 : 0.3, scarcity: 0.2 }, categorical: { source: 'api' } } }))
   const d = await ctl.decide({ features: { numeric: { risk: 0.2 }, categorical: {} }, candidates, jev: async () => ({ chosenKey: 'RESOURCE_A', probabilities: {}, confidence: 1 }), fallback: () => ({ chosenKey: 'RESOURCE_A', probabilities: {}, confidence: 0.5 }) })
-  assert.equal(d.authority, 'local')
-  assert.equal(d.chosenKey, 'RESOURCE_B', 'it learned to read the fit, not the position')
+  // Its rung is earned and lost like any other, though it never decides (routing-policy.js): what
+  // it learned is read off its own answer.
+  assert.equal(d.local?.chosenKey, 'RESOURCE_B', 'it learned to read the fit, not the position')
   ctl.noteEnvironmentChange({ kind: 'new_resource', detail: 'RESOURCE_D appeared' })
   assert.equal(ctl.state().maturity, 'GUARDED_LOCAL')
+})
+
+test('a domain whose local classifier never decides is decided by its rule at every rung, with the teacher down too, and the local answer is kept beside it', async () => {
+  // The resource ranking's case, by the owner's decision (routing-policy.js DOMAINS): the rule is
+  // the authority, and a classifier that earned LOCAL_ONLY is recorded for comparison but never
+  // decides. It is the domain's own property, not something each caller has to remember, so the
+  // Router tab reads it from the same place. The sample says who decided, because the run labels
+  // whatever the sample says was acted on.
+  const root = dir()
+  const store = storeAt(root)
+  const domain = 'resource_selection'
+  for (let i = 0; i < 100; i++) {
+    const best = i % 3
+    const candidates = [0, 1, 2].map((k) => ({ key: `RESOURCE_${'ABC'[k]}`, features: { numeric: { fit: k === best ? 0.9 : 0.3, scarcity: 0.2 }, categorical: { source: 'api' } } }))
+    const row = await store.append({ domain, input: { features: { numeric: { risk: 0.2 }, categorical: {} }, candidates }, teacher: { chosenKey: candidates[best].key, probabilities: {}, confidence: 0.9 }, local: null, authority: 'jev' })
+    await store.resolveOutcome(row.id, { chosenKey: candidates[best].key, labelSource: 'verified_outcome', verified: true, details: { finalStatus: 'accepted', attempts: 1, escalated: false } })
+  }
+  const ctl = controller({ domain, store, root })
+  assert.equal(await climbTo(ctl, 'LOCAL_ONLY'), 'LOCAL_ONLY')
+  assert.equal(ctl.state().localDecides, false, 'the domain says so in its state, which is what the Router tab reads')
+  const candidates = [0, 1, 2].map((k) => ({ key: `RESOURCE_${'ABC'[k]}`, features: { numeric: { fit: k === 1 ? 0.9 : 0.3, scarcity: 0.2 }, categorical: { source: 'api' } } }))
+  const rule = () => ({ chosenKey: 'RESOURCE_A', probabilities: { RESOURCE_A: 0.6, RESOURCE_B: 0.3, RESOURCE_C: 0.1 }, confidence: 0.67 })
+  const ask = (over = {}) => ctl.decide({ features: { numeric: { risk: 0.2 }, categorical: {} }, candidates, jev: null, fallback: rule, codeAuthority: true, ...over })
+  const d = await ask()
+  assert.equal(d.local?.chosenKey, 'RESOURCE_B', 'the setting: the classifier disagrees with the rule')
+  assert.ok(d.local.confidence >= d.requiredConfidence && !d.ood.flag, 'and is sure enough, on familiar input, to have decided at a rung that let it')
+  assert.equal(d.authority, 'code')
+  assert.equal(d.chosenKey, 'RESOURCE_A', 'the rule decides')
+  assert.equal(d.maturity, 'LOCAL_ONLY', 'whatever rung the classifier holds')
+  assert.match(d.reason, /never decides/)
+  const row = await store.get(d.sampleId)
+  assert.equal(row.authority, 'code')
+  assert.equal(row.code.chosenKey, 'RESOURCE_A')
+  assert.equal(row.local.chosenKey, 'RESOURCE_B', 'and the classifier\'s own answer is kept for comparison')
+  const asked = await ask({ localMayDecide: true })
+  assert.deepEqual([asked.authority, asked.chosenKey], ['code', 'RESOURCE_A'], 'a caller cannot hand back what the domain withholds')
+  // The domain has no teacher, so one a caller hands it is never asked, and a failing one cannot
+  // open the path where a mature classifier answers for a teacher that is down.
+  let asks = 0
+  const down = await ask({ codeAuthority: false, jev: async () => { asks++; throw new Error('teacher down') } })
+  assert.equal(asks, 0, 'a rule decides this domain: no teacher is asked')
+  assert.equal(down.jevCalled, false)
+  assert.equal(down.authority, 'code', 'and the rule stays the authority, whatever the caller says')
+  assert.equal(down.chosenKey, 'RESOURCE_A')
+  assert.equal(down.local?.chosenKey, 'RESOURCE_B')
+  assert.equal(ctl.state().teacher, 'code', 'the domain says who teaches it, which is what the Router tab reads')
+})
+
+test('a domain a rule in code decides asks no teacher at any rung, and its classifier may still earn a local rung', async () => {
+  // The frontier review: a threshold on the task's risk, answered by a rule in code rather than by
+  // Jev. Until its classifier earns a local rung the rule decides, whatever teacher a caller passes.
+  const root = dir()
+  const store = storeAt(root)
+  const domain = 'frontier_escalation'
+  // A HIGH-risk domain: the small MEDIUM gates, so the climb below fits a test.
+  const ctl = controller({ domain, store, root, policy: smallPolicy({ gates: { HIGH: smallPolicy().gates.MEDIUM } }) })
+  assert.equal(ctl.state().teacher, 'code')
+  assert.equal(ctl.state().maturity, 'JEV_PRIMARY')
+  let asks = 0
+  const jev = async () => { asks++; return { label: 'no', probabilities: { yes: 0, no: 1 }, confidence: 1 } }
+  const rule = () => ({ label: 'yes', probabilities: { yes: 0.9, no: 0.1 }, confidence: 0.9 })
+  const d = await ctl.decide({ features: { numeric: { risk: 0.9 }, categorical: {} }, jev, fallback: rule })
+  assert.equal(asks, 0, 'no teacher is asked')
+  assert.deepEqual([d.authority, d.label], ['code', 'yes'], 'the rule decides, reported as code rather than as a fallback')
+  assert.match(d.reason, /a rule in code decides/)
+  // Its classifier climbs like any other, and at a local rung decides a confident, familiar case
+  // for itself, which is what the Router tab's words for this domain promise.
+  await fill(store, domain, 100)
+  assert.equal(await climbTo(ctl, 'GUARDED_LOCAL'), 'GUARDED_LOCAL')
+  const earned = await ctl.decide({ features: highFeatures, jev, fallback: () => ({ label: 'low', probabilities: { low: 1 }, confidence: 0.5 }) })
+  assert.deepEqual([earned.authority, earned.label], ['local', 'high'], 'the local classifier decides, not the rule')
+  assert.equal(asks, 0, 'and no teacher was asked on the way')
+  // A domain Jev teaches is unchanged: the teacher is asked and decides.
+  const taskCtl = controller({ store, root })
+  assert.equal(taskCtl.state().teacher, 'jev')
+  const t = await taskCtl.decide({ features: highFeatures, jev: teacher('low'), fallback: fallback('low') })
+  assert.deepEqual([t.authority, t.label], ['jev', 'low'])
+})
+
+test('where the caller says a local classifier may not decide, it does not, on the main path or with the teacher down', async () => {
+  // decision.js says it at the resource ranking's call as well, so the argument has to hold on its
+  // own, on a domain whose classifier may otherwise decide.
+  const root = dir()
+  const store = storeAt(root)
+  await fill(store, 'task_classification', 100)
+  const ctl = controller({ store, root })
+  assert.equal(await climbTo(ctl, 'GUARDED_LOCAL'), 'GUARDED_LOCAL')
+  assert.equal(ctl.state().localDecides, true, 'the setting: this domain\'s classifier may decide')
+  const allowed = await ctl.decide({ features: highFeatures, jev: teacher('low'), fallback: fallback('low') })
+  assert.deepEqual([allowed.authority, allowed.label], ['local', 'high'], 'the setting: left to itself, the classifier decides, and not as the teacher would')
+  const barred = await ctl.decide({ features: highFeatures, jev: teacher('low'), fallback: fallback('low'), localMayDecide: false })
+  assert.deepEqual([barred.authority, barred.label], ['jev', 'low'], 'the teacher decides instead')
+  assert.equal(barred.local?.label, 'high', 'and the classifier\'s answer is kept beside it')
+  assert.match(barred.reason, /recorded for comparison/)
+  const down = await ctl.decide({ features: highFeatures, jev: async () => { throw new Error('teacher down') }, fallback: fallback('low'), localMayDecide: false })
+  assert.deepEqual([down.authority, down.label], ['fallback', 'low'], 'with the teacher down too, the deterministic answer stands and the classifier does not')
+  assert.equal(down.local?.label, 'high')
+})
+
+test('a conservation state file, classifier and samples left by an older version are ignored at start-up', async () => {
+  // Conservation was a routing domain and is now a hard limit in decision.js. An install that ran
+  // the older version still has its maturity state, its classifier and its samples on disk, laid
+  // out as index.js lays them out. Start-up must read past them: not fail on them, not bring the
+  // domain back, and not rewrite or delete what the person has.
+  const root = dir()
+  const stateDir = join(root, 'domains')
+  const artifactsDir = join(root, 'classifiers')
+  const store = createTrainingStore({ file: join(root, 'routing-samples.jsonl') })
+  const old = Array.from({ length: 20 }, (_, i) => ({ ...sample(i), label: i % 2 ? 'yes' : 'no' }))
+  for (const s of old) {
+    const row = await store.append({ domain: 'conservation', input: { features: s.features }, teacher: null, local: null, authority: 'code', code: { label: s.label, probabilities: {}, confidence: 0.9 } })
+    await store.resolveOutcome(row.id, { label: 'no', negativeLabel: 'yes', labelSource: 'verified_outcome', verified: true, details: { finalStatus: 'accepted', attempts: 2, escalated: true } })
+  }
+  saveArtifact(join(artifactsDir, 'conservation.json'), trainMulticlass({ samples: old, domain: 'conservation', now: () => NOW }))
+  mkdirSync(stateDir, { recursive: true })
+  writeFileSync(join(stateDir, 'conservation.state.json'), JSON.stringify({ stateVersion: STATE_VERSION, domain: 'conservation', riskClass: 'MEDIUM', kind: 'multiclass', maturity: 'LOCAL_ONLY', since: new Date(NOW).toISOString() }))
+  const files = [join(stateDir, 'conservation.state.json'), join(artifactsDir, 'conservation.json')]
+  const before = files.map((f) => readFileSync(f, 'utf8'))
+
+  // What index.js does at start-up, in its order: the store, the registry over the policy's
+  // domains, load; then what the first runs and the first retrain pass do with it.
+  const reg = createDomainRegistry({ policy: smallPolicy(), store, artifactsDir, stateDir, now: () => NOW })
+  assert.equal('conservation' in reg.load(), false)
+  assert.equal(reg.get('conservation'), null, 'an unknown domain has no controller')
+  assert.equal('conservation' in reg.states(), false, 'and no row in the Router tab')
+  assert.deepEqual(Object.keys(reg.states()), Object.keys(smallPolicy().domains))
+  assert.equal('conservation' in await reg.evaluateAll(), false, 'the retrain pass never trains it')
+  assert.equal((await store.stats()).total, old.length, 'its samples stay in the store, read by nothing that decides')
+  assert.deepEqual(files.map((f) => readFileSync(f, 'utf8')), before, 'and its files are left exactly as they were')
 })
 
 test('an unfamiliar candidate is out of distribution even when every feature is ordinary', async () => {
@@ -498,7 +631,9 @@ test('an unfamiliar candidate is out of distribution even when every feature is 
     { key: 'RESOURCE_Z', features: { numeric: { fit: 0.3 }, categorical: { source: 'api' } } },
   ]
   const d = await ctl.decide({ features: { numeric: { risk: 0.2 }, categorical: {} }, candidates: withNew, jev: async () => ({ chosenKey: 'RESOURCE_A', probabilities: {}, confidence: 1 }), fallback: () => ({ chosenKey: 'RESOURCE_A', probabilities: {}, confidence: 0.5 }) })
-  assert.equal(d.authority, 'jev', 'a resource this domain has never ranked is not something to decide alone')
+  // This domain's classifier never decides (routing-policy.js), so who decided proves nothing
+  // here; the reason says whether its answer would have been trusted at all.
+  assert.match(d.reason, /^out of distribution/, 'a resource this domain has never ranked is not something to decide alone')
   assert.ok(d.ood.reasons.includes('unfamiliar_candidate:RESOURCE_Z'))
 })
 
@@ -601,6 +736,21 @@ test('splitRows keeps time order: oldest trains, newest is held out', () => {
   assert.deepEqual(validation, [7])
   assert.deepEqual(holdout, [8, 9])
   assert.ok(Math.max(...train) < Math.min(...holdout), 'no future row can leak into training')
+})
+
+test('a split with no holdout share gives no holdout rows, however the floors round', () => {
+  // floor(0.8 x 7) + floor(0.2 x 7) is 6, one short of 7: the row the floors dropped became a
+  // one-row holdout slice, and the LOCAL_ONLY holdout gate was then scored on that single row
+  // instead of falling back to the validation slice.
+  for (const n of [7, 11, 13, 50, 99]) {
+    const rows = Array.from({ length: n }, (_, i) => i)
+    const { train, validation, holdout } = splitRows(rows, { train: 0.8, validation: 0.2, holdout: 0 })
+    assert.deepEqual(holdout, [], `n=${n}: a holdout share of 0 holds nothing out`)
+    assert.equal(train.length + validation.length, n, `n=${n}: every row is used`)
+    assert.equal(train.length, Math.floor(n * 0.8))
+  }
+  // With a holdout share the remainder still goes to the holdout, as before.
+  assert.deepEqual(splitRows([0, 1, 2, 3, 4, 5, 6], { train: 0.8, validation: 0.1, holdout: 0.1 }).holdout, [5, 6])
 })
 
 test('label quality gates LOCAL_ONLY: teacher-confirmed evidence alone is not enough', async () => {
@@ -760,7 +910,9 @@ test('a brand-new resource that inherits a familiar key is still unfamiliar', as
   const known = await ask([{ key: 'RESOURCE_A', id: 'claude', features: { numeric: { fit: 0.9 }, categorical: { source: 'api' } } }, { key: 'RESOURCE_B', id: 'codex', features: { numeric: { fit: 0.3 }, categorical: { source: 'api' } } }])
   assert.ok(!known.ood?.reasons?.some((r) => r.startsWith('unfamiliar_candidate')), 'the resources it trained on are familiar')
   const d = await ask([{ key: 'RESOURCE_A', id: 'claude', features: { numeric: { fit: 0.9 }, categorical: { source: 'api' } } }, { key: 'RESOURCE_B', id: 'newcomer', features: { numeric: { fit: 0.3 }, categorical: { source: 'api' } } }])
-  assert.equal(d.authority, 'jev', 'a resource this domain has never ranked is not something to decide alone')
+  // This domain's classifier never decides (routing-policy.js), so who decided proves nothing
+  // here; the reason says whether its answer would have been trusted at all.
+  assert.match(d.reason, /^out of distribution/, 'a resource this domain has never ranked is not something to decide alone')
   assert.ok(d.ood.reasons.includes('unfamiliar_candidate:RESOURCE_B'), 'flagged under its key, recognised by its id')
   assert.deepEqual(Object.keys(ctl.artifact().extras.candidateSamples).sort(), ['claude', 'codex'])
   // An artifact trained before the counts were kept by id is read the old way until its next
@@ -897,6 +1049,37 @@ test('a bad window from a rung that was lost does not follow the domain back up'
   await ctl.evaluate()
   assert.equal(ctl.state().maturity, 'GUARDED_LOCAL', 'a small breach needs two consecutive windows')
   assert.equal(ctl.state().consecutiveBadWindows, 1)
+})
+
+test('at the store\'s cap every window is still new evidence: a regression is confirmed, and a lost rung earned back', async () => {
+  const root = dir()
+  const policy = smallPolicy()
+  // The cap the small LOW gates imply (60 verified rows and a quarter; the HIGH gates are left at
+  // the shipped ones, which would cap it far higher), and the store holds its newest 75 again after
+  // every ten rows. What it holds then stands still, so each count below has to include what the
+  // cap let go of, or every window after the first would look like the same rows again.
+  const store = createTrainingStore({ file: join(root, 'samples.jsonl'), policy, cap: 75, slack: 10 })
+  await fill(store, 'task_classification', 100)
+  assert.ok((await store.stats('task_classification')).dropped.verified > 0, 'the store is at its cap')
+  const ctl = controller({ store, root, policy })
+  assert.equal(await climbTo(ctl, 'GUARDED_LOCAL'), 'GUARDED_LOCAL')
+  await fill(store, 'task_classification', 30, { attempts: 2 })
+  await ctl.evaluate()
+  assert.equal(ctl.state().consecutiveBadWindows, 1, 'a retry spike is one bad window')
+  await fill(store, 'task_classification', 5, { attempts: 2 })
+  await ctl.evaluate()
+  assert.equal(ctl.state().maturity, 'SHADOW', 'and new rows that still need retries are the second: a sustained regression')
+  for (let i = 0; i < 6 && ctl.state().maturity !== 'GUARDED_LOCAL'; i++) {
+    await fill(store, 'task_classification', 30)
+    await ctl.evaluate()
+  }
+  assert.equal(ctl.state().maturity, 'GUARDED_LOCAL', 'the rung is earned back on the clean rows that came after')
+  // A critical failure found outside an evaluation has its point fixed at the next one, and only
+  // rows after that count towards undoing it.
+  ctl.noteCriticalFailure('verified high-risk mistake')
+  assert.equal((await ctl.evaluate()).samples.sinceRollback, 0)
+  await fill(store, 'task_classification', 10)
+  assert.equal((await ctl.evaluate()).samples.sinceRollback, 10)
 })
 
 test('a saved bad-window count at a rung that decides nothing is not carried forward', async () => {
@@ -1053,4 +1236,89 @@ test('a version 2 state keeps its rollback point and owes every rung', async () 
   assert.equal(ctl.state().samplesAtRollback, 140, 'a version 2 point was counted at the rollback and is kept')
   assert.equal(ctl.state().recoverTo, 'LOCAL_ONLY')
   assert.equal(ctl.state().consecutiveGoodWindows, 0, 'a window it counted may have had no new rows in it')
+})
+
+// ---------------------------------------------------------------- a run Laya decides (docs/laya-auto.md 6.3)
+
+/** Laya's answer, as the teacher closures of decision.js and jev-review hand it over. */
+const laya = (label, over = {}) => async () => ({
+  label, probabilities: { [label]: 0.6 }, confidence: 0.6, informative: true,
+  model: 'laya-english/0.3.20@1a2b3c4', identity: 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1', lang: 'latin', ...over,
+})
+const layaStoreAt = (root) => createTrainingStore({ file: join(root, 'laya-samples.jsonl'), kind: 'laya' })
+
+test('in a Laya run a mature, confident local classifier never decides, and the ladder is left exactly as it was', async () => {
+  const root = dir()
+  const store = storeAt(root)
+  await fill(store, 'task_classification', 100)
+  const ctl = controller({ store, root })
+  assert.equal(await climbTo(ctl, 'LOCAL_ONLY'), 'LOCAL_ONLY')
+  const stateFile = join(root, 'task_classification.state.json')
+  const onDisk = readFileSync(stateFile, 'utf8')
+  const inMemory = JSON.stringify(ctl.state())
+  const sink = layaStoreAt(root)
+  const asLaya = (jev, over = {}) => ctl.decide({ features: highFeatures, jev, fallback: fallback(), answeredBy: 'laya', sink, ...over })
+
+  // At LOCAL_ONLY, confident and in distribution, the classifier would have decided 'high' alone.
+  const d = await asLaya(laya('low'), { context: { runId: 'run-laya' } })
+  assert.equal(d.authority, 'laya')
+  assert.equal(d.label, 'low', 'Laya decides')
+  assert.equal(d.local?.label, 'high', 'and the local answer is recorded beside it')
+  assert.equal(d.teacher, null)
+  assert.equal(d.provider?.label, 'low')
+  assert.equal(d.maturity, null, 'the local rung says nothing about a run Laya decided')
+  assert.equal(d.jevCalled, false)
+  const row = await sink.get(d.sampleId)
+  assert.equal(row.runId, 'run-laya')
+  assert.equal(row.teacher, null)
+  assert.equal(row.authority, 'laya')
+  assert.deepEqual({ label: row.provider.label, informative: row.provider.informative, model: row.provider.model, lang: row.provider.lang }, { label: 'low', informative: true, model: 'laya-english/0.3.20@1a2b3c4', lang: 'latin' })
+  assert.equal(row.local.label, 'high')
+  assert.equal(await store.get(d.sampleId), null, 'nothing reached the store Jev teaches from')
+
+  // An unseen category that pulls LOCAL_ONLY down in a Jev run (scenario W) moves no rung here.
+  const odd = await asLaya(laya('high'), { features: { numeric: { score: 0.8, other: 0.3 }, categorical: { kind: 'something-new' } } })
+  assert.equal(odd.authority, 'laya')
+  assert.equal(odd.ood.flag, true, 'the input is still seen as unfamiliar')
+
+  // No answer is the deterministic one, never the local classifier's and never Jev's.
+  const down = await asLaya(async () => { throw new Error('timed out after 40 s') })
+  assert.deepEqual([down.authority, down.label, down.reason], ['fallback', 'low', 'Laya unavailable (timed out after 40 s); using the deterministic fallback'])
+  const none = await asLaya(async () => null)
+  assert.equal(none.authority, 'fallback')
+  // Nor is an answer Laya marked too flat to use, which is still kept on the sample, flagged.
+  const flat = await asLaya(laya('high', { informative: false }))
+  assert.deepEqual([flat.authority, flat.label, flat.reason], ['fallback', 'low', 'Laya\'s answer was too flat to use'])
+  assert.equal((await sink.get(flat.sampleId)).provider.informative, false)
+  assert.equal(await store.get(flat.sampleId), null)
+
+  assert.equal(readFileSync(stateFile, 'utf8'), onDisk, 'the state file is byte-identical')
+  assert.equal(JSON.stringify(ctl.state()), inMemory, 'and so is the state in memory, its out-of-distribution count included')
+  await assert.rejects(() => ctl.decide({ features: highFeatures, jev: laya('low'), fallback: fallback(), answeredBy: 'laya' }), /a Laya decision needs the store its sample goes to/)
+})
+
+test('in a Laya run a flat disposition still decides, a domain a rule decides keeps its rule, and none reports a rung', async () => {
+  const root = dir()
+  const store = storeAt(root)
+  const sink = layaStoreAt(root)
+  const policy = smallPolicy()
+  const outcome = controller({ domain: 'outcome_disposition', store, root, policy })
+  const d = await outcome.decide({ features: highFeatures, jev: laya('PASS', { informative: false }), fallback: fallback('RETRY_SAME_TIER'), answeredBy: 'laya', sink, context: { extra: { decidedAt: 0 } } })
+  assert.equal(d.authority, 'laya', 'the review action comes from Laya\'s yes/no answers, so its flat disposition is kept')
+  assert.equal(d.label, 'PASS')
+  const row = await sink.get(d.sampleId)
+  assert.equal(row.provider.informative, false, 'and only the sample says it was flat')
+  assert.deepEqual(row.extra, { decidedAt: 0 })
+  // A rule in code decides the frontier review in any run; Laya is not asked for it.
+  let asked = 0
+  const frontier = controller({ domain: 'frontier_escalation', store, root, policy })
+  const f = await frontier.decide({ features: highFeatures, jev: async () => { asked++; return { label: 'yes', confidence: 1 } }, fallback: fallback('no'), answeredBy: 'laya', sink })
+  assert.deepEqual([f.authority, f.label, f.maturity, asked], ['code', 'no', null, 0])
+  assert.equal((await sink.get(f.sampleId)).code.label, 'no', 'the rule\'s answer is the pick the sample records')
+  // The resource ranking likewise, over its candidates.
+  const cands = [{ key: 'RESOURCE_A', id: 'claude', features: { numeric: { fit: 0.8 }, categorical: { tier: 'frontier' } } }]
+  const r = await controller({ domain: 'resource_selection', store, root, policy }).decide({ features: highFeatures, candidates: cands, jev: null, fallback: () => ({ chosenKey: 'RESOURCE_A', probabilities: { RESOURCE_A: 1 }, confidence: 1 }), codeAuthority: true, localMayDecide: false, answeredBy: 'laya', sink })
+  assert.deepEqual([r.authority, r.chosenKey, r.maturity], ['code', 'RESOURCE_A', null])
+  assert.equal((await store.list()).length, 0, 'the Jev store holds nothing of the run')
+  assert.equal((await sink.list()).length, 3)
 })

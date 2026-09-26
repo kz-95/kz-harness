@@ -1,0 +1,20 @@
+{
+  "id": "review-1",
+  "skill": "review",
+  "level": 1,
+  "dimensions": ["code_review"],
+  "folder": "pagination",
+  "prompt": "Review src/paginate.js against what its doc comment promises.\nWrite every defect you find to REVIEW.json in this folder: a JSON array of objects with file (the path from this folder, such as src/paginate.js), line (the line of the defect) and problem (one sentence).\nDo not change any other file.",
+  "protect": [],
+  "onlyChanged": ["REVIEW.json"],
+  "grade": {
+    "kind": "findings",
+    "defects": [
+      { "file": "src/paginate.js", "from": 23, "to": 24 },
+      { "file": "src/paginate.js", "from": 19, "to": 20 },
+      { "file": "src/paginate.js", "from": 24, "to": 24 }
+    ],
+    "minFound": 3,
+    "maxExtra": 2
+  }
+}

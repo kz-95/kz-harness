@@ -4,7 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { compareAnswers, formatReport, runRouted } from '../router.js'
@@ -607,6 +607,203 @@ test('routing: an answer-only dislike cannot move the pick, a routing dislike do
   const suggest = [fbRow({ messageId: 'm1', tag: 'not enough detail', suggestedAgent: 'claude' })]
   const r3 = await runRouted({ task: 'fix', cwd: dir3, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir3), history: fbHistory(suggest) } })
   assert.equal(r3.attempts[0].agent, 'codex', 'the suggestion is ignored behind an answer-only tag')
+})
+
+// ---------- the feedback bias, matched by task type across sessions ----------
+// The wiring apply() gives the router, made by the same factory (createHistoryDeps): a real
+// history.jsonl holding the runs, the real feedback log beside it, whose reader returns every
+// session when it is given none, and runOfVerdict to find the run each verdict is about, whose
+// routing.taskType says what kind of work was judged. closeRoute routes debugging work.
+async function typedHistory(verdicts, runs, capabilities = null) {
+  const { createFeedback } = await import('../feedback.js')
+  const { createHistoryDeps } = await import('../index.js')
+  const dir = mkdtempSync(join(tmpdir(), 'jev-fb-'))
+  const historyFile = join(dir, 'history.jsonl')
+  writeFileSync(historyFile, runs.map((r) => `${JSON.stringify(r)}\n`).join(''))
+  const fb = createFeedback({ file: join(dir, 'feedback.jsonl') })
+  for (const v of verdicts) await fb.append(v)
+  return createHistoryDeps({ historyFile, feedback: fb, capabilities })
+}
+const typedRun = (runId, sessionId, taskType) => ({ ts: '2026-09-20T00:00:00.000Z', runId, sessionId, routing: { taskType, primaryAgent: 'claude' } })
+const r2 = (x) => Math.round(x * 100) / 100
+// The movement the prior applied to one agent's probability, or 0 when it applied none.
+const nudge = (r, id) => { const m = r.routing.feedback?.find((x) => x.agent === id && 'to' in x); return m ? m.to - m.from : 0 }
+
+test('feedback prior: a like on work of the same type moves the pick more than one on another type', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const runs = [typedRun('r-debug', 's', 'debugging'), typedRun('r-docs', 's', 'documentation')]
+  const likes = (runId) => [1, 2, 3].map((i) => fbRow({ messageId: `m${i}`, verdict: 'like', provider: 'claude', runId }))
+  const dir1 = repo()
+  const same = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: await typedHistory(likes('r-debug'), runs) } })
+  const dir2 = repo()
+  const other = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: await typedHistory(likes('r-docs'), runs) } })
+  assert.equal(same.attempts[0].agent, 'claude', 'three likes on debugging work raise claude over a close debugging pick')
+  assert.equal(other.attempts[0].agent, 'codex', 'three likes on documentation work do not')
+  assert.ok(nudge(same, 'claude') > nudge(other, 'claude'), `same type ${nudge(same, 'claude')} against another type ${nudge(other, 'claude')}`)
+  assert.ok(nudge(other, 'claude') > 0, 'a verdict on other work still counts, a little')
+})
+
+test('feedback prior: verdicts from another session now count, and their words stay out of this routing call', async () => {
+  let seen
+  const jev = { route: async (args) => { seen = args.trackRecord; return closeRoute() }, assess: async () => verdict('accept') }
+  const runs = [typedRun('r-past', 'past', 'debugging')]
+  const past = [1, 2, 3].map((i) => fbRow({ sessionId: 'past', messageId: `m${i}`, runId: 'r-past', reason: 'codex looped on the stack trace' }))
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: await typedHistory(past, runs) } })
+  assert.equal(r.attempts[0].agent, 'claude', 'three dislikes on debugging work in an earlier session cost codex this debugging call')
+  assert.equal(r.routing.feedbackFrom, 'codex')
+  // The typed reasons ride the routing call exactly as before: this session's only.
+  assert.equal(seen.codex.feedback, undefined, 'another session\'s reason did not ride this session\'s routing call')
+})
+
+test('feedback prior: a verdict with no runId is weighed by the run it was credited to, as its evidence was', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  // An earlier session's debugging run, then a documentation run, both ended before the verdicts.
+  const runs = [{ ...typedRun('r-debug', 'past', 'debugging'), ts: '2026-09-20T10:00:00.000Z' }, { ...typedRun('r-docs', 'past', 'documentation'), ts: '2026-09-20T10:10:00.000Z' }]
+  const past = [1, 2, 3].map((i) => fbRow({ ts: '2026-09-20T10:15:00.000Z', sessionId: 'past', messageId: `m${i}` }))
+  // The registry credited them to the debugging run (creditedRun), whatever ended since.
+  const credited = { creditedRun: (v) => (v.sessionId === 'past' ? 'r-debug' : null) }
+  const dir1 = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: await typedHistory(past, runs, credited) } })
+  assert.equal(r2(nudge(r, 'codex')), -0.15, 'three dislikes on debugging work, at full weight')
+  assert.equal(r.attempts[0].agent, 'claude')
+  const dir2 = repo()
+  const guessed = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: await typedHistory(past, runs) } })
+  assert.equal(r2(nudge(guessed, 'codex')), -0.04, 'with no credit to go by, the newest run before them is the documentation one')
+})
+
+test('feedback prior: an edited verdict with no runId is placed by when it was first given, as its evidence is', async () => {
+  const { effectiveVerdicts, runOfVerdict } = await import('../index.js')
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const runs = [{ ...typedRun('r-debug', 'past', 'debugging'), ts: '2026-09-20T10:00:00.000Z' }, { ...typedRun('r-docs', 'past', 'documentation'), ts: '2026-09-20T10:10:00.000Z' }]
+  // Three answers of the debugging run disliked at 10:05, each re-tagged at 10:15, after the
+  // documentation run ended, and never credited (learning was off).
+  const past = [1, 2, 3].flatMap((i) => [
+    fbRow({ ts: '2026-09-20T10:05:00.000Z', sessionId: 'past', messageId: `m${i}` }),
+    fbRow({ ts: '2026-09-20T10:15:00.000Z', sessionId: 'past', messageId: `m${i}`, tag: 'wrong agent' }),
+  ])
+  const typed = await typedHistory(past, runs)
+  const evidence = runOfVerdict(effectiveVerdicts(past)[0], runs, null)
+  assert.equal(evidence?.runId, 'r-debug', 'the evidence path reads the debugging run')
+  assert.equal(typed.runOfVerdict((await typed.feedback())[0], runs)?.runId, evidence.runId, 'and the router reads the same one')
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: typed } })
+  assert.equal(r2(nudge(r, 'codex')), -0.15, 'so the dislikes count as debugging work, fully')
+  assert.equal(r.attempts[0].agent, 'claude')
+})
+
+test('feedback prior: a suggested agent switches the pick only from this session, never from another', async () => {
+  const jev = { route: async () => routeResult({ primaryAgent: 'codex', agentConfidence: 0.8, agentProbabilities: { codex: 0.8, claude: 0.2 } }), assess: async () => verdict('accept') }
+  const runs = [typedRun('r-past', 'past', 'debugging'), typedRun('r-here', 's', 'debugging')]
+  const should = (sessionId, runId) => fbRow({ sessionId, messageId: 'm1', runId, reason: 'should have been claude', suggestedAgent: 'claude' })
+  const dir1 = repo()
+  const elsewhere = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: await typedHistory([should('past', 'r-past')], runs) } })
+  assert.equal(elsewhere.attempts[0].agent, 'codex', 'another session\'s newest correction does not switch this pick')
+  assert.equal(elsewhere.routing.feedback?.some((m) => m.suggested), false, 'and is not recorded as a suggestion')
+  assert.ok(nudge(elsewhere, 'codex') < 0, 'its dislike still counts as a vote on debugging work')
+  const dir2 = repo()
+  const here = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: await typedHistory([should('s', 'r-here')], runs) } })
+  assert.equal(here.attempts[0].agent, 'claude', 'the same correction in this session does')
+  assert.ok(here.routing.feedback.some((m) => m.agent === 'claude' && m.suggested))
+})
+
+test('feedback prior: no number of matching verdicts moves a probability past the cap', async () => {
+  const jev = { route: async () => routeResult({ primaryAgent: 'codex', agentConfidence: 0.8, agentProbabilities: { codex: 0.8, claude: 0.2 } }), assess: async () => verdict('accept') }
+  const runs = ['a', 'b', 'c'].map((s) => typedRun(`r-${s}`, s, 'debugging'))
+  const rows = []
+  for (let i = 0; i < 30; i++) {
+    const s = ['a', 'b', 'c'][i % 3]
+    rows.push(fbRow({ sessionId: s, messageId: `like${i}`, verdict: 'like', provider: 'claude', runId: `r-${s}` }))
+    rows.push(fbRow({ sessionId: s, messageId: `dislike${i}`, provider: 'codex', runId: `r-${s}` }))
+  }
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: await typedHistory(rows, runs) } })
+  assert.equal(r2(nudge(r, 'claude')), 0.15, 'claude is raised by exactly the cap')
+  assert.equal(r2(nudge(r, 'codex')), -0.15, 'codex is lowered by exactly the cap')
+  assert.equal(r.attempts[0].agent, 'codex', 'sixty matching verdicts still cannot overturn a confident pick')
+})
+
+test('feedback prior: a verdict with no run to match counts as it always did, fully in this session and not at all from another', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  // A runId naming no run, and no runId with no run of its session to fall back on.
+  const here = [1, 2, 3].map((i) => fbRow({ messageId: `m${i}`, ...(i === 1 ? { runId: 'gone' } : {}) }))
+  const dir1 = repo()
+  const kept = await runRouted({ task: 'fix', cwd: dir1, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir1), history: await typedHistory(here, []) } })
+  assert.equal(kept.attempts[0].agent, 'claude', 'three dislikes in this session still demote codex, run or no run')
+  const elsewhere = [1, 2, 3].map((i) => fbRow({ sessionId: 'past', messageId: `m${i}` }))
+  const dir2 = repo()
+  const ignored = await runRouted({ task: 'fix', cwd: dir2, sessionId: 's', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir2), history: await typedHistory(elsewhere, []) } })
+  assert.equal(ignored.attempts[0].agent, 'codex', 'another session\'s verdicts about no known work say nothing about this one')
+  assert.equal(ignored.routing.feedback, undefined)
+})
+
+test('feedbackPrior: a weighted vote moves the bias by its weight, and the cap holds at any weight', async () => {
+  const { feedbackPrior, verdictWeight } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }]
+  const runs = new Map([['r-debug', { routing: { taskType: 'debugging' } }], ['r-docs', { routing: { taskType: 'documentation' } }], ['r-manual', { routing: {} }]])
+  const weightOf = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: (v) => runs.get(v.runId) ?? null })
+  assert.equal(weightOf({ sessionId: 'x', runId: 'r-debug' }), 1, 'the same type counts fully, from any session')
+  assert.equal(weightOf({ sessionId: 's', runId: 'r-docs' }), 0.25, 'another type counts a little, even in this session')
+  assert.equal(weightOf({ sessionId: 's', runId: 'r-manual' }), 1, 'a run that never had a type is no match: this session counts as before')
+  assert.equal(weightOf({ sessionId: 'x', runId: 'r-none' }), 0, 'and another session is not read, as before')
+  assert.equal(verdictWeight({ sessionId: 's', runOf: (v) => runs.get(v.runId) })({ sessionId: 's', runId: 'r-docs' }), 1, 'no task type now: exactly the old prior')
+  const throwing = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: () => { throw new Error('history unreadable') } })
+  assert.deepEqual([throwing({ sessionId: 's' }), throwing({ sessionId: 'x' })], [1, 0], 'a reader that throws has found no run: the old prior, and nothing escapes')
+  assert.equal(verdictWeight({})({ sessionId: 'x' }), 1, 'no session: every row reads as this session\'s, as list() with no session returns them')
+  const like = (runId) => ({ sessionId: 's', verdict: 'like', provider: 'claude', runId })
+  assert.equal(feedbackPrior([like('r-debug')], agents, { weightOf }).agents.get('claude').bias, 0.05)
+  assert.equal(feedbackPrior([like('r-docs')], agents, { weightOf }).agents.get('claude').bias, 0.01)
+  assert.equal(feedbackPrior(Array.from({ length: 50 }, () => like('r-debug')), agents, { weightOf }).agents.get('claude').bias, 0.15)
+  assert.equal(feedbackPrior(Array.from({ length: 50 }, () => like('r-docs')), agents, { weightOf }).agents.get('claude').bias, 0.15, 'many small votes reach the cap and stop there')
+  assert.equal(feedbackPrior([like('r-debug')], agents).agents.get('claude').bias, 0.05, 'no weights: every vote counts fully, as before')
+})
+
+test('feedbackPrior: the window holds twenty verdicts\' worth of weight, so votes on other work cannot crowd out ones on this work', async () => {
+  const { feedbackPrior, verdictWeight } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }, { id: 'deepseek', provider: 'deepseek' }]
+  const runs = new Map([['r-here', { routing: { taskType: 'debugging' } }], ['r-docs', { routing: { taskType: 'documentation' } }]])
+  const weightOf = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: (v) => runs.get(v.runId) ?? null })
+  // This session's three dislikes of codex on debugging work, then twenty newer verdicts on
+  // documentation work from another session, a quarter each.
+  const here = [1, 2, 3].map((i) => ({ sessionId: 's', messageId: `h${i}`, verdict: 'dislike', provider: 'codex', runId: 'r-here' }))
+  const docs = (provider) => Array.from({ length: 20 }, (_, i) => ({ sessionId: 'other', messageId: `o${i}`, verdict: 'like', provider, runId: 'r-docs' }))
+  const crowded = feedbackPrior([...here, ...docs('deepseek')], agents, { weightOf })
+  assert.deepEqual([crowded.agents.get('codex')?.dislikes, crowded.agents.get('codex')?.bias], [3, -0.15], 'the dislikes on this work still count in full')
+  assert.equal(crowded.agents.get('deepseek').likes, 20, 'and the twenty on other work are read as well')
+  const outvoted = feedbackPrior([...here, ...docs('codex')], agents, { weightOf }).agents.get('codex')
+  assert.deepEqual([outvoted.likes, outvoted.dislikes], [20, 3], 'every verdict is read')
+  assert.equal(outvoted.bias, 0.04, 'twenty likes on other work weigh five, against three dislikes on this work')
+  // Rows at full weight fill the window exactly as before: twenty of them, the newest.
+  const full = Array.from({ length: 25 }, (_, i) => ({ sessionId: 's', messageId: `f${i}`, verdict: i < 5 ? 'like' : 'dislike', provider: 'codex', runId: 'r-here' }))
+  assert.deepEqual([feedbackPrior(full, agents, { weightOf }).agents.get('codex').likes, feedbackPrior(full, agents).agents.get('codex').dislikes], [0, 20])
+})
+
+test('feedbackPrior: a verdict that weighs nothing is not in the window at all, nor the newest verdict', async () => {
+  const { feedbackPrior, verdictWeight } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }, { id: 'deepseek', provider: 'deepseek' }]
+  const runs = new Map([['r-here', { routing: { taskType: 'debugging' } }]])
+  const weightOf = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: (v) => runs.get(v.runId) ?? null })
+  const here = [1, 2, 3].map((i) => ({ sessionId: 's', messageId: `h${i}`, verdict: 'dislike', provider: 'codex', runId: 'r-here' }))
+  // Twenty newer dislikes from another session about no run anyone knows, each naming deepseek.
+  const unplaced = Array.from({ length: 20 }, (_, i) => ({ sessionId: 'other', messageId: `o${i}`, verdict: 'dislike', provider: 'claude', suggestedAgent: 'deepseek' }))
+  assert.equal(weightOf(unplaced[0]), 0)
+  const p = feedbackPrior([...here, ...unplaced], agents, { weightOf })
+  assert.deepEqual([p.agents.get('codex')?.dislikes, p.agents.get('codex')?.bias], [3, -0.15], 'they crowd nothing out')
+  assert.equal(p.agents.has('claude'), false, 'they are not counted, even as whole verdicts')
+  assert.equal(p.agents.has('deepseek'), false, 'nor their suggestions')
+  assert.equal(p.suggestion, undefined, 'and the newest of them is not the newest verdict')
+})
+
+test('routing: twenty newer verdicts on other work from another session do not erase this session\'s on this work', async () => {
+  const jev = { route: async () => closeRoute(), assess: async () => verdict('accept') }
+  const cfg = { ...FB_CONFIG, agents: [...FB_CONFIG.agents, { id: 'deepseek', provider: 'deepseek', description: 'c', enabled: true }] }
+  const runs = [typedRun('r-here', 's', 'debugging'), typedRun('r-docs', 'other', 'documentation')]
+  const here = [1, 2, 3].map((i) => fbRow({ ts: '2026-09-21T00:00:00.000Z', messageId: `h${i}`, runId: 'r-here' }))
+  const docs = Array.from({ length: 20 }, (_, i) => fbRow({ ts: '2026-09-22T00:00:00.000Z', sessionId: 'other', messageId: `o${i}`, verdict: 'like', provider: 'deepseek', runId: 'r-docs' }))
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: cfg, signal, deps: { jev, execute: fixer(dir), history: await typedHistory([...here, ...docs], runs) } })
+  assert.equal(r2(nudge(r, 'codex')), -0.15, 'codex keeps the full demotion from three dislikes on debugging work')
+  assert.equal(r.attempts[0].agent, 'claude', 'so it still loses the close debugging call')
 })
 
 // ---------- hard facts, marginal cost, and the strategy's own steps ----------
@@ -1347,4 +1544,369 @@ test('each attempt ends under its own index when a parallel opinion rides along'
   const ends = events.filter((e) => e.type === 'attempt_end').map((e) => [e.index, e.attempt.agent])
   assert.deepEqual(starts, [[0, 'deepseek'], [1, 'claude']])
   assert.deepEqual(ends.sort(), [[0, 'deepseek'], [1, 'claude']], 'the primary\'s end is paired with its start, not filed under the opinion')
+})
+
+// ---------- the decider: a run Laya decides, branch by branch (docs/laya-auto.md 3.2) ----------
+// Laya is handed to the loop as Jev is, a client beside its record, and every cut-off is then read
+// from that record. Each test holds Laya and Jev side by side, so a bar that moved for Laya is seen
+// to stay where it was for Jev.
+const records = async () => (await import('../providers.js')).resolveProviders({}, { policy: (await import('../routing-policy.js')).resolvePolicy() })
+const LAYA_LABEL = 'laya-english/0.3.20@1a2b3c4'
+/** A decider that answers as the fakes above do, under the record it is handed. */
+const answering = (provider, over = {}, review = verdict('accept')) => ({
+  provider,
+  route: async () => ({ model: provider.id === 'laya' ? LAYA_LABEL : 'jev-1.13.0', ...routeResult(over) }),
+  assess: async () => review,
+})
+
+test('decider: every run names who decided it, a forced one included, and whoever decides reviews', async () => {
+  const { jev, laya } = await records()
+  for (const [provider, forceAgent, mode] of [[jev, undefined, 'jev'], [laya, undefined, 'jev'], [jev, 'claude', 'manual'], [laya, 'claude', 'manual']]) {
+    const dir = repo()
+    const r = await runRouted({ task: 'fix', cwd: dir, forceAgent, config, signal, deps: { decider: answering(provider), provider, execute: fixer(dir), history: history() } })
+    const what = `${provider.id}${forceAgent ? ', forced' : ''}`
+    assert.deepEqual([r.routing.mode, r.routing.decider], [mode, provider.id], what)
+    assert.equal(r.assessments[0].mode, provider.id, `${what}: whoever decides reviews`)
+  }
+  // A client handed under the old name with no record is Jev, deciding as it always has.
+  const dir = repo()
+  const old = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { jev: { route: async () => routeResult(), assess: async () => verdict('accept') }, execute: fixer(dir), history: history() } })
+  assert.deepEqual([old.routing.mode, old.routing.decider, old.assessments[0].mode], ['jev', 'jev', 'jev'])
+})
+
+test('decider: offline, a decider on this PC decides through the engine over the local agents; offline Jev takes the fixed rule', async () => {
+  const { jev, laya } = await records()
+  const seen = []
+  const decide = async (args) => {
+    seen.push({ provider: args.provider?.id, decider: args.decider?.provider?.id, agents: args.agents.map((a) => a.id) })
+    return { routing: pick('qwen-local', 0.9, { 'qwen-local': 0.9 }), plan: directPlan('qwen-local') }
+  }
+  const { r } = await adaptiveRun({ deps: { offline: true, decide, decider: answering(laya), provider: laya } })
+  assert.deepEqual([r.routing.mode, r.routing.decider, r.routing.primaryAgent], ['local', 'laya', 'qwen-local'])
+  assert.deepEqual(seen, [{ provider: 'laya', decider: 'laya', agents: ['qwen-local'] }], 'the engine was handed Laya and its record, and the local agents only')
+  assert.equal(formatReport(r).split('\n')[0], '**Laya router** · AUTO (Laya decided), LOCAL MODELS ONLY · OFFLINE: local models only')
+  const { r: fixed } = await adaptiveRun({ deps: { offline: true, decide, decider: null, provider: jev, jevUnavailableReason: 'offline: no internet, checks only' } })
+  assert.deepEqual([fixed.routing.mode, fixed.routing.decider, fixed.routing.primaryAgent], ['offline', 'jev', 'qwen-local'])
+  assert.equal(seen.length, 1, 'offline Jev never reaches the engine')
+})
+
+test('decider: a named capability nothing here can do is refused the same way under Laya, and the refusal names no decider', async () => {
+  const { laya } = await records()
+  const executors = executorsFrom({ agents: ADAPTIVE_AGENTS })
+  const handed = []
+  const decide = async (args) => { handed.push(args.provider?.id); return { routing: { ...pick('qwen-local', 0.9, { 'qwen-local': 0.9 }), capability: 'web_research' }, plan: directPlan('qwen-local') } }
+  await assert.rejects(
+    runRouted({ task: 'what changed in node 24', cwd: repo(), config: adaptiveConfig(), signal, deps: { localOnly: true, decide, executors, decider: answering(laya), provider: laya, review: accept, history: quiet, execute: async () => ({ stopReason: 'completed', answerText: 'done' }) } }),
+    (err) => /^nothing on this PC can do this request as "web_research"/.test(err.message) && !/Laya|Jev/.test(err.message),
+  )
+  assert.deepEqual(handed, ['laya'], 'Laya decided it')
+})
+
+test('decider: the earlier note, the tool and its arguments are held to the decider\'s own bars', async () => {
+  const { jev, laya } = await records()
+  // A note from an earlier run is handed on at Jev's 0.5 and not at Laya's 0.6.
+  const noted = async (provider) => {
+    const dir = repo()
+    mkdirSync(join(dir, '.kz-harness'), { recursive: true })
+    writeFileSync(join(dir, '.kz-harness', 'handoff.md'), '## Done\nhalf of the parser')
+    const prompts = []
+    const r = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { decider: answering(provider, { continueHandoff: 0.55 }), provider, execute: async (a, prompt) => { prompts.push(prompt); writeFileSync(join(dir, 'state.txt'), 'fixed'); return { stopReason: 'completed', answerText: 'ok' } }, history: history() } })
+    return [r.continuedFromHandoff, /half of the parser/.test(prompts[0])]
+  }
+  assert.deepEqual(await noted(jev), [true, true], 'continueHandoff 0.55 clears Jev\'s 0.5')
+  assert.deepEqual(await noted(laya), [false, false], 'and not Laya\'s 0.6')
+  // A tool runs only when its fit and its weakest argument clear the decider's bars.
+  const first = async (provider, over) => {
+    const dir = repo()
+    const r = await runRouted({ task: 'weather?', cwd: dir, config: { ...config, tools }, signal, deps: { decider: answering(provider, { handler: 'weather', toolFits: 0.9, toolArgConfidence: 0.8, toolArgs: { units: 'f' }, ...over }), provider, runTool: async (t, args) => ({ stopReason: 'completed', answerText: `${t.id} ${args.units}` }), execute: fixer(dir), history: history() } })
+    return r.attempts[0].agent
+  }
+  assert.equal(await first(jev, { toolFits: 0.7 }), 'tool:weather', 'fits 0.7 clears Jev\'s 0.5')
+  assert.equal(await first(laya, { toolFits: 0.7 }), 'codex', 'and not Laya\'s 0.8')
+  assert.equal(await first(jev, { toolArgConfidence: 0.6 }), 'tool:weather', 'an argument at 0.6 clears Jev\'s 0.5')
+  assert.equal(await first(laya, { toolArgConfidence: 0.6 }), 'codex', 'and not Laya\'s 0.7')
+  assert.equal(await first(laya, { toolFits: 0.85, toolArgConfidence: 0.75 }), 'tool:weather', 'over both, Laya runs the tool too')
+})
+
+test('decider: checks are required under Laya whatever needsTests says, and at the needsTests bar under Jev', async () => {
+  const { jev, laya } = await records()
+  // The failing test failed before the attempt too, and the attempt touched another file.
+  const run = async (provider) => {
+    const dir = repo()
+    return runRouted({ task: 'tidy', cwd: dir, config: { ...config, limits: { maxAttempts: 1, maxReviews: 1, maxRounds: 2 } }, signal, deps: { decider: answering(provider, { needsTests: 0.1 }), provider, execute: async () => { writeFileSync(join(dir, 'notes.txt'), 'x'); return { stopReason: 'completed', answerText: 'done' } }, history: history() } })
+  }
+  const j = await run(jev)
+  assert.equal(j.assessments[0].action, 'accept', 'needsTests 0.1 is under Jev\'s bar: checks are not required, as today')
+  const l = await run(laya)
+  assert.equal(l.assessments[0].action, 'retry', 'Laya\'s bar is always')
+  assert.match(l.assessments[0].why, /blocked/)
+})
+
+test('decider: a person is needed at the decider\'s own bar, and the reason names who read it so', async () => {
+  const { jev, laya } = await records()
+  const run = async (provider, capabilityConfidence) => {
+    const dir = repo()
+    return runRouted({ task: 'fix', cwd: dir, config, signal, deps: { decider: answering(provider, { capability: 'human_required', capabilityConfidence }), provider, execute: fixer(dir), history: history() } })
+  }
+  const jevStop = await run(jev, 0.7)
+  assert.deepEqual([jevStop.finalStatus, jevStop.statusReason], ['needs_human', 'Jev read this as needing a person (confidence 0.70)'])
+  const layaRuns = await run(laya, 0.7)
+  assert.equal(layaRuns.finalStatus, 'accepted', '0.7 is under Laya\'s 0.8: the run proceeds')
+  const layaStop = await run(laya, 0.85)
+  assert.deepEqual([layaStop.finalStatus, layaStop.statusReason], ['needs_human', 'Laya read this as needing a person (confidence 0.85)'])
+  assert.match(formatReport(layaStop), /Laya read this as needing a person/)
+})
+
+test('decider: the effort bands are the decider\'s', async () => {
+  const { jev } = await records()
+  const { laya: quick } = (await import('../providers.js')).resolveProviders({ laya: { thresholds: { effortBands: { medium: 0.1, high: 0.2 } } } }, { policy: (await import('../routing-policy.js')).resolvePolicy() })
+  const claudeOnly = { ...config, agents: [{ id: 'claude', provider: 'claude-code', description: 'a', enabled: true }] }
+  const run = async (provider) => {
+    const dir = repo()
+    const r = await runRouted({ task: 'fix', cwd: dir, config: claudeOnly, signal, deps: { decider: answering(provider, { primaryAgent: 'claude', agentProbabilities: { claude: 1 }, complexity: 0.3, risk: 0.2 }), provider, execute: fixer(dir), history: history() } })
+    return r.attempts[0].effort
+  }
+  assert.equal(await run(jev), 'high', 'complexity 0.3 is high on Jev\'s bands')
+  assert.equal(await run(quick), 'xhigh', 'and xhigh on bands of 0.1 and 0.2')
+})
+
+test('decider: a Laya call that did not answer is kept on the routing record and said in the report; Jev\'s are not recorded there', async () => {
+  const { jev, laya } = await records()
+  const failing = (provider) => ({
+    provider,
+    route: async () => { throw Object.assign(new Error('timed out after 42 s (20 questions on the CPU)'), { code: 'LAYA_TIMEOUT' }) },
+    assess: async () => { throw Object.assign(new Error('timed out after 40 s'), { code: 'LAYA_TIMEOUT' }) },
+  })
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { decider: failing(laya), provider: laya, execute: fixer(dir), history: history(), deciderDevice: () => 'cpu' } })
+  assert.deepEqual([r.routing.mode, r.routing.decider], ['fallback', 'laya'])
+  assert.deepEqual(r.routing.deciderErrors, [{ phase: 'route', reason: 'timed out after 42 s (20 questions on the CPU)' }, { phase: 'review', reason: 'timed out after 40 s' }])
+  assert.equal(r.assessments[0].why, 'fallback policy (Laya unavailable (timed out after 40 s))', 'the review names the provider that did not answer')
+  const report = formatReport(r).split('\n')
+  assert.equal(report[0], '**Laya router** · AUTO, LAYA UNAVAILABLE: routing fallback activated')
+  assert.ok(report.includes('- Laya did not answer: route: timed out after 42 s (20 questions on the CPU)'))
+  assert.ok(report.includes('- Laya did not answer: review: timed out after 40 s'))
+  const d2 = repo()
+  const j = await runRouted({ task: 'fix', cwd: d2, config, signal, deps: { decider: failing(jev), provider: jev, execute: fixer(d2), history: history() } })
+  assert.deepEqual([j.routing.mode, j.routing.decider], ['fallback', 'jev'])
+  assert.equal('deciderErrors' in j.routing, false, 'a Jev record is as it was')
+  assert.equal(formatReport(j).split('\n')[0], '**Jev router** · AUTO, JEV UNAVAILABLE: routing fallback activated')
+})
+
+test('decider: the Laya client\'s own timeout reads in the report with its questions and device, as 3.3 writes it', async () => {
+  // Built by the client's own constructor: the message names the deadline, and the call's size and
+  // device ride beside it (docs/laya-auto.md 3.5, 4.5). A call never sent keeps its message alone.
+  const { laya } = await records()
+  const { layaError } = await import('../laya-client.js')
+  const failing = {
+    provider: laya,
+    route: async () => { throw layaError('LAYA_TIMEOUT', 'timed out after 42 s', { questions: 20, device: 'cpu' }) },
+    assess: async () => { throw layaError('LAYA_PREDICTED_OVER', 'Laya would need about 150 s for this call on the CPU, over its 120 s deadline', { questions: 9, device: 'cpu' }) },
+  }
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { decider: failing, provider: laya, execute: fixer(dir), history: history() } })
+  assert.deepEqual(r.routing.deciderErrors, [
+    { phase: 'route', reason: 'timed out after 42 s (20 questions on the CPU)' },
+    { phase: 'review', reason: 'Laya would need about 150 s for this call on the CPU, over its 120 s deadline' },
+  ])
+  const report = formatReport(r).split('\n')
+  assert.ok(report.includes('- Laya did not answer: route: timed out after 42 s (20 questions on the CPU)'), report.join('\n'))
+  assert.ok(report.includes('- Laya did not answer: review: Laya would need about 150 s for this call on the CPU, over its 120 s deadline'), report.join('\n'))
+})
+
+test('decider: the run id is the caller\'s, on the record, the history row, every attempt row and the review', async () => {
+  const dir = repo()
+  const h = history()
+  const logged = []
+  const reviewed = []
+  const review = async (input) => { reviewed.push(input.runId); return { status: 'accepted', action: 'accept', why: 'ok' } }
+  const r = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { runId: 'run-7f3a', jev: { route: async () => routeResult() }, review, execute: fixer(dir), history: h, logAttempt: (e) => logged.push(e.runId) } })
+  assert.equal(r.runId, 'run-7f3a')
+  assert.equal(h.rows[0].runId, 'run-7f3a')
+  assert.deepEqual([...new Set(logged)], ['run-7f3a'])
+  assert.deepEqual(reviewed, ['run-7f3a'])
+  const other = await runRouted({ task: 'fix', cwd: repo(), config, signal, deps: { jev: { route: async () => routeResult() }, review, execute: noop, history: history() } })
+  assert.match(other.runId, /^[0-9a-f-]{36}$/, 'with none given, the run mints its own as before')
+})
+
+/** A finished Laya Auto run as the report reads it; `over` replaces fields of its routing. */
+const layaRecord = (over = {}, rest = {}) => ({
+  runId: 'r1', workspace: 'C:/ws', task: 'fix the parser', gated: [], limits: [], baseline: [],
+  routing: {
+    mode: 'jev', decider: 'laya', model: LAYA_LABEL, primaryAgent: 'codex', agentConfidence: 0.8, agentProbabilities: { codex: 0.8, claude: 0.2 },
+    taskType: 'debugging', taskTypeConfidence: 0.9, complexity: 0.3, risk: 0.5, needsSecondOpinion: 0.2, needsHumanReview: 0.1, needsTests: 0.9,
+    strategy: 'STANDARD_DIRECT', profile: { filledByRules: ['risk', 'req.planning'] },
+    decision: {
+      decider: 'laya', jevCalls: 2, candidates: [], excluded: [],
+      domains: { task_classification: { authority: 'laya', maturity: null }, skill_selection: { authority: 'laya', maturity: null }, resource_selection: { authority: 'code', maturity: null }, execution_strategy: { authority: 'fallback', maturity: null } },
+    },
+    deciderErrors: [{ phase: 'route', reason: 'timed out after 42 s (20 questions on the CPU)' }], deciderMs: 21_400, deciderDevice: 'cpu',
+    ...over,
+  },
+  plan: { strategy: 'STANDARD_DIRECT', steps: [{ role: 'primary', agent: 'codex' }] },
+  availability: { out: [], near: [] },
+  attempts: [{ agent: 'codex', role: 'primary', stopReason: 'completed', durationMs: 1000, changedFiles: ['a.js'], answerExcerpt: 'fixed', model: 'gpt-5.6' }],
+  assessments: [{ mode: 'laya', action: 'second_review', why: 'quality 0.52 under Laya\'s accept bar 0.80 (risk 0.50)' }],
+  finalStatus: 'accepted', statusReason: '', lastAnswer: 'fixed',
+  ...rest,
+})
+
+test('decider: the report of a Laya run names Laya in its heading, says what the rules filled and what did not answer, and prints no maturity', async () => {
+  const lines = formatReport(layaRecord()).split('\n')
+  assert.equal(lines[0], '**Laya router** · AUTO (Laya, routing rules and the safe fallback decided)')
+  assert.ok(lines.includes('- Filled by the routing rules (Laya\'s answers were too flat to use): risk, req.planning'), lines.join('\n'))
+  assert.ok(lines.includes('- Laya did not answer: route: timed out after 42 s (20 questions on the CPU)'))
+  assert.ok(lines.includes('- Decided by: task_classification laya · skill_selection laya · resource_selection code · execution_strategy fallback · 2 Laya calls (21.4 s on the CPU)'), lines.join('\n'))
+  assert.ok(lines.includes('- Review: second_review. quality 0.52 under Laya\'s accept bar 0.80 (risk 0.50)'))
+  const all = { task_classification: { authority: 'laya', maturity: null }, resource_selection: { authority: 'code', maturity: null } }
+  const clean = { profile: {}, deciderErrors: [], decision: { decider: 'laya', jevCalls: 2, candidates: [], domains: all } }
+  assert.equal(formatReport(layaRecord(clean)).split('\n')[0], '**Laya router** · AUTO (Laya and routing rules decided)')
+  assert.equal(formatReport(layaRecord({ ...clean, mode: 'local' }, { offline: true })).split('\n')[0], '**Laya router** · AUTO (Laya and routing rules decided), LOCAL MODELS ONLY · OFFLINE: local models only')
+  assert.equal(formatReport(layaRecord({ mode: 'manual', primaryAgent: 'qwen-local', decision: undefined, profile: undefined, deciderErrors: [] })).split('\n')[0], '**Laya router** · MANUAL /qwen-local')
+  const fallback = formatReport(layaRecord({ mode: 'fallback', reason: 'Laya unavailable (timed out after 42 s)', decision: undefined, profile: undefined })).split('\n')
+  assert.deepEqual(fallback.slice(0, 2), ['**Laya router** · AUTO, LAYA UNAVAILABLE: routing fallback activated', 'Fallback reason: Laya unavailable (timed out after 42 s). Default agent: codex'])
+  assert.ok(formatReport(layaRecord({ ...clean, decision: { ...clean.decision, jevCalls: 0 } })).includes(' · no Laya call'))
+  // Jev's report is today's: no timing, Jev's name, its maturity brackets.
+  const jevDomains = { task_classification: { authority: 'jev', maturity: 'JEV_PRIMARY' }, resource_selection: { authority: 'code', maturity: 'JEV_PRIMARY' } }
+  const jevLines = formatReport(layaRecord({ decider: 'jev', model: 'jev-1.13.0', profile: {}, deciderErrors: undefined, deciderMs: undefined, deciderDevice: undefined, decision: { decider: 'jev', jevCalls: 2, candidates: [], domains: jevDomains } }, { assessments: [{ mode: 'jev', action: 'accept', why: 'quality 0.90 ≥ bar 0.70 (risk 0.50)' }] })).split('\n')
+  assert.equal(jevLines[0], '**Jev router** · AUTO (Jev and routing rules decided)')
+  assert.ok(jevLines.includes('- Decided by: task_classification jev [JEV_PRIMARY] · resource_selection code [JEV_PRIMARY] · 2 Jev calls'))
+  assert.ok(!jevLines.some((l) => l.startsWith('- Review: ')), 'an accept is not a stop under any bar')
+})
+
+test('decider: the agent strip starts with Laya and its label when Laya decided a domain, and with the rules when it decided none', async () => {
+  const { answeredSteps } = await import('../router.js')
+  assert.deepEqual(answeredSteps(layaRecord())[0], { agent: 'Laya', model: LAYA_LABEL, roles: [] })
+  const none = { task_classification: { authority: 'fallback' }, resource_selection: { authority: 'code' } }
+  assert.deepEqual(answeredSteps(layaRecord({ decision: { decider: 'laya', jevCalls: 0, candidates: [], domains: none } }))[0], { agent: 'Routing rules', model: '', roles: [] })
+  assert.deepEqual(answeredSteps(layaRecord({ decider: undefined, model: 'jev-1.13.0', decision: { jevCalls: 1, candidates: [], domains: { task_classification: { authority: 'jev' } } } }))[0], { agent: 'Jev', model: 'jev-1.13.0', roles: [] }, 'a record from before `decider` was kept is Jev\'s')
+})
+
+test('decider: verdictWeight weighs a verdict about a Laya-decided run as one about work of unknown type', async () => {
+  const { verdictWeight } = await import('../router.js')
+  const runs = new Map([
+    ['r-jev', { routing: { taskType: 'debugging', decider: 'jev' } }],
+    ['r-old', { routing: { taskType: 'debugging' } }],
+    ['r-laya', { routing: { taskType: 'debugging', decider: 'laya' } }],
+    ['r-laya-docs', { routing: { taskType: 'documentation', decider: 'laya' } }],
+  ])
+  const weightOf = verdictWeight({ taskType: 'debugging', sessionId: 's', runOf: (v) => runs.get(v.runId) ?? null })
+  assert.equal(weightOf({ sessionId: 'x', runId: 'r-jev' }), 1, 'Jev\'s label of the same type counts fully, from any session')
+  assert.equal(weightOf({ sessionId: 'x', runId: 'r-old' }), 1, 'and so does a run recorded before `decider` was kept')
+  assert.equal(weightOf({ sessionId: 'x', runId: 'r-laya' }), 0, 'Laya\'s label never makes another session\'s verdict count')
+  assert.equal(weightOf({ sessionId: 's', runId: 'r-laya' }), 1, 'in this session it counts as any verdict of unknown type does')
+  assert.equal(weightOf({ sessionId: 's', runId: 'r-laya-docs' }), 1, 'nor does Laya\'s label cut one to a quarter')
+})
+
+test('decider: the track record counts a Laya-decided run overall, and never under Laya\'s label for its task type', async () => {
+  const { trackRecord } = await import('../router.js')
+  const run = (decider, taskType, finalStatus) => ({ workspace: '/ws', finalStatus, routing: { ...(decider ? { decider } : {}), taskType }, attempts: [{ agent: 'claude', role: 'primary', durationMs: 1000 }] })
+  const rows = [run('laya', 'documentation', 'accepted'), run('laya', 'documentation', 'accepted'), run('laya', 'documentation', 'failed'), run('jev', 'debugging', 'accepted'), run(undefined, 'debugging', 'accepted')]
+  const t = trackRecord(rows, '/ws', [{ id: 'claude', provider: 'claude-code' }]).claude
+  assert.deepEqual(Object.keys(t.here_by_task_type), ['debugging'], 'only the types Jev gave, a run from before `decider` was kept included')
+  assert.equal(t.here_by_task_type.debugging.attempts, 2)
+  assert.equal(t.overall.attempts, 5, 'every run counts overall, where no label is read')
+})
+
+test('decider: a run is decided only by the client of its own record: a null decider is none, and a Jev client beside Laya\'s record is refused', async () => {
+  const { jev, laya } = await records()
+  const asked = []
+  const jevClient = { provider: jev, route: async () => { asked.push('route'); return routeResult() }, assess: async () => { asked.push('assess'); return verdict('accept') } }
+  // No decider, said outright: the old name is not read for one, so Jev is never asked and the
+  // rules route and review the run Laya's record names.
+  const dir = repo()
+  const r = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { decider: null, jev: jevClient, provider: laya, jevUnavailableReason: 'Laya is not running', execute: fixer(dir), history: history() } })
+  assert.deepEqual(asked, [], 'Jev was never asked')
+  assert.deepEqual([r.routing.mode, r.routing.decider, r.assessments[0].mode], ['fallback', 'laya', 'fallback'])
+  // Jev's client beside Laya's record, under either name, is refused before anything runs.
+  for (const handed of [{ decider: jevClient }, { jev: jevClient }]) {
+    const executed = []
+    const h = history()
+    await assert.rejects(
+      runRouted({ task: 'fix', cwd: repo(), config, signal, deps: { ...handed, provider: laya, execute: async (a) => { executed.push(a.id); return { stopReason: 'completed', answerText: 'x' } }, history: h } }),
+      /router: Jev's client was handed Laya's record/,
+      Object.keys(handed)[0],
+    )
+    assert.deepEqual([executed, h.rows], [[], []], 'nothing ran and nothing was written')
+  }
+  assert.deepEqual(asked, [], 'and Jev was never asked')
+  // Jev's client under the old name, beside Jev's record or none, decides as it always has.
+  for (const provider of [jev, undefined]) {
+    const d = repo()
+    const j = await runRouted({ task: 'fix', cwd: d, config, signal, deps: { jev: jevClient, provider, execute: fixer(d), history: history() } })
+    assert.deepEqual([j.routing.mode, j.routing.decider, j.assessments[0].mode], ['jev', 'jev', 'jev'])
+  }
+})
+
+test('decider: a near tie hands the work to the cheaper peer under Laya as under Jev, and the tie-break names who decided the run', async () => {
+  const { jev, laya } = await records()
+  const tied = pick('deepseek', 0.3, { deepseek: 0.36, claude: 0.34, 'qwen-local': 0.3 })
+  // Through the decision engine, the path a Laya run takes, and through the decider's own routing
+  // call, the legacy path: the move is the same either way, whoever decided.
+  for (const via of ['engine', 'legacy']) {
+    for (const provider of [jev, laya]) {
+      const events = []
+      const decider = { provider, route: async () => ({ model: 'm', ...tied }), assess: async () => ({}) }
+      const decide = via === 'engine' ? { decide: async () => ({ routing: tied, plan: directPlan('deepseek') }) } : {}
+      const { r, seen } = await adaptiveRun({ deps: { decider, provider, ...decide, emit: (e) => events.push(e) } })
+      const what = `${provider.id} through the ${via}`
+      assert.deepEqual([r.routing.decider, r.routing.primaryAgent, r.routing.tiebrokeFrom, seen[0]], [provider.id, 'claude', 'deepseek', 'claude'], what)
+      const tie = events.find((e) => e.type === 'tiebreak')
+      assert.deepEqual(tie && { from: tie.from, to: tie.to, confidence: tie.confidence, margin: tie.margin, decider: tie.decider }, { from: 'deepseek', to: 'claude', confidence: 0.3, margin: 0.1, decider: provider.id }, what)
+    }
+  }
+})
+
+test('decider: the person\'s verdicts move a close pick under Laya as under Jev', async () => {
+  const { jev, laya } = await records()
+  const rows = [1, 2, 3].map((i) => fbRow({ messageId: `m${i}` }))
+  for (const provider of [jev, laya]) {
+    const dir = repo()
+    const events = []
+    const decider = answering(provider, { primaryAgent: 'codex', agentConfidence: 0.8, agentProbabilities: { codex: 0.55, claude: 0.45 } })
+    const r = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: FB_CONFIG, signal, deps: { decider, provider, execute: fixer(dir), history: fbHistory(rows), emit: (e) => events.push(e) } })
+    assert.deepEqual([r.routing.decider, r.attempts[0].agent, r.routing.feedbackFrom], [provider.id, 'claude', 'codex'], `${provider.id}: three dislikes cost codex the close call`)
+    assert.deepEqual(r.routing.moves, [{ kind: 'feedback', from: 'codex', to: 'claude' }], provider.id)
+    assert.ok(events.some((e) => e.type === 'feedback' && e.from === 'codex' && e.to === 'claude'), `${provider.id}: the move is said as it happens`)
+  }
+})
+
+test('an agent held back before its work starts is not run out of time by the wait: its time limit stands still while it waits (untimed), the wait is kept apart from its own time, and the limit still holds for the work after it', async () => {
+  const quick = { ...config, agentTimeoutMs: 200 }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  // Held back for more than twice its whole time limit, then it does the work: the attempt completes,
+  // and one attempt is all the run needs.
+  const dir = repo()
+  const held = async (agentDef, prompt, agentSignal, options) => {
+    await options.untimed(sleep(500))
+    agentSignal.throwIfAborted()
+    writeFileSync(join(dir, 'state.txt'), 'fixed')
+    return { stopReason: 'completed', answerText: 'fixed it' }
+  }
+  const r = await runRouted({ task: 'fix', cwd: dir, forceAgent: 'claude', config: quick, signal, deps: { jev: null, execute: held, history: history() } })
+  assert.equal(r.attempts.length, 1, JSON.stringify(r.attempts.map((a) => [a.stopReason, a.diagnostic])))
+  const [a] = r.attempts
+  assert.deepEqual([a.stopReason, r.finalStatus], ['completed', 'accepted'])
+  assert.ok(a.waitedMs >= 480, `it waited ${a.waitedMs} ms`)
+  assert.ok(a.durationMs < a.waitedMs, `its own time, ${a.durationMs} ms, leaves the wait out`)
+
+  // The limit counts again once the wait is over, from where it stood: work that runs past it is stopped
+  // by the limit, as any attempt's is, after its own 200 ms and not before.
+  const dir2 = repo()
+  const slow = async (agentDef, prompt, agentSignal, options) => {
+    await options.untimed(sleep(100))
+    // Work that never ends on its own. The limit's timer, like AbortSignal.timeout's, does not keep
+    // the process alive, so this stands in for the engine that does.
+    const alive = setInterval(() => {}, 20)
+    try {
+      await new Promise((resolve, reject) => agentSignal.addEventListener('abort', () => reject(agentSignal.reason), { once: true }))
+    } finally { clearInterval(alive) }
+  }
+  const one = { ...quick, limits: { ...quick.limits, maxAttempts: 1 } }
+  const timedOut = await runRouted({ task: 'fix', cwd: dir2, forceAgent: 'claude', config: one, signal, deps: { jev: null, execute: slow, history: history() } })
+  const [t] = timedOut.attempts
+  assert.equal(t.stopReason, 'error')
+  assert.match(t.diagnostic, /aborted due to timeout/)
+  assert.ok(t.waitedMs >= 90 && t.waitedMs < 200, `it waited ${t.waitedMs} ms`)
+  assert.ok(t.durationMs >= 190, `the limit gave its work its own time, ${t.durationMs} ms`)
 })

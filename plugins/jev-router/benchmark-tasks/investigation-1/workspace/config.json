@@ -1,0 +1,5 @@
+{
+  "timeout": "4s",
+  "retries": 5,
+  "region": "eu-west"
+}

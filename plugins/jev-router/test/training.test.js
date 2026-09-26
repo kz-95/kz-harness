@@ -1,13 +1,20 @@
 // The training store and the run-to-label rules: append and join, the shadow comparison,
-// which outcome a finished run justifies per domain, and the refusal to guess or to store text.
+// which outcome a finished run justifies per domain, the refusal to guess or to store text, and
+// the cap that keeps the file from growing for ever without starving the maturity gates.
 // Every row is a fixture; no real task text is anywhere near this file.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { appendFileSync, mkdtempSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createDomainController, splitRows } from '../domains.js'
 import { FEATURE_SCHEMA_VERSION } from '../features.js'
-import { AUTHORITIES, LABEL_SOURCES, OUTCOME_BACKED, attachOutcomes, createTrainingStore, labelFromRun } from '../training.js'
+import { resolvePolicy } from '../routing-policy.js'
+import { AUTHORITIES, LABEL_SOURCES, OUTCOME_BACKED, attachOutcomes, createTrainingStore, labelFromRun, samplesCap } from '../training.js'
+// The Laya store's exports, read through the namespace so this file still loads where they are
+// missing and each test says for itself what it needs.
+import * as training from '../training.js'
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), 'kz-training-')), 'routing-samples.jsonl')
 /** A clock that ticks one second per call, so rows order deterministically. */
@@ -184,7 +191,9 @@ test('strategy domains: confirmed, rescued, or negative', () => {
   const yesno = (label, domain) => sample({ domain, input: { features: features(), candidates: CANDIDATES }, teacher: { label, probabilities: { yes: 0.3, no: 0.7 }, confidence: 0.7, model: 'jev-1' } })
   assert.deepEqual([labelFromRun('frontier_escalation', yesno('no', 'frontier_escalation'), reviewRescue).label, labelFromRun('frontier_escalation', yesno('no', 'frontier_escalation'), reviewRescue).labelSource], ['yes', 'verified_outcome'])
   assert.equal(labelFromRun('second_opinion', yesno('yes', 'second_opinion'), reviewRescue).labelSource, 'teacher_confirmed')
-  assert.equal(labelFromRun('conservation', yesno('no', 'conservation'), record()).labelSource, 'teacher_confirmed')
+  // Conservation is a hard limit now, not a domain: a sample an older version left in the store is
+  // labelled by nothing, whatever the run did.
+  assert.equal(labelFromRun('conservation', yesno('no', 'conservation'), record()), null)
 })
 
 test('outcome disposition: what the run needed after the decided attempt', () => {
@@ -311,37 +320,465 @@ test('a session verdict labels exactly one run: the last one that ended at or be
   assert.equal(humanOn(first, [{ runId: 'run-1', ts: '2026-09-21T00:00:00.000Z', sessionId: 'sess-1', messageId: 'm4', verdict: 'like', tag: 'good pick' }], second.ts), true)
 })
 
-test('conservation: a stronger resource rescuing the run says conserving was wrong', () => {
+test('a judgment sample is read against a rescue through the tiers recorded beside it', () => {
   // A judgment sample has no candidate features; the engine records each resource's tier beside
   // it, and that is all the rescue rule needs.
   const tiers = [{ id: 'claude', key: 'RESOURCE_A', tier: 'frontier' }, { id: 'deepseek', key: 'RESOURCE_C', tier: 'standard' }]
-  const judged = (label, domain = 'conservation') => sample({ domain, extra: { candidates: tiers }, teacher: { label, probabilities: { yes: label === 'yes' ? 0.9 : 0.1 }, confidence: 0.9, model: 'jev-1' } })
+  const judged = (label, domain) => sample({ domain, extra: { candidates: tiers }, teacher: { label, probabilities: { yes: label === 'yes' ? 0.9 : 0.1 }, confidence: 0.9, model: 'jev-1' } })
   const rescued = record({ strategy: 'CHEAP_DIRECT', attempts: [attempt('deepseek', 'primary', { stopReason: 'error' }), attempt('claude', 'retry')] })
-  const out = labelFromRun('conservation', judged('yes'), rescued)
-  assert.deepEqual([out.label, out.negativeLabel, out.labelSource], ['no', 'yes', 'verified_outcome'])
-  assert.equal(labelFromRun('conservation', judged('no'), rescued).labelSource, 'teacher_confirmed', 'a no is what the rescue says')
-  // The other yes/no domains keep their reading: a rescue means more should have been planned.
-  assert.equal(labelFromRun('frontier_escalation', judged('no', 'frontier_escalation'), rescued).label, 'yes')
+  // A yes/no domain reads a rescue as "more should have been planned".
+  const out = labelFromRun('frontier_escalation', judged('no', 'frontier_escalation'), rescued)
+  assert.deepEqual([out.label, out.negativeLabel, out.labelSource], ['yes', 'no', 'verified_outcome'])
+  assert.equal(labelFromRun('frontier_escalation', judged('yes', 'frontier_escalation'), rescued).labelSource, 'teacher_confirmed', 'a yes is what the rescue says')
   // Without the recorded tiers nobody is known to be stronger, so the run only confirms.
-  assert.equal(labelFromRun('conservation', sample({ domain: 'conservation', teacher: { label: 'yes', probabilities: {}, confidence: 0.9, model: 'jev-1' } }), rescued).labelSource, 'teacher_confirmed')
+  assert.equal(labelFromRun('frontier_escalation', sample({ domain: 'frontier_escalation', teacher: { label: 'no', probabilities: {}, confidence: 0.9, model: 'jev-1' } }), rescued).labelSource, 'teacher_confirmed')
+  // Conservation read the same rescue the other way round ("the strongest should not have been
+  // spared"). It is a hard limit now, and a sample of it an older version left is labelled by nothing.
+  assert.equal(labelFromRun('conservation', judged('yes', 'conservation'), rescued), null)
 })
 
-test('a review the plan forced is the design working, not a rescue that proves conservation wrong', () => {
-  // Conservation moved the work to deepseek, and frontier escalation had the conserved claude
-  // review it. The run was accepted exactly as planned: nothing was rescued.
+test('a review the plan forced is the design working, not a rescue', () => {
+  // The conservation limit moved the work to deepseek, and the frontier review had the conserved
+  // claude review it. The run was accepted exactly as planned: nothing was rescued, so the direct
+  // strategy that planned it is confirmed rather than taught that it needed a review.
   const tiers = [{ id: 'claude', key: 'RESOURCE_A', tier: 'frontier' }, { id: 'deepseek', key: 'RESOURCE_C', tier: 'standard' }]
-  const judged = (label, domain = 'conservation') => sample({ domain, extra: { candidates: tiers }, teacher: { label, probabilities: { yes: label === 'yes' ? 0.9 : 0.1 }, confidence: 0.9, model: 'jev-1' } })
+  const judged = (label, domain) => sample({ domain, extra: { candidates: tiers }, teacher: { label, probabilities: { [label]: 0.9 }, confidence: 0.9, model: 'jev-1' } })
   const asPlanned = record({
     strategy: 'STANDARD_DIRECT',
     plan: { strategy: 'STANDARD_DIRECT', reviewer: 'claude', forceReview: true },
     attempts: [attempt('deepseek'), attempt('claude', 'review')],
   })
-  assert.equal(labelFromRun('conservation', judged('yes'), asPlanned).labelSource, 'teacher_confirmed', 'conserving was right')
+  assert.equal(labelFromRun('execution_strategy', judged('STANDARD_DIRECT', 'execution_strategy'), asPlanned).labelSource, 'teacher_confirmed', 'the direct run went as planned')
   assert.equal(labelFromRun('second_opinion', judged('no', 'second_opinion'), asPlanned).labelSource, 'teacher_confirmed', 'and nothing else is relabelled')
   // The same review, NOT forced by the plan, is still a rescue.
   const unplanned = { ...asPlanned, plan: { ...asPlanned.plan, forceReview: false } }
-  assert.equal(labelFromRun('conservation', judged('yes'), unplanned).label, 'no')
+  assert.equal(labelFromRun('execution_strategy', judged('STANDARD_DIRECT', 'execution_strategy'), unplanned).label, 'CHEAP_EXECUTE_FRONTIER_REVIEW')
   // A review by someone other than the named reviewer is still a rescue.
   const other = { ...asPlanned, plan: { ...asPlanned.plan, reviewer: 'codex' } }
-  assert.equal(labelFromRun('conservation', judged('yes'), other).label, 'no')
+  assert.equal(labelFromRun('execution_strategy', judged('STANDARD_DIRECT', 'execution_strategy'), other).label, 'CHEAP_EXECUTE_FRONTIER_REVIEW')
+})
+
+// --- the cap ------------------------------------------------------------------------------
+
+/** The rows of a samples file as they are on disk, by kind. */
+const onDisk = (file) => {
+  const rows = readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  return {
+    lines: rows.length,
+    samples: rows.filter((r) => typeof r.domain === 'string' && !('outcomeTs' in r)).map((r) => r.id),
+    outcomes: rows.filter((r) => 'outcomeTs' in r),
+    dropped: rows.find((r) => r.dropped)?.dropped ?? null,
+  }
+}
+const verifiedOutcome = (labelSource = 'teacher_confirmed', verified = true) => ({ label: 'implementation', labelSource, verified, details: {} })
+/**
+ * Gates small enough to fill in a test, shaped like the shipped ones: LOCAL_ONLY wants 20 verified
+ * rows and a holdout of 3, which a 15% holdout share carves out of 20, so the cap they imply is a
+ * quarter again, 25.
+ */
+const small = { shadowSamples: 5, guardedSamples: 10, localOnlySamples: 20, perClassSamples: 2, holdoutSamples: 3, recentWindow: 5 }
+const fsp = createRequire(import.meta.url)('node:fs/promises')
+/**
+ * Run `fn` with node:fs/promises' `name` replaced by `fake(real)`, as every module that imports it
+ * sees it: syncBuiltinESMExports carries the swap over to the named imports training.js holds.
+ */
+async function swapped(name, fake, fn) {
+  const real = fsp[name]
+  fsp[name] = fake(real)
+  syncBuiltinESMExports()
+  try { return await fn() } finally {
+    fsp[name] = real
+    syncBuiltinESMExports()
+  }
+}
+const refusal = (code) => Object.assign(new Error(`${code}: refused by the test`), { code })
+
+test('the cap holds every verified row the most demanding gate counts, with room to spare', () => {
+  const policy = resolvePolicy()
+  // HIGH asks the most: 6000 verified samples for LOCAL_ONLY, and a holdout of 1200, which a 15%
+  // holdout share only carves out of 8000. A quarter on top of 8000 is 10000.
+  assert.equal(samplesCap(policy), 10_000)
+  // The room is for verified rows the classifier cannot learn from (a verified negative carries
+  // no label): with a fifth of the kept verified rows like that, every risk class still passes
+  // both sample gates on the rest, counted exactly as the time-aware split counts.
+  const usable = Math.floor(samplesCap(policy) * 0.8)
+  for (const [risk, g] of Object.entries(policy.gates)) {
+    assert.ok(usable >= g.localOnlySamples, `${risk}: the LOCAL_ONLY sample gate`)
+    assert.ok(splitRows(new Array(usable).fill(null), policy.split).holdout.length >= g.holdoutSamples, `${risk}: the holdout gate`)
+  }
+  assert.equal(samplesCap(resolvePolicy({ gates: { HIGH: { localOnlySamples: 20_000 } } })), 25_000, 'a gate raised in config raises the cap with it')
+  assert.equal(samplesCap(resolvePolicy({ gates: { LOW: { holdoutSamples: 3000 } } })), 25_000, 'and so does a larger holdout, through the share that carves it')
+  // A split that holds nothing out has its holdout gate scored on the validation slice (measure()
+  // in domains.js), so that is the share the holdout has to come out of: HIGH's 1200 from a 20%
+  // slice needs 6000 rows, level with its sample gate, and a quarter on top is 7500.
+  assert.equal(samplesCap(resolvePolicy({ split: { train: 0.8, validation: 0.2, holdout: 0 } })), 7500, 'no holdout share is still a cap')
+  // With no validation slice either there is nothing to score the holdout gate on at any size,
+  // so only the sample gate can need rows.
+  assert.equal(samplesCap(resolvePolicy({ split: { train: 1, validation: 0, holdout: 0 } })), 7500)
+  // The store takes the policy it is handed: the small gates cap it at 25.
+  assert.equal(samplesCap(resolvePolicy({ gates: { LOW: small, MEDIUM: small, HIGH: small } })), 25)
+})
+
+test('an over-cap file loads only the newest samples of each domain, and is cut down on disk', async () => {
+  const file = tmp()
+  const writer = createTrainingStore({ file, now: clock() })
+  for (const id of ['a1', 'a2', 'a3', 'a4', 'a5', 'a6']) await writer.append(sample({ id }))
+  for (const id of ['b1', 'b2']) await writer.append(sample({ id, domain: 'skill_selection' }))
+  await writer.resolveOutcome('a2', verifiedOutcome('teacher_confirmed', false))
+  const before = readFileSync(file, 'utf8')
+  // Within the slack the file is left as it is, but memory already holds only what the cap keeps.
+  const reader = createTrainingStore({ file, now: clock(), cap: 3, slack: 100 })
+  assert.deepEqual(await reader.load(), { samples: 5, outcomes: 0 })
+  assert.deepEqual((await reader.list({ domain: 'task_classification' })).map((r) => r.id), ['a4', 'a5', 'a6'], 'the newest three')
+  assert.deepEqual((await reader.list({ domain: 'skill_selection' })).map((r) => r.id), ['b1', 'b2'], 'a domain under the cap keeps everything')
+  assert.equal(await reader.get('a1'), null)
+  assert.equal(readFileSync(file, 'utf8'), before, 'not rewritten: it is not yet a slack past what the cap keeps')
+  // Past the slack, loading it rewrites it to the capped set.
+  await createTrainingStore({ file, now: clock(), cap: 3, slack: 1 }).load()
+  const disk = onDisk(file)
+  assert.deepEqual(disk.samples, ['a4', 'a5', 'a6', 'b1', 'b2'])
+  assert.deepEqual(disk.outcomes, [], 'the outcome of a dropped sample went with it')
+  assert.deepEqual(disk.dropped, { task_classification: { samples: 3, verified: 0 } })
+})
+
+test('the newest samples the cap keeps are the newest by time, as list() orders them, not by place in the file', async () => {
+  const file = tmp()
+  // A caller's own timestamp is kept as given, so the file and the clock can disagree on the order.
+  const writer = createTrainingStore({ file })
+  await writer.append(sample({ id: 'late', ts: '2026-09-21T00:00:09.000Z' }))
+  await writer.append(sample({ id: 'early', ts: '2026-09-21T00:00:01.000Z' }))
+  const reader = createTrainingStore({ file, cap: 1, slack: 100 })
+  assert.deepEqual((await reader.list()).map((r) => r.id), ['late'], 'the one list() and the domains read as the newest')
+})
+
+test('compaction keeps the newest outcome of every kept sample, and verified samples outlive rows that proved nothing', async () => {
+  const file = tmp()
+  // A slack of one rewrites the file whenever the cap lets anything go.
+  const store = createTrainingStore({ file, now: clock(), cap: 2, slack: 1 })
+  for (const id of ['v1', 'v2', 'v3']) {
+    await store.append(sample({ id }))
+    await store.resolveOutcome(id, verifiedOutcome())
+  }
+  await store.resolveOutcome('v3', verifiedOutcome('human'))
+  await store.append(sample({ id: 'u1' }))
+  await store.append(sample({ id: 'u2' }))
+  await store.resolveOutcome('u2', verifiedOutcome('teacher_confirmed', false))
+  await store.append(sample({ id: 'u3' }))
+  const disk = onDisk(file)
+  // The newest two, whatever became of them, and the newest two a run verified: v1 is the third
+  // verified one back, and u1 is neither.
+  assert.deepEqual(disk.samples, ['v2', 'v3', 'u2', 'u3'])
+  assert.deepEqual(disk.outcomes.map((o) => [o.id, o.outcome.labelSource]), [['v2', 'teacher_confirmed'], ['v3', 'human'], ['u2', 'teacher_confirmed']], 'one outcome row per kept sample, the newest')
+  assert.deepEqual(disk.dropped, { task_classification: { samples: 2, verified: 1 } })
+  const reread = createTrainingStore({ file, now: clock(), cap: 2, slack: 1 })
+  const joined = (await reread.list()).map((r) => [r.id, r.outcome?.labelSource ?? null, r.outcome?.verified ?? null])
+  assert.deepEqual(joined, [['v2', 'teacher_confirmed', true], ['v3', 'human', true], ['u2', 'teacher_confirmed', false], ['u3', null, null]])
+  assert.deepEqual((await reread.stats()).dropped, { samples: 2, verified: 1 }, 'what was let go is still counted after a restart')
+  assert.deepEqual((await reread.stats('skill_selection')).dropped, { samples: 0, verified: 0 })
+})
+
+test('the file is rewritten only once it has grown a slack past what the cap keeps', async () => {
+  const file = tmp()
+  const store = createTrainingStore({ file, now: clock(), cap: 2, slack: 4 })
+  const lines = []
+  for (let i = 0; i < 9; i++) {
+    await store.append(sample())
+    lines.push(onDisk(file).lines)
+  }
+  // Looked at every fourth row. At the fourth the rewrite would save one row (two samples and the
+  // count of the two it let go, against four), so it is skipped; at the eighth it would save five,
+  // and it happens. Rewriting whenever anything could go, or looking at every row, would have cut
+  // the file at the fourth row or the seventh.
+  assert.deepEqual(lines, [1, 2, 3, 4, 5, 6, 7, 3, 4])
+})
+
+test('a row appended while a compaction runs is never lost', async () => {
+  const file = tmp()
+  const store = createTrainingStore({ file, now: clock(), cap: 5, slack: 5 })
+  for (let i = 1; i <= 6; i++) await store.append(sample({ id: `s${i}` }))
+  // Ten appends issued together: the ninth crosses the slack and compacts the file while the
+  // tenth is already on its way. Had it been written into the file the compaction was replacing,
+  // the rename would have taken it with it.
+  await Promise.all(Array.from({ length: 10 }, (_, i) => store.append(sample({ id: `s${i + 7}` }))))
+  const disk = onDisk(file)
+  assert.deepEqual(disk.dropped, { task_classification: { samples: 10, verified: 0 } }, 'the file was compacted')
+  assert.deepEqual(disk.samples, ['s11', 's12', 's13', 's14', 's15', 's16'], 'the five the cap kept, and the row that raced it')
+  assert.deepEqual((await store.list()).map((r) => r.id), disk.samples, 'memory and disk agree')
+})
+
+test('a row appended while a load compacts the file is never lost', async () => {
+  const file = tmp()
+  const now = clock()
+  const writer = createTrainingStore({ file, now })
+  for (let i = 0; i < 10; i++) await writer.append(sample({ id: `w${i}` }))
+  const store = createTrainingStore({ file, now, cap: 2, slack: 3 })
+  await store.list()
+  assert.ok(onDisk(file).dropped, 'the first load compacted the file')
+  // Another writer grows it past the slack again, so the next load compacts it once more, and an
+  // append is issued at the same moment. A load that read the file around the append would have
+  // replaced it, and memory, with a copy that never saw the row.
+  for (let i = 10; i < 15; i++) await writer.append(sample({ id: `w${i}` }))
+  await Promise.all([store.append(sample({ id: 'x' })), store.load()])
+  assert.ok(onDisk(file).samples.includes('x'), 'the row is on disk')
+  assert.ok((await store.list()).map((r) => r.id).includes('x'), 'and in memory')
+})
+
+test('a file that could not be read is never rewritten, since the copy would hold only what was read', async () => {
+  const file = tmp()
+  const writer = createTrainingStore({ file, now: clock() })
+  for (let i = 0; i < 6; i++) await writer.append(sample({ id: `old${i}` }))
+  const logs = []
+  // A transient refusal, as a scanner or a backup holding the file on Windows gives.
+  await swapped('readFile', (real) => async (path, ...rest) => {
+    if (path === file) throw refusal('EBUSY')
+    return real(path, ...rest)
+  }, async () => {
+    const store = createTrainingStore({ file, now: clock(), cap: 2, slack: 2, log: (m) => logs.push(m) })
+    for (let i = 0; i < 8; i++) await store.append(sample({ id: `new${i}` }))
+  })
+  assert.deepEqual(onDisk(file).samples.filter((id) => id.startsWith('old')), ['old0', 'old1', 'old2', 'old3', 'old4', 'old5'], 'every row it could not read is still there')
+  assert.equal(onDisk(file).dropped, null, 'and the file was never compacted')
+  assert.ok(logs.some((m) => m.startsWith('routing samples not read: EBUSY')), logs.join('; '))
+})
+
+test('a compaction is written to a temporary file and renamed over the samples, retrying a rename Windows refuses for a moment', async () => {
+  const file = tmp()
+  const renames = []
+  const logs = []
+  await swapped('rename', (real) => async (from, to) => {
+    // What the copy holds at the moment it replaces the file: complete, and already compacted.
+    renames.push({ from, to, rows: onDisk(from).lines })
+    // Refused twice, as a reader holding the destination open makes Windows refuse it.
+    if (renames.length <= 2) throw refusal('EPERM')
+    return real(from, to)
+  }, async () => {
+    const store = createTrainingStore({ file, now: clock(), cap: 2, slack: 3, log: (m) => logs.push(m) })
+    for (let i = 0; i < 6; i++) await store.append(sample({ id: `s${i}` }))
+  })
+  assert.deepEqual(renames.map((r) => [r.from, r.to, r.rows]), Array(3).fill([`${file}.tmp`, file, 3]), 'one copy of the two kept rows and the count, renamed on the third try')
+  assert.deepEqual(onDisk(file).dropped, { task_classification: { samples: 4, verified: 0 } }, 'the file was compacted')
+  assert.deepEqual(onDisk(file).samples, ['s4', 's5'])
+  assert.equal(existsSync(`${file}.tmp`), false, 'and the copy is gone, renamed over it')
+  assert.deepEqual(logs, [])
+})
+
+test('a compaction that cannot replace the file leaves it exactly as it was', async () => {
+  const file = tmp()
+  const logs = []
+  const store = createTrainingStore({ file, now: clock(), cap: 2, slack: 3, log: (m) => logs.push(m) })
+  for (let i = 0; i < 5; i++) await store.append(sample({ id: `s${i}` }))
+  const before = readFileSync(file, 'utf8')
+  // A refusal that is not a moment's lock (another device, say) is not retried.
+  let tries = 0
+  const row = await swapped('rename', () => async () => { tries++; throw refusal('EXDEV') }, () => store.append(sample({ id: 's5' })))
+  assert.equal(tries, 1)
+  assert.equal(readFileSync(file, 'utf8'), `${before}${JSON.stringify(row)}\n`, 'every row it held, and the one just appended, byte for byte')
+  assert.ok(logs.some((m) => m.startsWith('routing samples not compacted: EXDEV')), logs.join('; '))
+  // Nothing was lost: read afresh, the file gives back the rows the cap keeps.
+  assert.deepEqual((await createTrainingStore({ file, cap: 2, slack: 100 }).list()).map((r) => r.id), ['s4', 's5'])
+})
+
+/** A separable two-class task sample, `score` above 0.5 being 'high', so a classifier can learn it. */
+const separable = (i, over = {}) => {
+  const label = i % 2 === 0 ? 'high' : 'low'
+  const score = (label === 'high' ? 0.75 : 0.25) + ((i % 5) - 2) * 0.02
+  return sample({
+    input: { features: { numeric: { score }, categorical: { kind: label === 'high' ? 'a' : 'b' } } },
+    teacher: { label, probabilities: { [label]: 0.9 }, confidence: 0.9, model: 'jev-1' },
+    ...over,
+  })
+}
+
+test('a capped store still hands the maturity gates every verified row they count', async () => {
+  // The small gates cap the store at 25.
+  const policy = resolvePolicy({ gates: { LOW: small, MEDIUM: small, HIGH: small }, retrain: { minSamples: 10, everyNewSamples: 1, epochs: 300, learningRate: 0.3 } })
+  const root = mkdtempSync(join(tmpdir(), 'kz-training-'))
+  const file = join(root, 'routing-samples.jsonl')
+  const writer = createTrainingStore({ file, now: clock(), policy, slack: 10 })
+  // Twenty-five decisions a run verified, then sixty the local classifier made alone, which an
+  // accepted run cannot confirm (confirms()): the regime a domain is in once it holds a local rung.
+  for (let i = 0; i < 25; i++) {
+    const row = await writer.append(separable(i))
+    await writer.resolveOutcome(row.id, { label: row.teacher.label, labelSource: 'verified_outcome', verified: true, details: {} })
+  }
+  for (let i = 0; i < 60; i++) {
+    const label = i % 2 === 0 ? 'high' : 'low'
+    await writer.append(separable(i, { authority: 'local', teacher: null, local: { label, probabilities: { [label]: 0.95 }, confidence: 0.95, artifactVersion: 'task_classification@1', ood: false } }))
+  }
+  assert.ok(onDisk(file).dropped, 'the file was capped')
+  const ctl = createDomainController({
+    domain: 'task_classification', policy, store: createTrainingStore({ file, policy }),
+    artifactsDir: join(root, 'classifiers'), stateFile: join(root, 'task_classification.state.json'),
+  })
+  const ev = await ctl.evaluate()
+  // Keeping only the newest 25 rows would have kept none of these: all sixty unverified rows are
+  // newer than every verified one.
+  assert.equal(ev.samples.verified, 25, 'every verified row outlived the newer rows that proved nothing')
+  assert.equal(ev.samples.total, 50, 'and of those, the newest 25 are kept')
+  assert.ok(ev.samples.verified >= policy.gates.LOW.localOnlySamples, 'the LOCAL_ONLY sample gate can pass')
+  assert.ok(ev.holdout?.n >= policy.gates.LOW.holdoutSamples, `the holdout gate can pass (${ev.holdout?.n} held out)`)
+})
+
+test('a domain at its cap keeps retraining, and keeps a recent window to judge the classifier on', async () => {
+  const policy = resolvePolicy({ gates: { LOW: small, MEDIUM: small, HIGH: small }, retrain: { minSamples: 10, everyNewSamples: 5, epochs: 100, learningRate: 0.3 } })
+  const root = mkdtempSync(join(tmpdir(), 'kz-training-'))
+  const store = createTrainingStore({ file: join(root, 'routing-samples.jsonl'), now: clock(), policy, slack: 10 })
+  const ctl = createDomainController({ domain: 'task_classification', policy, store, artifactsDir: join(root, 'classifiers'), stateFile: join(root, 'task_classification.state.json') })
+  let n = 0
+  const verify = async (count) => {
+    for (let k = 0; k < count; k++, n++) {
+      const row = await store.append(separable(n))
+      await store.resolveOutcome(row.id, { label: row.teacher.label, labelSource: 'verified_outcome', verified: true, details: {} })
+    }
+  }
+  await verify(30)
+  await ctl.evaluate()
+  assert.ok((await store.stats('task_classification')).dropped.verified > 0, 'the store is at its cap')
+  const atCap = ctl.artifact()
+  // Sixty more verified rows, ten at a time. After each batch the store holds its 25 newest again,
+  // so a count of what it holds stands still, and nothing that arrives would ever look new.
+  let ev
+  for (let k = 0; k < 6; k++) {
+    await verify(10)
+    ev = await ctl.evaluate()
+  }
+  assert.notEqual(ctl.artifact(), atCap, 'retrained on rows that arrived after the cap')
+  assert.equal(ev.samples.seen, 90, 'every verified row the domain has had, the ones the cap let go of included')
+  assert.equal(ctl.artifact().extras.verifiedSamples, 90, 'and the classifier in service was trained after the last batch')
+  assert.ok(ev.recent?.n > 0, 'it is still measured on rows it never saw, so the rollback checks can see')
+})
+
+test('a classifier whose training rows the cap let go of is measured on exactly the rows verified after it', async () => {
+  // A recent window wider than the store holds, so the count below is every row it is read from.
+  const policy = resolvePolicy({ gates: { LOW: { ...small, recentWindow: 30 }, MEDIUM: small, HIGH: small }, retrain: { minSamples: 10, everyNewSamples: 5, epochs: 100, learningRate: 0.3 } })
+  const root = mkdtempSync(join(tmpdir(), 'kz-training-'))
+  const store = createTrainingStore({ file: join(root, 'routing-samples.jsonl'), now: clock(), policy, cap: 25, slack: 10 })
+  const ctl = createDomainController({ domain: 'task_classification', policy, store, artifactsDir: join(root, 'classifiers'), stateFile: join(root, 'task_classification.state.json') })
+  let n = 0
+  const verify = async (count) => {
+    for (let k = 0; k < count; k++, n++) {
+      const row = await store.append(separable(n))
+      await store.resolveOutcome(row.id, { label: row.teacher.label, labelSource: 'verified_outcome', verified: true, details: {} })
+    }
+  }
+  // Trained with 30 verified rows seen, of which the store held the newest 25, rows 5 to 29.
+  await verify(30)
+  await ctl.evaluate()
+  assert.equal(ctl.artifact().extras.verifiedSamples, 30)
+  // Twenty more, not trained on. The store now holds rows 25 to 49, and the rows that mark where
+  // the classifier's training and calibration slices ended (21 and 24) have gone with the cap.
+  await verify(20)
+  const ev = await ctl.evaluate({ retrain: false })
+  const held = (await store.list({ verifiedOnly: true })).map((r) => r.id)
+  assert.ok(!held.includes(ctl.artifact().extras.trainedThrough) && !held.includes(ctl.artifact().extras.calibratedThrough), 'the markers are gone')
+  // Taken to have seen every row verified when it was trained: 30, of which the oldest 25 are no
+  // longer held, so of the held rows it saw the first five and none of the twenty after them.
+  assert.equal(ev.recent?.n, 20, 'the twenty rows verified since it was trained')
+  assert.equal(ev.recent.calibration?.n, 20)
+})
+
+test('the plugin hands its training store the policy it resolved, so the gates in config set the cap', async () => {
+  const { apply, Config } = await import('../index.js')
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-training-'))
+  const writer = createTrainingStore({ file: join(dataDir, 'routing-samples.jsonl'), now: clock() })
+  for (let i = 0; i < 40; i++) await writer.append(sample())
+  const routes = []
+  const disposers = []
+  const effect = (f) => { const d = f(); if (typeof d === 'function') disposers.push(d) }
+  // Just enough of the plugin runtime for apply() to build the router and register its routes.
+  const ctx = {
+    credentials: { resolve: async () => undefined }, effect, subagents: {}, get: () => null,
+    commands: { register: () => {} }, tools: { register: () => {} },
+    inject: (deps, fn) => {
+      if (deps.includes('webServer')) fn({ effect, webServer: { register: (r) => { routes.push(r); return () => {} } }, connection: { requestRejection: () => 0 } })
+    },
+  }
+  // No agents, so nothing is shelled out to for a login check.
+  apply(ctx, Config({ agents: [], historyFile: join(dataDir, 'history.jsonl'), routing: { gates: { LOW: small, MEDIUM: small, HIGH: small } } }))
+  try {
+    const res = await new Promise((resolve) => {
+      const r = { statusCode: 0, setHeader() {}, end(body) { r.body = body; resolve(r) } }
+      routes[0].handler({ method: 'GET', url: '/jev-router/routing', headers: {} }, r)
+    })
+    assert.equal(res.statusCode, 200)
+    // The shipped gates cap it at 10000, which would keep all forty.
+    const { training } = JSON.parse(res.body)
+    assert.equal(training.total, 25, 'the small gates in config cap the store at 25')
+    assert.deepEqual(training.dropped, { samples: 15, verified: 0 })
+  } finally { for (const d of disposers) d() }
+})
+
+// ---------------------------------------------------------------- the Laya store (docs/laya-auto.md 6.1 to 6.4)
+
+/** A sample as a Laya-decided run writes it: no teacher, and Laya's answer as `provider`. */
+const layaSample = (over = {}) => sample({
+  teacher: null,
+  authority: 'laya',
+  provider: { id: 'laya', label: 'implementation', probabilities: { implementation: 0.7, debugging: 0.3 }, confidence: 0.7, informative: true, model: 'laya-english/0.3.20@1a2b3c4', identity: 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1', lang: 'latin' },
+  ...over,
+})
+
+test('the Jev store keeps its list of authorities, and every store\'s list is named beside it', () => {
+  assert.ok(Array.isArray(training.ALL_AUTHORITIES), 'ALL_AUTHORITIES is exported')
+  assert.deepEqual([...training.ALL_AUTHORITIES], ['jev', 'laya', 'local', 'code', 'deterministic', 'fallback'])
+  assert.equal(training.STORE_AUTHORITIES.jev, AUTHORITIES, 'the Jev store reads the list it always had')
+  assert.deepEqual([...training.STORE_AUTHORITIES.laya], ['laya', 'code', 'deterministic', 'fallback'], 'a Laya run is never decided by Jev or by a local classifier')
+  assert.deepEqual([...AUTHORITIES], ['jev', 'local', 'code', 'deterministic', 'fallback'], 'and that list has not moved')
+})
+
+test('store kinds: the Jev store refuses a Laya row, and the Laya store refuses a teacher and keeps what Laya said', async () => {
+  const now = clock()
+  const jevStore = createTrainingStore({ file: tmp(), now })
+  const layaStore = createTrainingStore({ file: tmp(), kind: 'laya', now })
+  assert.equal(layaStore.kind, 'laya')
+  assert.equal(jevStore.kind, 'jev', 'a store that names no kind is the Jev store, as every store was')
+  assert.throws(() => createTrainingStore({ file: tmp(), kind: 'shadow' }), /kind must be one of jev, laya/)
+
+  // The Jev store: a Laya authority, or a provider field of any value, is a programming error.
+  await assert.rejects(() => jevStore.append(layaSample()), /training: a laya sample was refused by the jev store/)
+  await assert.rejects(() => jevStore.append(sample({ authority: 'laya' })), /refused by the jev store/)
+  await assert.rejects(() => jevStore.append(sample({ provider: null })), /refused by the jev store/, 'even an empty provider field')
+  const jevRow = await jevStore.append(sample())
+  assert.equal('provider' in jevRow, false, 'a Jev row has the shape it always had')
+  assert.equal((await jevStore.append(sample({ authority: 'nobody' }))).authority, 'fallback', 'an unknown authority still reads as the fallback')
+  assert.equal((await jevStore.list()).length, 2, 'nothing refused reached the file')
+
+  // The Laya store: Laya is never a teacher, and it cannot ride in as one under another name.
+  await assert.rejects(() => layaStore.append(layaSample({ teacher: { label: 'implementation', confidence: 0.9 } })), /a sample with a teacher was refused by the laya store/)
+  await assert.rejects(() => layaStore.append(layaSample({ provider: { id: 'jev', label: 'x' } })), /provider must be/)
+  const row = await layaStore.append(layaSample({ provider: { ...layaSample().provider, informative: false, prompt: 'the task text as typed', raw: { profile: {} } } }))
+  assert.equal(row.teacher, null)
+  assert.equal(row.authority, 'laya')
+  assert.deepEqual(row.provider, {
+    id: 'laya', label: 'implementation', chosenKey: null, probabilities: { implementation: 0.7, debugging: 0.3 }, confidence: 0.7,
+    informative: false, model: 'laya-english/0.3.20@1a2b3c4', identity: 'laya-0.3.20|english|1a2b3c4d5e6f|adapter-1|corr:choice:11+=3.27|margin:0.1', lang: 'latin',
+  }, 'only the answer is kept: no field a caller adds beside it reaches the file')
+  assert.equal((await layaStore.get(row.id)).provider.informative, false, 'and it reads back as written')
+  assert.equal((await layaStore.append(layaSample({ authority: 'local' }))).authority, 'fallback', 'an authority the Laya store does not hold reads as the fallback')
+  assert.equal((await layaStore.append(layaSample({ authority: 'code', provider: null, code: { label: 'yes', probabilities: {}, confidence: 1 } }))).provider, null)
+  const s = await layaStore.stats('task_classification')
+  assert.equal(s.byAuthority.laya, 1)
+  assert.equal(s.byLabel.implementation, 2, 'a Laya row is counted by the label Laya gave')
+})
+
+test('pickOf and confirms: a Laya pick is contradicted as any pick is, and an accepted run never confirms it', () => {
+  // Task type: a person's tag decides either way, and an accepted run alone says nothing.
+  const s = layaSample()
+  const misread = [{ ts: AFTER, sessionId: 'sess-1', messageId: 'm1', verdict: 'dislike', tag: 'misread my question' }]
+  const good = [{ ts: AFTER, sessionId: 'sess-1', messageId: 'm1', verdict: 'like', tag: 'good pick' }]
+  assert.deepEqual(labelFromRun('task_classification', s, record(), { feedback: misread }), { label: null, negativeLabel: 'implementation', labelSource: 'human', verified: true, details: { finalStatus: 'accepted', attempts: 1, escalated: false } }, 'the pick is Laya\'s answer')
+  assert.equal(labelFromRun('task_classification', s, record(), { feedback: good })?.label, 'implementation')
+  assert.equal(labelFromRun('task_classification', s, record()), null, 'the accept that would confirm it came from Laya\'s own review')
+  // Resource: a rescue labels the rescuer, and the pick doing the accepted work confirms nothing.
+  const res = resourceSample('RESOURCE_C', { teacher: null, authority: 'laya', provider: { id: 'laya', chosenKey: 'RESOURCE_C', probabilities: { RESOURCE_C: 0.6 }, confidence: 0.6, informative: true } })
+  const rescued = record({ attempts: [attempt('deepseek', 'primary', { stopReason: 'error' }), attempt('claude', 'retry')] })
+  assert.deepEqual(labelFromRun('resource_selection', res, rescued), { chosenKey: 'RESOURCE_A', labelSource: 'verified_outcome', negativeKey: 'RESOURCE_C', verified: true, details: { finalStatus: 'accepted', attempts: 2, escalated: true } })
+  assert.equal(labelFromRun('resource_selection', res, record()), null)
+  // Disposition: what followed the review labels it only where it contradicts it.
+  const disp = sample({ domain: 'outcome_disposition', teacher: null, authority: 'laya', provider: { id: 'laya', label: 'PASS', confidence: 0.5, informative: false }, extra: { decidedAt: 0 } })
+  const retried = record({ attempts: [attempt('deepseek'), attempt('deepseek', 'retry')] })
+  assert.equal(labelFromRun('outcome_disposition', disp, retried)?.label, 'RETRY_SAME_TIER')
+  assert.equal(labelFromRun('outcome_disposition', disp, record()), null, 'a PASS the run then accepted is Laya agreeing with itself')
+  // A Jev pick is confirmed as it always was.
+  assert.equal(labelFromRun('task_classification', sample(), record()).labelSource, 'teacher_confirmed')
 })

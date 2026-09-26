@@ -4,16 +4,23 @@
 // Dependencies are injected so the loop runs the same in DSH and in tests. `deps.decide` is the
 // decision engine (decision.js); without it the loop asks `deps.jev.route` directly, the way it
 // always has, so a bare Jev client still routes.
+//
+// Whoever decides the run (`deps.decider`, the old `deps.jev`) answers its routing and review
+// questions, and every cut-off here is read from that provider's record (`deps.provider`,
+// providers.js): Jev in Jev Auto, Laya on this PC in Laya Auto (docs/laya-auto.md 3.2).
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { createReview } from '../jev-review/index.js'
 import { kindOf, marginalCostOf } from './accounts.js'
+import { decidedBy, deviceName, timeoutSize } from './adapter.js'
 import { CHARS_PER_TOKEN, eligible, rank } from './capabilities.js'
 import { NO_CANDIDATES, contextEstimate } from './decision.js'
 import { effortFamily, toAgentEffort } from './effort.js'
+import { redactSecrets } from './export.js'
 import { tagIsAnswerOnly } from './feedback.js'
 import { offlinePick } from './local.js'
+import { TEACHER, jevRecord, providerName } from './providers.js'
 import { assertWorkspace, changedSince, compareChecks, ensureHandoffIgnored, gatherContext, runChecks, snapshot } from './workspace.js'
 
 const pct = (n) => (typeof n === 'number' ? n.toFixed(2) : 'n/a')
@@ -28,8 +35,53 @@ const PEERS = { claude: 'codex', codex: 'claude' }
 const JUDGMENT_ROLES = ['review']
 
 function describeError(err) {
-  // Class name + message only; SDK errors never include the API key.
-  return `${err?.constructor?.name ?? 'Error'}: ${err?.message ?? String(err)}`.slice(0, 300)
+  // Class name + message only; SDK errors never include the API key. An executor's error can
+  // quote what it was sent, and this becomes an attempt's diagnostic, which the review sends to
+  // Jev, so it is scrubbed before it is cut: a key the cut split would go out as a plain word.
+  return redactSecrets(`${err?.constructor?.name ?? 'Error'}: ${err?.message ?? String(err)}`).slice(0, 300)
+}
+
+/**
+ * One agent's time limit in an attempt (config.agentTimeoutMs). `signal` fires when the run is
+ * stopped or the agent has had `ms` of its own time, with the reason AbortSignal.timeout gives.
+ * `untimed(promise)` is a wait that is not the agent's work: the clock stands still until the
+ * promise settles, and `waitedMs` adds up how long it stood. It is how a local agent held back
+ * before it starts, while a speed benchmark goes (docs/benchmark.md 2.6), is neither run out of time
+ * by that wait nor charged for it; a stop of the run still ends the wait at once. `end()` clears the
+ * timer once the attempt is over.
+ */
+export function attemptClock(signal, ms) {
+  const limit = new AbortController()
+  let left = ms
+  let since = Date.now()
+  let timer = null
+  let waits = 0
+  let waitedMs = 0
+  const arm = () => {
+    timer = setTimeout(() => limit.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), left)
+    // As AbortSignal.timeout's own timer: a limit never keeps the process alive.
+    timer.unref?.()
+  }
+  arm()
+  return {
+    signal: AbortSignal.any([signal, limit.signal]),
+    get waitedMs() { return waitedMs },
+    async untimed(promise) {
+      if (waits++ === 0) {
+        clearTimeout(timer)
+        left = Math.max(0, left - (Date.now() - since))
+        since = Date.now()
+      }
+      try { return await promise } finally {
+        if (--waits === 0) {
+          waitedMs += Date.now() - since
+          since = Date.now()
+          if (!limit.signal.aborted) arm()
+        }
+      }
+    },
+    end() { clearTimeout(timer) },
+  }
 }
 
 // The model an executor says it actually served, when it says so. `model` on an attempt is what
@@ -74,13 +126,21 @@ const STALL_AFTER = 2
 // and the routing prompt weighs accepted rate first, so noise wins picks.
 const MIN_RATE_SAMPLES = 3
 
-// Feedback priors: how many recent Like/Dislike verdicts the routing prior weighs, and the
-// most a run of them may move an agent's probability. A verdict is explicit, so it counts more
-// than one quiet run, but a click is still one data point: the bias is ramped over three
-// verdicts and capped, so one cannot swing a pick and ten cannot make an agent unoverridable.
+// Feedback priors: how many recent Like/Dislike verdicts the routing prior weighs (by weight, so
+// a verdict on other work takes only its share of a place), and the most a run of them may move
+// an agent's probability. A verdict is explicit, so it counts more than one quiet run, but a
+// click is still one data point: the bias is ramped over three verdicts and capped, so one
+// cannot swing a pick and ten cannot make an agent unoverridable.
 const FEEDBACK_WINDOW = 20
 const FEEDBACK_WEIGHT = 0.15
 const FEEDBACK_RAMP = 3
+// A verdict about another kind of work still says something about an agent, but far less than one
+// about the kind of work being routed now, so it counts this share of a matching one. It is the
+// share the capability evidence gives an unrelated task type by default (routing-policy.js
+// evidence.similarity.other), copied rather than read: this does not tell a related type (which
+// that evidence counts at a half) from an unrelated one, and an install that overrides the
+// evidence similarity does not move it.
+const FEEDBACK_OTHER_TYPE = 0.25
 
 const TIER = { local: 'free-local', api: 'api', subscription: 'subscription' }
 // The same tiers by what a job costs at the margin, for an operator's `resources.economics` override.
@@ -186,7 +246,10 @@ export function pricingNow(peak = {}, at = Date.now()) {
  * accepted rate (its attempt was the last work in an accepted run), average seconds and limit hits,
  * by task type in this workspace and overall, over the last `n` runs of each; plus cost tier (the
  * operator's `economics` override first, then the billing kind), what it costs at this hour
- * (`pricing`) and availability.
+ * (`pricing`) and availability. Only a run Jev decided is counted under its task type: in a run
+ * another provider decided (Laya) the type is that provider's label, which must never decide which
+ * row of an agent's record the routing call reads (docs/laya-auto.md 6.6, as verdictWeight). Those
+ * runs still count overall, where no label is read.
  */
 export function trackRecord(records, cwd, agents, { availability = {}, pricing = {}, economics, n = 50 } = {}) {
   const here = records.filter((r) => r.workspace === cwd).slice(-n)
@@ -219,10 +282,11 @@ export function trackRecord(records, cwd, agents, { availability = {}, pricing =
       limit_hits: limits,
     }
   }
+  const typed = here.filter((r) => (r.routing?.decider ?? TEACHER) === TEACHER)
   return Object.fromEntries(agents.map((a) => {
     const byType = {}
-    for (const t of new Set(here.map((r) => r.routing?.taskType).filter(Boolean))) {
-      const s = stats(here.filter((r) => r.routing?.taskType === t), a.id)
+    for (const t of new Set(typed.map((r) => r.routing?.taskType).filter(Boolean))) {
+      const s = stats(typed.filter((r) => r.routing?.taskType === t), a.id)
       if (s) byType[t] = s
     }
     return [a.id, { cost_tier: tierOf(a, economics), ...(pricing[a.id] ? { price_now: pricing[a.id] } : {}), availability: availability[a.id] ?? 'ok', here_by_task_type: byType, overall: stats(all, a.id) ?? 'no runs yet' }]
@@ -230,9 +294,54 @@ export function trackRecord(records, cwd, agents, { availability = {}, pricing =
 }
 
 /**
+ * How much one verdict counts toward the feedback bias of the task being routed now, by how well
+ * the work it judged matches this task. The work it judged is the run it is about (`runOf`, which
+ * index.js answers with runOfVerdict: the runId the client sends, else the same fallback the
+ * capability evidence is credited by), and that run's routing.taskType says what kind of work it
+ * was. A verdict about the same kind of work counts fully, from any session; one about another
+ * kind counts FEEDBACK_OTHER_TYPE of that, from this session too. A verdict whose kind of work
+ * cannot be told - no run found, a run that never had a task type (a manual pick), or no task
+ * type for the task at hand - counts exactly as every verdict did before there was a match: fully
+ * when it is from this session and not at all when it is from another, since nothing then says
+ * it was about similar work. A run another provider decided (Laya) is such a run too: its task
+ * type is that provider's label, and Laya's label must never set how much a person's verdict
+ * counts in Jev Auto (docs/laya-auto.md 6.6).
+ * @param {object} p
+ * @param {string} [p.taskType]  what routing said the task at hand is
+ * @param {string} [p.sessionId] this run's session; without one every row reads as this session's,
+ *   as feedback.js list() returns every session when it is asked for none
+ * @param {(verdict: object) => object|null} [p.runOf] the run a verdict is about
+ * @returns {(verdict: object) => number} the verdict's weight, 0..1
+ */
+export function verdictWeight({ taskType, sessionId, runOf } = {}) {
+  const judged = (v) => {
+    // A reader that fails has found no run, which is a verdict it cannot place and nothing worse.
+    try {
+      const run = runOf?.(v)
+      return (run?.routing?.decider ?? TEACHER) === TEACHER ? run?.routing?.taskType : undefined
+    } catch { return undefined }
+  }
+  return (v) => {
+    const type = taskType ? judged(v) : undefined
+    if (type) return type === taskType ? 1 : FEEDBACK_OTHER_TYPE
+    return !sessionId || v?.sessionId === sessionId ? 1 : 0
+  }
+}
+
+/**
  * The routing prior from recent feedback.jsonl rows: per agent, the Like/Dislike counts, the
  * reasons the person gave, and a bounded bias for Jev's probabilities. It extends the same
  * deps.history path trackRecord uses, one file over, so there is one priors mechanism, not two.
+ *
+ * `weightOf` says how much each row counts (verdictWeight); without it every row counts fully.
+ * The window is `n` verdicts' worth of weight, newest first: at full weight that is the newest
+ * `n` rows, as it always was, and a verdict on other work takes only its share of a place, so a
+ * run of them cannot push out the verdicts that bear on this task. A row that weighs nothing is
+ * left out before the window is counted, so it can neither crowd out one that bears on this task
+ * nor be the newest verdict. The counts stay whole verdicts; the bias is taken over the weights,
+ * and since the weighted likes less the weighted dislikes can never exceed their sum, it stays
+ * inside FEEDBACK_WEIGHT however many rows there are and whatever they weigh, the same bound a
+ * whole vote has always had.
  *
  * Which agent a verdict is about comes from `provider` (and `model`): the engine's message id
  * is never known on this side, so `messageId` is only the client's key and this file's upsert
@@ -247,8 +356,22 @@ export function trackRecord(records, cwd, agents, { availability = {}, pricing =
  * but it never reaches `likes` / `dislikes`, so the bias it feeds is untouched, and it cannot
  * raise a `suggestion` either, because that would promote an agent through the answer door.
  */
-export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } = {}) {
-  const recent = (records ?? []).slice(-n)
+export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf, weightOf = () => 1 } = {}) {
+  // Newest first until the window holds n verdicts' worth of weight, so a long log is only
+  // weighed as far back as it counts. Filled by weight, not by rows: counted by rows, twenty
+  // quarter-weight verdicts on other work from other sessions took every place and pushed out
+  // this session's verdicts on this very work.
+  const rows = records ?? []
+  const recent = []
+  const weight = new Map()
+  let filled = 0
+  for (let i = rows.length - 1; i >= 0 && filled < n; i--) {
+    const w = weightOf(rows[i])
+    if (!(w > 0)) continue
+    recent.unshift(rows[i])
+    weight.set(rows[i], w)
+    filled += w
+  }
   const modelOfAgent = (a) => a.llm?.model ?? modelOf?.(a) ?? ''
   const agentOf = (r) => {
     if (!r?.provider) return undefined
@@ -261,7 +384,7 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } 
   const tally = new Map()
   const bump = (id, fn) => {
     if (!id || !agents.some((a) => a.id === id)) return
-    const t = tally.get(id) ?? { likes: 0, dislikes: 0, suggested: 0, reasons: [] }
+    const t = tally.get(id) ?? { likes: 0, dislikes: 0, suggested: 0, reasons: [], up: 0, down: 0 }
     fn(t)
     tally.set(id, t)
   }
@@ -278,8 +401,8 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } 
     const counts = !tagIsAnswerOnly(r.tag)
     bump(agentOf(r), (t) => {
       if (counts) {
-        if (r.verdict === 'dislike') t.dislikes++
-        else t.likes++
+        if (r.verdict === 'dislike') { t.dislikes++; t.down += weight.get(r) }
+        else { t.likes++; t.up += weight.get(r) }
       }
       const text = note(r)
       if (text) t.reasons.push(text)
@@ -295,7 +418,7 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf } 
       dislikes: t.dislikes,
       suggested: t.suggested,
       reasons: t.reasons.slice(-3),
-      bias: votes ? r2(FEEDBACK_WEIGHT * (t.likes - t.dislikes) / Math.max(FEEDBACK_RAMP, votes)) : 0,
+      bias: votes ? r2(FEEDBACK_WEIGHT * (t.up - t.down) / Math.max(FEEDBACK_RAMP, t.up + t.down)) : 0,
     })
   }
   const latest = recent.at(-1)
@@ -313,6 +436,14 @@ function skillLine(skill) {
   return `Approach this mainly as ${skill.primary} work${skill.description ? ` (${skill.description})` : ''}.${supporting.length ? ` It also draws on ${supporting.join(', ')}.` : ''}`
 }
 
+/**
+ * The handoff note of a run in `cwd`, named by its full path in every prompt: an agent's working
+ * directory need not be its workspace (a capability benchmark's agent works in the scratch root and
+ * its task folder is named only in the prompt, docs/benchmark.md 3.7), and a path from the
+ * workspace would land wherever the agent resolves it.
+ */
+const handoffIn = (cwd) => join(cwd, HANDOFF)
+
 function basePrompt(task, cwd, { near, handoff, plan, skill } = {}) {
   return [
     task,
@@ -320,11 +451,11 @@ function basePrompt(task, cwd, { near, handoff, plan, skill } = {}) {
     `Workspace: ${cwd}. Work only inside this workspace.`,
     skillLine(skill),
     'Do not commit, push, deploy, publish packages, or touch databases.',
-    `Keep ${HANDOFF} (in the workspace) updated as you work, with sections Done / Next / Open problems / How to verify, so another agent can take over.`,
+    `Keep ${handoffIn(cwd)} updated as you work, with sections Done / Next / Open problems / How to verify, so another agent can take over.`,
     near ? 'You are close to your usage limit: work in small steps and update the handoff after each step.' : '',
     'When done, summarize what you changed (or found) and how you verified it.',
     plan ? `\nA stronger model planned this work first. Follow the plan unless the code proves it wrong, and say where you departed from it:\n${plan.slice(0, 6000)}` : '',
-    handoff ? `\nEarlier unfinished work on this task (handoff note from ${HANDOFF}); continue from it:\n${handoff.slice(0, 8000)}` : '',
+    handoff ? `\nEarlier unfinished work on this task (handoff note from ${handoffIn(cwd)}); continue from it:\n${handoff.slice(0, 8000)}` : '',
   ].filter((l, i) => l !== '' || i === 1).join('\n')
 }
 
@@ -337,7 +468,7 @@ function planPrompt(task, cwd, { skill } = {}) {
     // The planner sets the approach the worker follows, so it is told the skill the work needs too.
     skillLine(skill),
     'Read whatever you need. Then write a concrete plan another engineer can follow: the files to change and why, the order of steps, the risks and how to verify each step.',
-    `Do not modify any files (do not write ${HANDOFF} either). Your answer is the plan.`,
+    `Do not modify any files (do not write ${handoffIn(cwd)} either). Your answer is the plan.`,
   ].filter((l, i) => l !== '' || i === 2).join('\n')
 }
 
@@ -361,16 +492,43 @@ function reviewPrompt(task, cwd, diff) {
     '',
     `Uncommitted changes (git diff HEAD):\n${diff.stat || '(no file changes; review the earlier answer and the code it refers to)'}`,
     '',
-    `Do not modify any files (do not write ${HANDOFF} either). Report concrete defects or regressions with file and line, or state that the work is correct and complete.`,
+    `Do not modify any files (do not write ${handoffIn(cwd)} either). Report concrete defects or regressions with file and line, or state that the work is correct and complete.`,
   ].join('\n')
 }
 
-/** Handoff note written by the harness from evidence when the limited agent left none. */
+/**
+ * Handoff note written by the harness from evidence when the limited agent left none. The next
+ * run's routing call carries it to Jev, so each excerpt is scrubbed before it is cut: a key the
+ * cut split would stay in the note as a piece too short for any scrubber to know it for a key.
+ */
+/**
+ * The first line of a note the harness wrote, and the only way to tell one from an agent's. It is
+ * part of the file's own text on purpose: authorship has to survive a restart, and a fact held
+ * only in this process would be lost the moment the run that wrote it ended.
+ */
+const HARNESS_NOTE_HEAD = '# Handoff (written by Kz-harness from evidence'
+
+/** Did the harness write this note, rather than an agent? */
+export const isHarnessHandoff = (text) => String(text ?? '').startsWith(HARNESS_NOTE_HEAD)
+
+const EARLIER_HEAD = '\n## Earlier note\n'
+
+/**
+ * The agent's note that a harness note is carrying, or nothing. A harness note holds no evidence
+ * its replacement does not already have, so it is not kept below the new one - but the agent note
+ * inside it is the last thing anybody wrote by hand, and it has to survive every rewrite after it.
+ * Taken out and passed forward, so it is carried rather than wrapped one layer deeper each time.
+ */
+export const carriedHandoff = (text) => {
+  const i = String(text ?? '').indexOf(EARLIER_HEAD)
+  return i === -1 ? '' : text.slice(i + EARLIER_HEAD.length)
+}
+
 function harnessHandoff({ task, attempts, diff, checks, previous }) {
   const failing = checks.filter((c) => !c.passed)
-  const lastAnswer = attempts.findLast((a) => a.answerText)?.answerText ?? ''
+  const lastAnswer = redactSecrets(attempts.findLast((a) => a.answerText)?.answerText ?? '')
   return [
-    '# Handoff (written by Kz-harness from evidence; the agent hit its usage limit before updating this note)',
+    `${HARNESS_NOTE_HEAD}; the agent hit its usage limit before updating this note)`,
     '',
     `Task: ${task}`,
     '',
@@ -390,7 +548,7 @@ function harnessHandoff({ task, attempts, diff, checks, previous }) {
     '',
     '## How to verify',
     checks.length ? `Run the project checks: ${checks.map((c) => c.name).join(', ')}.` : 'No project checks configured; verify the task by hand.',
-    previous ? `\n## Earlier note\n${previous.slice(0, 2000)}` : '',
+    previous ? `\n## Earlier note\n${redactSecrets(previous).slice(0, 2000)}` : '',
   ].join('\n')
 }
 
@@ -400,7 +558,13 @@ function harnessHandoff({ task, attempts, diff, checks, previous }) {
  * @param {string} p.cwd
  * @param {string} [p.forceAgent]  manual override; skips Jev routing only
  * @param {object} p.config        plugin config (agents, tools, limits, thresholds, checks)
- * @param {object} p.deps          { offline?: true when the internet is unreachable (local agents only, no Jev), localOnly?: true to use local agents only while Jev still routes, checkBalance?(agentId) -> {state, balance, until} re-read after each attempt, ready?: {[agentId]: {loggedIn, detail}}, quota?: {[agentId]: {state, until}}, isLimitError?, onLimit?, logAttempt?, jev | null, jevUnavailableReason, execute(agentDef, prompt, signal), runTool?(tool, args, task, signal), review?, emit?, history }
+ * @param {object} p.deps          { offline?: true when the internet is unreachable (local agents only, no Jev), localOnly?: true to use local agents only while Jev still routes, checkBalance?(agentId) -> {state, balance, until} re-read after each attempt, ready?: {[agentId]: {loggedIn, detail}}, quota?: {[agentId]: {state, until}}, isLimitError?, onLimit?, logAttempt?, jev | null, jevUnavailableReason, execute(agentDef, prompt, signal, { effort, speed, untimed }) where untimed(promise) is a wait before the work that the agent's time limit does not count (attemptClock), runTool?(tool, args, task, signal), review?, emit?, history }
+ *   and, for whoever decides: decider?: the createJev() client that answers, or null for none (`jev`
+ *   is its old name, read only when `decider` is not given),
+ *   provider?: that client's record (providers.js; a Jev record from config.thresholds without one);
+ *   a client whose own record is another provider's is refused before anything runs,
+ *   runId?: the run's id, minted by the caller so every file of the run shares it,
+ *   deciderDevice?(): where a provider on this PC ran its calls ('cuda' | 'cpu'), for the report
  * @param {AbortSignal} p.signal
  */
 /** The routing record's field for each kind of move the router makes on its own. */
@@ -421,8 +585,46 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   const level = effort && effort !== 'auto' ? effort : config.effort?.default ?? 'auto'
   const emit = (type, data = {}) => deps.emit?.({ type, at: Date.now(), ...data })
   await assertWorkspace(cwd)
-  const runId = randomUUID()
+  // One id for the whole run, the caller's when it minted one, so its usage rows, its live log,
+  // its samples, its history row and the Laya shadow's rows can all be joined.
+  const runId = deps.runId ?? randomUUID()
   const runStartedAt = Date.now()
+  // Who decides, and the bars its answers are read against. A caller that names no provider gets
+  // Jev with the configured thresholds, every key a caller leaves out filled from Jev's defaults.
+  const P = deps.provider ?? jevRecord({ thresholds: config.thresholds })
+  const T = P.thresholds
+  // A Laya-decided run keeps, on its routing record, every call of Laya's that did not answer and
+  // how long the routing calls that did took, so the report can say what the rules decided and
+  // why. Watched here rather than wherever the client is made, because only the run knows which
+  // of its decisions a failed call left to the rules. Jev's client is handed on as it is.
+  const deciderErrors = []
+  let deciderMs = 0
+  // The Laya client's timeout names only its deadline in the message and carries the call's size
+  // and device beside it (docs/laya-auto.md 3.5, 4.5); the report says all three, as 3.3 writes it.
+  const reasonOf = (err) => redactSecrets(`${String(err?.message ?? err)}${timeoutSize(err)}`).slice(0, 300)
+  const watch = (d) => ({
+    ...d,
+    route: async (...args) => {
+      const t0 = Date.now()
+      try { const r = await d.route(...args); deciderMs += Date.now() - t0; return r } catch (err) {
+        if (!signal.aborted) deciderErrors.push({ phase: 'route', reason: reasonOf(err) })
+        throw err
+      }
+    },
+    assess: async (...args) => {
+      try { return await d.assess(...args) } catch (err) {
+        if (!signal.aborted) deciderErrors.push({ phase: 'review', reason: reasonOf(err) })
+        throw err
+      }
+    },
+  })
+  // `jev` is the old name of `decider`, read only when `decider` is not given at all: a caller that
+  // says there is none (null) means none, never a client it also passed under the old name.
+  const given = deps.decider !== undefined ? deps.decider : deps.jev ?? null
+  // A client is never run under another provider's record, as decision.js refuses too: a Jev client
+  // beside Laya's record would route and review a run its record says Laya decided.
+  if (given?.provider && given.provider.id !== P.id) throw new Error(`router: ${given.provider.name ?? given.provider.id}'s client was handed ${P.name}'s record; a run is decided only under the record of the provider that answers it`)
+  const decider = given && !P.teacher ? watch(given) : given
   const quota = deps.quota ?? {}
   // Admin-set hard facts, from the routing policy block (config.routing - not config.policy,
   // which is the cost block). A resource the operator disabled, or left out of an allow-list, is
@@ -480,7 +682,8 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // The outcome domain controller, when index.js wired one, lets the review mature locally.
   // modelOf: the review call masks the model a CLI agent really runs, as the routing call does, for
   // an agent that has not run yet too (one that ran is masked through the model its attempt recorded).
-  const review = deps.review ?? createReview(deps.jev, config.thresholds, deps.jevUnavailableReason, { outcome: deps.outcomeDomain, modelOf: deps.modelOf })
+  // Whoever decides the run reviews it, against its own bars.
+  const review = deps.review ?? createReview(decider, T, deps.jevUnavailableReason, { outcome: deps.outcomeDomain, modelOf: deps.modelOf })
   const near = (id) => quota[id]?.state === 'near'
 
   // --- subscription-first gate -------------------------------------------
@@ -528,6 +731,11 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // Read before the capability filter, because the note is part of what an agent must hold.
   const handoffFile = join(cwd, HANDOFF)
   const priorHandoff = await readFile(handoffFile, 'utf8').catch(() => null)
+  // The part of the note Jev reads. It quotes whatever the earlier agent printed, so it is
+  // scrubbed before it is cut: a key the cut splits keeps neither the prefix nor the length the
+  // scrubber knows it by, and jev.js, which scrubs again, would see only an ordinary word. The
+  // context estimate below reads the raw note, so what an agent must hold is measured as it is.
+  const handoffForJev = priorHandoff ? redactSecrets(priorHandoff).slice(0, 3000) : undefined
   // How much this request needs an agent to hold, in the units decision.js estimates with: the
   // context window is a hard fact the registry applies (capabilities.js maxInputBytes), so the
   // same check covers online, offline and local-only runs, and every capability-checked move.
@@ -593,21 +801,31 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   }
   const availability = deps.quota ? Object.fromEntries(agents.map((a) => [a.id, gated(a.id) ? 'over the weekly gate: judgment only' : near(a.id) ? 'near limit' : 'ok'])) : undefined
 
-  const { limits, thresholds } = config
+  const { limits } = config
   const productionCritical = config.productionWorkspaces.some((p) => cwd.toLowerCase().startsWith(p.toLowerCase()))
   emit('start', { task, cwd, forceAgent })
-  await ensureHandoffIgnored(cwd).catch(() => {})
-  const { context, snapshot: startSnap } = await gatherContext(cwd, { productionCritical, signal })
+  // The environment every git call in the workspace runs with, when the config gives one: the
+  // capability benchmark's names its task's repository, kept outside the folder the agent writes to,
+  // and holds no key of KzH's (docs/benchmark.md 3.7). KzH's own environment otherwise.
+  const gitOpts = config.git?.env ? { env: config.git.env } : {}
+  await ensureHandoffIgnored(cwd, gitOpts).catch(() => {})
+  const { context, snapshot: startSnap } = await gatherContext(cwd, { productionCritical, signal, ...gitOpts })
   const history = await deps.history.recent(cwd, 10)
   // Agents billed by time of day (DeepSeek): Jev sees which are on their cheap rate right now.
   const pricing = pricingNow(config.pricing?.peak)
-  const agentRecord = deps.history.records ? trackRecord(await deps.history.records().catch(() => []), cwd, agents, { availability, pricing, economics: config.resources?.economics }) : undefined
+  const records = deps.history.records ? await deps.history.records().catch(() => []) : null
+  const agentRecord = records ? trackRecord(records, cwd, agents, { availability, pricing, economics: config.resources?.economics }) : undefined
   // Feedback priors: the person's Like/Dislike on earlier answers, read through the same
-  // deps.history path history.jsonl uses. The reasons ride each agent's track record into the
-  // routing prompt, and the bounded bias is applied to Jev's own probabilities once it answers.
+  // deps.history path history.jsonl uses, every session at once. This session's verdicts alone
+  // (the filter feedback.js list() applies for one session) make the counts and reasons that ride
+  // each agent's track record into the routing prompt, and the correction a suggestedAgent makes,
+  // exactly as when nothing else was read: another session's typed words never reach this
+  // session's routing call. The bounded bias applied to Jev's own probabilities once it answers
+  // is weighed over every session's verdicts, by how well the work each judged matches this task.
   // No feedback, an unreadable file, or a verdict naming no agent leaves all of this empty.
-  const feedbackRows = deps.history.feedback ? await deps.history.feedback(sessionId).catch(() => []) : []
-  const priors = feedbackPrior(feedbackRows, agents, { modelOf: deps.modelOf })
+  const everyVerdict = (deps.history.feedback ? await deps.history.feedback().catch(() => []) : null) ?? []
+  const sessionVerdicts = sessionId ? everyVerdict.filter((r) => r?.sessionId === sessionId) : everyVerdict
+  const priors = feedbackPrior(sessionVerdicts, agents, { modelOf: deps.modelOf })
   if (agentRecord) {
     for (const [id, f] of priors.agents) {
       if (agentRecord[id]) agentRecord[id] = { ...agentRecord[id], feedback: { likes: f.likes, dislikes: f.dislikes, suggested: f.suggested, recent_reasons: f.reasons } }
@@ -629,8 +847,9 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   let plan = null
   if (forceAgent) {
     routing = { mode: 'manual', primaryAgent: forceAgent }
-  } else if (deps.offline) {
+  } else if (deps.offline && !P.local) {
     // Offline is local-only, so the pool is already restricted; pick the best of what is left.
+    // A decider on this PC needs no network, so offline it keeps deciding, over the local agents.
     routing = { mode: 'offline', primaryAgent: offlinePick(pickPool.length ? pickPool : agents).id, reason: 'no internet: fixed rule, local agents only' }
   } else if (deps.decide) {
     // The decision engine: task profile, hard eligibility, anonymous candidates with their
@@ -642,15 +861,16 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       const d = await deps.decide({
         task, context, history, tools, answerOnly, runId,
         capableFor: executors.length ? (capability) => new Set(rank(eligible(executors, { ...need, capability })).filter((e) => e.kind === 'agent').map((e) => e.id)) : undefined,
-        everyAgent: config.agents,
-        handoff: priorHandoff ? priorHandoff.slice(0, 3000) : undefined,
+        handoff: handoffForJev,
         agents: [...pickPool, ...gatedPool],
         gated: gatedIds,
         modelOf: deps.modelOf,
         modalities: deps.inputModalities ?? ['text'],
         capabilitySet: capabilitySet ?? undefined,
         availability, trackRecord: agentRecord,
-        jev: deps.jev, jevUnavailableReason: deps.jevUnavailableReason,
+        // The client and the record beside it, always the router's own record: a missing client
+        // can never make a Laya run use Jev's (decision.js).
+        jev: decider, decider, provider: P, jevUnavailableReason: deps.jevUnavailableReason,
         signal, emit,
       })
       routing = { mode: localOnly ? 'local' : 'jev', ...d.routing }
@@ -664,18 +884,22 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       const pick = fallbackPick()
       routing = { mode: 'fallback', primaryAgent: pick, reason: describeError(err), ...(pick !== config.fallbackAgent ? movedTo('capability', config.fallbackAgent, pick) : {}) }
     }
-  } else if (!deps.jev) {
+  } else if (!decider) {
     const pick = fallbackPick()
     routing = { mode: 'fallback', primaryAgent: pick, reason: deps.jevUnavailableReason, ...(pick !== config.fallbackAgent ? movedTo('capability', config.fallbackAgent, pick) : {}) }
   } else {
     try {
-      routing = { mode: localOnly ? 'local' : 'jev', ...(await deps.jev.route({ task, context, agents: pickPool, tools, history, availability, trackRecord: agentRecord, ...(capabilitySet ? { capabilities: capabilitySet } : {}), ...(priorHandoff ? { handoff: priorHandoff.slice(0, 3000) } : {}) }, signal)) }
+      routing = { mode: localOnly ? 'local' : 'jev', ...(await decider.route({ task, context, agents: pickPool, tools, history, availability, trackRecord: agentRecord, ...(capabilitySet ? { capabilities: capabilitySet } : {}), ...(handoffForJev ? { handoff: handoffForJev } : {}) }, signal)) }
     } catch (err) {
       if (signal.aborted) throw err
       const pick = fallbackPick()
       routing = { mode: 'fallback', primaryAgent: pick, reason: describeError(err), ...(pick !== config.fallbackAgent ? movedTo('capability', config.fallbackAgent, pick) : {}) }
     }
   }
+  // `mode` says how the pool and the decision path were chosen, whoever chose; `decider` says who
+  // that was, for every run, a manual one included: a forced agent under Laya Auto is still
+  // Laya's to review. history.jsonl keeps it with the rest of `routing`.
+  routing = { ...routing, decider: P.id }
   // Jev has now said what the request needs, so the filter runs a second time with that answer
   // in hand: a `web_research` job must not run on an agent with no network, and a read-only
   // request must not demand - or be granted - write permission. This is what makes the
@@ -712,26 +936,26 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // permission system.
   const capableSet = capableNowIds.size ? capableNowIds : capableIds
   // What the decision engine excluded as a FACT (a context window too small, a resource the
-  // governor reads as unusable, a capability it lacks) rather than as a judgment (the floor, the
+  // governor reads as unusable, a capability it lacks) rather than as policy (the floor, the
   // gate, conservation). Those bind every move the router makes of its own - swap, retry, review,
   // hand-over - exactly like the facts the router filters itself.
   const hardOut = new Set((routing.decision?.excluded ?? []).filter((e) => e?.hard).map((e) => e.id))
   // Whether an agent can do what this run needs. An agent the registry does not know is not
   // filtered out: an unwired registry must never silently empty the pool.
   function canDo(id) { return !hardOut.has(id) && (!executors.some((e) => e.id === id && e.kind === 'agent') || capableSet.has(id)) }
-  // Conservation (decision.js) moved the work off the most capable resource on purpose. It is a
-  // judgment, not a router gate, so that resource is still in pickPool, and every swap below would
-  // otherwise be free to hand the work straight back. None of them may; it stays available to
-  // review. The capability swap alone may still land there when nothing else can do the job,
-  // because a capability is a hard fact and conservation is not.
+  // Conservation (decision.js) moved the work off the most capable resource on purpose. It is the
+  // decision engine's limit, not a router gate, so that resource is still in pickPool, and every
+  // swap below would otherwise be free to hand the work straight back. None of them may; it stays
+  // available to review. The capability swap alone may still land there when nothing else can do
+  // the job, because a capability is a hard fact and conservation is not.
   const conservedFrom = routing.conservedFrom ?? null
   if (!forceAgent && executors.some((e) => e.id === routing.primaryAgent && e.kind === 'agent') && !capableSet.has(routing.primaryAgent)) {
     // Only an agent that can do what was named may take the work: the very set the pick was just
     // measured against, never the looser one (which let the swap "move" the work onto another
     // agent that cannot do it either). A capability is a hard fact, so it outranks conservation
-    // (a judgment) and the weekly gate (a cost rule): first an agent neither applies to, then the
-    // conserved one, and only when nothing ungated can do it at all, a gated one - the gate
-    // yields, and the record says so.
+    // (a spending limit) and the weekly gate (a cost rule): first an agent neither applies to,
+    // then the conserved one, and only when nothing ungated can do it at all, a gated one - the
+    // gate yields, and the record says so.
     const fitSet = (capableNowIds.size ? capableNow : capable).filter((e) => e.kind === 'agent' && byId.has(e.id) && !hardOut.has(e.id))
     const inPool = fitSet.filter((e) => pickPool.some((a) => a.id === e.id))
     const swap = inPool.find((e) => e.id !== conservedFrom) ?? inPool[0] ?? fitSet.find((e) => gated(e.id))
@@ -769,7 +993,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       .filter((a) => a.id !== routing.primaryAgent && a.id !== conservedFrom && !gated(a.id) && canDo(a.id) && marginalCost(a.id) === 'low' && top - (p[a.id] ?? 0) <= tieMargin)
       .sort((x, y) => (p[y.id] ?? 0) - (p[x.id] ?? 0))[0]
     if (cheaper) {
-      emit('tiebreak', { from: routing.primaryAgent, to: cheaper.id, confidence: routing.agentConfidence ?? null, margin: tieMargin })
+      emit('tiebreak', { from: routing.primaryAgent, to: cheaper.id, confidence: routing.agentConfidence ?? null, margin: tieMargin, decider: P.id })
       routing = { ...routing, ...movedTo('tiebreak', routing.primaryAgent, cheaper.id, routing.moves) }
     }
   }
@@ -795,17 +1019,28 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
 
   // The feedback prior, applied. The bounded bias from recent Likes and Dislikes moves an
   // agent's probability, and the top pick is re-read from the adjusted numbers, so a demoted
-  // agent loses a close call while a confident pick survives. The person's newest correction (a
-  // suggestedAgent) is stronger and switches the pick outright, but only to an agent this run
-  // could really have used: enabled, in the capability pool, and not past its weekly gate.
+  // agent loses a close call while a confident pick survives. The bias is weighed here rather
+  // than before routing because only now is the task type known: a verdict about the same kind of
+  // work counts fully from any session, one about other work a little (verdictWeight). The
+  // person's newest correction in this session (a suggestedAgent) is stronger and switches the
+  // pick outright, but only to an agent this run could really have used: enabled, in the
+  // capability pool, and not past its weekly gate.
   // Manual overrides and non-Jev routes never reach here, so those are untouched.
-  // Only vote rows are in `priors.agents` with a non-zero bias: an answer-only tag contributed no
+  // Only vote rows are in `weighed.agents` with a non-zero bias: an answer-only tag contributed no
   // vote (see feedbackPrior), so nothing here can move a pick because of one. Its words already
   // reached the routing prompt through the track record above, which is all it is meant to do.
-  if (!forceAgent && routing.mode === 'jev' && priors.agents.size) {
+  // runOfVerdict reads only the verdict's own session, so the history is split by session once
+  // rather than filtered whole for every verdict weighed: a verdict that weighs nothing never
+  // fills the window, so the scan can walk the whole feedback log.
+  const bySession = records && deps.history.runOfVerdict ? Map.groupBy(records, (r) => r?.sessionId) : null
+  const runOf = bySession ? (v) => deps.history.runOfVerdict(v, bySession.get(v?.sessionId) ?? []) : undefined
+  const weighed = !forceAgent && routing.mode === 'jev'
+    ? feedbackPrior(everyVerdict, agents, { modelOf: deps.modelOf, weightOf: verdictWeight({ taskType: routing.taskType, sessionId, runOf }) })
+    : null
+  if (weighed && (weighed.agents.size || priors.suggestion)) {
     const probs = { ...(routing.agentProbabilities ?? {}) }
     const moved = []
-    for (const [id, f] of priors.agents) {
+    for (const [id, f] of weighed.agents) {
       if (!f.bias || !pickPool.some((a) => a.id === id && !gated(a.id))) continue
       const before = probs[id] ?? 0
       probs[id] = Math.max(0, Math.min(1, before + f.bias))
@@ -886,15 +1121,15 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   routing = { ...routing, strategy: plan.strategy }
 
   // An unfinished note from an earlier run goes to the primary agent only when the task continues it.
-  const continuing = !!priorHandoff && (typeof routing.continueHandoff === 'number' ? routing.continueHandoff >= 0.5 : /continue|resume|carry on/i.test(task))
+  const continuing = !!priorHandoff && (typeof routing.continueHandoff === 'number' ? routing.continueHandoff >= T.continueHandoff : /continue|resume|carry on/i.test(task))
   let handoffNote = continuing ? priorHandoff : null
-  // Tool only when handler picks it, its "fits" Noul clears thresholds.tool (a Noul
-  // bar, not a Choice confidence), and its weakest argument choice is confident. The registry
+  // Tool only when handler picks it, its "fits" Noul clears the decider's `tool` bar (a Noul
+  // bar, not a Choice confidence), and its weakest argument choice clears `toolArgConfidence`. The registry
   // gates it too: a registered script is an executor, so a text-only one must not be handed an
   // image just because its description matched.
   const toolAllowed = (id) => !executors.length || (namedCapability ? capableNowIds.has(`tool:${id}`) : capableIds.has(`tool:${id}`))
-  const tool = routing.handler && routing.handler !== 'agent' && (routing.toolFits ?? 0) >= (thresholds.tool ?? 0.5)
-    && (routing.toolArgConfidence ?? 0) >= 0.5 && toolAllowed(routing.handler)
+  const tool = routing.handler && routing.handler !== 'agent' && (routing.toolFits ?? 0) >= T.tool
+    && (routing.toolArgConfidence ?? 0) >= T.toolArgConfidence && toolAllowed(routing.handler)
     ? tools.find((t) => t.id === routing.handler) : undefined
   if (routing.handler && routing.handler !== 'agent' && !tool) {
     emit('capability', { from: `tool:${routing.handler}`, to: routing.primaryAgent, capability: routing.capability ?? null })
@@ -904,7 +1139,8 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // 2. Baseline checks, so later failures can be told apart from pre-existing ones.
   //    Taken before the first agent attempt; a tool run skips them to stay fast.
   // ponytail: after a tool that edited files escalates, the baseline includes the tool's edits.
-  const checkOpts = { scripts: config.checks.scripts, timeoutMs: config.checks.timeoutMs, outputChars: config.checks.outputChars, signal }
+  // `env`, when the config gives one, is the environment the checks run the agent's code with.
+  const checkOpts = { scripts: config.checks.scripts, timeoutMs: config.checks.timeoutMs, outputChars: config.checks.outputChars, signal, ...(config.checks.env ? { env: config.checks.env } : {}) }
   let baseline = null
   const ensureBaseline = async () => {
     if (baseline) return
@@ -912,14 +1148,29 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     lastChecks = baseline
     if (baseline.length) emit('checks', { phase: 'baseline', checks: baseline.map(({ name, passed, exitCode, durationMs }) => ({ name, passed, exitCode, durationMs })) })
   }
-  const requireChecks = routing.mode !== 'jev' || routing.needsTests >= thresholds.needsTests
+  // Checks must pass before an accept unless the decider routed and said they need not: a decider
+  // whose bar is 'always' (Laya's) always requires them, answered or not.
+  const requireChecks = routing.mode !== 'jev' || T.needsTests === 'always' || routing.needsTests >= T.needsTests
 
   // The agent's own note when it updated it during the attempt, else one written from evidence.
+  //
+  // Who wrote the note is read from the note, not from its timestamp. The clock cannot answer it:
+  // the window it was racing is the agent's own runtime, so every attempt lasting more than a
+  // second saw the harness's own note as the agent's, wrapped it under `## Earlier note` inside a
+  // fresh harness note, and the 2000-character clip then pushed the genuine earlier note out. Each
+  // retry nested it one deeper until nothing of the original was left.
+  //
+  // The timestamp still has one job, and only over a note an agent really wrote: a note from an
+  // earlier attempt is not this attempt's answer, so the harness writes fresh evidence and keeps
+  // that note below it. A harness note is not kept below the new one, because it holds no evidence
+  // the new one does not already have - but the agent note it was carrying is taken out and
+  // carried on, or the first rewrite would lose the last thing a person or an agent wrote by hand.
   const saveHandoff = async (since) => {
     const s = await stat(handoffFile).catch(() => null)
     const previous = s ? await readFile(handoffFile, 'utf8').catch(() => '') : ''
-    if (s && s.mtimeMs >= since - 1000) { emit('handoff', { path: HANDOFF, source: 'agent' }); return previous }
-    const text = harnessHandoff({ task, attempts, diff: await changedSince(cwd, startSnap, signal), checks: lastChecks, previous })
+    const ours = isHarnessHandoff(previous)
+    if (s && previous && !ours && s.mtimeMs >= since - 1000) { emit('handoff', { path: HANDOFF, source: 'agent' }); return previous }
+    const text = harnessHandoff({ task, attempts, diff: await changedSince(cwd, startSnap, signal, gitOpts), checks: lastChecks, previous: ours ? carriedHandoff(previous) : previous })
     await mkdir(dirname(handoffFile), { recursive: true })
     await writeFile(handoffFile, text)
     emit('handoff', { path: HANDOFF, source: 'harness' })
@@ -961,15 +1212,15 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   let statusReason = ''
   let reviewed = false
 
-  // Jev can read a request as needing a person: a permission nobody granted, a consequential
-  // choice, information only they have. Nothing is executed in that case - an agent would
-  // guess at an answer it is not allowed to give, and a confident "this needs you" is more
-  // useful than a plausible wrong answer. Below the threshold the run proceeds as normal, so
-  // one unsure Noul cannot stall ordinary work.
+  // The decider can read a request as needing a person: a permission nobody granted, a
+  // consequential choice, information only they have. Nothing is executed in that case - an agent
+  // would guess at an answer it is not allowed to give, and a confident "this needs you" is more
+  // useful than a plausible wrong answer. Below the decider's own bar the run proceeds as normal,
+  // so one unsure answer cannot stall ordinary work; Laya's bar sits higher than Jev's for that.
   if (!forceAgent && routing.mode === 'jev' && routing.capability === 'human_required'
-    && (routing.capabilityConfidence ?? 1) >= (config.thresholds?.humanRequired ?? 0.6)) {
+    && (routing.capabilityConfidence ?? 1) >= T.humanRequired) {
     status = 'needs_human'
-    statusReason = `Jev read this as needing a person (confidence ${pct(routing.capabilityConfidence)})`
+    statusReason = `${P.name} read this as needing a person (confidence ${pct(routing.capabilityConfidence)})`
     next = null
   }
 
@@ -986,8 +1237,8 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       if (next.role === 'review' && reviewCount >= limits.maxReviews) { status = 'limit_reached'; statusReason = `maxReviews (${limits.maxReviews}) reached`; break }
 
       if (next.role !== 'tool' && !answerOnly) await ensureBaseline()
-      const before = await snapshot(cwd, signal)
-      const diffSoFar = attempts.length ? await changedSince(cwd, startSnap, signal) : { stat: '', patch: '' }
+      const before = await snapshot(cwd, signal, gitOpts)
+      const diffSoFar = attempts.length ? await changedSince(cwd, startSnap, signal, gitOpts) : { stat: '', patch: '' }
       const opts = { near: near(next.agent), handoff: handoffNote, plan: planText, skill: plan.skill }
       const prompt = next.role === 'tool' ? '' : next.role === 'primary' ? basePrompt(task, cwd, opts)
         : next.role === 'plan' ? planPrompt(task, cwd, { skill: plan.skill })
@@ -1003,30 +1254,35 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       const agentDef = byId.get(next.agent)
       const family = effortFamily(agentDef)
       const eff = next.role === 'tool' ? null
-        : toAgentEffort(level, agentDef, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[family], model: deps.modelOf?.(agentDef) })
+        : toAgentEffort(level, agentDef, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[family], model: deps.modelOf?.(agentDef), bands: T.effortBands })
       const speed = family === 'codex' ? config.effort?.codexSpeed : undefined
       let result
       // A parallel second opinion is read-only work by construction (broker.js offers it only for
       // answer-only requests), so two agents answering at once cannot collide in the working tree.
       const opinionAgent = next.role === 'primary' && answerOnly && !parallelDone && plan.parallelWith && byId.get(plan.parallelWith) ? byId.get(plan.parallelWith) : null
       let opinion = null
+      // Each agent's own time limit, which a wait before its work starts does not use up (attemptClock).
+      const clock = attemptClock(signal, config.agentTimeoutMs)
+      const sideClock = opinionAgent ? attemptClock(signal, config.agentTimeoutMs) : null
       try {
-        const agentSignal = AbortSignal.any([signal, AbortSignal.timeout(config.agentTimeoutMs)])
         const main = next.role === 'tool'
-          ? deps.runTool(tool, routing.toolArgs ?? {}, task, agentSignal)
-          : deps.execute(agentDef, prompt, agentSignal, { effort: eff, speed })
+          ? deps.runTool(tool, routing.toolArgs ?? {}, task, clock.signal)
+          : deps.execute(agentDef, prompt, clock.signal, { effort: eff, speed, untimed: clock.untimed })
         if (opinionAgent) {
           parallelDone = true
           emit('attempt_start', { index: attemptIndex + 1, agent: opinionAgent.id, role: 'opinion' })
-          const side = deps.execute(opinionAgent, prompt, agentSignal, { effort: toAgentEffort(level, opinionAgent, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[effortFamily(opinionAgent)], model: deps.modelOf?.(opinionAgent) }) })
+          const side = deps.execute(opinionAgent, prompt, sideClock.signal, { effort: toAgentEffort(level, opinionAgent, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[effortFamily(opinionAgent)], model: deps.modelOf?.(opinionAgent), bands: T.effortBands }), untimed: sideClock.untimed })
             .then((r) => r, (err) => (signal.aborted ? Promise.reject(err) : { stopReason: 'error', diagnostic: describeError(err), answerText: '' }))
           ;[result, opinion] = await Promise.all([main, side])
         } else result = await main
       } catch (err) {
         if (signal.aborted) throw err
         result = { stopReason: 'error', diagnostic: describeError(err), answerText: '' }
+      } finally {
+        clock.end()
+        sideClock?.end()
       }
-      const changes = await changedSince(cwd, before, signal)
+      const changes = await changedSince(cwd, before, signal, gitOpts)
       let limit = next.role === 'tool' ? { hit: false }
         : (deps.isLimitError ? deps.isLimitError(byId.get(next.agent), result) : builtinLimit(result)) ?? { hit: false }
       const attempt = {
@@ -1036,7 +1292,10 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
         stopReason: result.stopReason,
         diagnostic: result.diagnostic,
         answerText: result.answerText,
-        durationMs: Date.now() - started,
+        // Its own time: a wait before its work started is kept apart, so an average of these says
+        // how long the agent works, not how long it was held back.
+        durationMs: Date.now() - started - clock.waitedMs,
+        ...(clock.waitedMs ? { waitedMs: clock.waitedMs } : {}),
         changedFiles: changes.files,
         ...(next.role === 'tool' ? {} : { model: deps.modelOf?.(agentDef) }),
         ...(next.role === 'tool' ? {} : servedModel(result)),
@@ -1045,7 +1304,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       }
       attempts.push(attempt)
       if (opinion) {
-        const o = { agent: opinionAgent.id, role: 'opinion', stopReason: opinion.stopReason, diagnostic: opinion.diagnostic, answerText: opinion.answerText, durationMs: Date.now() - started, changedFiles: [], model: deps.modelOf?.(opinionAgent), ...servedModel(opinion) }
+        const o = { agent: opinionAgent.id, role: 'opinion', stopReason: opinion.stopReason, diagnostic: opinion.diagnostic, answerText: opinion.answerText, durationMs: Date.now() - started - sideClock.waitedMs, ...(sideClock.waitedMs ? { waitedMs: sideClock.waitedMs } : {}), changedFiles: [], model: deps.modelOf?.(opinionAgent), ...servedModel(opinion) }
         attempts.push(o)
         emit('attempt_end', { index: attemptIndex + 1, attempt: { ...o, answerText: (o.answerText ?? '').slice(0, 4000) } })
         // PARALLEL_SECOND_OPINION promises that the two answers are COMPARED. Without this the
@@ -1154,7 +1413,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       attempt.checks = lastChecks.map(({ name, passed, exitCode, durationMs }) => ({ name, passed, exitCode, durationMs }))
       emit('attempt_end', { index: attemptIndex, attempt: { ...attempt, answerText: (attempt.answerText ?? '').slice(0, 4000) } })
       const cmp = compareChecks(baseline ?? [], lastChecks)
-      const totalDiff = await changedSince(cwd, startSnap, signal)
+      const totalDiff = await changedSince(cwd, startSnap, signal, gitOpts)
       const touchedCode = totalDiff.files === null || totalDiff.files.length > 0
       const blockAccept = result.stopReason !== 'completed' || cmp.regressed.length > 0 || (requireChecks && touchedCode && cmp.failing.length > 0)
 
@@ -1239,6 +1498,14 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     await rename(handoffFile, join(cwd, '.kz-harness', `handoff-done-${new Date().toISOString().replace(/[:.]/g, '-')}.md`)).catch(() => {})
   }
 
+  // A run another provider decided says what its calls cost and which did not answer: every call
+  // of the review included, so this is filled in only now. `model` is already the client's label.
+  if (!P.teacher) {
+    let device = null
+    try { device = deps.deciderDevice?.() ?? null } catch { /* a device nobody can read is not said */ }
+    routing = { ...routing, deciderErrors, deciderMs, ...(device ? { deciderDevice: device } : {}) }
+  }
+
   const record = {
     ts: new Date().toISOString(),
     runId,
@@ -1299,16 +1566,6 @@ export function moveLine(m, R = {}) {
 const STRIP_LABEL = 'jev-agents'
 const STRIP_PREFIX = 'kzh-agents-1-'
 
-/** Who made the routing decision across its domains: jev, local, mixed, fallback, or none. */
-export function decisionAuthority(R) {
-  const list = Object.values(R?.decision?.domains ?? {}).map((d) => d.authority).filter((a) => a && a !== 'none')
-  if (!list.length) return R?.mode === 'jev' || R?.mode === 'local' ? 'jev' : 'none'
-  const set = new Set(list)
-  if (set.size === 1) return list[0]
-  if (set.has('fallback') && !set.has('jev') && !set.has('local') && !set.has('code')) return 'fallback'
-  return 'mixed'
-}
-
 // Whose words you are reading: the last attempt that produced an answer, never a parallel
 // second opinion - that one is its own step in the chain, not the answer - unless nothing else
 // answered at all. The report carries excerpts, the live record carries the full text; either
@@ -1336,9 +1593,15 @@ export function answeredSteps(r) {
   // One chain, in the order the work actually moved: router, then whoever worked, then
   // whoever judged. Agents used to be joined with a middot, which read as an unordered list
   // and hid the handover.
-  const who = decisionAuthority(r.routing)
+  // The router's step names who decided, as the report's heading does (adapter.js decidedBy):
+  // the run's decider (Jev, or Laya with its client's model label) whenever it answered a domain,
+  // or when there is no per-domain report (legacy named routing); else the local router; else the
+  // rules in code alone.
+  const decider = r.routing?.decider ?? TEACHER
+  const auths = new Set(Object.values(r.routing?.decision?.domains ?? {}).map((d) => d?.authority))
+  const byDecider = !r.routing?.decision || auths.has(decider)
   const router = r.routing?.mode === 'jev' || r.routing?.mode === 'local'
-    ? [who === 'local' ? { agent: 'Local router', model: '', roles: [] } : { agent: 'Jev', model: r.routing.model ?? '', roles: [] }]
+    ? [byDecider ? { agent: providerName(decider), model: r.routing.model ?? '', roles: [] } : { agent: auths.has('local') ? 'Local router' : 'Routing rules', model: '', roles: [] }]
     : []
   return [...router, ...steps]
 }
@@ -1355,10 +1618,16 @@ export function answeredBy(r) {
 export function formatReport(r) {
   const R = r.routing
   const lines = []
-  const who = decisionAuthority(R)
-  const decided = who === 'local' ? 'local router decided' : who === 'code' ? 'routing rules decided' : who === 'mixed' ? 'Jev and the local router decided' : who === 'fallback' ? 'safe fallback, nothing could decide' : 'Jev decided'
-  const modeLabel = { jev: `AUTO (${decided})`, manual: `MANUAL /${R.primaryAgent}`, fallback: 'AUTO, JEV UNAVAILABLE: routing fallback activated', offline: 'OFFLINE: local models only', local: `AUTO (${decided}), LOCAL MODELS ONLY` }[R.mode]
-  lines.push(`**Jev router** · ${modeLabel}${R.mode !== 'offline' && r.offline ? ' · OFFLINE: local models only' : ''}`)
+  // Who decided the run names the router: Jev, or Laya in Laya Auto. A record from before
+  // `decider` was kept was Jev's.
+  const decider = R.decider ?? TEACHER
+  const name = providerName(decider)
+  // Every authority that decided a domain, the rules that rank the resources included; a run
+  // with no per-domain report (legacy named routing) was the decider's. The heading names them
+  // only: the "Decided by" line under it says which domain each one answered.
+  const decided = decidedBy(R.decision?.domains, { detail: false }) ?? `${name} decided`
+  const modeLabel = { jev: `AUTO (${decided})`, manual: `MANUAL /${R.primaryAgent}`, fallback: `AUTO, ${name.toUpperCase()} UNAVAILABLE: routing fallback activated`, offline: 'OFFLINE: local models only', local: `AUTO (${decided}), LOCAL MODELS ONLY` }[R.mode]
+  lines.push(`**${name} router** · ${modeLabel}${R.mode !== 'offline' && r.offline ? ' · OFFLINE: local models only' : ''}`)
   if (R.mode === 'fallback') lines.push(`Fallback reason: ${R.reason}. Default agent: ${R.primaryAgent}`)
   lines.push(`- Selected agent: **${R.primaryAgent}**${R.mode === 'jev' ? ` (confidence ${pct(R.agentConfidence)}; ${Object.entries(R.agentProbabilities).map(([k, v]) => `${k} ${pct(v)}`).join(', ')})` : ''}`)
   if (R.mode === 'jev') {
@@ -1367,6 +1636,12 @@ export function formatReport(r) {
     lines.push(`- Complexity ${pct(R.complexity)} · Risk ${pct(R.risk)}`)
     lines.push(`- Needs second review ${pct(R.needsSecondOpinion)} · Needs human review ${pct(R.needsHumanReview)} · Needs tests ${pct(R.needsTests)}`)
   }
+  // What a provider on this PC answered too flat to act on, which the routing rules stood in for,
+  // and every call of it that did not answer at all: nothing it could not decide is passed off as
+  // its decision (docs/laya-auto.md 3.3).
+  const filled = R.profile?.filledByRules ?? []
+  if (filled.length) lines.push(`- Filled by the routing rules (${name}'s answers were too flat to use): ${filled.join(', ')}`)
+  for (const e of R.deciderErrors ?? []) lines.push(`- ${name} did not answer: ${e.phase}: ${e.reason}`)
   // A strategy may put someone other than the routed resource in the primary step (LOCAL_FIRST
   // does), and then "Selected agent" alone would name an agent that never ran. This follows the
   // plan, not the decision record: the plan is what the loop executed, whoever made it.
@@ -1377,8 +1652,13 @@ export function formatReport(r) {
     const p = r.plan ?? d.plan
     const extras = [p?.steps?.some((st) => st.role === 'plan') ? `plan by ${p.steps.find((st) => st.role === 'plan').agent}` : '', p?.reviewer ? `review by ${p.reviewer}` : '', p?.parallelWith ? `second opinion from ${p.parallelWith}` : ''].filter(Boolean)
     lines.push(`- Strategy: ${R.strategy ?? p?.strategy ?? 'STANDARD_DIRECT'}${extras.length ? ` (${extras.join(', ')})` : ''}`)
+    // A run another provider decided has no maturity to print: the local ladder's rung says
+    // nothing about it (decision.js reports null), so no bracket appears. Its calls are counted
+    // to it, with the time they took on this PC and where.
     const domains = Object.entries(d.domains ?? {}).map(([k, v]) => `${k} ${v.authority}${v.maturity ? ` [${v.maturity}]` : ''}`)
-    if (domains.length) lines.push(`- Decided by: ${domains.join(' · ')}${d.jevCalls ? ` · ${d.jevCalls} Jev call${d.jevCalls === 1 ? '' : 's'}` : ' · no Jev call'}`)
+    const caller = providerName(d.decider ?? decider)
+    const spent = typeof R.deciderMs === 'number' && d.jevCalls ? ` (${(R.deciderMs / 1000).toFixed(1)} s${R.deciderDevice ? ` on the ${deviceName(R.deciderDevice)}` : ''})` : ''
+    if (domains.length) lines.push(`- Decided by: ${domains.join(' · ')}${d.jevCalls ? ` · ${d.jevCalls} ${caller} call${d.jevCalls === 1 ? '' : 's'}${spent}` : ` · no ${caller} call`}`)
     const cands = (d.candidates ?? []).map((c) => `${c.key}=${c.id} (${c.tier}, fit ${pct(c.fit)}, scarcity ${c.scarcity == null ? 'unknown' : pct(c.scarcity)}, cost ${c.expectedCost?.class ?? 'unknown'})`)
     if (cands.length) lines.push(`- Candidates: ${cands.join('; ')}`)
     if (d.excluded?.length) lines.push(`- Excluded: ${d.excluded.map((e) => `${e.id} (${e.reason})`).join('; ')}`)
@@ -1404,6 +1684,11 @@ export function formatReport(r) {
     lines.push(`- ${[av.out.length ? `Out: ${av.out.map((o) => `${o.id}${o.until ? ` until ${hhmm(o.until)}` : ''}`).join(', ')}` : '', av.near.length ? `near limit: ${av.near.join(', ')}` : ''].filter(Boolean).join('; ')}`)
   }
   if (r.baseline.length) lines.push(`- Baseline checks: ${r.baseline.map((c) => `${c.name} ${c.passed ? 'pass' : 'FAIL'}`).join(', ')}`)
+  // A review another provider stopped under its own accept bar says so where the run is summed up,
+  // since that bar is higher than Jev's and its cost should be seen, not guessed (jev-review).
+  for (const s of r.assessments ?? []) {
+    if (s?.mode && s.mode !== TEACHER && String(s.why ?? '').includes(`under ${providerName(s.mode)}'s accept bar`)) lines.push(`- Review: ${s.action}. ${s.why}`)
+  }
   lines.push('', '**Attempts**')
   // Limit-hit attempts get no assessment, so assessments are matched in order over the others.
   let k = 0

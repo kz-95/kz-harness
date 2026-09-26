@@ -20,18 +20,27 @@
 // Confidence is how much evidence there is AND how well it agrees: contradictory evidence pins
 // the score less well than unanimous evidence of the same weight (see dimensionProfile).
 //
-// Benchmark evidence has a source, a reliability and a half-life here, but NOTHING produces it
-// yet: no importer, fetcher or job in this plugin records a `benchmark` row or a
-// `benchmark_prior`. The effective capability today is the prior plus execution evidence (runs,
-// reviews, feedback); the benchmark slots exist so a future importer has a schema to write to.
+// Benchmark evidence comes from the capability benchmark (docs/benchmark.md section 3, benchmark.js):
+// one row per task and credited dimension, scored 1 or 0, with a capped observation count so a
+// whole run weighs on a dimension as three observations do (benchmarkEvidence). Its rows are not
+// runs: they are left out of every `samples` count, which is what the ranking, Jev and the
+// inspector read as verified runs, and reported apart as a dimension's `benchmark` summary. Only
+// the newest benchmark run recorded for a subject and a benchmark id counts; an older one stays on
+// file and counts in explain()'s notCounted. No code writes a `benchmark_prior`.
+//
+// Capability profiles are shared by Jev Auto and Laya Auto, so a run another provider decided
+// (docs/laya-auto.md 6.6) gives only what depends on no judgment of its: whether each attempt
+// completed. Every other row would rest on that provider's task type, accept or assessment, and a
+// zero-shot model must not move what Jev Auto believes about the agents.
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { TEACHER } from './providers.js'
 import { DIMENSIONS, RELATED_TASK_TYPES, TASK_DIMENSIONS, resolvePolicy } from './routing-policy.js'
 
 /**
  * Where a piece of evidence came from, best first. The weights per source live in the policy.
- * `benchmark` is accepted and weighted but has no producer yet: nothing records one today.
+ * `benchmark` rows come from the capability benchmark (benchmarkEvidence).
  */
 export const EVIDENCE_SOURCES = Object.freeze(['objective_deterministic', 'human_outcome', 'independent_review', 'benchmark', 'jev_label', 'self_assessment'])
 /**
@@ -248,6 +257,8 @@ const weightedMean = (items) => {
   return items.length ? items.reduce((s, it) => s + it.row.score, 0) / items.length : null
 }
 const countOf = (items) => items.reduce((s, it) => s + it.row.n, 0)
+// A benchmark row is one task of a synthetic run, not a run: it counts toward no `samples`.
+const isBenchmark = (row) => row.source === 'benchmark'
 
 /**
  * The weight of one evidence row: source reliability, its own confidence, its observation count,
@@ -316,16 +327,19 @@ function dimensionProfile(rows, prior, { policy, nowMs, taskType }) {
     contributions.set(it.row.source, (contributions.get(it.row.source) ?? 0) + it.weight)
   }
   const precision = k0 + sumW
-  const base = { prior: prior ?? null, k0, sumW, precision, items, samples: countOf(items), lastUpdate: items.length ? items.map((it) => it.row.ts).sort().at(-1) : null }
+  const base = { prior: prior ?? null, k0, sumW, precision, items, samples: countOf(items.filter((it) => !isBenchmark(it.row))), lastUpdate: items.length ? items.map((it) => it.row.ts).sort().at(-1) : null }
   if (precision <= 0) return { ...base, score: ev.unknownScore, confidence: 0, amount: 0, spread: 0, stdError: 0, agreement: 1, benchmark: null, execution: null, sources: [], source: 'unknown' }
   let score = (k0 * (prior?.score ?? 0) + sumWS) / precision
   // How much evidence there is, times how well it agrees (agreementOf).
   const amount = 1 - Math.exp(-precision / ev.confidenceScale)
   const { spread, stdError, agreement } = agreementOf(items, precision)
   const confidence = amount * agreement
-  const bench = items.filter((it) => it.row.source === 'benchmark')
-  const benchmark = bench.length ? { score: weightedMean(bench), n: countOf(bench) } : null
-  const exec = items.filter((it) => it.row.source !== 'benchmark')
+  // The benchmark's rows are one per task, scored 1 or 0, so their plain mean is the pass rate;
+  // `weight` is what they carry in the score now, beside the prior's k0.
+  const bench = items.filter((it) => isBenchmark(it.row))
+  const passed = bench.filter((it) => it.row.score === 1).length
+  const benchmark = bench.length ? { score: bench.reduce((sum, it) => sum + it.row.score, 0) / bench.length, tasks: bench.length, passed, weight: bench.reduce((sum, it) => sum + it.weight, 0) } : null
+  const exec = items.filter((it) => !isBenchmark(it.row))
   let execution = null
   if (exec.length) {
     const lifetime = weightedMean(exec)
@@ -381,6 +395,12 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
   // the counting batch says (every row of one verdict carries the same one), so a caller can tell
   // whether what counts is still what the person says now (countsAs).
   const verdicts = new Map()
+  // subject key and benchmark id -> the runId of the newest benchmark run recorded for them, by
+  // file order. Running the same fixed tasks again measures run-to-run variance, not more
+  // capability, so only the newest run's rows count (docs/benchmark.md 3.9).
+  const benchmarkRuns = new Map()
+  const benchmarkKey = (row) => `${subjectKey(row.subject)}|${row.benchmark.id}`
+  const supersedable = (row) => isBenchmark(row) && !!row.benchmark && !!row.runId
 
   const remember = (row) => {
     const key = subjectKey(row.subject)
@@ -390,17 +410,21 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
     if (!dims.has(row.dimension)) dims.set(row.dimension, [])
     dims.get(row.dimension).push(row)
     if (row.verdictKey) verdicts.set(row.verdictKey, { batch: row.batch, runId: row.runId ?? verdicts.get(row.verdictKey)?.runId ?? null, retracted: false, score: row.score })
+    if (supersedable(row)) benchmarkRuns.set(benchmarkKey(row), row.runId)
     return row
   }
   const rememberRetraction = (line) => {
     verdicts.set(line.verdictKey, { batch: line.batch, runId: line.runId ?? verdicts.get(line.verdictKey)?.runId ?? null, retracted: true, score: null })
   }
-  // The rows that count now: a verdict row only from its verdict's newest batch, and for a
-  // subject whose version is not pinned only the last UNPINNED_WINDOW_DAYS, so a version swapped
-  // in behind the same name inherits the old one's record for a bounded time at most.
+  // The rows that count now: a verdict row only from its verdict's newest batch, a benchmark row
+  // only from the newest run of its benchmark for its subject, and for a subject whose version is
+  // not pinned only the last UNPINNED_WINDOW_DAYS, so a version swapped in behind the same name
+  // inherits the old one's record for a bounded time at most.
   const counts = (subject, at) => {
     const floor = versionPinned(subject?.version) ? -Infinity : at - UNPINNED_WINDOW_DAYS * DAY_MS
-    return (row) => (!row.verdictKey || verdicts.get(row.verdictKey)?.batch === row.batch) && !(Date.parse(row.ts) < floor)
+    return (row) => (!row.verdictKey || verdicts.get(row.verdictKey)?.batch === row.batch)
+      && (!supersedable(row) || benchmarkRuns.get(benchmarkKey(row)) === row.runId)
+      && !(Date.parse(row.ts) < floor)
   }
   // Verdict rows carry the batch they were recorded in; nothing else needs one.
   const stamp = (rows) => {
@@ -441,7 +465,7 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
      * @returns {number} rows loaded
      */
     load() {
-      memory.clear(); known.clear(); verdicts.clear()
+      memory.clear(); known.clear(); verdicts.clear(); benchmarkRuns.clear()
       let raw = ''
       try { raw = readFileSync(file, 'utf8') } catch { raw = '' }
       let count = 0
@@ -533,7 +557,7 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
           agreement: r3(p.agreement),
           samples: p.samples,
           prior: p.prior ? { score: r3(p.prior.score), confidence: r3(p.prior.confidence), source: p.prior.source } : null,
-          benchmark: p.benchmark ? { score: r3(p.benchmark.score), n: p.benchmark.n } : null,
+          benchmark: p.benchmark ? { score: r3(p.benchmark.score), tasks: p.benchmark.tasks, passed: p.benchmark.passed, weight: r3(p.benchmark.weight) } : null,
           execution: p.execution ? { score: r3(p.execution.score), n: p.execution.n, recentScore: r3(p.execution.recentScore), recentN: p.execution.recentN, trend: p.execution.trend } : null,
           sources: p.sources,
           lastUpdate: p.lastUpdate,
@@ -570,8 +594,8 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
         dimension: dim,
         taskType: taskType ?? null,
         version: versionOfSubject(subject),
-        // Rows stored for this subject that do not count now: outside the unpinned window, or an
-        // older copy of a verdict that was recorded again.
+        // Rows stored for this subject that do not count now: outside the unpinned window, an
+        // older copy of a verdict that was recorded again, or a benchmark run a newer one replaced.
         notCounted: allRowsOf(subject, dim).length - p.items.length,
         prior: p.prior,
         priorStrength: p.k0,
@@ -605,7 +629,7 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
     },
     /** Every subject with evidence, as `{ key, provider, family, model, version }`. */
     subjects: () => [...known.values()].map((s) => ({ ...s })),
-    /** Observations that count for the subject now, across every dimension (the sum of `n`). */
+    /** Observations that count for the subject now, across every dimension (the sum of `n`), benchmark rows included. */
     evidenceCount(subject) {
       let total = 0
       for (const rows of liveRows(subject)) for (const r of rows) total += r.n
@@ -616,6 +640,9 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
 }
 
 const isSuccess = (status) => String(status ?? '').startsWith('accepted') || status === 'answered'
+// Whether the teacher decided the run. A record from before there were two deciders says nothing,
+// and it was Jev.
+const taughtRun = (record) => (record?.routing?.decider ?? TEACHER) === TEACHER
 // A run that ran out of allowance or was stopped by the person says nothing about the work.
 const NO_EVIDENCE = new Set(['paused_limit', 'stopped'])
 const isWork = (a) => (a.role === 'primary' || a.role === 'retry') && !a.limitHit
@@ -670,7 +697,7 @@ function humanRows(record, verdicts, scored, { lastWork, reviewDims, until, push
 // model instead moved a past run onto a model configured since, so a verdict re-posted on it
 // named no scored attempt any more and was retracted by a settings change. A version is taken
 // from the attempt, or from versionOf when the caller passes it (only for a run that just ended).
-function subjectOfAttempt(attempt, def, { versionOf, priors }) {
+export function subjectOfAttempt(attempt, def, { versionOf, priors }) {
   const recorded = str(attempt.model)
   const asRan = def.llm ? { ...def, llm: { ...def.llm, model: recorded ?? undefined } } : def
   return subjectOf(asRan, { modelOf: () => recorded ?? undefined, versionOf: (d, m) => str(attempt.modelVersion) ?? versionOf?.(d, m), priors })
@@ -689,7 +716,8 @@ function subjectOfAttempt(attempt, def, { versionOf, priors }) {
  * @param {{ agents?: object[] }} [deps]
  */
 export function answererUnconfigured(verdict, record, { agents = [] } = {}) {
-  if (!record || NO_EVIDENCE.has(record.finalStatus) || !verdictIsAbout(verdict, record)) return false
+  // A run another provider decided gives no verdict rows at all (evidenceFromFeedback).
+  if (!record || !taughtRun(record) || NO_EVIDENCE.has(record.finalStatus) || !verdictIsAbout(verdict, record)) return false
   const work = (Array.isArray(record.attempts) ? record.attempts : []).filter(isWork)
   if (!work.length) return false
   const scored = work.length === 1 ? work : [work[0], work.at(-1)]
@@ -700,13 +728,17 @@ export function answererUnconfigured(verdict, record, { agents = [] } = {}) {
 }
 
 // What evidenceFromRun and evidenceFromFeedback share: the work attempts worth scoring, each with
-// the subject it stands for, and the dimensions the task type exercises.
+// the subject it stands for, and the dimensions the task type exercises. A run the teacher did not
+// decide has no task type to give a row: it would be that provider's label, and it would set how
+// much the row weighs when Jev Auto reads a profile (evidenceWeight); a row with none is general
+// evidence, fully relevant.
 function runShape(record, { versionOf, agents, priors, now }) {
   if (!record || NO_EVIDENCE.has(record.finalStatus)) return null
   const attempts = Array.isArray(record.attempts) ? record.attempts : []
   const work = attempts.filter(isWork)
   if (!work.length) return null
-  const taskType = str(record.routing?.taskType) ?? 'other'
+  const taught = taughtRun(record)
+  const taskType = taught ? str(record.routing?.taskType) ?? 'other' : null
   const dims = TASK_DIMENSIONS[taskType] ?? TASK_DIMENSIONS.other
   const first = work[0]; const last = work.at(-1)
   // The version reported now says what runs NOW. It is only the version that ran this record when
@@ -725,9 +757,9 @@ function runShape(record, { versionOf, agents, priors, now }) {
   }
   const out = []
   const push = (subject, dimension, source, score, confidence, extra = {}) => out.push({
-    ...(record.ts ? { ts: record.ts } : {}), subject, dimension, score, source, confidence, n: 1, taskType, ...(record.runId ? { runId: record.runId } : {}), ...extra,
+    ...(record.ts ? { ts: record.ts } : {}), subject, dimension, score, source, confidence, n: 1, ...(taskType ? { taskType } : {}), ...(record.runId ? { runId: record.runId } : {}), ...extra,
   })
-  return { attempts, work, first, last, taskType, dims, reviewDims: dims.filter((d) => d !== 'reliability'), scored, out, push }
+  return { attempts, work, first, last, taught, taskType, dims, reviewDims: dims.filter((d) => d !== 'reliability'), scored, out, push }
 }
 
 /**
@@ -741,6 +773,12 @@ function runShape(record, { versionOf, agents, priors, now }) {
  * about THIS run (verdictIsAbout), credited to one attempt and keyed by the verdict so the
  * registry counts it once however often it is derived. Nothing from the record's text reaches a
  * row: ids, numbers, categories and timestamps only.
+ *
+ * A run another provider decided (`routing.decider` is not Jev) gives only the `reliability` row
+ * of each scored attempt, with no task type (runShape): the dimensions come from that provider's
+ * task type, the objective row rests on its accept, and a review row on its assessment. The loop
+ * over review attempts below is never reached for one, so it needs no mode check of its own; one
+ * that read `mode === 'jev'` would drop Jev Auto's own local-mode review evidence.
  * @param {object} record  one history.jsonl row
  * @param {{ versionOf?: Function, agents?: object[], feedback?: object[], until?: string, priors?: object, now?: () => number|string }} [deps]
  *   `until` is the ts of the next run in the same session, when known (a backfill over history).
@@ -750,7 +788,11 @@ function runShape(record, { versionOf, agents, priors, now }) {
 export function evidenceFromRun(record, { versionOf, agents = [], feedback = [], until, priors, now = Date.now } = {}) {
   const shape = runShape(record, { versionOf, agents, priors, now })
   if (!shape) return []
-  const { attempts, work, first, last, dims, reviewDims, scored, out, push } = shape
+  const { attempts, work, first, last, taught, dims, reviewDims, scored, out, push } = shape
+  if (!taught) {
+    for (const { attempt, subject } of scored) push(subject, 'reliability', 'objective_deterministic', attempt.stopReason === 'completed' ? 1 : 0, 0.9)
+    return out
+  }
   // Two dimensions have their own rule below, so the task loop leaves them out.
   const taskDims = dims.filter((d) => d !== 'first_pass_quality' && d !== 'reliability')
   const success = isSuccess(record.finalStatus)
@@ -787,14 +829,69 @@ export function evidenceFromRun(record, { versionOf, agents = [], feedback = [],
  * before anyone could judge its answer. The caller passes the run the verdict is about (the run
  * it was credited to before, else the last run of the session that ended before it); a verdict
  * that is not about that run gives nothing. Rows carry the verdict's key, so a changed verdict
- * replaces the earlier one in the registry.
+ * replaces the earlier one in the registry. A run another provider decided gives nothing: the
+ * dimensions a verdict is credited on come from that provider's task type.
  * @param {object} verdict  one feedback.js row
  * @param {object} record   the history.jsonl row of the run it is about
  * @param {{ versionOf?: Function, agents?: object[], until?: string, priors?: object, now?: () => number|string }} [deps]
  */
 export function evidenceFromFeedback(verdict, record, { versionOf, agents = [], until, priors, now = Date.now } = {}) {
   const shape = runShape(record, { versionOf, agents, priors, now })
-  if (!shape) return []
+  if (!shape?.taught) return []
   humanRows(record, [verdict], shape.scored, { lastWork: shape.last, reviewDims: shape.reviewDims, until, push: shape.push })
   return shape.out
+}
+
+/** What a benchmark row credits of a task's own dimensions: the pass rate, as 1 or 0. */
+const BENCHMARK_SCORED = new Set(['passed', 'failed', 'timed_out'])
+
+/**
+ * The capability evidence of one agent's complete run of the capability benchmark
+ * (docs/benchmark.md 3.9): one row per task and dimension the task credits, 1 when it passed and 0
+ * when it failed or ran out of time. So the mean of a dimension's rows is the pass rate, and each
+ * row stands for one task, which lets agreementOf see how split the tasks were. A task that did not
+ * fit a local agent's window gives no row: the window is the context KzH gives the model, its own
+ * setting and the RAM of the moment, not what the model can do, and routing already keeps a task
+ * from a window too small for it.
+ *
+ * `n` is 3 over the number of the set's tasks that credit the dimension, so a whole run weighs on a
+ * dimension as three observations at the benchmark's reliability do, and never more, however many
+ * of its tasks credit it; a run in which some tasks did not fit weighs less.
+ *
+ * The subject is the one the attempts recorded (subjectOfAttempt, as evidenceFromRun has it): the
+ * model the agent ran, and for a local model the SHA-256 of its weights. A run whose attempts
+ * name more than one model describes no one model, and throws.
+ *
+ * @param {{ task: string, outcome: string, ts: string, model?: string|null, modelVersion?: string|null }[]} rows
+ *   the run's task rows: the last row of each task, the preflight's included
+ * @param {{ tasks: { id: string, skill: string, dimensions: string[] }[], agent: object, priors?: object, benchmark: { id: string, version: string }, runId: string }} p
+ *   `tasks` the scored tasks of the set, `agent` the agent's definition
+ * @returns {object[]} the rows, for capabilities.recordMany
+ */
+export function benchmarkEvidence(rows, { tasks, agent, priors, benchmark, runId }) {
+  const last = new Map()
+  for (const r of rows ?? []) last.set(r.task, r)
+  const ran = [...last.values()].filter((r) => r.outcome !== 'did_not_fit')
+  const subjects = new Map(ran.map((r) => {
+    const s = subjectOfAttempt({ model: r.model ?? undefined, modelVersion: r.modelVersion ?? undefined }, agent, { priors })
+    return [subjectKey(s), s]
+  }))
+  if (subjects.size !== 1) {
+    throw new Error(subjects.size ? `${agent.id} ran on more than one model during the benchmark (${[...subjects.values()].map((s) => s.model ?? 'its default model').join(', ')}), so its results describe no one model` : `${agent.id} ran no task of the benchmark`)
+  }
+  const [subject] = subjects.values()
+  const crediting = (dim) => tasks.filter((t) => t.dimensions.includes(dim)).length
+  const out = []
+  for (const task of tasks) {
+    const r = last.get(task.id)
+    if (!r) throw new Error(`${agent.id} has no result for ${task.id}`)
+    const row = (dimension, score) => out.push({
+      ts: r.ts, subject, dimension, score, source: 'benchmark', confidence: 0.9, n: 3 / crediting(dimension),
+      taskType: task.skill, benchmark: { id: benchmark.id, version: benchmark.version }, runId, note: task.id,
+    })
+    if (r.outcome === 'did_not_fit') continue
+    if (BENCHMARK_SCORED.has(r.outcome)) for (const dim of task.dimensions) row(dim, r.outcome === 'passed' ? 1 : 0)
+    else throw new Error(`${agent.id}'s ${task.id} was not scored (${r.outcome})`)
+  }
+  return out
 }

@@ -7,11 +7,16 @@
 //   codex    -> @deepseek-ai/dsh-subagent-codex       (ChatGPT login)
 //   deepseek -> built-in `spawn` provider              (DSH's DeepSeek model)
 // A new agent is one `agents` entry naming any installed subagent provider.
+//
+// Laya, a decision model on this PC, is the second decider beside Jev (docs/laya-auto.md): in the
+// Laya Auto row it answers every routing, intent and review question instead of Jev, and in Jev
+// Auto it answers the same questions in the background (the shadow) so the two can be compared.
+// Its supervisor, client, stores and shadow are all wired here.
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import { createJev } from './jev.js'
@@ -24,7 +29,7 @@ import { executorsFrom } from './capabilities.js'
 import { createDelivery } from './delivery.js'
 import { createFormatter } from './format.js'
 import { CLEAR, createFeedback, validFeedback } from './feedback.js'
-import { TERMINAL_STATES, createLanes, createTasks, laneKey, validJobId } from './tasks.js'
+import { TERMINAL_STATES, WAITING, createLanes, createTasks, laneKey, validJobId } from './tasks.js'
 import { SESSION_ID, exportSession, redactSecrets } from './export.js'
 import { KEY_NAME, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
 import { createUsage, detectLimit, longWindowPercent } from './usage.js'
@@ -36,6 +41,15 @@ import { createTrainingStore, labelFromRun } from './training.js'
 import { createDomainRegistry } from './domains.js'
 import { createDecisionEngine } from './decision.js'
 import { LOCAL_PROVIDER, buildCatalog, createConnectivity, createLocalModels, detectSpecs, installLlmCommand, localAdapter, looksLikeQuestion, readManifest, removeLlmCommand } from './local.js'
+import { JEV_THRESHOLDS, LAYA_SCHEMA, MINIMUM_REVIEW_KEYS, resolveProviders, thresholdsSchema } from './providers.js'
+import { createResidency } from './residency.js'
+import { LAYA_TEXT, LayaUnavailable, createLayaSidecar } from './laya-sidecar.js'
+import { createLayaInstaller, installOffer, readPins } from './laya-install.js'
+import { createLayaClient } from './laya-client.js'
+import { createProbe, runSelfTest, selfTestCalls, taskCalls } from './laya-selfcheck.js'
+import { estimateRequestTokens, renderForLaya } from './laya-questions.js'
+import { createShadow, jevHostOf } from './shadow.js'
+import { agentEnv, createBenchmark, timedOutBy } from './benchmark.js'
 
 export const name = 'jev-router'
 export const inject = ['tools', 'commands', 'subagents', 'credentials']
@@ -115,7 +129,7 @@ export const Config = Schema.object({
   }).default({}).description('Real model the Jev Auto model hands session titles, conversation compaction and direct answers to. Unset, these follow this machine: the installed local chat model when there is one, then the first enabled agent that pins llm.provider and llm.model. Set both to pin one.'),
   local: Schema.object({
     port: Schema.natural().default(8081).description('First 127.0.0.1 port for llama-server; the next ones are tried when it is taken.'),
-    contextSize: Schema.natural().min(2048).description('Context tokens for every local model; unset = the model\'s manifest value (16,384), 12,288 on PCs with under 12 GB RAM.'),
+    contextSize: Schema.natural().min(2048).description('Context tokens every local model starts with; unset = the model\'s manifest value (16,384), 12,288 on PCs with under 12 GB RAM. A RAM budget may size it down, to 12,288 at least.'),
   }).description('Local models (llama.cpp llama-server under <harness>/engine/llama, GGUF files under <harness>/models).'),
   format: Schema.object({
     enabled: Schema.boolean().default(true).description('Rewrite a finished background result into readable prose with the installed local chat model before it is posted. Off, the report is posted exactly as the agent wrote it.'),
@@ -205,17 +219,14 @@ export const Config = Schema.object({
     maxReviews: Schema.natural().default(2),
     maxRounds: Schema.natural().min(1).default(5).description('All agent runs, work and review.'),
   }),
-  thresholds: Schema.object({
-    accept: Schema.object({
-      low: Schema.number().min(0).max(1).default(0.55),
-      medium: Schema.number().min(0).max(1).default(0.7),
-      high: Schema.number().min(0).max(1).default(0.85),
-    }).description('Minimum review quality to accept, by routing risk (< 0.25, < 0.6, else).'),
-    secondOpinion: Schema.number().min(0).max(1).default(0.6).description('Second-opinion bar for a run with no routing decision (routing switched off, a forced agent): accepted changed code at or over it is reviewed first. A routed run follows its second-opinion decision instead.'),
-    humanReview: Schema.number().min(0).max(1).default(0.7),
-    needsTests: Schema.number().min(0).max(1).default(0.5),
-    tool: Schema.number().min(0).max(1).default(0.5).description('Minimum "tool fits" probability to run a tool instead of an agent.'),
-  }),
+  // Jev's cut-offs, each defaulting to the value the code has always used, so a config that sets
+  // none of them decides as it always did (docs/laya-auto.md 2.6). riskForReview and
+  // riskForFrontierReview stay under routing.minimumReview, their one source for Jev.
+  thresholds: thresholdsSchema(JEV_THRESHOLDS, { omit: MINIMUM_REVIEW_KEYS }).description('Every bar Jev\'s answers are read against. Laya has its own, under laya.thresholds.'),
+  // Typed only in providers.js (LAYA_SCHEMA), which resolveProviders runs inside its own try/catch:
+  // the host refuses to load the plugin on a Config error, and one bad Laya value must not take
+  // Jev Auto down with it.
+  laya: Schema.any().default({}).description('The Laya decision model; validated by providers.js, see docs/laya-auto.md 2.2.'),
   checks: Schema.object({
     enabled: Schema.boolean().default(true),
     scripts: Schema.array(String).default(['typecheck', 'lint', 'test', 'build']).description('package.json scripts to run when present, in order.'),
@@ -379,11 +390,15 @@ export function effectiveVerdicts(rows) {
  * as it ends, before anyone can judge its answer. With `learn` off it still runs, for what the
  * person withdrew: a clear or a changed verdict takes back what the earlier form counted, and only
  * new credit waits for learning to be on.
+ *
+ * The labels are relabelled in the store of whoever decided the run (docs/laya-auto.md 6.4): Jev's
+ * `training` store for a Jev-decided run, `layaStore` for a run Laya decided, and never the other.
+ * A Laya run's samples looked up in the Jev store would be missing there and skipped silently.
  * @param {object} stored the feedback.js row just appended
- * @param {{ feedbackRows: object[], records: object[], capabilities: object, training?: object, versionOf?: Function, agents?: object[], priors?: object, learn?: boolean }} deps
+ * @param {{ feedbackRows: object[], records: object[], capabilities: object, training?: object, layaStore?: object, versionOf?: Function, agents?: object[], priors?: object, learn?: boolean }} deps
  * @returns {Promise<{ run: object|null, evidence: object[], relabelled: string[] }>}
  */
-export async function onVerdict(stored, { feedbackRows, records, capabilities, training, versionOf, agents, priors, learn = true }) {
+export async function onVerdict(stored, { feedbackRows, records, capabilities, training, layaStore, versionOf, agents, priors, learn = true }) {
   const effective = effectiveVerdicts(feedbackRows)
   const isThis = (f) => f?.sessionId === stored?.sessionId && f?.messageId === stored?.messageId
   const verdict = effective.find(isThis) ?? stored
@@ -393,7 +408,8 @@ export async function onVerdict(stored, { feedbackRows, records, capabilities, t
   const run = runOfVerdict(verdict, records, capabilities)
   const evidence = creditVerdict(verdict, records, { capabilities, previous, learn, versionOf, agents, priors })
   const relabelled = []
-  if (!run?.runId || !training) return { run, evidence, relabelled }
+  const store = run?.routing?.decider === 'laya' ? layaStore : training
+  if (!run?.runId || !store) return { run, evidence, relabelled }
   // With learning off nothing new is learnt, but a verdict the person cleared or changed is
   // withdrawn: a human label it gave is recomputed without it. The same verdict again changes
   // nothing, and a sample no person labelled has nothing of it to withdraw.
@@ -410,7 +426,7 @@ export async function onVerdict(stored, { feedbackRows, records, capabilities, t
   // The next run of the session bounds which verdicts are about this one (training.js feedbackFor).
   const after = (records ?? []).filter((r) => r?.sessionId === run.sessionId && Date.parse(r.ts) > Date.parse(run.ts)).sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts))[0]
   for (const domain of FEEDBACK_DOMAINS) {
-    for (const sample of await training.list({ domain })) {
+    for (const sample of await store.list({ domain })) {
       if (sample.runId !== run.runId) continue
       if (labels && !labels.has(sample.id)) continue
       if (!learn && sample.outcome?.labelSource !== 'human') continue
@@ -418,7 +434,7 @@ export async function onVerdict(stored, { feedbackRows, records, capabilities, t
       if (!outcome) continue
       const was = sample.outcome
       if (was && was.labelSource === outcome.labelSource && was.label === outcome.label && was.negativeLabel === outcome.negativeLabel) continue
-      await training.resolveOutcome(sample.id, outcome)
+      await store.resolveOutcome(sample.id, outcome)
       relabelled.push(sample.id)
     }
   }
@@ -444,6 +460,80 @@ export async function acceptVerdict(record, { feedback, records, agents, log = (
     await onVerdict(stored, { ...deps, feedbackRows: await feedback.history(stored.sessionId), records: await records(), agents: await agents() })
   } catch (err) { log(`a verdict was stored but not credited: ${err.message}`) }
   return stored
+}
+
+/**
+ * POST /jev-router/feedback without the HTTP: the request body's text in, the status and the JSON
+ * to answer with out. A body that is not JSON, or not a verdict validFeedback accepts, is a 400
+ * that stores nothing, so an unknown tag is refused before it could be read as routing rights. A
+ * valid one is stored and applied by acceptVerdict, one verdict at a time: the evidence is
+ * recorded in the order feedback.jsonl is written, so a quick like-then-dislike cannot land the
+ * other way round. apply() makes one for the plugin's life, which is what makes it one queue. A
+ * store that fails throws, and the route answers that as it answers any other failure.
+ * @param {{ learn: () => boolean } & object} deps acceptVerdict's, with `learn` read as each
+ *   verdict arrives, so a verdict is marked by the setting it was given under
+ * @returns {(raw: string) => Promise<{ status: number, body: object }>}
+ */
+export function createFeedbackRoute({ learn, ...deps }) {
+  let queue = Promise.resolve()
+  return async (raw) => {
+    let record
+    try { record = validFeedback(JSON.parse(raw)) } catch (err) { return { status: 400, body: { error: err.message } } }
+    const on = learn()
+    const job = queue.then(() => acceptVerdict(record, { ...deps, learn: on }))
+    queue = job.catch(() => {})
+    return { status: 200, body: { ok: true, record: await job } }
+  }
+}
+
+/**
+ * What the router reads its priors from (runRouted's deps.history): history.jsonl and the feedback
+ * log beside it. A function of its own, which apply() makes once, so the wiring the feedback prior
+ * depends on - the run a verdict is about, placed with the capability registry's credit - is
+ * tested without the plugin runtime.
+ * @param {object} p
+ * @param {string} p.historyFile  history.jsonl
+ * @param {object} p.feedback     feedback.js's store for the log beside it
+ * @param {object} [p.capabilities] the capability registry, whose creditedRun places a verdict
+ */
+export function createHistoryDeps({ historyFile, feedback, capabilities }) {
+  const dataDir = dirname(historyFile)
+  // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
+  const allRecords = async () => {
+    const raw = await readFile(historyFile, 'utf8').catch(() => '')
+    return raw.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  }
+  return {
+    async recent(cwd, n) {
+      return (await allRecords()).filter((r) => r.workspace === cwd).slice(-n)
+        .map((r) => ({ task_type: r.routing?.taskType, first_agent: r.routing?.primaryAgent, attempts: r.attempts?.length, outcome: r.finalStatus }))
+    },
+    // Full rows for trackRecord: what each agent costs, how it has done here, and whether it is
+    // on its cheap rate right now. Without this the router silently skips all of that and Jev
+    // picks with no cost or history prior at all.
+    records: allRecords,
+    // The same priors path as history.jsonl, one file over: the router reads it to demote an
+    // agent whose picks were disliked and promote one whose picks were liked. The rows are
+    // list()'s, dated by their newest form, which is the order the router's window reads them
+    // in; a row whose answer was first judged earlier also carries that time as `judgedAt`
+    // (effectiveVerdicts), which is what places it on a run below.
+    async feedback(sessionId) {
+      const [rows, forms] = await Promise.all([feedback.list(sessionId), feedback.history(sessionId)])
+      const key = (f) => `${f.sessionId}\u0000${f.messageId}`
+      const judged = new Map(effectiveVerdicts(forms).map((f) => [key(f), f.ts]))
+      return rows.map((r) => { const at = judged.get(key(r)); return at && at !== r.ts ? { ...r, judgedAt: at } : r })
+    },
+    // The run a verdict is about, which the router's feedback prior reads the task type off: the
+    // same run its capability evidence is credited to, so both read a verdict as one answer.
+    // Placed, as the evidence is, by when the answer was first judged: dated by its latest edit,
+    // a verdict with no runId that was never credited (learning off, a tag that credits
+    // nothing) and was edited after a newer run ended was read as being about that newer run.
+    runOfVerdict: (verdict, records) => runOfVerdict(verdict?.judgedAt ? { ...verdict, ts: verdict.judgedAt } : verdict, records, capabilities),
+    async append(record) {
+      await mkdir(dataDir, { recursive: true })
+      await appendFile(historyFile, `${JSON.stringify(record)}\n`)
+    },
+  }
 }
 
 // The routing domains whose labels a person's verdict can change (training.js labelClassification).
@@ -545,54 +635,139 @@ export function createResourceTracker({ file, store, records, domains }) {
   }
 }
 
-export function apply(ctx, config) {
+/**
+ * @param {object} ctx     the plugin context
+ * @param {object} config  Config, as the host validated it
+ * @param {{ laya?: object, local?: object, localModels?: object, benchmark?: { scratchRoot?: string, tasksDir?: string } }} [seams]  for tests only; the host passes none.
+ *   `laya.harnessDir` is the folder Laya's engine, model and pins (config/laya.json) live under
+ *   (the harness by default), and the rest of `laya` (`spawn`, `run`, `fetch`, `timing`,
+ *   `isAlive`, `killTree`, `readWorkingSet`) goes to Laya's supervisor as it is, so a test can run
+ *   a fake laya.serve on a PC of its own. `local` stands in for methods of the local models
+ *   (`chatModel`), so a test can have a local chat model without llama.cpp. `localModels` goes to
+ *   createLocalModels as it is (`modules`, `engineDir`, `modelsDir`, `spawn`, `fetch`, `specs`, `port`),
+ *   so a test can run a fake llama-server with models of its own instead of the harness's.
+ *   `benchmark` places the capability benchmark's scratch workspace and task set elsewhere
+ *   (docs/benchmark.md 3.7), so a test runs it in a folder of its own over tasks of its choosing.
+ */
+export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {}, localModels: localModelSeams = {}, benchmark: benchmarkSeams = {} } = {}) {
   // A spawn agent without a pinned model inherits the parent's model, which is Jev itself.
   const unpinned = config.agents.filter((a) => a.provider === 'spawn' && !(a.llm?.provider && a.llm?.model))
   if (unpinned.length) throw new Error(`jev-router: spawn agents need llm: { provider, model }: ${unpinned.map((a) => a.id).join(', ')}`)
   if (config.auxModel.provider === JEV_PROVIDER) throw new Error('jev-router: auxModel must be a real model, not Jev')
   const dataDir = dirname(config.historyFile)
-  // Like/Dislike on a finished answer, next to history.jsonl, read back by the router below.
-  const feedback = createFeedback({ file: join(dataDir, 'feedback.jsonl') })
-  let verdictQueue = Promise.resolve()
-  // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
-  const allRecords = async () => {
-    const raw = await readFile(config.historyFile, 'utf8').catch(() => '')
-    return raw.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
-  }
-  const history = {
-    async recent(cwd, n) {
-      return (await allRecords()).filter((r) => r.workspace === cwd).slice(-n)
-        .map((r) => ({ task_type: r.routing?.taskType, first_agent: r.routing?.primaryAgent, attempts: r.attempts?.length, outcome: r.finalStatus }))
-    },
-    // Full rows for trackRecord: what each agent costs, how it has done here, and whether it is
-    // on its cheap rate right now. Without this the router silently skips all of that and Jev
-    // picks with no cost or history prior at all.
-    records: allRecords,
-    // The same priors path as history.jsonl, one file over: the router reads it to demote an
-    // agent whose picks were disliked and promote one whose picks were liked.
-    feedback: (sessionId) => feedback.list(sessionId),
-    async append(record) {
-      await mkdir(dataDir, { recursive: true })
-      await appendFile(config.historyFile, `${JSON.stringify(record)}\n`)
-    },
-  }
-
-  // --- the adaptive router ------------------------------------------------
-  // Policy first: every threshold the router reasons with, config over the defaults. Then the
-  // capability registry (what each resource is good at, priors plus recorded evidence), the
-  // training store (every decision and what the run proved), the routing domains (who may decide
-  // what, and what they must prove first) and the decision engine that puts them together.
-  // A broken priors file is fatal on purpose: routing on a half-read set of capability numbers
-  // would be worse than not starting.
+  // Policy first: every threshold the router reasons with, config over the defaults. A broken
+  // priors file is fatal on purpose, and found before anything starts: routing on a half-read set
+  // of capability numbers would be worse than not starting.
   const policy = resolvePolicy(config.routing ?? {})
   const priorsFile = join(harnessDir, policy.priorsFile ?? 'config/capability-priors.json')
   let priors = { families: {}, models: {} }
   try { priors = loadPriors(priorsFile) } catch (err) {
     if (config.routing?.enabled !== false) throw new Error(`jev-router: capability priors not loaded from ${priorsFile}: ${err.message}`)
   }
+
+  // --- Laya, the decision model on this PC ----------------------------------
+  // Both deciders' records (providers.js), built once: a run reads every cut-off from the record
+  // of the provider that answers it. A bad Jev value throws here, as a bad Jev threshold always
+  // has; a bad Laya value only takes Laya out (layaError), and Jev Auto runs on.
+  const providers = resolveProviders(config, { policy })
+  const layaLog = (m) => process.stdout.write(`[jev] ${m}\n`)
+  const layaError = providers.layaError
+  const { harnessDir: layaHarness = harnessDir, ...supervisor } = layaSeams
+  // Laya's pins are a harness file, not the laya block: when they cannot be read, Laya can be
+  // neither installed nor asked, and what puts them back is the harness's update, never an edit of
+  // cordis.patch.yml, so the failure is kept apart from layaError and says so.
+  let pins = null
+  let pinsError = null
+  try { pins = readPins(layaHarness) } catch (err) { pinsError = err.message }
+  // Laya's record only while nothing is wrong with its settings: a run Laya cannot be asked for is
+  // refused, and never decided under Jev's record instead (2.4).
+  const LAYA = layaError ? null : providers.laya
+  const layaSettings = LAYA ? providers.layaSettings : null
+  if (layaError) layaLog(`laya: ${layaError}; Laya Auto and the Laya shadow are off until it is fixed`)
+  if (pinsError) layaLog(`laya: ${pinsUnreadable(pinsError)}; Laya Auto and the Laya shadow are off until then`)
+  // One RAM budget for every local model process, llama and Laya together (7.7).
+  const residency = createResidency({ log: (m) => layaLog(`local: ${m}`) })
+  let layaClient = null
+  const sidecar = createLayaSidecar({
+    // Unreadable pins reach the supervisor as its one reason Laya cannot be asked whatever its
+    // state, so nothing starts it; the refusals and the status name them apart (layaUnavailable).
+    harnessDir: layaHarness, dataDir, config: layaSettings ?? {}, configError: layaError ?? (pinsError && pinsUnreadable(pinsError)), pins: pins ?? {},
+    specs: () => specs(), residency,
+    // The budget llama's planner reads, read the same way (7.4).
+    readBudget: () => local.readSettings(),
+    probe: (conn) => createProbe(conn, { temperatureCorrections: layaSettings?.temperatureCorrections, minTopMargin: layaSettings?.minTopMargin }),
+    isLocalBusy: () => local.isBusy(),
+    isBusy: () => layaClient?.busy() ?? false,
+    log: layaLog,
+    // The model menu offers Laya Auto by Laya's state, so every change of it refreshes the menu (3.1).
+    onChange: () => { try { llmRuntime?.emit?.('llm/adapters-updated') } catch {} },
+    ...supervisor,
+  })
+  const installer = pins ? createLayaInstaller({ harnessDir: layaHarness, dataDir, pins, specs: () => specs(), sidecar, log: layaLog }) : null
+  // Before anything else: finish or roll back an install an engine kill interrupted (7.2), then
+  // stop a laya.serve an earlier session left holding memory and a port while the card says
+  // stopped (7.5). Every start waits for both.
+  const layaStartup = Promise.resolve(installer?.recover())
+    .catch((err) => layaLog(`laya install: nothing recovered: ${err.message}`))
+    .then(() => sidecar.sweepOrphans())
+    .catch((err) => layaLog(`laya: the orphan sweep failed: ${err.message}`))
+  // Nothing starts Laya once the plugin is disposed, however long the startup above took: a
+  // laya.serve started on a disposed supervisor has no exit hook and nobody to stop it, and that
+  // supervisor would even restart it after a crash, the orphan the sweep is there for.
+  let disposed = false
+  const afterStartup = async () => {
+    await layaStartup
+    if (disposed) throw new LayaUnavailable('Laya was stopped with KzH', { reason: 'disposed' })
+  }
+  const layaReady = async (o) => { await afterStartup(); return sidecar.ensureReady(o) }
+  layaClient = createLayaClient({
+    sidecar: { ...sidecar, ensureReady: layaReady },
+    settings: layaSettings,
+    isLocalBusy: () => local.isBusy(),
+    log: layaLog,
+  })
+  ctx.effect(() => () => { disposed = true; layaClient.dispose(); sidecar.dispose().catch(() => {}) })
+  // Laya can be asked at all: installed, switched on, its settings valid and its pins read. Whether
+  // a run may be decided by it is layaUnavailable's, below, which says why not.
+  const layaAskable = () => !!LAYA && !pinsError && layaSettings.enabled !== false && !!sidecar.installed()
+  // The shadow of Jev Auto (5): on while Laya can be asked, learning is on (off, nothing new is
+  // recorded, the comparisons included) and the card's switch is on. It never starts Laya and
+  // never keeps it loaded: the Laya client skips a call while Laya is not ready, and counts why.
+  const shadowOn = () => layaAskable() && config.routing?.learn !== false && sidecar.readSettings().shadow !== false
+  const shadow = createShadow({
+    file: join(dataDir, 'laya-shadow.jsonl'),
+    laya: layaClient,
+    enabled: shadowOn,
+    log: layaLog,
+    providers: { jev: providers.jev, laya: LAYA },
+    // A row also goes to the inspector's log of its run, whose id is the run id (5.3); one that
+    // lands after the run has left memory is on disk only.
+    onRow: (row) => { logEntry(row.runId)?.events.push({ type: 'shadow', at: Date.now(), row }) },
+    files: {
+      jevSamples: join(dataDir, 'routing-samples.jsonl'), layaSamples: join(dataDir, 'laya-samples.jsonl'),
+      feedback: join(dataDir, 'feedback.jsonl'), history: config.historyFile, standing: join(dataDir, 'laya-standing.jsonl'),
+    },
+  })
+
+  // Like/Dislike on a finished answer, next to history.jsonl, read back by the router below.
+  const feedback = createFeedback({ file: join(dataDir, 'feedback.jsonl') })
+
+  // --- the adaptive router ------------------------------------------------
+  // The capability registry (what each resource is good at, priors plus recorded evidence), the
+  // training store (every decision and what the run proved), the routing domains (who may decide
+  // what, and what they must prove first) and the decision engine that puts them together.
   const capabilities = createCapabilityRegistry({ file: join(dataDir, 'capability-evidence.jsonl'), priors, policy })
   try { capabilities.load() } catch (err) { process.stdout.write(`[jev] capability evidence not loaded: ${err.message}\n`) }
-  const training = createTrainingStore({ file: join(dataDir, 'routing-samples.jsonl') })
+  // What the router reads its priors from: history.jsonl, the feedback log beside it, and the run
+  // each verdict is about, placed with this registry's credit (createHistoryDeps).
+  const history = createHistoryDeps({ historyFile: config.historyFile, feedback, capabilities })
+  const allRecords = history.records
+  const training = createTrainingStore({ file: join(dataDir, 'routing-samples.jsonl'), policy, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
+  // Every decision of a run Laya decided goes to a store of its own (docs/laya-auto.md 6.1): no
+  // local classifier reads it, and the Jev store refuses a Laya row, so Laya Auto's failures can
+  // never roll back a ladder Jev taught. The same cap and compaction as Jev's.
+  const layaStore = createTrainingStore({ file: join(dataDir, 'laya-samples.jsonl'), kind: 'laya', policy, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
+  const storeOf = (kind) => (kind === 'laya' ? layaStore : training)
   const domains = config.routing?.learn === false ? null : createDomainRegistry({
     policy,
     store: training,
@@ -610,8 +785,9 @@ export function apply(ctx, config) {
 
   /**
    * What a finished run taught: capability evidence per resource, and the label each routing
-   * decision of that run turned out to deserve. Both are append-only and neither can block the
-   * run, which has already finished by the time this is called.
+   * decision of that run turned out to deserve. Capability evidence is append-only, and the
+   * routing samples are appended and compacted under their cap (training.js); neither can block
+   * the run, which has already finished by the time this is called.
    */
   async function learnFrom(record, samples) {
     // Learning off means nothing new is recorded: capability evidence changes future routing just
@@ -627,19 +803,23 @@ export function apply(ctx, config) {
     // The review's own decision is a routing decision too, and its sample id comes back on the
     // assessment rather than from the decision engine. Without this the outcome domain would
     // collect samples for ever and never see one of them verified, so it could never mature.
+    // Each sample is labelled in the store it was written to: the decision engine names the
+    // store of each of its own, and the review's is in the store of whoever decided the run (6.3).
+    const reviewStore = record.routing?.decider === 'laya' ? 'laya' : 'jev'
     const all = [
       ...(samples ?? []),
-      ...(record.assessments ?? []).map((a) => a.outcomeDomain?.sampleId).filter(Boolean).map((id) => ({ domain: 'outcome_disposition', id })),
+      ...(record.assessments ?? []).map((a) => a.outcomeDomain?.sampleId).filter(Boolean).map((id) => ({ domain: 'outcome_disposition', id, store: reviewStore })),
     ]
     if (!all.length) return
     try {
       // No feedback here either: at the moment a run ends no verdict about its answer can exist.
       // A verdict relabels this run's samples when it is given (onVerdict), by their runId.
-      for (const { domain, id } of all) {
-        const sample = await training.get(id)
+      for (const { domain, id, store } of all) {
+        const from = storeOf(store)
+        const sample = await from.get(id)
         if (!sample) continue
         const outcome = labelFromRun(domain, sample, record)
-        if (outcome) await training.resolveOutcome(id, outcome)
+        if (outcome) await from.resolveOutcome(id, outcome)
       }
     } catch (err) { process.stdout.write(`[jev] routing outcomes not recorded: ${err.message}\n`) }
   }
@@ -651,6 +831,16 @@ export function apply(ctx, config) {
     if (!domains || retraining || Date.now() - lastRetrain < 60_000) return
     lastRetrain = Date.now()
     retraining = domains.evaluateAll().catch((err) => process.stdout.write(`[jev] routing evaluation failed: ${err.message}\n`)).finally(() => { retraining = null })
+  }
+  // Laya's own evaluation pass (6.7): at most once a minute after any run, its standing is worked
+  // out in the shadow's worker and appended to laya-standing.jsonl, outside domains/, so no file
+  // the Jev ladders own changes on Laya's account. A reading only: nothing acts on it.
+  let standing = null
+  let lastStanding = 0
+  const maybeStanding = () => {
+    if (!layaAskable() || config.routing?.learn === false || standing || Date.now() - lastStanding < 60_000) return
+    lastStanding = Date.now()
+    standing = shadow.recordStanding().catch((err) => process.stdout.write(`[jev] laya standing not recorded: ${err.message}\n`)).finally(() => { standing = null })
   }
 
   // Setup-page state, layered over config: on/off switches and user-added
@@ -756,19 +946,46 @@ export function apply(ctx, config) {
     readyGen++; readyCache = null
     try { llmRuntime?.emit?.('llm/adapters-updated') } catch {}
   }).catch(() => {}).finally(() => { refreshing = null }))
-  const local = createLocalModels({
+  // The capability benchmark (docs/benchmark.md 3), made once everything it reads exists, below.
+  let benchmark = null
+  const localModels = createLocalModels({
     modules,
     engineDir: join(harnessDir, 'engine', 'llama'),
     modelsDir: join(harnessDir, 'models'),
     settingsFile: join(dataDir, 'local.json'),
+    // Every speed run's summary and its detail log (docs/benchmark.md 2.13), beside local.json,
+    // where Speed-Run.bat writes its runs too.
+    speedLogDir: join(dataDir, 'speed-runs'),
     port: config.local.port,
     contextSize: config.local.contextSize,
     specs,
     log: (t) => process.stdout.write(`[jev] ${t}\n`),
     onChange: () => { refreshLocal(); resolveAux() },
+    // The resource budget reaches what follows it: readiness, since a local model over the budget is
+    // not ready, the lanes' cap on tasks at once, the chat model, which is the quickest local model
+    // the budget lets load, and the local agents' context windows, which the budget sizes. `lanes`
+    // is declared further down; this runs only on a saved settings change, and no request can make
+    // one before apply() has returned.
+    onSettings: (s) => { readyGen++; readyCache = null; lanes.setMax(s.maxConcurrentTasks); resolveAux(); refreshLocal() },
+    // The residency Laya is in too, so one RAM budget covers both and an unheld Laya gives its
+    // memory up when a local model starts (7.7).
+    residency,
+    // Laya answering a call refuses a speed benchmark, and has a measured request run again
+    // (docs/benchmark.md 2.3, 2.7): it would slow the measurement.
+    layaBusy: () => layaClient?.busy() ?? false,
+    // So does a capability benchmark with a local agent's task left: the two would unload each
+    // other's model (docs/benchmark.md 2.7). `benchmark` is made further down, before any request.
+    capabilityBusy: () => benchmark?.localPending() ?? false,
+    ...localModelSeams,
   })
+  // Every local model process on this PC in one status: llama's, and Laya's beside it while Laya is
+  // installed, which the resource budget table counts with llama's (7.7).
+  const local = { ...localModels, ...localSeams, status: async () => ({ ...(await localModels.status()), laya: sidecar.installed() ? await layaStatus() : null }) }
   ctx.effect(() => () => { local.dispose() })
   refreshLocal()
+  // Start Laya with KzH when the card says so (7.6): after the startup sweep, in the background,
+  // never awaited and never holding up anything else.
+  layaStartup.then(() => { if (!disposed) sidecar.warm({ atStartup: true }) })
   // Hugging Face download counts: a tie-breaker for suggestions only, cached a day, skipped offline.
   let hfCache = { at: 0, value: {} }
   const hfDownloads = async () => {
@@ -781,7 +998,10 @@ export function apply(ctx, config) {
   }
   const catalog = async () => buildCatalog(local, await specs(), { downloads: await hfDownloads().catch(() => ({})) })
   const connectivity = createConnectivity()
-  const isOffline = async () => !(await connectivity.online())
+  // Laya needs no network, so a Laya Auto session asks laya.connectivityUrl whether cloud agents
+  // can run, never a TypeSafe host: not to route, not to pick the chat model, not for a title (2.4).
+  const layaConnectivity = createConnectivity({ urls: [(layaSettings ?? LAYA_SCHEMA({})).connectivityUrl] })
+  const isOffline = async (decider = 'jev') => !(await (decider === 'laya' ? layaConnectivity : connectivity).online())
   const localChat = async () => { const id = await local.chatModel(); return id ? { provider: LOCAL_PROVIDER, model: id } : null }
   // Titles, compaction and direct answers need one real chat model, and none is assumed:
   // a hidden DeepSeek default sent that housekeeping to api.deepseek.com for everyone. An
@@ -835,22 +1055,80 @@ export function apply(ctx, config) {
   // teaches it; once it has earned authority the review is decided here without a Jev call.
   const outcomeDomain = () => (config.routing?.enabled === false ? null : domains?.get('outcome_disposition') ?? null)
 
-  // A Jev client on the active jev key; on 429/402 it moves to the next jev key and retries the call once.
-  async function makeJev({ onTrace, runId, emit }) {
+  // The outcome domain of a run Laya decides, behind a facade that decides for Laya into Laya's
+  // store (6.3), so jev-review stays ignorant of stores.
+  const layaOutcomeDomain = () => {
+    const outcome = outcomeDomain()
+    return outcome ? { decide: (args) => outcome.decide({ ...args, answeredBy: 'laya', sink: layaStore }) } : null
+  }
+
+  // What Laya Auto says when routing is off: Laya decides only through the adaptive router (3.5).
+  const ROUTING_OFF = 'Laya Auto needs adaptive routing (routing.enabled in the jev-router configuration). Nothing was run.'
+  /**
+   * Whether Laya can be asked at all, the one place that decides it (docs/laya-auto.md 2.4, 3.5):
+   * throws LayaUnavailable with the reply the person reads, in this order, when Laya is not
+   * installed, is switched off, has invalid settings, its pins cannot be read, when routing is off
+   * (a run only, `role` 'act'; the intent of a message is still Laya's to answer), or when it
+   * stopped after an error. A run it refuses is never handed to Jev.
+   * @param {'act'|'intent'} [role]
+   */
+  function layaUnavailable(role = 'act') {
+    const refuse = (message, reason, detail = null) => { throw new LayaUnavailable(message, { reason, detail }) }
+    if (!sidecar.installed()) refuse(LAYA_TEXT.notInstalled, 'not_installed')
+    if ((layaSettings ?? config.laya)?.enabled === false) refuse(LAYA_TEXT.disabled, 'disabled')
+    if (!LAYA) refuse(LAYA_TEXT.invalid(layaError), 'invalid', layaError)
+    if (pinsError) refuse(`Laya Auto did not run this: ${pinsUnreadable(pinsError)}. Nothing was run.`, 'pins', pinsError)
+    if (role === 'act' && config.routing?.enabled === false) refuse(ROUTING_OFF, 'routing_off')
+    const s = sidecar.status()
+    if (s.state === 'failed') refuse(LAYA_TEXT.failed(s.why ?? 'unknown'), 'failed', s.why ?? null)
+  }
+
+  const tokensOf = (t) => ({ input: t.usage?.input_tokens ?? 0, output: t.usage?.output_tokens ?? 0 })
+  /**
+   * The client of whoever decides (docs/laya-auto.md 2.4), in createJev's shape with its record on
+   * `provider`. Every answered call is logged through usage.logDecision, priced by that record;
+   * a failed one goes to `onError` only and is never a usage row.
+   *
+   * Jev: a client on the active jev key; on 429/402 it moves to the next jev key and retries the
+   * call once. Every call is offered to the shadow, which decides per call whether Laya answers it
+   * too, so a rotated call's first settle gets the 429 or 402 and its job is withdrawn. Null
+   * without a key.
+   *
+   * Laya: refused by layaUnavailable first; then the Laya client, which waits for a start and
+   * holds its own gate, with no accounts, no rotation and no shadow.
+   * @param {'jev'|'laya'} id
+   * @param {{ onTrace?: Function, onError?: Function, runId?: string|null, emit?: Function, onWait?: (line: string) => void, role?: 'act'|'intent' }} [o]
+   */
+  async function makeDecider(id, { onTrace = () => {}, onError = () => {}, runId = null, emit = () => {}, onWait, role = 'act' } = {}) {
+    if (id === 'laya') {
+      layaUnavailable(role)
+      return createJev({
+        provider: LAYA,
+        client: layaClient.client('act', { runId, onWait }),
+        onTrace: (t) => {
+          onTrace(t)
+          usage.logDecision({ provider: LAYA, runId, phase: t.phase, ms: t.ms, model: t.model, tokens: tokensOf(t) }).catch(() => {})
+        },
+        onError,
+      })
+    }
+    if (id !== 'jev') throw new Error(`jev-router: no decider named ${id}`)
     await accounts.ready().catch(() => {})
     let name = accounts.activeKey('jev')
     let value = name ? await accounts.resolveKey('jev', name) : undefined
     if (!value) { name = 'default'; value = (await resolveCredential(config.credentialRef).catch(() => undefined))?.value }
     if (!value) return null
+    const onCall = shadow.offerer({ runId: runId === 'intent' ? null : runId })
     const build = () => createJev({
+      provider: providers.jev,
       apiKey: value,
-      model: config.jevModel,
-      timeoutMs: config.jevTimeoutMs,
       onTrace: (t) => {
         onTrace(t)
         // model and request id together: the two things a TypeSafe support query needs.
-        usage.logJev({ runId, account: name, phase: t.phase, ms: t.ms, model: t.model, requestId: t.requestId, tokens: { input: t.usage?.input_tokens ?? 0, output: t.usage?.output_tokens ?? 0 } }).catch(() => {})
+        usage.logDecision({ provider: providers.jev, runId, account: name, phase: t.phase, ms: t.ms, model: t.model, requestId: t.requestId, tokens: tokensOf(t) }).catch(() => {})
       },
+      onError,
+      onCall,
     })
     let client = build()
     const call = (method) => async (...args) => {
@@ -868,18 +1146,44 @@ export function apply(ctx, config) {
         return await client[method](...args)
       }
     }
-    return { route: call('route'), assess: call('assess'), intent: call('intent') }
+    return { provider: providers.jev, route: call('route'), assess: call('assess'), intent: call('intent') }
   }
 
-  // Task or question? Questions are answered directly by a chat model instead of running agents in the workspace.
-  // `mode` is the picked Jev row; 'offline' keeps this on the local heuristic.
-  // Without Jev (no key, error) everything is a task, as before.
-  async function classify(message, mode) {
+  /**
+   * Task or question? Questions are answered directly by a chat model instead of running agents in
+   * the workspace. `mode` is the picked row's; 'offline' keeps this on the local heuristic.
+   * `decider` is who answers it: the result carries that provider's `thresholds`, so the adapter's
+   * bars are the answering provider's, and a `depth` answered too flat to use is left out, so the
+   * caller keeps the cheap default.
+   *
+   * Jev: without Jev (no key, error) everything is a task, as before.
+   * Laya (docs/laya-auto.md 3.4): never probes TypeSafe. A message waits for Laya to start, with
+   * the Starting Laya line through `onWait`, bounded as a routing call is, and is then asked; only a
+   * refusal, a failed start or a timeout makes it a task, marked `unsure` with the reason, because
+   * unsure means task and a word rule would send work to a chat model that cannot touch files.
+   * @param {string} message
+   * @param {string} mode
+   * @param {'jev'|'laya'} [decider]
+   * @param {{ onWait?: (line: string) => void, signal?: AbortSignal }} [o]
+   */
+  async function classify(message, mode, decider = 'jev', { onWait, signal } = {}) {
+    const answered = (r, thresholds) => ({ ...r, depth: r.uninformative?.includes('depth') ? undefined : r.depth, thresholds })
+    if (decider === 'laya') {
+      const thresholds = LAYA?.thresholds
+      const unsure = (why) => ({ kind: 'task', unsure: true, why: `Laya could not sort this message (${why}); treating it as a task.`, thresholds })
+      let laya
+      try { laya = await makeDecider('laya', { runId: 'intent', onWait, role: 'intent' }) } catch (err) { return unsure(layaReason(err)) }
+      try { return answered(await laya.intent({ message }, signal), thresholds) } catch (err) {
+        if (signal?.aborted) throw err
+        return unsure(err?.message ?? String(err))
+      }
+    }
+    const thresholds = providers.jev.thresholds
     // Offline mode is a choice, not a network state: it must not call out even with the internet up.
-    if (mode === 'offline' || await isOffline()) return { kind: looksLikeQuestion(message) ? 'question' : 'task', offline: true }
-    const jev = await makeJev({ onTrace: () => {}, runId: 'intent', emit: () => {} }).catch(() => null)
-    if (!jev) return { kind: 'task' }
-    try { return await jev.intent({ message }, AbortSignal.timeout(config.jevTimeoutMs)) } catch { return { kind: 'task' } }
+    if (mode === 'offline' || await isOffline('jev')) return { kind: looksLikeQuestion(message) ? 'question' : 'task', offline: true, thresholds }
+    const jev = await makeDecider('jev', { runId: 'intent' }).catch(() => null)
+    if (!jev) return { kind: 'task', thresholds }
+    try { return answered(await jev.intent({ message }, AbortSignal.timeout(config.jevTimeoutMs)), thresholds) } catch { return { kind: 'task', thresholds } }
   }
 
   // The model each agent runs, for the "Answered by" line. Claude and Codex use their own settings
@@ -904,6 +1208,13 @@ export function apply(ctx, config) {
   refreshModels()
   // The one versionOf every profile reader and writer gets (localVersionOf).
   const versionOf = localVersionOf(local)
+  // What POST /jev-router/feedback does (createFeedbackRoute), made once so every verdict the
+  // plugin is given goes through its one queue.
+  const postFeedback = createFeedbackRoute({
+    feedback, records: allRecords, capabilities, training, layaStore, versionOf, agents: enabledAgents, priors,
+    learn: () => config.routing?.learn !== false,
+    log: (m) => process.stdout.write(`[jev] ${m}\n`),
+  })
 
   const hoursFromNow = (h) => new Date(Date.now() + h * 3600_000).toISOString()
   const keyOut = (provider, name) => ['stopped', 'exhausted'].includes(usage.last()?.keys?.[provider]?.find((k) => k.name === name)?.state)
@@ -948,9 +1259,11 @@ export function apply(ctx, config) {
 
   // Router decision log per session, for the Jev inspector. Memory only; history.jsonl is the durable record.
   const logs = new Map() // sessionId -> runs [{ id, startedAt, task, events }], most recently used last
-  function logRun(sessionId, task) {
+  // The entry's id is the run's id (docs/laya-auto.md 2.4), so the live run, Stop, the task
+  // record, usage.jsonl, history.jsonl, the samples and the shadow's rows all name one run alike.
+  function logRun(sessionId, task, runId = randomUUID()) {
     const runs = logs.get(sessionId) ?? []
-    const entry = { id: randomUUID(), startedAt: Date.now(), task, events: [] }
+    const entry = { id: runId, startedAt: Date.now(), task, events: [] }
     runs.push(entry)
     if (runs.length > 20) runs.shift()
     logs.delete(sessionId)
@@ -958,33 +1271,200 @@ export function apply(ctx, config) {
     if (logs.size > 50) logs.delete(logs.keys().next().value)
     return entry
   }
-  const stoppers = new Map() // log run id -> AbortController, while the run is active (POST /runs/stop)
+  /** The inspector's entry of one run, while it is still in memory. */
+  const logEntry = (runId) => {
+    if (!runId) return null
+    for (const runs of logs.values()) { const entry = runs.find((r) => r.id === runId); if (entry) return entry }
+    return null
+  }
+  const stoppers = new Map() // run id -> AbortController, while the run is active (POST /runs/stop)
+
+  // The token counts of an agent's usage as usage.jsonl keeps them, whatever names its provider gives them.
+  const usageTokens = (u) => (u ? { input: u.inputTokens ?? u.input ?? 0, output: u.outputTokens ?? u.output ?? 0, cacheRead: u.cacheReadTokens ?? u.cacheRead ?? 0, reasoning: u.reasoningTokens ?? u.reasoning ?? 0 } : null)
+
+  /**
+   * Everything runRouted() needs around it to run agents for the chat whose root agent is `agent`,
+   * in `cwd` (docs/benchmark.md 3.8): the enabled agents, the key rotation, the quota, `execute`
+   * with its subagent start, readiness, the executor registry, `modelOf`, the limit handling,
+   * `checkBalance` and `logAttempt`. route() and the capability benchmark both build their runs on
+   * it, so the two cannot drift apart. Resolves to { agents, byId, ready, deps }.
+   *
+   * `purpose` and `benchmarkRunId`, when given, go on every usage.jsonl row the run writes, so the
+   * benchmark's real usage is kept and marked. `onExecuted`, when given, hears of each attempt
+   * `execute` ran once it is over: whether the attempt's own time limit ended it (not a stop of the
+   * run, `signal`), whether its subagent's dispose() failed, its tokens, the version of the model it
+   * ran on when one is known (a local model's weights), and for a local agent the engine's load and
+   * unload counters before and after. route() gives neither.
+   * @param {{ agent: object, cwd: string, sessionId: string, runId: string, signal: AbortSignal, onEvent: (e: object) => void, purpose?: string|null, benchmarkRunId?: string|null, onExecuted?: ((report: object) => void)|null }} p
+   */
+  async function runDepsFor({ agent, cwd, sessionId, runId, signal, onEvent, purpose = null, benchmarkRunId = null, onExecuted = null }) {
+    const onWait = (text) => onEvent({ type: 'loading', at: Date.now(), text })
+    const agents = await enabledAgents()
+    await rotateSpentKeys(agents)
+    const quota = await quotaFor(agents)
+    const byId = new Map(agents.map((a) => [a.id, a]))
+    const accountOf = (a) => (kindOf(a) === 'subscription' ? usage.last()?.out?.[a.id]?.account?.email ?? null : accounts.activeKey(keyProviderOf(a)) ?? a.credentialRef ?? null)
+
+    // A local agent's attempt is counted while it runs, so a speed benchmark is refused meanwhile,
+    // and while one goes it waits before its subagent starts, with a line that says so
+    // (docs/benchmark.md 2.6): the two would otherwise take turns unloading each other's model.
+    // The wait is `untimed`: the attempt's time limit stands still while it lasts, so a long
+    // benchmark never runs the task out of time before it has begun.
+    const execute = async (agentDef, prompt, agentSignal, options = {}) => {
+      const localAgent = kindOf(agentDef) === 'local'
+      const report = onExecuted ? { agent: agentDef.id, timedOut: false, disposeError: null, tokens: null, ...(localAgent ? { engine: { before: local.engineCounters(), after: null } } : {}) } : null
+      try {
+        return await (localAgent
+          ? local.localAgentAttempt(() => runAgent(agentDef, prompt, agentSignal, options, report), { signal: agentSignal, onWait, untimed: options.untimed })
+          : runAgent(agentDef, prompt, agentSignal, options, report))
+      } finally {
+        if (report) {
+          report.timedOut = timedOutBy(agentSignal, signal)
+          if (report.engine) report.engine.after = local.engineCounters()
+          try { onExecuted(report) } catch { /* the caller's */ }
+        }
+      }
+    }
+    const runAgent = async (agentDef, prompt, agentSignal, { effort: eff, speed } = {}, report = null) => {
+      // Claude Code and Codex executors take no per-run options: they read these from process.env
+      // when the run starts (Claude: SDK child env; Codex: patched turn/start, see README).
+      // ponytail: process-wide env, two workspaces starting Claude/Codex in the same instant can swap efforts.
+      if (agentDef.provider === 'claude-code') setEnv('CLAUDE_CODE_EFFORT_LEVEL', eff)
+      if (agentDef.provider === 'codex') { setEnv('KZ_CODEX_EFFORT', eff); setEnv('KZ_CODEX_SERVICE_TIER', codexServiceTier(speed)) }
+      // A local run names the weights it ran on, so its history record keeps that version
+      // however late it is read back (a verdict an hour on, a backfill), never the one
+      // installed by then; profiles.js does not ask versionOf about a past run. It is read as the
+      // attempt starts and reported at once, so an attempt that rejects (on its time limit, say),
+      // whose result the router builds without it, still says which weights it ran on
+      // (docs/benchmark.md 3.9).
+      const version = versionOf(agentDef, agentDef.llm?.model ?? null)
+      if (report && version) report.modelVersion = version
+      const sub = await ctx.subagents.start(agentDef.provider, {
+        label: `jev:${agentDef.id}`,
+        prompt: [{ type: 'text', text: prompt }],
+        parent: agent,
+        signal: agentSignal,
+        ...(agentDef.persona ? { persona: agentDef.persona } : {}),
+        // In-process children see global tools; hide the router so an agent never re-routes its own task.
+        ...(agentDef.provider === 'spawn' && config.registerTool ? { toolFilter: { deny: ['jev_route'] } } : {}),
+        // Pin the model: a spawn child otherwise inherits the parent's (Jev) model and routes back into Jev.
+        ...(agentDef.llm?.provider && agentDef.llm?.model ? { agentOptions: { provider: agentDef.llm.provider, model: agentDef.llm.model, ...(eff ? { reasoningEffort: eff } : {}) } } : {}),
+      })
+      try {
+        const r = await sub.result
+        if (report) report.tokens = usageTokens(r.usage)
+        return { stopReason: r.stopReason, diagnostic: r.diagnostic, answerText: textOf(r.output), usage: r.usage, ...(version ? { modelVersion: version } : {}) }
+      } finally {
+        // Both providers' dispose() ends the agent's process and waits for its exit. A failure here
+        // is still not the run's, but a caller that grades the folder next is told of it: something
+        // of the agent may still be running there (docs/benchmark.md 3.6).
+        await sub.dispose().catch((err) => { if (report) report.disposeError = String(err?.message ?? err) })
+      }
+    }
+
+    // Which agents can be handed an image. A fact about their own tool loop, not a guess.
+    const seesImages = new Set()
+    for (const a of agents) if (await agentSeesImages(a.id).catch(() => false)) seesImages.add(a.id)
+    const ready = await readiness()
+    return {
+      agents,
+      byId,
+      ready,
+      deps: {
+        ready,
+        // Capability routing: what each executor on this machine really is, so code can drop
+        // the ones that cannot do this request before Jev is asked (and check its pick after).
+        executors: executorsFrom({
+          agents,
+          tools: config.tools ?? [],
+          chat: await chatPair(),
+          seesImages: (id) => seesImages.has(id),
+          economics: config.resources?.economics ?? {},
+        }),
+        execute,
+        runTool: runTool(cwd, config.agentTimeoutMs),
+        modelOf,
+        emit: onEvent,
+        quota,
+        isLimitError: detectLimit,
+        onLimit: (agentId, info) => onLimit(byId.get(agentId), info),
+        // Only metered keys need re-reading; a subscription's window is rationed by the gate,
+        // and a local model costs nothing.
+        checkBalance: async (agentId) => {
+          const a = byId.get(agentId)
+          if (!a || kindOf(a) !== 'api') return null
+          const snap = await usage.snapshot([a], { force: true }).catch(() => null)
+          const q = snap?.[agentId]
+          return q ? { state: q.state, balance: q.balance ?? null, until: q.until ?? null } : null
+        },
+        logAttempt: (entry) => {
+          // This run's id (shared with its Jev call lines) and normalized token counts win over the router's.
+          const { tokens: u, runId: _routerRunId, answerText: _a, ...rest } = entry
+          const a = byId.get(entry.agent)
+          return usage.logAttempt({
+            ...rest, runId, sessionId, workspace: cwd, provider: a?.provider ?? null, account: a ? accountOf(a) : null,
+            tokens: usageTokens(u),
+            costUsd: rest.costUsd ?? null, quotaBefore: quota[entry.agent]?.summary ?? null, quotaAfter: usage.last()?.out?.[entry.agent] ? summaryOf(usage.last().out[entry.agent]) : null,
+            ...(purpose ? { purpose } : {}),
+            ...(benchmarkRunId ? { benchmarkRunId } : {}),
+          }).catch(() => {})
+        },
+      },
+    }
+  }
+
+  // The capability benchmark's scratch workspace, beside the harness (docs/benchmark.md 3.7): no
+  // routed task runs there but the benchmark's.
+  const scratchRoot = resolve(benchmarkSeams.scratchRoot ?? join(harnessDir, '..', 'kzh-scratch'))
+  const sameDir = (a, b) => (process.platform === 'win32' ? resolve(a).toLowerCase() === resolve(b).toLowerCase() : resolve(a) === resolve(b))
+  const inScratch = (cwd) => sameDir(cwd, scratchRoot) || resolve(cwd).startsWith(scratchRoot + sep)
+  const SCRATCH_ONLY = 'The KzH scratch workspace is for the capability benchmark only; open one of your projects to run tasks.'
 
   // Subagents inherit the jev_route tool and would re-route their own prompt, nesting forever.
   // Also stops two routes editing the same workspace at once.
   const active = new Set()
-  async function route({ task, agent, forceAgent, answerOnly, effort, mode = 'auto', laneHeld = false, modalities, signal = new AbortController().signal, emit, onEntry }) {
+  async function route({ task, agent, forceAgent, answerOnly, effort, mode = 'auto', decider = 'jev', laneHeld = false, modalities, signal = new AbortController().signal, emit, onEntry }) {
     const cwd = agent?.session?.header?.cwd
     if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
+    if (inScratch(cwd)) throw new Error(SCRATCH_ONLY)
+    // Who decides the run. Laya is refused here, before anything is queued or run, when it cannot
+    // be asked at all, whatever sent the run (a message, a background task however long after it
+    // was queued, /laya), and a run it refuses is never handed to Jev (docs/laya-auto.md 3.5).
+    const laya = decider === 'laya'
+    if (laya) layaUnavailable('act')
+    else if (decider !== 'jev') throw new Error(`jev-router: no decider named ${decider}`)
     const key = resolve(cwd).toLowerCase()
     // A nested agent calling jev_route would deadlock on the lane its own parent holds,
     // so that case still refuses outright rather than waiting.
     if (active.has(key)) throw new Error('already routing a task in this workspace; wait for it to finish (a nested agent must do its task directly, not call jev_route)')
     // One queue per workspace for every caller. Background tasks and slash commands
-    // used to hold two independent mutexes, which let both run in one working tree.
-    const release = laneHeld ? () => {} : await lanes.acquire(key, `route-${randomUUID()}`, signal)
+    // used to hold two independent mutexes, which let both run in one working tree. The budget's
+    // cap on tasks at once counts this run too, so when it has to wait it says so, in its live lines
+    // and the log, rather than sitting silent until a task in another workspace ends.
+    const release = laneHeld ? () => {} : await lanes.acquire(key, `route-${randomUUID()}`, signal, { onWait: (why) => { emit?.({ type: 'queued', text: WAITING[why] }); process.stdout.write(`[jev] ${WAITING[why]}\n`) } })
     active.add(key)
     const sessionId = sessionIdOf(agent) ?? cwd
-    const entry = logRun(sessionId, task)
+    // One id for the whole run, minted before anything records it (2.4): the inspector's entry,
+    // Stop, the task record, the router, usage.jsonl and the shadow's rows all carry it.
+    const runId = randomUUID()
+    const entry = logRun(sessionId, task, runId)
     onEntry?.(entry)
     const stop = new AbortController()
-    stoppers.set(entry.id, stop)
+    stoppers.set(runId, stop)
     signal = AbortSignal.any([signal, stop.signal])
-    const runId = randomUUID()
+    // From the moment a Laya-decided run starts to its return, Laya is held: neither the idle stop
+    // nor the RAM watchdog takes it away between the run's calls, which can be minutes apart (7.6).
+    if (laya) sidecar.hold(runId)
+    let client = null
+    // Jev Auto says once, at the routed event, whether Laya answers the same questions in the
+    // background, and nothing else of the shadow reaches the live stream (3.3).
+    const withShadowNote = (e) => (e.type === 'routed' && !laya && client && shadowOn() ? { ...e, shadow: sidecar.isReady() ? 'answering' : 'not_running' } : e)
     // Each step also goes to the server log, which the Kz-harness app shows in its log window.
-    const onEvent = (e) => { entry.events.push({ ...e, text: line(e) }); emit?.(e); process.stdout.write(`[jev] ${redactLine(line(e))}\n`) }
+    const onEvent = (event) => { const e = withShadowNote(event); entry.events.push({ ...e, text: line(e) }); emit?.(e); logStep(line(e)) }
     try {
       const onTrace = (trace) => onEvent({ type: 'jev', at: Date.now(), trace })
+      // A call that did not answer is a line of its own, and never a usage row (2.4, 3.3).
+      const onError = (error) => onEvent({ type: 'decider-error', at: Date.now(), error })
       // Review runs on this same client (router's default createReview), so it shares key rotation and the usage log.
       // Offline: no Jev at all (fixed routing rule, deterministic review), so nothing waits on a dead network.
       // 'local' keeps Jev routing but only over local models; 'offline' also drops Jev.
@@ -992,46 +1472,19 @@ export function apply(ctx, config) {
       // The mirror of localOnly. The router drops it when offline or local-only is in force, so a
       // dead network reports the offline restriction rather than an empty agent pool.
       const remoteOnly = mode === 'online'
-      const offline = mode === 'offline' || await isOffline()
-      const jev = offline ? null : await makeJev({ onTrace, runId, emit: onEvent })
-      const agents = await enabledAgents()
-      await rotateSpentKeys(agents)
-      const quota = await quotaFor(agents)
-      const byId = new Map(agents.map((a) => [a.id, a]))
-      const accountOf = (a) => (kindOf(a) === 'subscription' ? usage.last()?.out?.[a.id]?.account?.email ?? null : accounts.activeKey(keyProviderOf(a)) ?? a.credentialRef ?? null)
-
-      const execute = async (agentDef, prompt, agentSignal, { effort: eff, speed } = {}) => {
-        // Claude Code and Codex executors take no per-run options: they read these from process.env
-        // when the run starts (Claude: SDK child env; Codex: patched turn/start, see README).
-        // ponytail: process-wide env, two workspaces starting Claude/Codex in the same instant can swap efforts.
-        if (agentDef.provider === 'claude-code') setEnv('CLAUDE_CODE_EFFORT_LEVEL', eff)
-        if (agentDef.provider === 'codex') { setEnv('KZ_CODEX_EFFORT', eff); setEnv('KZ_CODEX_SERVICE_TIER', codexServiceTier(speed)) }
-        const sub = await ctx.subagents.start(agentDef.provider, {
-          label: `jev:${agentDef.id}`,
-          prompt: [{ type: 'text', text: prompt }],
-          parent: agent,
-          signal: agentSignal,
-          ...(agentDef.persona ? { persona: agentDef.persona } : {}),
-          // In-process children see global tools; hide the router so an agent never re-routes its own task.
-          ...(agentDef.provider === 'spawn' && config.registerTool ? { toolFilter: { deny: ['jev_route'] } } : {}),
-          // Pin the model: a spawn child otherwise inherits the parent's (Jev) model and routes back into Jev.
-          ...(agentDef.llm?.provider && agentDef.llm?.model ? { agentOptions: { provider: agentDef.llm.provider, model: agentDef.llm.model, ...(eff ? { reasoningEffort: eff } : {}) } } : {}),
-        })
-        try {
-          const r = await sub.result
-          // A local run names the weights it ran on, so its history record keeps that version
-          // however late it is read back (a verdict an hour on, a backfill), never the one
-          // installed by then; profiles.js does not ask versionOf about a past run.
-          const version = versionOf(agentDef, agentDef.llm?.model ?? null)
-          return { stopReason: r.stopReason, diagnostic: r.diagnostic, answerText: textOf(r.output), usage: r.usage, ...(version ? { modelVersion: version } : {}) }
-        } finally {
-          await sub.dispose().catch(() => {})
-        }
-      }
-
-      // Which agents can be handed an image. A fact about their own tool loop, not a guess.
-      const seesImages = new Set()
-      for (const a of agents) if (await agentSeesImages(a.id).catch(() => false)) seesImages.add(a.id)
+      // Laya needs no network: offline it keeps deciding, and its own probe only narrows the pool
+      // to the local agents.
+      const offline = mode === 'offline' || await isOffline(decider)
+      const onWait = (text) => onEvent({ type: 'loading', at: Date.now(), text })
+      client = laya
+        ? await makeDecider('laya', { onTrace, onError, runId, emit: onEvent, onWait })
+        : offline ? null : await makeDecider('jev', { onTrace, onError, runId, emit: onEvent })
+      // A stopped Laya is started now, and the run waits for it with the Starting Laya line; one
+      // still starting after startWaitMs, or whose start failed, refuses the run as one that cannot
+      // be asked at all does, before anything has run (3.5). A later call that finds Laya down waits
+      // for its own start and, past that, fails as a timeout.
+      if (laya) await layaReady({ signal, onWait })
+      const { agents, ready, deps } = await runDepsFor({ agent, cwd, sessionId, runId, signal, onEvent })
 
       // What each resource actually is right now, through its provider's own adapter: its limits
       // in that provider's own terms, its economics, its hardware, how much to trust the figures.
@@ -1039,7 +1492,7 @@ export function apply(ctx, config) {
       const snapshots = config.routing?.enabled === false ? [] : snapshotResources({
         agents,
         usage: usage.last()?.out ?? {},
-        ready: await readiness(),
+        ready,
         config,
         specs: await specs().catch(() => null),
         now: Date.now,
@@ -1059,72 +1512,131 @@ export function apply(ctx, config) {
         config: { ...config, agents, effort: await readEffort() },
         signal,
         deps: {
-          ready: await readiness(),
-          jev,
+          ...deps,
+          // Whoever decides, and always its record beside it, so the run's bars are its bars even
+          // when there is no client (docs/laya-auto.md 2.4).
+          decider: client,
+          provider: laya ? LAYA : providers.jev,
+          runId,
           offline,
           localOnly,
           remoteOnly,
-          jevUnavailableReason: offline ? (mode === 'offline' ? 'offline mode: local models and checks only' : 'offline: no internet, checks only') : `${config.credentialRef} not configured`,
-          // Capability routing: what each executor on this machine really is, so code can drop
-          // the ones that cannot do this request before Jev is asked (and check its pick after).
-          executors: executorsFrom({
-            agents,
-            tools: config.tools ?? [],
-            chat: await chatPair(),
-            seesImages: (id) => seesImages.has(id),
-            economics: config.resources?.economics ?? {},
-          }),
+          jevUnavailableReason: laya ? 'Laya unavailable' : offline ? (mode === 'offline' ? 'offline mode: local models and checks only' : 'offline: no internet, checks only') : `${config.credentialRef} not configured`,
+          // Where Laya ran its calls, for the report's lines.
+          ...(laya ? { deciderDevice: () => sidecar.connection()?.device ?? sidecar.status().running?.device ?? null } : {}),
           inputModalities: modalities ?? ['text'],
           // The decision engine. Absent (routing switched off) the loop asks Jev directly, the
           // way it did before any of this existed.
+          // A Laya-decided run's samples go to Laya's store, and its review decides the outcome
+          // domain for Laya into that store (6.3).
           ...(config.routing?.enabled === false ? {} : {
             decide: async (args) => {
-              const d = await decisions.decide({ ...args, versionOf, snapshots })
+              const d = await decisions.decide({ ...args, versionOf, snapshots, ...(laya ? { sink: layaStore } : {}) })
               decisionSamples = d.samples ?? []
               return d
             },
-            outcomeDomain: outcomeDomain(),
+            outcomeDomain: laya ? layaOutcomeDomain() : outcomeDomain(),
           }),
-          execute,
-          runTool: runTool(cwd, config.agentTimeoutMs),
-          modelOf,
-          emit: onEvent,
           history,
-          quota,
-          isLimitError: detectLimit,
-          onLimit: (agentId, info) => onLimit(byId.get(agentId), info),
-          // Only metered keys need re-reading; a subscription's window is rationed by the gate,
-          // and a local model costs nothing.
-          checkBalance: async (agentId) => {
-            const a = byId.get(agentId)
-            if (!a || kindOf(a) !== 'api') return null
-            const snap = await usage.snapshot([a], { force: true }).catch(() => null)
-            const q = snap?.[agentId]
-            return q ? { state: q.state, balance: q.balance ?? null, until: q.until ?? null } : null
-          },
-          logAttempt: (entry) => {
-            // This run's id (shared with its Jev call lines) and normalized token counts win over the router's.
-            const { tokens: u, runId: _routerRunId, answerText: _a, ...rest } = entry
-            const a = byId.get(entry.agent)
-            return usage.logAttempt({
-              ...rest, runId, sessionId, workspace: cwd, provider: a?.provider ?? null, account: a ? accountOf(a) : null,
-              tokens: u ? { input: u.inputTokens ?? u.input ?? 0, output: u.outputTokens ?? u.output ?? 0, cacheRead: u.cacheReadTokens ?? u.cacheRead ?? 0, reasoning: u.reasoningTokens ?? u.reasoning ?? 0 } : null,
-              costUsd: rest.costUsd ?? null, quotaBefore: quota[entry.agent]?.summary ?? null, quotaAfter: usage.last()?.out?.[entry.agent] ? summaryOf(usage.last().out[entry.agent]) : null,
-            }).catch(() => {})
-          },
         },
       })
       // What the run proved, recorded after the fact: capability evidence per resource, and the
       // label each routing decision earned. Never on the run's critical path, and never fatal.
-      learnFrom(result, decisionSamples).then(maybeRetrain).catch(() => {})
+      // A Laya-decided run gives the Jev domains nothing new to evaluate, and their evaluation pass
+      // stamps and saves every Jev domain state, so only Laya's own pass follows it (2.4, 6.7).
+      learnFrom(result, decisionSamples).then(() => {
+        if (!laya) maybeRetrain()
+        maybeStanding()
+      }).catch(() => {})
       return withRunMark(formatReport(result), result.runId)
     } catch (err) {
       onEvent({ type: 'error', at: Date.now(), message: err.message })
       throw err
     } finally {
+      if (laya) sidecar.release(runId)
       active.delete(key)
       release()
-      stoppers.delete(entry.id)
+      stoppers.delete(runId)
+    }
+  }
+
+  // Each agent at high effort and Codex at its normal service tier, whatever Settings say, so the
+  // spend the confirmation states cannot change after it and a score does not move when Settings
+  // do; one work attempt, no review and one round, so no other agent is ever scored for it
+  // (docs/benchmark.md 3.8).
+  const BENCHMARK_EFFORT = Object.freeze({ default: 'high', perAgent: {}, codexSpeed: 'normal' })
+  const BENCHMARK_LIMITS = Object.freeze({ maxAttempts: 1, maxReviews: 0, maxRounds: 1 })
+
+  /**
+   * One task of the capability benchmark through the normal run path (docs/benchmark.md 3.8): the
+   * agent forced, in the task's `folder`, started with the scratch chat's root agent `owner` as its
+   * parent, with no decider, no Jev or Laya call and no routing sample, and a history that keeps
+   * the run's record for the task's row and writes nothing to history.jsonl. It takes the lane of its
+   * own folder, so it counts under the cap on tasks at once, is logged under the scratch session
+   * like any run and can be stopped from the inspector. `git` is the environment every git call on
+   * the folder runs with (benchmark.js gitEnv). Resolves to { record, executed, error, stoppedBy },
+   * never rejecting: what the run came to is benchmark.js's to read.
+   */
+  async function runBenchmarkTask({ agent: agentDef, owner, session, folder, git, prompt, benchmarkRunId, signal, onWait, onStart }) {
+    const executed = []
+    let record = null
+    let release = null
+    const stop = new AbortController()
+    const runId = randomUUID()
+    const runSignal = AbortSignal.any([signal, stop.signal])
+    // Who stopped the task, if anyone: the person from the inspector, or the benchmark's own Stop.
+    const stoppedBy = () => (stop.signal.aborted ? 'person' : signal.aborted ? 'benchmark' : null)
+    try {
+      release = await lanes.acquire(laneKey(folder), `benchmark-${runId}`, signal, { onWait: (why) => onWait?.(WAITING[why]) })
+      onStart?.()
+      const entry = logRun(session, prompt, runId)
+      stoppers.set(runId, stop)
+      const onEvent = (e) => { entry.events.push({ ...e, text: line(e) }); logStep(line(e)) }
+      try {
+        const { agents, deps } = await runDepsFor({ agent: owner, cwd: folder, sessionId: session, runId, signal: runSignal, onEvent, purpose: 'benchmark', benchmarkRunId, onExecuted: (r) => executed.push(r) })
+        await runRouted({
+          task: prompt,
+          cwd: folder,
+          sessionId: session,
+          forceAgent: agentDef.id,
+          config: {
+            ...config,
+            agents,
+            effort: BENCHMARK_EFFORT,
+            limits: BENCHMARK_LIMITS,
+            // The task's own test script decides the run's own status and is recorded; the grade
+            // decides the score. It runs the agent's code with the environment the engine gives the
+            // agents' own processes, so no key of KzH's is within its reach.
+            checks: { enabled: true, scripts: ['test'], timeoutMs: 120_000, outputChars: config.checks?.outputChars ?? 3000, env: agentEnv() },
+            // Every git call on the task folder runs with the environment benchmark.js gives it: the
+            // folder's repository, kept outside the scratch root where no agent writes, and no key
+            // of KzH's (docs/benchmark.md 3.7).
+            git: { env: git },
+          },
+          signal: runSignal,
+          deps: {
+            ...deps,
+            decider: null,
+            provider: providers.jev,
+            runId,
+            offline: false,
+            jevUnavailableReason: 'the capability benchmark asks no decider',
+            history: { recent: async () => [], records: async () => [], feedback: async () => [], append: async (r) => { record = r } },
+          },
+        })
+      } catch (err) {
+        onEvent({ type: 'error', at: Date.now(), message: err.message })
+        throw err
+      }
+      // runRouted() returns without throwing after a stop too: when the provider settles the stopped
+      // attempt as aborted rather than rejecting, and when the stop lands after the attempt, while
+      // the router's git and checks read it as a failure. A stop is a stop either way.
+      return { record, executed, stoppedBy: stoppedBy() }
+    } catch (err) {
+      return { record, executed, error: err, stoppedBy: stoppedBy() }
+    } finally {
+      stoppers.delete(runId)
+      release?.()
     }
   }
 
@@ -1133,6 +1645,8 @@ export function apply(ctx, config) {
   // at a time per workspace (a lane) so two agents never edit the same folder.
   // The result is posted into the chat on the session's next turn.
   const lanes = createLanes()
+  // The budget's cap on tasks at once, across every workspace. Changes arrive through onSettings.
+  local.readSettings().then((s) => lanes.setMax(s.maxConcurrentTasks), () => {})
 
   // The delivery path lives in its own module so it can be tested (test/delivery.test.js): it is
   // the path a person's result travels, and inside this closure it had no test at all. It needs
@@ -1159,11 +1673,12 @@ export function apply(ctx, config) {
     run: (t, { signal, emit, onEntry }) => {
       // Read before the first emit: `t.agent` becomes the agent the router picked.
       const forceAgent = t.agent ?? undefined
-      // Only say "waiting" when something is actually ahead of it.
-      if (lanes.busy(laneKey(t.workspace))) emit({ type: 'queued' })
-      return lanes.acquire(laneKey(t.workspace), t.jobId, signal).then(async (release) => {
+      // Only say "waiting" when it will wait, and what for: its workspace, or the cap on tasks at once.
+      return lanes.acquire(laneKey(t.workspace), t.jobId, signal, { onWait: (why) => emit({ type: 'queued', text: WAITING[why] }) }).then(async (release) => {
         try {
-          return await route({ task: t.task, agent: t.owner, forceAgent, effort: t.effort ?? undefined, mode: t.mode ?? 'auto', laneHeld: true, modalities: t.modalities ?? ['text'], signal, emit, onEntry })
+          // Whoever the task was queued for decides it, and route() asks now whether Laya can be
+          // asked, however long ago the task was queued.
+          return await route({ task: t.task, agent: t.owner, forceAgent, effort: t.effort ?? undefined, mode: t.mode ?? 'auto', decider: t.decider ?? 'jev', laneHeld: true, modalities: t.modalities ?? ['text'], signal, emit, onEntry })
         } finally { release() }
       })
     },
@@ -1190,15 +1705,22 @@ export function apply(ctx, config) {
     // `modalities` rides along: dropped here the task record falls back to text, the capability
     // filter stops requiring image support, and an attached picture reaches an agent that is blind to it.
     enqueue({ agent, task, effort, forceAgent, mode, sessionId, modalities }) {
+      // The adapter's second argument: `decider`, the row's, kept on the task so it decides the run
+      // whenever it starts, and `why`, the reason a message the decider could not sort was queued
+      // as a task, said in the line. Read from `arguments` so this signature stays the one
+      // test/tasks.test.js checks the task's own fields against.
+      const { decider = 'jev', why } = arguments[1] ?? {}
       const cwd = agent?.session?.header?.cwd
       if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
+      if (inScratch(cwd)) throw new Error(SCRATCH_ONLY)
       // sessionId comes from the caller that will also read the results back.
-      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode, modalities })
+      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode, decider, modalities })
       if (!t) return null
       // Counted, not read from the lane: the job joins the lane a tick after enqueue returns.
       const key = laneKey(cwd)
       const ahead = tasks.list().filter((x) => x.jobId !== t.jobId && laneKey(x.workspace) === key && !TERMINAL_STATES.includes(x.state)).length
-      return queuedLine({ jobId: t.jobId, agent: t.agent, position: ahead ? ahead + 1 : 0, workspace: cwd })
+      // Nothing ahead in this workspace can still mean waiting: the cap on tasks at once may be full.
+      return queuedLine({ jobId: t.jobId, agent: t.agent, position: ahead ? ahead + 1 : lanes.waits(key) ? 1 : 0, workspace: cwd, decider: t.decider, why })
     },
   }
 
@@ -1244,6 +1766,20 @@ export function apply(ctx, config) {
       try { return { kind: 'success', text: await route({ task, agent, signal }) } } catch (err) { return { kind: 'error', text: `jev-router: ${err.message}` } }
     },
   })
+  // One task to Laya from any session, a Jev Auto one included, for testing both together (2.4).
+  // When Laya cannot be asked it answers with the same reply Laya Auto gives.
+  ctx.commands.register({
+    name: 'laya',
+    description: 'Laya, the decision model on this PC, routes this task and reviews the result instead of Jev',
+    input: { hint: '<task>' },
+    handler: async ({ agent, rawInput, signal }) => {
+      const task = rawInput.trim()
+      if (!task) return { kind: 'error', text: 'Usage: /laya <task>' }
+      try { return { kind: 'success', text: await route({ task, agent, signal, decider: 'laya' }) } } catch (err) {
+        return { kind: 'error', text: err instanceof LayaUnavailable ? err.message : `jev-router: ${err.message}` }
+      }
+    },
+  })
   for (const a of config.agents.filter((x) => x.enabled)) {
     ctx.commands.register({
       name: a.id,
@@ -1282,6 +1818,8 @@ export function apply(ctx, config) {
 
   // Models the setup page offers for new BYOK agents: everything in Settings -> Models except Jev itself.
   let llm = null
+  // The engine's agents, for the capability benchmark's look-up of the chat it starts from.
+  let agentsApi = null
   async function modelProviders() {
     if (!llm) return []
     const out = []
@@ -1347,10 +1885,138 @@ export function apply(ctx, config) {
     return { providers, models, agents }
   }
 
+  // --- Laya on the model menu, the Laya card and the inspector's Laya views -
+  /**
+   * The Laya Auto row's state (docs/laya-auto.md 3.1), or null while the row is not offered: Laya
+   * not installed, switched off, its settings invalid, or adaptive routing off. What a task costs
+   * is said once the device it runs on, or would start on, has measured every phase, whatever the
+   * state: a restart, an update or a start under way changes nothing this PC measured.
+   */
+  async function layaRow() {
+    if (!layaAskable() || config.routing?.enabled === false) return null
+    const s = sidecar.status()
+    const { measured, device: wanted } = sidecar.readSettings()
+    // Where it runs, else where it would start.
+    const device = s.running?.device ?? nextDevice(s, wanted)
+    return { state: s.state, device, ...layaCosts(measured[device]?.msPerToken), lastStartMs: measured[device]?.loadMs?.at(-1) ?? null }
+  }
+  // The device Laya would start on: the GPU where PyTorch has CUDA and the CPU was not picked.
+  const nextDevice = (s, wanted) => (s.installed?.cuda && wanted !== 'cpu' ? 'cuda' : 'cpu')
+
+  // What an install would get on this PC (7.2): PyTorch for the GPU where the driver runs one of
+  // the pinned CUDA builds, else for the CPU, and the disk and downloads it takes.
+  const layaOffer = async () => installOffer(pins, await specs().catch(() => null))
+
+  /**
+   * GET /jev-router/laya (8.4): the sidecar's status, the shadow's counters, and what the card
+   * reads beside them: what recover() did at start, the last check for a newer model, where Laya
+   * lives, what it would take at its next start, what a task costs it where it runs, until it is
+   * installed, what an install would get, and the two reasons Laya can be off apart, since each has
+   * its own remedy: an error in the laya block of cordis.patch.yml (`configError`), and the harness's
+   * own pins that could not be read (`pinsError`), which its update puts back. The supervisor holds
+   * either as its `configError`, so Laya reads as off for both.
+   */
+  async function layaStatus() {
+    const s = sidecar.status()
+    const { measured, device } = sidecar.readSettings()
+    const job = installer?.status().job
+    return {
+      ...s,
+      running: s.running ? { ...s.running, ...layaCosts(measured[s.running.device]?.msPerToken) } : null,
+      shadow: shadow.counters(),
+      recovered: installer?.status().message ?? null,
+      configError: layaError ?? null,
+      pinsError,
+      weights: job?.kind === 'weights' && job.weights ? job.weights : null,
+      paths: { engine: sidecar.paths.engine, models: sidecar.paths.models },
+      need: {
+        device: nextDevice(s, device),
+        cpu: { ramGB: measured.cpu.ramGB ?? pins?.ramEstimateGB?.cpu ?? null },
+        cuda: { ramGB: measured.cuda.ramGB ?? pins?.ramEstimateGB?.cuda ?? null, vramGB: measured.cuda.vramGB ?? pins?.vramEstimateGB ?? null },
+      },
+      ...(s.installed ? {} : { offer: await layaOffer() }),
+    }
+  }
+
+  /**
+   * Test Laya (4.6): its fixed calls through the real Laya client and adapter, starting Laya when
+   * it is stopped and holding it while they run. The result goes to laya.json and the card; it
+   * gates nothing.
+   */
+  async function layaSelfTest() {
+    layaUnavailable('intent')
+    sidecar.hold('selftest')
+    try {
+      await afterStartup()
+      const conn = await sidecar.ensureReady({})
+      const client = layaClient.client('act')
+      const result = await runSelfTest((body, o) => client.systemOne(body, o), { identity: layaClient.identity(), device: conn.device })
+      await sidecar.noteSelfTest(result)
+      return result
+    } finally { sidecar.release('selftest') }
+  }
+
+  /** The routes under /jev-router/laya (8.4). A long job (an install, an update, a repair) answers once it has begun, and the card follows it through GET /jev-router/laya. */
+  async function layaRoute(req, url, send) {
+    const op = url.pathname.slice('/jev-router/laya'.length)
+    if (req.method === 'GET') {
+      if (op === '') return send(200, await layaStatus())
+      if (op === '/log') {
+        const n = Math.min(500, Math.max(1, Math.trunc(Number(url.searchParams.get('lines'))) || 200))
+        // An install that failed says why in its own lines; otherwise laya.serve's log.
+        const s = sidecar.status()
+        return send(200, { lines: s.state === 'install_failed' ? (installer?.status().job?.lines ?? []).slice(-n) : sidecar.logTail(n) })
+      }
+      if (op === '/shadow') {
+        const runId = url.searchParams.get('runId')
+        if (!runId) return send(400, { error: 'runId: the run id' })
+        return send(200, { rows: shadow.read({ runId }), waiting: shadow.waiting({ runId }) })
+      }
+      if (op === '/compare') {
+        const days = url.searchParams.get('days') ?? '7'
+        const identity = url.searchParams.get('identity') ?? 'current'
+        if (days !== 'all' && !(Number.isInteger(Number(days)) && Number(days) > 0)) return send(400, { error: "days: a whole number of days, or 'all'" })
+        if (identity !== 'current' && identity !== 'all') return send(400, { error: "identity: 'current' or 'all'" })
+        const c = await shadow.compare({ days: days === 'all' ? 'all' : Number(days), identity })
+        // A PC where Laya cannot be asked and nothing was ever compared has nothing to put side by
+        // side: the Router tab shows no card, rather than a table of nothing (5.6).
+        if (!layaAskable() && !comparedAnything(c)) return send(404, { error: 'Laya cannot be asked on this PC, and nothing has been compared' })
+        return send(200, c)
+      }
+      return send(404, { error: 'not found' })
+    }
+    if (req.method !== 'POST') return send(404, { error: 'not found' })
+    const body = JSON.parse((await readBody(req)) || '{}')
+    if (op === '/settings') return send(200, await sidecar.setSettings(body))
+    if (op === '/selftest') return send(200, await layaSelfTest())
+    if (op === '/start') { await afterStartup(); await sidecar.start({ reason: 'user' }); return send(200, { ok: true }) }
+    if (op === '/stop') { await sidecar.stop({ reason: 'user' }); return send(200, { ok: true }) }
+    if (op === '/restart') { await afterStartup(); await sidecar.restart({ reason: 'user', device: body.device }); return send(200, { ok: true }) }
+    const jobs = {
+      '/install': () => {
+        if (body.device !== 'gpu' && body.device !== 'cpu') throw new Error("device: 'gpu' or 'cpu'")
+        return installer.install({ device: body.device })
+      },
+      '/update': () => installer.update({ device: body.device }),
+      '/repair': () => installer.repair(),
+      '/weights/check': () => installer.checkWeights(),
+      '/weights/apply': () => installer.applyWeights(),
+    }
+    if (op === '/install/cancel') { installer?.cancel(); return send(200, { ok: true }) }
+    if (!jobs[op] && op !== '/remove') return send(404, { error: 'not found' })
+    if (!installer) return send(400, { error: pinsUnreadable(pinsError) })
+    if (installer.status().running) return send(409, { error: `Another Laya install is running (pid ${process.pid}).` })
+    // Removing is quick and the card waits for it; the rest take minutes and report as they go.
+    if (op === '/remove') { await installer.remove(); return send(200, { ok: true }) }
+    jobs[op]().catch(() => {})
+    return send(200, { ok: true })
+  }
+
   // "Jev Auto" in the model picker: every message goes straight to the router, no chat model in front.
   ctx.inject(['llm', 'agents'], (c) => {
     llm = c.llm
     llmRuntime = c
+    agentsApi = c.agents
     // Message transfer: the local chat model rewrites a finished result body into prose. Built
     // here because `c.llm` is what it streams through; it is asked only when a result settles.
     formatter = createFormatter({
@@ -1362,7 +2028,7 @@ export function apply(ctx, config) {
       reserveTokens: config.format?.reserveTokens ?? 2048,
       log: (m) => process.stdout.write(`[jev] ${m}\n`),
     })
-    c.effect(() => () => { llm = null; llmRuntime = null; formatter = null })
+    c.effect(() => () => { llm = null; llmRuntime = null; formatter = null; agentsApi = null })
     c.effect(() => c.llm.registerAdapter([JEV_PROVIDER], jevAdapter({
       ctx: c, route, classify, auxModel, isOffline, localChat, orchestrator, agents: enabledAgents,
       canSeeImages, agentSeesImages, handOffImages,
@@ -1378,8 +2044,13 @@ export function apply(ctx, config) {
           return { ...e, provider, model: model.join('/') }
         })
       },
-      // A question answered without an agent: the "Saved by Jev" estimate counts these.
-      onDirectAnswer: (durationMs, m) => usage.logAttempt({ agent: 'chat', role: 'direct-answer', durationMs, provider: m.provider, model: m.model }).catch(() => {}),
+      // A question answered without an agent: the "Saved by Jev" estimate counts these, only the
+      // ones that came through a row Jev decides (2.5).
+      onDirectAnswer: (durationMs, m, row) => usage.logAttempt({ agent: 'chat', role: 'direct-answer', durationMs, provider: m.provider, model: m.model, decider: row?.decider ?? 'jev' }).catch(() => {}),
+      // Laya Auto refuses a message at once when Laya cannot be asked, and is on offer, with what
+      // a task costs on this PC, only while it can (3.1, 3.5).
+      layaUnavailable,
+      layaRow,
     })))
     // Local models in the picker and for local agents: our own adapter, so a request can start llama-server first.
     c.effect(() => c.llm.registerAdapter([LOCAL_PROVIDER], localAdapter(local, { attachments: () => c.get?.('attachments') })))
@@ -1395,6 +2066,71 @@ export function apply(ctx, config) {
   // Effort settings from Settings -> Jev setup, over the Config defaults.
   const effortFile = join(dataDir, 'effort.json')
   const readEffort = async () => { try { return Config.dict.effort({ ...config.effort, ...JSON.parse(await readFile(effortFile, 'utf8').catch(() => '{}')) }) } catch { return config.effort } }
+
+  // --- The capability benchmark (docs/benchmark.md 3) -----------------------
+  // Its runner, over this plugin's own state: the agents, readiness, the quota and the usage figures
+  // the router reads, the capability registry it records into, and runBenchmarkTask, which runs one
+  // task through runRouted() as every run is run.
+  const excludedBy = (id) => {
+    const disabled = config.routing?.disabledResources ?? []
+    const allowed = config.routing?.allowedResources ?? []
+    return disabled.includes(id) ? 'disabled by configuration' : allowed.length && !allowed.includes(id) ? 'not in the allowed resources' : null
+  }
+  benchmark = createBenchmark({
+    scratchRoot,
+    file: join(dataDir, 'benchmark.jsonl'),
+    ...(benchmarkSeams.tasksDir ? { tasksDir: benchmarkSeams.tasksDir } : {}),
+    agents: enabledAgents,
+    readiness: () => readiness(),
+    quota: quotaFor,
+    // A provider that does not answer must not hold the card or the run: an ordinary read waits as
+    // the router's quota read does, a forced one (the spend before and after an agent) longer, and
+    // either falls back on the last snapshot.
+    usage: (list, { force = false } = {}) => Promise.race([
+      usage.snapshot(list, { force }).catch(() => null),
+      new Promise((done) => setTimeout(done, force ? 15_000 : 4000, null).unref?.()),
+    ]).then((snap) => snap ?? usage.last()?.out ?? {}),
+    usageLines: () => usage.lines(),
+    windowOf: (a) => local.contextOf(a.llm?.model),
+    subjectOf: (a) => subjectOf(a, { modelOf, versionOf, priors }),
+    capabilities,
+    priors,
+    policy,
+    learn: () => config.routing?.learn !== false,
+    runTask: runBenchmarkTask,
+    sessionAgent: (id) => { try { return agentsApi?.get?.(id) ?? null } catch { return null } },
+    listed: () => (workspaceRegistry?.list?.() ?? []).some((w) => typeof w?.path === 'string' && sameDir(w.path, scratchRoot)),
+    speedRunning: () => !!local.speedRunning?.(),
+    loadModel: (a) => local.start(a.llm?.model),
+    gateAt: (id) => config.policy?.gateAtPercent?.[id] ?? config.policy?.gateAtPercent?.default ?? 80,
+    excludedBy,
+    peak: config.pricing?.peak ?? {},
+    rateNow: (id) => pricingNow(config.pricing?.peak)[id] ?? null,
+    agentTimeoutMs: config.agentTimeoutMs,
+    log: (m) => process.stdout.write(`[jev] ${m}\n`),
+  })
+  // KzH closing stops a run: nothing records for an agent that had not finished.
+  ctx.effect(() => () => { benchmark?.stop() })
+
+  /** The routes under /jev-router/benchmark (docs/benchmark.md 3.12). A refusal answers with its own status. */
+  async function benchmarkRoute(req, url, send) {
+    const op = url.pathname.slice('/jev-router/benchmark'.length)
+    try {
+      if (req.method === 'GET' && op === '') {
+        const session = url.searchParams.get('session') || null
+        if (session !== null && !SESSION_ID.test(session)) return send(400, { error: 'session: a session id' })
+        return send(200, await benchmark.state({ session }))
+      }
+      if (req.method !== 'POST') return send(404, { error: 'not found' })
+      const body = JSON.parse((await readBody(req)) || '{}')
+      if (op === '/plan') return send(200, await benchmark.plan({ session: body.session, agents: body.agents }))
+      if (op === '/start') return send(200, await benchmark.start({ session: body.session, agents: body.agents, planId: body.planId }))
+      if (op === '/stop') { benchmark.stop(); return send(200, { ok: true }) }
+      return send(404, { error: 'not found' })
+    } catch (err) {
+      return send(err.status ?? 400, { error: err.message })
+    }
+  }
 
   // HTTP routes for the browser half (inspector tab, setup page), behind DSH's own Host/Origin/cookie checks.
   ctx.inject(['webServer', 'connection'], (c) => {
@@ -1450,6 +2186,10 @@ export function apply(ctx, config) {
             } catch (err) { return send(err.status ?? 500, { error: err.message }) }
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/names') return send(200, await displayNames())
+          // Laya's card, the inspector's Laya column and the side-by-side card (docs/laya-auto.md 8.4).
+          if (url.pathname === '/jev-router/laya' || url.pathname.startsWith('/jev-router/laya/')) return await layaRoute(req, url, send)
+          // The capability benchmark's card in the Router tab (docs/benchmark.md 3.12).
+          if (url.pathname === '/jev-router/benchmark' || url.pathname.startsWith('/jev-router/benchmark/')) return await benchmarkRoute(req, url, send)
           // The adaptive router's own state, for the Jev inspector: how far each routing domain
           // has matured and what is blocking the next rung, what the registry currently believes
           // each resource is good at and on what evidence, and what each provider's limits look
@@ -1471,7 +2211,8 @@ export function apply(ctx, config) {
                 lastUpdate: p.lastUpdate,
                 // Only the dimensions something is actually known about: an unknown one is
                 // reported as unknown rather than as a number nobody stands behind.
-                dimensions: Object.fromEntries(Object.entries(p.dimensions ?? {}).filter(([, d]) => d.prior || d.samples > 0)),
+                // A dimension only a benchmark has measured is known too: its rows are not runs.
+                dimensions: Object.fromEntries(Object.entries(p.dimensions ?? {}).filter(([, d]) => d.prior || d.samples > 0 || d.benchmark)),
               }
             })
             return send(200, {
@@ -1555,16 +2296,11 @@ export function apply(ctx, config) {
           // The verdict also becomes capability evidence here, once, for the run it is about
           // (creditVerdict): a run's own evidence was recorded when it ended, before anyone could
           // judge it. One queue, so the evidence is recorded in the order feedback.jsonl is
-          // written and a quick like-then-dislike cannot land the other way round.
+          // written and a quick like-then-dislike cannot land the other way round. All of that
+          // is postFeedback's (createFeedbackRoute), so the route is tested without a server.
           if (req.method === 'POST' && url.pathname === '/jev-router/feedback') {
-            let record
-            try { record = validFeedback(JSON.parse(await readBody(req))) } catch (err) { return send(400, { error: err.message }) }
-            const job = verdictQueue.then(async () => acceptVerdict(record, {
-              feedback, records: allRecords, capabilities, training, versionOf, agents: enabledAgents, priors, learn: config.routing?.learn !== false,
-              log: (m) => process.stdout.write(`[jev] ${m}\n`),
-            }))
-            verdictQueue = job.catch(() => {})
-            return send(200, { ok: true, record: await job })
+            const { status, body } = await postFeedback(await readBody(req))
+            return send(status, body)
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/feedback') {
             const session = url.searchParams.get('session')
@@ -1605,7 +2341,9 @@ export function apply(ctx, config) {
               resolveCredential(config.credentialRef).catch(() => undefined),
             ])
             return send(200, {
-              jev: { configured: !!jevKey?.value || !!accounts.activeKey('jev'), credentialRef: config.credentialRef },
+              // Where Jev calls go: TYPESAFE_BASE_URL still redirects Jev, and the card says so (8.1).
+              jev: { configured: !!jevKey?.value || !!accounts.activeKey('jev'), credentialRef: config.credentialRef, host: jevHostOf(), hostFromEnv: !!process.env.TYPESAFE_BASE_URL?.trim() },
+              laya: sidecar.status(),
               agents: agents.map((a) => ({ id: a.id, provider: a.provider, description: a.description, enabled: a.enabled, custom: !!a.custom, llm: a.llm?.provider ? a.llm : undefined, status: status[a.id] })),
               providers: await modelProviders(),
               tools: (config.tools ?? []).map((t) => ({ id: t.id, description: t.description, command: t.command, enabled: t.enabled })),
@@ -1673,12 +2411,21 @@ export function apply(ctx, config) {
           }
           // Local models: status for the Settings card, the picker's catalog, installs and removals (manifest ids only).
           if (req.method === 'GET' && url.pathname === '/jev-router/local') {
-            return send(200, { ...(await local.status()), online: connectivity.last()?.online ?? null })
+            return send(200, await localStatus({ local, lanes, online: connectivity.last()?.online ?? null }))
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/local/catalog') return send(200, await catalog())
           if (req.method === 'POST' && url.pathname.startsWith('/jev-router/local/')) {
             const b = JSON.parse((await readBody(req)) || '{}')
             const op = url.pathname.slice('/jev-router/local/'.length)
+            // The speed benchmark (docs/benchmark.md 2.10): Benchmark on a model's row sends its id,
+            // Benchmark all none. A refusal answers 400 with its reason, and 409 while a run goes.
+            if (op === 'benchmark') {
+              try { return send(200, { queued: await local.benchmark({ ids: b.ids }) }) } catch (err) { return send(err.status ?? 400, { error: err.message }) }
+            }
+            // Cancel: 200, also when nothing runs; 409 with why while the run puts the engine back.
+            if (op === 'benchmark/cancel') {
+              try { local.cancelBenchmark(); return send(200, { ok: true }) } catch (err) { return send(err.status ?? 400, { error: err.message }) }
+            }
             const ids = Array.isArray(b.ids) ? b.ids.map(String) : []
             if (op === 'start') await local.start(String(b.model ?? ''))
             else if (op === 'stop') await local.stop()
@@ -1743,6 +2490,14 @@ export async function workspaceDir(cwd, projectPaths) {
   return dir
 }
 
+/**
+ * GET /jev-router/local: the local models' status, whether this PC is online, and `slots`, how many
+ * runs hold a slot under the budget's cap on tasks at once and how many wait for one (lanes.slots()).
+ * The count comes from the lanes because that is where the cap is held: a count of background tasks
+ * would leave out the foreground /auto, /<agent> and jev_route runs the cap counts as well.
+ */
+export const localStatus = async ({ local, lanes, online }) => ({ ...(await local.status()), online, slots: lanes.slots() })
+
 /** One line for Jev and the log: windows, balance or spend. */
 function summaryOf(q) {
   const parts = (q.windows ?? []).map((w) => `${w.name} ${Math.round(w.usedPercent)}%`)
@@ -1753,9 +2508,67 @@ function summaryOf(q) {
 
 const sessionIdOf = (agent) => agent?.session?.id ?? agent?.session?.header?.id
 
+/**
+ * Laya's pins (config/laya.json) could not be read: a harness file, which the harness's update
+ * puts back, so this never points at the laya block in cordis.patch.yml as a settings error does.
+ */
+const pinsUnreadable = (message) => `Laya's pinned versions could not be read (${message}); run Update-Harness.ps1`
+
+/** A refusal of Laya as the reason one call could not be asked, in the Laya client's words (3.4). */
+export const layaReason = (err) => ({
+  not_installed: 'Laya is not installed on this PC',
+  disabled: 'Laya is switched off in the configuration',
+  invalid: `Laya's settings are invalid (${err?.detail})`,
+  pins: `Laya's pinned versions could not be read (${err?.detail})`,
+  routing_off: 'adaptive routing is off',
+  failed: `Laya stopped after an error (${err?.detail ?? 'unknown'})`,
+})[err?.reason] ?? String(err?.message ?? err)
+
+// The input tokens of what routing one task sends (its intent, its task group and its resource and
+// judgments call) and of Test Laya's review, rendered as the Laya client renders them: the sizes the
+// picker's figures are worked out over. Built once, on first use.
+let layaCallTokens = null
+const callTokens = () => {
+  if (layaCallTokens) return layaCallTokens
+  const tokens = (c) => renderForLaya(c, { role: 'act' }).reduce((n, r) => n + estimateRequestTokens(r), 0)
+  const of = (phase) => taskCalls().filter((c) => c.phase === phase).reduce((n, c) => n + tokens(c), 0)
+  layaCallTokens = { intent: of('intent'), route: of('route'), review: tokens(selfTestCalls().protocol.find((c) => c.name === 'review')) }
+  return layaCallTokens
+}
+
+/** Whether a comparison (8.4) holds anything: a Jev call Laya answered, skipped or failed in the background, or a run Laya decided. */
+function comparedAnything(c) {
+  const k = c?.skips ?? {}
+  const rows = (k.answered ?? 0) + (k.partial ?? 0) + (k.failed ?? 0) + Object.values(k.skipped ?? {}).reduce((a, n) => a + (n ?? 0), 0)
+  return rows > 0 || (c?.domains ?? []).some((d) => (d.layaAutoRuns?.runs ?? 0) > 0)
+}
+
+/**
+ * What a task and a review cost Laya on one device (docs/laya-auto.md 3.1): the measured ms per
+ * token of each phase (4.5) over what routing a task sends (its intent, its task group and its
+ * resource and judgments call), and over Test Laya's review for each attempt. `{}` until the device
+ * has a figure for every phase, which its first start measures.
+ * @param {{ intent?: number|null, route?: number|null, review?: number|null }} [msPerToken]
+ * @returns {{ routeMs?: number, reviewMs?: number }}
+ */
+export function layaCosts(msPerToken) {
+  const m = msPerToken ?? {}
+  if (!['intent', 'route', 'review'].every((p) => typeof m[p] === 'number' && Number.isFinite(m[p]))) return {}
+  const t = callTokens()
+  return { routeMs: Math.round(t.intent * m.intent + t.route * m.route), reviewMs: Math.round(t.review * m.review) }
+}
+
 // Model text can quote anything; mask key-shaped strings before they reach the log.
 // One redaction rule for the log and the export, so a provider added to one covers both.
 const redactLine = redactSecrets
+
+/**
+ * One step of a run to the server log. A step can be several lines (a Laya call with its device and
+ * flat answers, a routed step with the shadow's note), and the Kz-harness app reads the log line by
+ * line, filing a line as the router's only by its own `[jev] ` prefix (app/main.js levelOf), so
+ * every line carries it.
+ */
+const logStep = (text) => { for (const l of redactLine(text).split('\n')) process.stdout.write(`[jev] ${l}\n`) }
 
 // Writes must declare a JSON body: a cross-site form cannot send one without a CORS preflight.
 export const isJsonRequest = (req) => String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase() === 'application/json'

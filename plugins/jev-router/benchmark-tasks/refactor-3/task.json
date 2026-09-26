@@ -1,0 +1,16 @@
+{
+  "id": "refactor-3",
+  "skill": "refactor",
+  "level": 3,
+  "dimensions": ["coding"],
+  "folder": "config-files",
+  "prompt": "Convert the callback API in src/ to promises.\nEvery exported function that takes a callback as its last argument should instead take no callback and return a promise that resolves to the value the callback received, or rejects with the error it received.\nUse async and await inside, and node:fs/promises instead of the callback functions of node:fs.\nKeep every function's name, arguments and results otherwise the same, and update src/index.js, which uses them, in the same way.\nDo not change package.json or fixtures/.",
+  "protect": ["package.json", "fixtures/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/promises.test.js": 8
+    }
+  }
+}

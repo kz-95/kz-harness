@@ -87,8 +87,8 @@ export function taskTextFeatures(task, { context = {}, modalities = ['text'] } =
 
 /**
  * Features of a task profile (the task classifier's output), for the domains that decide what
- * to do about it: strategy, conservation, second opinion, frontier escalation. Everything here
- * is known before any resource runs.
+ * to do about it: strategy, second opinion, frontier escalation. Everything here is known before
+ * any resource runs.
  */
 export function profileFeatures(profile = {}) {
   const numeric = { complexity: num(profile.complexity, 0.5), risk: num(profile.risk, 0.5) }

@@ -1,7 +1,11 @@
 // Time-of-day pricing: which agents are on their cheap rate right now.
 // DeepSeek's discount window wraps past midnight UTC, which is the part that breaks.
+// Also what a decision costs, which the provider that made it sets.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { inUtcWindow, pricingNow } from '../router.js'
 
 const utc = (h, m = 0) => Date.UTC(2026, 0, 15, h, m)
@@ -67,4 +71,25 @@ test('pricingNow: a window it cannot read tells Jev nothing, even outside peak h
   assert.equal('broken' in pricingNow(broken, utc(2)), false)
   assert.deepEqual(pricingNow({ empty: { windowsUtc: [] } }, utc(9)), {}, 'no windows, nothing said')
   assert.deepEqual(pricingNow(), {}, 'nothing configured, nothing said')
+})
+
+test('a decision is priced by the provider that made it: Jev per input token, Laya at $0', async () => {
+  const usageJs = await import('../usage.js')
+  const usage = usageJs.createUsage({ dataDir: mkdtempSync(join(tmpdir(), 'kz-price-')), accounts: {} })
+  assert.equal(typeof usage.logDecision, 'function', 'usage.js prices a decision by its provider record')
+  const { JEV_USD_PER_INPUT_TOKEN, resolveProviders } = await import('../providers.js')
+  const { jev, laya } = resolveProviders({}, {})
+  assert.equal(jev.usdPerInputToken, 0.042 / 1e6)
+  assert.equal(laya.usdPerInputToken, 0)
+  assert.equal(usageJs.JEV_USD_PER_INPUT_TOKEN, JEV_USD_PER_INPUT_TOKEN, 'one price, wherever it is read from')
+  await usage.logDecision({ provider: jev, phase: 'route', tokens: { input: 2_000_000, output: 40 } })
+  await usage.logDecision({ provider: laya, phase: 'route', tokens: { input: 2_000_000, output: 0 } })
+  const [j, l] = await usage.lines()
+  assert.ok(Math.abs(j.costUsd - 0.084) < 1e-12, `Jev: ${j.costUsd}`)
+  assert.equal(l.costUsd, 0, 'Laya runs on this PC')
+  // However many tokens Laya counted, nothing prices them at Jev's rate.
+  const { periods: { all } } = usageJs.computeSavings([l], [], {}, Date.now())
+  assert.equal(all.jevCostUsd, 0)
+  assert.equal(all.llmCostUsd, 0)
+  assert.equal(all.decisions, 0)
 })

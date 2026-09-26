@@ -16,11 +16,17 @@
 // performance and label quality its risk class demands; an out-of-distribution input goes to Jev
 // whatever the classifier's confidence says; and a critical failure drops the domain to
 // JEV_PRIMARY immediately. Local authority is a privilege the evidence keeps paying for.
+//
+// A run Laya decides (docs/laya-auto.md 6.3) goes through the same decide(), told so by
+// `answeredBy`: Laya answers every domain it is asked, the rules decide the rest, the local
+// classifier is only recorded beside it, and the ladder is left exactly as it was. Laya is never a
+// teacher, so nothing it answers can move a rung, and its samples go to a store of their own.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import {
   FEATURE_SCHEMA_VERSION, calibrate, calibrationMetrics, evaluate, loadArtifact, predict, rank, saveArtifact, trainMulticlass, trainRanker, verifyArtifact,
 } from './classifier.js'
+import { TEACHER, providerName } from './providers.js'
 import { MATURITY, gatesFor, resolvePolicy } from './routing-policy.js'
 
 /** The ladder, in order. ROLLBACK is a state, not a rung: it is where a domain waits to re-earn one. */
@@ -37,7 +43,9 @@ export const SEVERITIES = Object.freeze(['critical', 'severe', 'significant', 'm
  * to the verified count at each rung re-earned on the way, and a window only counts
  * with verified rows that arrived after the last one counted (`windowSamples`,
  * `badWindowSamples`). A version 2 file has neither, and the windows it counted may have been the
- * same evidence evaluated twice.
+ * same evidence evaluated twice. Each of these counts is `samples.seen`, every verified row the
+ * domain has had, the ones the training store's cap has let go of included. Before the cap that
+ * was the verified count, so a file of any version needs nothing converted.
  */
 export const STATE_VERSION = 3
 
@@ -46,6 +54,10 @@ export const STATE_VERSION = 3
 const MIN_DRIFT_BINS = 3
 // How many recent observations a drift reading needs before it means anything.
 const MIN_DRIFT_SAMPLES = 30
+// The domains where an answer a provider marks too flat to use still decides. The outcome domain's
+// disposition only labels the sample: what the review does comes from the provider's yes/no
+// answers (jev-review), so a flat disposition is no reason to throw its review away.
+const FLAT_STILL_DECIDES = new Set(['outcome_disposition'])
 
 const nextRung = (state) => LADDER[LADDER.indexOf(state) + 1] ?? null
 /** The higher of two states on the ladder; anything off it (null, ROLLBACK) is below every rung. */
@@ -53,7 +65,10 @@ const higherRung = (a, b) => (LADDER.indexOf(b) > LADDER.indexOf(a) ? b : LADDER
 const isLocal = (state) => LOCAL_STATES.includes(state)
 const r3 = (x) => (typeof x === 'number' ? Math.round(x * 1000) / 1000 : x)
 const num = (v, fallback = 0) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback)
-/** How many verified samples an artifact was trained from: the whole history it saw, all slices. */
+/**
+ * How many verified samples the domain had when an artifact was trained, counted as `samples.seen`
+ * is: the whole history, all slices, the rows the store's cap had let go of by then included.
+ */
 const trainedFrom = (a) => (a ? num(a.extras?.verifiedSamples, num(a.sampleCount)) : 0)
 
 /**
@@ -196,7 +211,10 @@ function trainingItem(row, kind) {
 export function splitRows(rows, split) {
   const n = rows.length
   const trainEnd = Math.floor(n * split.train)
-  const valEnd = trainEnd + Math.floor(n * split.validation)
+  // With no holdout share every row the training slice leaves is validation. Flooring both
+  // shares could otherwise leave a row over, and that row became a one-row holdout slice that the
+  // holdout gate was scored on, instead of falling back to the validation slice as it should.
+  const valEnd = split.holdout > 0 ? trainEnd + Math.floor(n * split.validation) : n
   return { train: rows.slice(0, trainEnd), validation: rows.slice(trainEnd, valEnd), holdout: rows.slice(valEnd) }
 }
 
@@ -232,6 +250,13 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
   if (!spec) throw new Error(`routing domain: unknown domain ${domain}`)
   const gates = gatesFor(policy, domain)
   const kind = spec.kind
+  // Whether this domain's local classifier may ever decide (routing-policy.js DOMAINS). Where it
+  // may not, it still answers and climbs, so its standing stays measured, but no rung lets it act.
+  const localDecides = spec.localDecides !== false
+  // Whether a rule in code is this domain's authority rather than a teacher (routing-policy.js
+  // DOMAINS). Such a domain asks no teacher, whatever a caller hands it, and the rule decides
+  // wherever the local classifier does not.
+  const codeTaught = spec.teacher === 'code'
   const artifactFile = artifactsDir ? join(artifactsDir, `${domain}.json`) : null
   const previousFile = artifactsDir ? join(artifactsDir, `${domain}.previous.json`) : null
 
@@ -278,12 +303,12 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
   }
 
   /**
-   * Walk to `next`, up or down. `samples` is the verified count AT this moment, and only a caller
-   * holding a fresh count can supply it: the last evaluation's count is the count from BEFORE the
-   * rows that caused the rollback, so reading it here would credit exactly those rows as the new
-   * evidence that undoes the rollback. A caller with no count of its own (a critical failure, an
-   * unfamiliar input, an artifact that will not load) passes none, and the rollback point stays
-   * null until the next evaluate() fixes it against the store.
+   * Walk to `next`, up or down. `samples` is the verified count (`samples.seen`) AT this moment,
+   * and only a caller holding a fresh count can supply it: the last evaluation's count is the
+   * count from BEFORE the rows that caused the rollback, so reading it here would credit exactly
+   * those rows as the new evidence that undoes the rollback. A caller with no count of its own (a
+   * critical failure, an unfamiliar input, an artifact that will not load) passes none, and the
+   * rollback point stays null until the next evaluate() fixes it against the store.
    */
   const setMaturity = (next, { reason, severity = null, samples = null } = {}) => {
     if (state.maturity === next) return
@@ -316,8 +341,12 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
     persist()
   }
 
-  /** The local prediction for one input, or null when there is no usable artifact. */
-  const localAnswer = (features, candidates) => {
+  /**
+   * The local prediction for one input, or null when there is no usable artifact. `readOnly` (a
+   * run another provider decides) leaves a prediction that throws for the next decision that may
+   * act on it: the artifact and the ladder stay as they are.
+   */
+  const localAnswer = (features, candidates, { readOnly = false } = {}) => {
     if (!artifact) return null
     try {
       if (kind === 'ranking') {
@@ -332,6 +361,7 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       const p = predict(artifact, features, { ood: policy.ood })
       return { label: p.label, probabilities: p.probabilities, confidence: p.confidence, rawConfidence: p.rawConfidence, margin: p.margin, ood: p.ood, artifactVersion: artifact.classifierVersion }
     } catch (err) {
+      if (readOnly) return null
       // A prediction that throws is a broken artifact, not an unlucky input: stop trusting it.
       artifactReason = `prediction failed: ${err.message}`
       artifact = null
@@ -365,6 +395,86 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
   }
   const oodRate = () => (state.oodRecent.n ? state.oodRecent.flagged / state.oodRecent.n : 0)
 
+  /**
+   * One decision of a run another provider decides (docs/laya-auto.md 6.3); `ask` is that
+   * provider's call. The ladder is read-only here: nothing notes an unfamiliar input, moves a rung
+   * or writes the state, because the provider is no teacher and its run says nothing about the
+   * rung. The local classifier answers and is recorded beside, and never decides at any rung: the
+   * owner decided that this provider decides, and a classifier Jev taught deciding would put Jev's
+   * teaching back into the run. A domain a rule decides is decided by its rule, as in any run.
+   * Every other domain takes the provider's answer, or the deterministic one when it gave none,
+   * failed, or marked its answer too flat to act on. The sample goes to `sink`, the provider's own
+   * store, with the answer as `provider` and no teacher.
+   */
+  async function decideFor(answeredBy, { features, candidates, ask, fallback, codeAuthority, context, sink }) {
+    const name = providerName(answeredBy)
+    if (!sink) throw new Error(`routing domain ${domain}: a ${name} decision needs the store its sample goes to`)
+    const local = localAnswer(features, candidates, { readOnly: true })
+    const unfamiliar = unfamiliarCandidates(candidates)
+    const ood = {
+      flag: !!local?.ood?.flag || unfamiliar.length > 0,
+      reasons: [...(local?.ood?.reasons ?? []), ...unfamiliar.map((k) => `unfamiliar_candidate:${k}`)],
+    }
+    const beside = local ? `; the local classifier is recorded beside it and never decides a ${name} run` : ''
+    let authority = codeAuthority ? 'code' : 'fallback'
+    let provider = null
+    let answer = null
+    let reason
+    if (ask) {
+      try {
+        provider = await ask()
+        if (!provider) reason = `${name} had no answer for this question; using the deterministic fallback`
+        else if (provider.informative === false && !FLAT_STILL_DECIDES.has(domain)) reason = `${name}'s answer was too flat to use`
+        else { authority = answeredBy; answer = provider; reason = `${name} decides this run${beside}` }
+      } catch (err) {
+        reason = `${name} unavailable (${err.message}); using the deterministic fallback`
+      }
+    } else {
+      reason = codeAuthority ? `a rule in code decides this domain${beside}` : `${name} was not asked this one; using the deterministic fallback`
+    }
+    if (!answer) {
+      answer = fallback ? fallback() : null
+      if (!answer) throw new Error(`routing domain ${domain}: nothing could decide and no fallback was given`)
+    }
+    let sampleId = null
+    try {
+      const row = await sink.append({
+        domain,
+        runId: context.runId ?? null,
+        input: { features, ...(candidates ? { candidates: candidates.map((c) => ({ key: c.key, id: c.id, features: c.features })) } : {}) },
+        teacher: null,
+        local: local ? { label: local.label, chosenKey: local.chosenKey, probabilities: local.probabilities ?? {}, confidence: num(local.confidence, 0), artifactVersion: local.artifactVersion ?? null, ood: !!ood.flag } : null,
+        authority,
+        ...(authority === 'code' ? { code: { label: answer.label, chosenKey: answer.chosenKey, probabilities: answer.probabilities ?? {}, confidence: num(answer.confidence, 0) } } : {}),
+        // What the provider said, whether or not it decided: an answer too flat to act on is kept
+        // with its flag, so a reading of the provider can leave it out rather than never see it.
+        provider: provider ? {
+          id: answeredBy, label: provider.label, chosenKey: provider.chosenKey, probabilities: provider.probabilities ?? {}, confidence: num(provider.confidence, 0),
+          informative: provider.informative !== false, model: provider.model ?? null, identity: provider.identity ?? null, lang: provider.lang ?? null,
+        } : null,
+        ...(extraOf(context.extra, { authority, answer, teacher: null, local, provider }) ?? {}),
+      })
+      sampleId = row.id
+    } catch (err) { log(`routing domain ${domain}: sample not recorded (${err.message})`) }
+    // No maturity: the local ladder's rung says nothing about a run this provider decided.
+    return {
+      authority,
+      label: answer.label,
+      chosenKey: answer.chosenKey,
+      probabilities: answer.probabilities ?? {},
+      confidence: num(answer.confidence, 0.5),
+      local,
+      teacher: null,
+      provider,
+      reason,
+      maturity: null,
+      requiredConfidence: gates.confidenceThreshold,
+      ood,
+      jevCalled: false,
+      sampleId,
+    }
+  }
+
   const api = {
     /** The domain's whole state, for the inspector. Pure read: nothing here decides anything. */
     state() {
@@ -373,11 +483,16 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
         ...state,
         // The counts belong at the top level: every reader wants them, and digging them out of
         // the last evaluation is how a view ends up reporting zero for a domain full of evidence.
-        samples: ev?.samples ?? { total: 0, verified: 0, outcomeBacked: 0, teacherOnly: 0, sinceRollback: 0, sinceArtifact: 0 },
+        samples: ev?.samples ?? { total: 0, verified: 0, seen: 0, outcomeBacked: 0, teacherOnly: 0, sinceRollback: 0, sinceArtifact: 0 },
         artifact: artifact
           ? { version: artifact.classifierVersion, createdAt: artifact.createdAt, sampleCount: artifact.sampleCount, classes: artifact.classes, featureSchemaVersion: artifact.featureSchemaVersion, calibration: artifact.calibration ? { temperature: artifact.calibration.temperature, ece: r3(artifact.calibration.ece), brier: r3(artifact.calibration.brier), highConfidenceErrorRate: r3(artifact.calibration.highConfidenceErrorRate), n: artifact.calibration.n } : null, validation: artifact.validation ?? null }
           : null,
         artifactReason: artifact ? null : artifactReason,
+        // Read by the Router tab, which would otherwise describe this domain's rung as authority
+        // its classifier never gets.
+        localDecides,
+        // Likewise: where a rule in code decides, the rungs a teacher holds elsewhere are the rule's.
+        teacher: codeTaught ? 'code' : 'jev',
         requiredConfidence: gates.confidenceThreshold,
         oodRate: r3(oodRate()),
         progress: progressOf(ev),
@@ -395,10 +510,27 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
      * @param {boolean} [p.codeAuthority]  the deterministic answer IS this domain's authority (a
      *   rule in code decides it, as the resource ranking does), so it is reported as `code`
      *   rather than `fallback`, which means the opposite: nobody could decide
+     * @param {boolean} [p.localMayDecide]  false keeps the local classifier from deciding this
+     *   one at any rung: it still answers, and its answer is recorded on the sample and returned
+     *   beside the one that decided, for comparison. The ladder is still walked, so its standing
+     *   stays measured, but it buys the classifier nothing. A domain whose policy says
+     *   `localDecides: false` is held to that whatever this says: a caller can narrow the
+     *   classifier's standing, never widen it
+     *   A domain whose policy says `teacher: 'code'` is held to `codeAuthority`, and the teacher
+     *   call is ignored: the rule is its authority, not a stand-in for one
      * @param {object} [p.context]    `extra` is stored on the training sample
-     * @returns {Promise<object>} `{ authority, label|chosenKey, probabilities, confidence, local, teacher, reason, maturity, requiredConfidence, ood, jevCalled, sampleId }`
+     * @param {string} [p.answeredBy]  who answers this run: `jev`, the teacher, by default. Anything
+     *   else (`laya`) is a run that provider decides, and `jev` is then its call: see decideFor.
+     *   An answer the call marks `informative: false` is too flat to act on
+     * @param {object} [p.sink]       the store the sample goes to: this domain's own by default, and
+     *   required when `answeredBy` is not the teacher
+     * @returns {Promise<object>} `{ authority, label|chosenKey, probabilities, confidence, local, teacher, reason, maturity, requiredConfidence, ood, jevCalled, sampleId }`,
+     *   and `provider`, its answer, in a run another provider decides
      */
-    async decide({ features, candidates, jev, fallback, codeAuthority = false, context = {} } = {}) {
+    async decide({ features, candidates, jev, fallback, codeAuthority = false, localMayDecide = true, context = {}, answeredBy = TEACHER, sink } = {}) {
+      if (codeTaught) { codeAuthority = true; jev = null }
+      if (answeredBy !== TEACHER) return decideFor(answeredBy, { features, candidates, ask: jev, fallback, codeAuthority, context, sink })
+      const target = sink ?? store
       const deterministic = codeAuthority ? 'code' : 'fallback'
       const maturity = state.maturity
       const local = localAnswer(features, candidates)
@@ -414,11 +546,18 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       // back down rather than just deferring one decision.
       const significantOod = ood.reasons.some((r) => r.startsWith('unseen_category') || r.startsWith('unfamiliar_candidate')) || oodRate() > policy.drift.oodRateDegrade
 
+      // An answer this rung would act on: a usable classifier, a familiar input, and the confidence
+      // the risk class demands. Whether it may act on it is the domain's to say first and the
+      // caller's second, and both must let it.
+      const trusted = isLocal(maturity) && !!local && !ood.flag && local.confidence >= threshold
+      const mayDecide = localDecides && localMayDecide !== false
       let authority = 'jev'
       let reason = ''
-      if (isLocal(maturity) && local && !ood.flag && local.confidence >= threshold) {
+      if (trusted && mayDecide) {
         authority = 'local'
         reason = `local classifier at ${r3(local.confidence)} confidence, at or above the ${threshold} this ${spec.risk} domain needs`
+      } else if (trusted) {
+        reason = `local classifier at ${r3(local.confidence)} confidence, recorded for comparison: ${localDecides ? 'the caller does not let it decide this one' : 'it never decides this domain'}`
       } else if (isLocal(maturity)) {
         reason = !local ? `no usable local classifier (${artifactReason})`
           : ood.flag ? `out of distribution: ${ood.reasons.slice(0, 3).join(', ')}`
@@ -446,7 +585,7 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
         } catch (err) {
           // Jev is down. A mature domain may still answer for itself when it is confident and the
           // input is familiar; an immature one must not invent a classification.
-          if (isLocal(maturity) && local && !ood.flag && local.confidence >= threshold) {
+          if (trusted && mayDecide) {
             authority = 'local'
             answer = local
             reason = `teacher unavailable (${err.message}); local classifier is confident and in distribution`
@@ -457,7 +596,12 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
         }
       } else {
         authority = deterministic
-        reason = codeAuthority ? 'a rule in code decides this domain' : isLocal(maturity) ? `${reason}, and no teacher is configured` : 'no teacher is configured and this domain has no local authority'
+        // At a local rung the reason already says why the classifier did not decide (an unfamiliar
+        // input, too little confidence, a domain it never decides); it stays, and the rule is named
+        // after it. Below the local rungs the reason spoke of a teacher this domain does not have.
+        reason = codeAuthority
+          ? (isLocal(maturity) ? `${reason}; a rule in code decides this one` : `a rule in code decides this domain${mayDecide ? '' : '; its local classifier is recorded beside it and never decides'}`)
+          : isLocal(maturity) ? `${reason}, and no teacher is configured` : 'no teacher is configured and this domain has no local authority'
       }
       if (!answer) {
         answer = fallback ? fallback() : null
@@ -468,9 +612,9 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       // Every decision is a training candidate, whoever made it. This is the line that makes
       // using the router the thing that teaches it.
       let sampleId = null
-      if (store) {
+      if (target) {
         try {
-          const row = await store.append({
+          const row = await target.append({
             domain,
             runId: context.runId ?? null,
             input: { features, ...(candidates ? { candidates: candidates.map((c) => ({ key: c.key, id: c.id, features: c.features })) } : {}) },
@@ -515,33 +659,43 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
      */
     async evaluate({ retrain = true } = {}) {
       const all = await store.list({ domain })
+      // In the same turn as the rows, so a compaction cannot fall between the two (see dropped()).
+      const gone = store.dropped(domain).verified
       const verified = all.filter((r) => r.outcome?.verified === true)
       const outcomeBacked = verified.filter(isOutcomeBacked)
+      // Every verified row the domain has had. The store keeps only a domain's newest verified
+      // rows (training.js, samplesCap), so once it is at its cap `verified.length` stands still:
+      // counted on that, no row after the cap would ever be new evidence, and the domain would
+      // stop retraining, stop counting windows and never earn back a rung it lost. Every count of
+      // what arrived since something is taken on this one. The sample gates still count what is
+      // held, which is what the classifier is trained and measured on.
+      const seen = verified.length + gone
       // A rollback raised outside an evaluation could not count what it had, so its point is fixed
       // here, at the first evaluation after it. Everything already in the store was in hand when
       // the rung was lost, whether or not anyone had looked at it: only later rows are new evidence.
-      if (state.rollbackAt && state.samplesAtRollback === null) state.samplesAtRollback = verified.length
+      if (state.rollbackAt && state.samplesAtRollback === null) state.samplesAtRollback = seen
       const samples = {
         total: all.length,
         verified: verified.length,
+        seen,
         outcomeBacked: outcomeBacked.length,
         teacherOnly: verified.length - outcomeBacked.length,
-        sinceRollback: Math.max(0, verified.length - (state.samplesAtRollback ?? 0)),
+        sinceRollback: Math.max(0, seen - (state.samplesAtRollback ?? 0)),
         // Against the verified count the artifact was trained from, not its training-row count:
         // that is only the oldest 70% of it, so the difference passed everyNewSamples as soon as
         // the history was a few hundred rows long and every evaluation retrained.
-        sinceArtifact: Math.max(0, verified.length - trainedFrom(artifact)),
+        sinceArtifact: Math.max(0, seen - trainedFrom(artifact)),
       }
       const evaluation = { at: new Date(now()).toISOString(), samples, holdout: null, recent: null, calibration: null, drift: null, labelQuality: null, rates: null, gates: [] }
 
       // Retrain when there is enough new evidence, or when there is no artifact yet. A challenger
       // that was measured and turned down is not retried until that much more evidence arrived.
       const lastTrained = Math.max(trainedFrom(artifact), num(state.challenger?.verified))
-      if (retrain && verified.length >= policy.retrain.minSamples && (!artifact || verified.length - lastTrained >= policy.retrain.everyNewSamples)) {
-        await api.retrain({ rows: verified })
+      if (retrain && verified.length >= policy.retrain.minSamples && (!artifact || seen - lastTrained >= policy.retrain.everyNewSamples)) {
+        await api.retrain({ rows: verified, seen })
       }
 
-      Object.assign(evaluation, measure(artifact, verified))
+      Object.assign(evaluation, measure(artifact, verified, gone))
       state.lastDrift = evaluation.drift
 
       // Rates the design asks to watch even when accuracy still looks fine.
@@ -562,10 +716,13 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
     /**
      * Train a fresh artifact from the verified rows and calibrate it on the validation slice. At a
      * rung where the classifier decides, it goes into service only once it has passed that rung's
-     * gates; one that does not is returned as null and recorded in `state.challenger`.
+     * gates; one that does not is returned as null and recorded in `state.challenger`. `seen` is
+     * the evaluation's count of every verified row the domain has had (see evaluate()); without
+     * one it is counted from the store here.
      */
-    async retrain({ rows, force = false } = {}) {
+    async retrain({ rows, seen, force = false } = {}) {
       const verified = rows ?? (await store.list({ domain, verifiedOnly: true }))
+      const history = seen ?? verified.length + store.dropped(domain).verified
       const usable = verified.map((r) => [r, trainingItem(r, kind)]).filter(([, item]) => item)
       const items = usable.map(([, item]) => item)
       if (items.length < (force ? 1 : policy.retrain.minSamples)) {
@@ -591,12 +748,12 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       // earlier and verified later lands inside the history rather than at its end.
       const trainedThrough = usable[trainRows.length - 1][0].id ?? null
       const calibratedThrough = validation.length ? usable[train.length + validation.length - 1][0].id ?? null : trainedThrough
-      const extras = { candidateSamples, candidateKeying: 'id', verifiedSamples: verified.length, trainedThrough, calibratedThrough, baseline: baselineOf(trainRows) }
+      const extras = { candidateSamples, candidateKeying: 'id', verifiedSamples: history, trainedThrough, calibratedThrough, baseline: baselineOf(trainRows) }
       let fresh
       try {
         fresh = kind === 'ranking'
-          ? trainRanker({ groups: trainRows, options: policy.retrain, domain, trainingDataVersion: String(verified.length), extras, now })
-          : trainMulticlass({ samples: trainRows, options: policy.retrain, domain, trainingDataVersion: String(verified.length), extras, now })
+          ? trainRanker({ groups: trainRows, options: policy.retrain, domain, trainingDataVersion: String(history), extras, now })
+          : trainMulticlass({ samples: trainRows, options: policy.retrain, domain, trainingDataVersion: String(history), extras, now })
       } catch (err) {
         artifactReason = `training failed: ${err.message}`
         log(`routing domain ${domain}: ${artifactReason}`)
@@ -614,14 +771,14 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       // Only with nothing in service to keep does the domain step down, to SHADOW, where the new
       // artifact's answers are recorded and never used.
       if (isLocal(state.maturity)) {
-        const trial = { samples: { verified: verified.length }, ...measure(fresh, verified) }
+        const trial = { samples: { verified: verified.length }, ...measure(fresh, verified, history - verified.length) }
         const blocked = gatesOf(trial, state.maturity, { challenger: true }).filter((g) => !g.ok).map((g) => g.name)
         if (blocked.length) {
-          state.challenger = { version: fresh.classifierVersion, at: new Date(now()).toISOString(), verified: verified.length, rung: state.maturity, blocked }
+          state.challenger = { version: fresh.classifierVersion, at: new Date(now()).toISOString(), verified: history, rung: state.maturity, blocked }
           const why = `a retrained classifier failed the ${state.maturity} gates (${blocked.join(', ')})`
           log(`routing domain ${domain}: ${why}${artifact ? '; the one in service stays' : ''}`)
           if (artifact) { persist(); return null }
-          setMaturity('SHADOW', { reason: why, severity: 'significant', samples: verified.length })
+          setMaturity('SHADOW', { reason: why, severity: 'significant', samples: history })
         }
       }
       if (artifactFile) {
@@ -831,16 +988,17 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
     if (state.rollbackAt) {
       if (ev.samples.sinceRollback < gates.rollback.repromoteSamples) { state.consecutiveGoodWindows = 0; return }
       // A window is new evidence: without a verified row since the last window counted, this is
-      // the same window looked at again, and it neither counts nor breaks the run.
-      const last = state.windowSamples ?? state.samplesAtRollback ?? ev.samples.verified
-      if (!(ev.samples.verified > last)) return
-      state.windowSamples = ev.samples.verified
+      // the same window looked at again, and it neither counts nor breaks the run. Counted on
+      // `seen`, which goes on growing when the store is at its cap and what it holds does not.
+      const last = state.windowSamples ?? state.samplesAtRollback ?? ev.samples.seen
+      if (!(ev.samples.seen > last)) return
+      state.windowSamples = ev.samples.seen
       state.consecutiveGoodWindows += 1
       if (state.consecutiveGoodWindows < policy.repromotion.consecutiveWindows) return
     }
     // No bad-window count to clear: the gate above refuses a climb while one is pending, and a
     // rung that decides nothing never holds one (stepping down from a local rung settles it).
-    setMaturity(target, { reason: null, samples: ev.samples.verified })
+    setMaturity(target, { reason: null, samples: ev.samples.seen })
   }
 
   /**
@@ -883,7 +1041,7 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
     // Every rollback here is decided from this evaluation, so it knows exactly how much evidence
     // the domain had when it lost the rung: the rows that caused the rollback are on this side of
     // the line, not on the side that earns it back.
-    const atRollback = ev.samples.verified
+    const atRollback = ev.samples.seen
     if (severe) {
       setMaturity(policy.rollback.severeTo, { reason: `severe regression: ${breaches[0]}`, severity: 'severe', samples: atRollback })
       state.consecutiveBadWindows = 0
@@ -920,13 +1078,15 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
    * longer in the store, is taken to have seen every row that was verified when it was trained,
    * which leaves its recent window short until the next retrain rather than partly in-sample. A
    * short window is not read as a regression either (regressionsOf), so the domain keeps its rung
-   * until the window holds enough rows to say something.
+   * until the window holds enough rows to say something. That count is of every verified row the
+   * domain had (trainedFrom), and the oldest `gone` of them are no longer in `verified`, let go of
+   * by the store's cap, so they are taken off it to make it a place among the rows still held.
    */
-  function seenThrough(a, verified, marker) {
+  function seenThrough(a, verified, marker, gone = 0) {
     const id = a?.extras?.[marker]
     const at = id ? verified.findIndex((r) => r.id === id) : -1
     if (at >= 0) return at + 1
-    return Math.min(verified.length, typeof a?.extras?.verifiedSamples === 'number' ? a.extras.verifiedSamples : verified.length)
+    return Math.min(verified.length, typeof a?.extras?.verifiedSamples === 'number' ? Math.max(0, a.extras.verifiedSamples - gone) : verified.length)
   }
 
   /** Calibration of `a` on labelled items, at the temperature it serves with. Null on none. */
@@ -962,17 +1122,18 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
    * for GUARDED_LOCAL: "recent accuracy" was then partly scored on the rows the weights were
    * fitted to, and so was the rollback floor. A window with too few unseen rows is short, and the
    * "recent window" gate says so, rather than being padded with rows the classifier has seen.
+   * `gone` is how many verified rows the store's cap has let go of (see seenThrough).
    */
-  function measure(a, verified) {
+  function measure(a, verified, gone = 0) {
     const usable = verified.map((row, at) => ({ at, item: trainingItem(row, kind) })).filter((u) => u.item)
     const out = { holdout: null, recent: null, calibration: null }
-    const trainEnd = a ? seenThrough(a, verified, 'trainedThrough') : verified.length
+    const trainEnd = a ? seenThrough(a, verified, 'trainedThrough', gone) : verified.length
     if (a) {
       const { validation, holdout } = splitRows(usable.map((u) => u.item), policy.split)
       const holdoutRows = holdout.length ? holdout : validation
       out.holdout = holdoutRows.length ? evaluate(a, holdoutRows) : null
       const window = gates.recentWindow
-      const fitEnd = Math.max(trainEnd, seenThrough(a, verified, 'calibratedThrough'))
+      const fitEnd = Math.max(trainEnd, seenThrough(a, verified, 'calibratedThrough', gone))
       const recentRows = usable.filter((u) => u.at >= trainEnd).slice(-window).map((u) => u.item)
       const unfitted = usable.filter((u) => u.at >= fitEnd).slice(-window).map((u) => u.item)
       out.recent = recentRows.length ? { ...evaluate(a, recentRows), n: recentRows.length, calibration: calibrationOn(a, unfitted) } : null

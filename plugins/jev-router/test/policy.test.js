@@ -47,6 +47,84 @@ test('accept still asks for a second opinion and flags human review', async () =
   assert.equal(r.status, 'accepted_pending_human_review')
 })
 
+// --- the review policy per provider (docs/laya-auto.md 2.5, 2.6 rows 11 to 18, 3.5) -------------
+
+/** A decider as createJev returns it over a provider record: its `provider` names who answers. */
+const deciderOf = (provider, answers, seen = []) => ({ provider, assess: async (...args) => { seen.push(args); return typeof answers === 'function' ? answers() : answers } })
+const providers = async () => (await import('../providers.js')).resolveProviders({}, { policy: (await import('../routing-policy.js')).resolvePolicy() })
+
+test('reviewAction is the review policy as a pure function, on the thresholds it is handed', async () => {
+  const review = await import('../../jev-review/index.js')
+  assert.equal(typeof review.reviewAction, 'function', 'jev-review exports reviewAction, which the shadow reuses')
+  const { jev } = await providers()
+  const at = (q, context, t = jev.thresholds, over = {}) => review.reviewAction({ mode: 'jev', ...nouls(q, over) }, context, t)
+  assert.deepEqual(at(0.72, { risk: 0.02 }), { action: 'accept', why: 'quality 0.72 ≥ bar 0.55 (risk 0.02)', quality: 0.72, bar: 0.55 })
+  assert.deepEqual(at(0.6, { risk: 0.4 }), { action: 'second_review', why: 'quality 0.60 between 0.3 and bar 0.70 (risk 0.40)', quality: 0.6, bar: 0.7 })
+  assert.equal(at(0.6, { risk: 0.4, reviewed: true }).action, 'human')
+  assert.equal(at(0.8, {}).bar, 0.7, 'no risk reads as 0.5, the medium band')
+  assert.deepEqual([at(0.95, { risk: 0.1, blockAccept: true }).action, at(0.95, { risk: 0.1, blockAccept: true }).why], ['retry', 'quality 0.95'])
+  // The bars are the ones handed in: a person at 0.8, a reject at 0.4, bands at 0.5 and 0.8.
+  const own = { ...jev.thresholds, needsPerson: 0.8, reject: 0.4, riskBands: { low: 0.5, medium: 0.8 } }
+  assert.equal(at(0.95, { risk: 0.1 }, own, { needsPerson: 0.7 }).action, 'accept', 'needsPerson 0.7 is under a bar of 0.8')
+  assert.equal(at(0.95, { risk: 0.1 }, jev.thresholds, { needsPerson: 0.7 }).action, 'human', 'and over Jev\'s 0.6')
+  assert.deepEqual([at(0.35, { risk: 0.1 }, own).action, at(0.35, { risk: 0.1 }, own).why], ['retry', 'quality 0.35 ≤ 0.4'])
+  assert.equal(at(0.6, { risk: 0.4 }, own).bar, 0.55, 'risk 0.4 is in the low band under riskBands.low 0.5')
+  // An old-shape object, as callers passed before there were providers, keeps today's bars.
+  assert.equal(at(0.95, { risk: 0.1 }, thresholds, { needsPerson: 0.65 }).action, 'human')
+  assert.equal(at(0.3, { risk: 0.1 }, thresholds).action, 'retry')
+  // The review itself reads them too.
+  const r = await createReview(deciderOf(undefined, nouls(0.95, { needsPerson: 0.7 })), own)(input({ risk: 0.1 }), signal)
+  assert.equal(r.action, 'accept')
+})
+
+test('a Laya review is judged against Laya\'s own bars, and a quality under them says so', async () => {
+  const { laya } = await providers()
+  const run = async (answers, routing, over) => createReview(deciderOf(laya, answers), laya.thresholds)(input(routing, over), signal)
+  const under = await run(nouls(0.6), { risk: 0.1 })
+  assert.equal(under.mode, 'laya', 'the assessment names who answered')
+  assert.deepEqual([under.action, under.why, under.bar], ['second_review', 'quality 0.60 under Laya\'s accept bar 0.65 (risk 0.10)', 0.65], 'Jev would have accepted at 0.55')
+  assert.equal((await run(nouls(0.6), { risk: 0.1 }, { reviewed: true })).why, 'quality 0.60 under Laya\'s accept bar 0.65 (risk 0.10), already reviewed')
+  const over = await run(nouls(0.7), { risk: 0.1 })
+  assert.deepEqual([over.action, over.why], ['accept', 'quality 0.70 ≥ bar 0.65 (risk 0.10)'])
+  assert.equal((await run(nouls(0.85), { risk: 0.9 })).why, 'quality 0.85 under Laya\'s accept bar 0.90 (risk 0.90)')
+  assert.equal((await run(nouls(0.95), { risk: 0.1, needsHumanReview: 0.65 })).status, 'accepted_pending_human_review', 'Laya flags a person at 0.6')
+  const jev = await createReview(deciderOf(undefined, nouls(0.6)), thresholds)(input({ risk: 0.1 }), signal)
+  assert.deepEqual([jev.mode, jev.action], ['jev', 'accept'], 'a decider with no record is Jev, as always')
+})
+
+test('the review hands its decider the numbers the shadow needs, and never the state', async () => {
+  const seen = []
+  await createReview(deciderOf(undefined, nouls(0.9), seen), thresholds)(input({ risk: 0.4 }, { reviewed: true, attempts: [{ agent: 'a', stopReason: 'completed' }, { agent: 'b', stopReason: 'completed' }] }), signal)
+  assert.deepEqual(seen[0][2], { attempt: 1, risk: 0.4, blockAccept: false, reviewed: true })
+  assert.equal(seen[0][1], signal)
+  seen.length = 0
+  await createReview(deciderOf(undefined, nouls(0.9), seen), thresholds)(input({}, { blockAccept: true }), signal)
+  assert.deepEqual(seen[0][2], { attempt: 0, risk: null, blockAccept: true, reviewed: false }, 'a run with no risk says so, rather than 0.5')
+})
+
+test('a review Laya did not answer says so in both of its fallback reasons', async () => {
+  const { laya } = await providers()
+  const { createDomainController } = await import('../domains.js')
+  const { createTrainingStore } = await import('../training.js')
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const late = () => { throw new Error('timed out after 40 s') }
+  // Learning off: no outcome domain.
+  const bare = await createReview(deciderOf(laya, late), laya.thresholds)(input({ risk: 0.1 }), signal)
+  assert.deepEqual([bare.action, bare.why], ['accept', 'fallback policy (Laya unavailable (timed out after 40 s))'])
+  // Learning on: the outcome domain decides, for Laya into Laya's store (index.js hands this facade).
+  const root = mkdtempSync(join(tmpdir(), 'kz-review-'))
+  const ctl = createDomainController({ domain: 'outcome_disposition', store: createTrainingStore({ file: join(root, 'routing-samples.jsonl') }) })
+  const sink = createTrainingStore({ file: join(root, 'laya-samples.jsonl'), kind: 'laya' })
+  const outcome = { decide: (args) => ctl.decide({ ...args, answeredBy: 'laya', sink }) }
+  const wired = await createReview(deciderOf(laya, late), laya.thresholds, 'x', { outcome })(input({ risk: 0.1 }), signal)
+  assert.deepEqual([wired.action, wired.why], ['accept', 'fallback policy (Laya unavailable (timed out after 40 s); using the deterministic fallback)'])
+  // A Jev failure reads as it always has.
+  const jev = await createReview(deciderOf(undefined, late), thresholds)(input({ risk: 0.1 }), signal)
+  assert.equal(jev.why, 'fallback policy (timed out after 40 s)')
+})
+
 test('route asks a fits Noul per tool and reports weakest argument confidence', async (t) => {
   const traces = []
   let asked
@@ -130,6 +208,42 @@ test('the policy carries no threshold that nothing reads', async () => {
   assert.equal('lowConfidence' in resolvePolicy(), false)
 })
 
+test('conservation is a hard limit in the decision engine, not a routing domain with cuts of its own', async () => {
+  const { DOMAINS, resolvePolicy } = await import('../routing-policy.js')
+  // A domain is something a classifier learns to decide. Conservation reads the governor's level
+  // for the most capable resource and moves the work in code (decision.js), so it has no ladder,
+  // no training lane and no probability cuts to tune.
+  const policy = resolvePolicy()
+  assert.equal('conservation' in DOMAINS, false)
+  assert.equal('conservation' in policy.domains, false)
+  assert.deepEqual(Object.keys(policy.codeJudgments), ['frontierReview'], 'the frontier review is the one judgment left answered in code')
+})
+
+test('the resource ranking\'s local classifier never decides, and no policy can say it does', async () => {
+  const { DOMAINS, resolvePolicy } = await import('../routing-policy.js')
+  // The owner's decision: the ranking makes the pick at every rung (decision.js). The domain
+  // carries it, so the controller and the Router tab read the same thing.
+  assert.equal(DOMAINS.resource_selection.localDecides, false)
+  assert.deepEqual(Object.keys(DOMAINS).filter((id) => DOMAINS[id].localDecides === false), ['resource_selection'], 'the one domain it holds for')
+  // decision.js takes that pick from the ranking whatever the policy says, so a policy that
+  // switched the classifier back on would only make the Router tab promise what nothing does.
+  assert.throws(() => resolvePolicy({ domains: { resource_selection: { localDecides: true } } }), /routing policy: domain resource_selection: localDecides/)
+  assert.throws(() => resolvePolicy({ domains: { task_classification: { localDecides: 'no' } } }), /routing policy: domain task_classification: localDecides must be true or false/)
+  // Taking a domain's local authority away is a choice the policy may make.
+  assert.equal(resolvePolicy({ domains: { task_classification: { localDecides: false } } }).domains.task_classification.localDecides, false)
+})
+
+test('the domains a rule in code decides are the ones decision.js asks Jev nothing for, and no policy moves them', async () => {
+  const { DOMAINS, resolvePolicy } = await import('../routing-policy.js')
+  // The resource ranking and the frontier review are comparisons of numbers: a rule decides each,
+  // and the Router tab says so at the rungs where it would otherwise say Jev decides.
+  assert.deepEqual(Object.keys(DOMAINS).filter((id) => DOMAINS[id].teacher === 'code'), ['resource_selection', 'frontier_escalation'])
+  assert.throws(() => resolvePolicy({ domains: { frontier_escalation: { teacher: 'jev' } } }), /routing policy: domain frontier_escalation: teacher cannot be changed/)
+  assert.throws(() => resolvePolicy({ domains: { second_opinion: { teacher: 'code' } } }), /routing policy: domain second_opinion: teacher cannot be changed/)
+  assert.throws(() => resolvePolicy({ domains: { task_classification: { teacher: 'someone' } } }), /routing policy: domain task_classification: teacher must be jev or code/)
+  assert.equal(resolvePolicy().domains.frontier_escalation.teacher, 'code')
+})
+
 test('the subscription-to-metered crossover falls where the policy comment says', async () => {
   const { resolvePolicy } = await import('../routing-policy.js')
   const { CURVE_KNEES, conservationCurve, expectedJobCost } = await import('../governor.js')
@@ -202,9 +316,10 @@ test('the minimum review thresholds are described as the fallback they are, not 
   assert.doesNotMatch(note, /always gets an independent review/)
   assert.match(note, /FALLBACK/)
   assert.match(note, /not a floor/)
-  // An operator who edits these keys also moves the fallback resource pick, the fallback
-  // conservation answer and the fallback strategy, so the note says so.
-  assert.match(note, /resource pick/)
+  // An operator who edits these keys also moves the conservation limit and the fallback strategy,
+  // so the note says so. It must not send them to a fallback resource pick: there is none, the
+  // ranking makes the pick at every risk (decision.js), and nothing there reads these cuts.
   assert.match(note, /conservation/)
   assert.match(note, /strategy/)
+  assert.doesNotMatch(note, /fallback resource pick/)
 })

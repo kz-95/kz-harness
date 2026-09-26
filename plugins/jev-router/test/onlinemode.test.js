@@ -113,3 +113,31 @@ test('locality hosted is understood by eligible, not silently ignored', async ()
   assert.deepEqual(eligible(executors, { locality: 'local' }).map((e) => e.id), ['local-1'])
   assert.deepEqual(eligible(executors, {}).map((e) => e.id), ['local-1', 'cloud-1'])
 })
+
+// Laya Auto keeps the same precedence, with one difference that follows from where Laya runs: it
+// needs no network, so a dead one narrows its pool to the local agents and Laya keeps deciding.
+const layaDecider = async (offered) => {
+  const { laya } = (await import('../providers.js')).resolveProviders({}, { policy: (await import('../routing-policy.js')).resolvePolicy() })
+  return {
+    provider: laya,
+    decider: {
+      provider: laya,
+      route: async (req) => { offered.push(...req.agents.map((a) => a.id)); return { primaryAgent: req.agents[0].id, agentProbabilities: { [req.agents[0].id]: 0.9 }, taskType: 'fix', taskTypeConfidence: 0.9, complexity: 0.2, risk: 0.2 } },
+      assess: async () => ({}),
+    },
+  }
+}
+
+test('online only under Laya: Laya routes, over the cloud agents only', async () => {
+  const offered = []
+  const { r } = await run({ deps: { remoteOnly: true, jev: null, ...(await layaDecider(offered)) } })
+  assert.deepEqual(offered, ['claude', 'deepseek'])
+  assert.deepEqual([r.routing.mode, r.routing.decider], ['jev', 'laya'], 'Laya decided, over the pool online narrowed')
+})
+
+test('offline beats online only under Laya too, and Laya keeps deciding, over the local agent', async () => {
+  const offered = []
+  const { r } = await run({ deps: { remoteOnly: true, offline: true, jev: null, ...(await layaDecider(offered)) } })
+  assert.deepEqual(offered, ['qwen-local'], 'a decider on this PC is still asked offline')
+  assert.deepEqual([r.routing.mode, r.routing.decider, r.routing.primaryAgent], ['local', 'laya', 'qwen-local'])
+})

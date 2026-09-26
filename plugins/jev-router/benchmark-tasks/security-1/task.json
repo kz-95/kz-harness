@@ -1,0 +1,16 @@
+{
+  "id": "security-1",
+  "skill": "security",
+  "level": 1,
+  "dimensions": ["security_review", "code_review"],
+  "folder": "static-files",
+  "prompt": "A report says resolveRequest in src/serve.js lets a request read files outside the public folder.\nFix it without breaking normal requests.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/serve.test.js": 12
+    }
+  }
+}

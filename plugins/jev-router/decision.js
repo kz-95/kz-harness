@@ -7,34 +7,44 @@
 // authoritative, and this file only supplies the inputs, the teacher call and a deterministic
 // answer per domain.
 //
-// Not every domain has a teacher. Which resource does the work, whether a scarce allowance is
-// worth spending here, and whether the strongest resource should review are all comparisons of
-// numbers, and a snap-judgment classifier cannot compare magnitudes. Those three are rules in
-// code, reported as `code` rather than `fallback`, which means the opposite: nobody could decide.
-// Their local classifiers still learn, from the runs that contradict a rule's answer.
+// Not every domain has a teacher. Which resource does the work and whether the strongest resource
+// should review are comparisons of numbers, and a snap-judgment classifier cannot compare
+// magnitudes. Both are rules in code, reported as `code` rather than `fallback`, which means the
+// opposite: nobody could decide. Their local classifiers still learn, from the runs that
+// contradict a rule's answer. The resource ranking's is only ever recorded beside the ranking and
+// never decides (see section 3); the frontier review's may decide once its evidence earns a local
+// rung.
 //
 // Inputs that reach Jev or a local classifier are the machine-readable ones: the capability
 // registry's effective profiles (profiles.js), the governor's scarcity and cost signals
 // (governor.js), the task profile. Candidates are anonymous (RESOURCE_A ...) on both paths.
-// Hard facts are applied here in code and never delegated: an unavailable resource, a context
-// window the input would not fit, a capability floor the task requires. What is left is
-// judgment, and judgment is what the domains learn.
+// Hard facts and limits are applied here in code and never delegated: an unavailable resource, a
+// context window the input would not fit, a capability floor the task requires, the weekly gate,
+// and keeping easy work off a most capable resource whose allowance is being used up. What is
+// left is judgment, and judgment is what the domains learn.
 //
 // One Jev call per run at most in the common case: the first domain that needs Jev triggers a
 // batched call carrying every question group some not-yet-local domain may still need; later
 // domains read from the same answer. A domain that is LOCAL_ONLY contributes no questions, so
 // a mature domain costs nothing.
+//
+// The decider need not be Jev (docs/laya-auto.md 2.5). The router hands over the provider record
+// of whoever decides this run beside its client, and every cut-off here is read from that record
+// through a per-run policy object, so a Laya run is judged against Laya's bars. A Laya run's
+// domains are decided by Laya or by the rules, never by a local classifier, and their samples go
+// to Laya's own store (`sink`), never to the one Jev teaches the classifiers from.
 import { MARGINAL_COST_BY_KIND, kindOf, marginalCostOf } from './accounts.js'
 import { CHARS_PER_TOKEN } from './capabilities.js'
-import { OPENING_STRATEGIES, cheapestOf, eligibleStrategies, planStrategy, rankCandidates, strongestOf } from './broker.js'
-import { anonymize, candidateFeatures, identityNames, mergeFeatures, poolFeatures, profileFeatures, taskTextFeatures } from './features.js'
-import { CURVE_KNEES, conservationHint, expectedJobCost, governorSignals } from './governor.js'
+import { cheapestOf, eligibleStrategies, planStrategy, rankCandidates, strongestOf } from './broker.js'
+import { anonymize, candidateFeatures, mergeFeatures, poolFeatures, profileFeatures, taskTextFeatures } from './features.js'
+import { conservationHint, expectedJobCost, governorSignals } from './governor.js'
 import { subjectOf } from './profiles.js'
-import { DIMENSIONS, REQUIREMENT_DIMENSIONS, SKILLS, TASK_DIMENSIONS, TASK_SKILLS, tierAtLeast, tierOf } from './routing-policy.js'
+import { DEFAULT_JEV, TEACHER } from './providers.js'
+import { DIMENSIONS, DOMAINS, REQUIREMENT_DIMENSIONS, SKILLS, TASK_DIMENSIONS, TASK_SKILLS, tierAtLeast, tierOf } from './routing-policy.js'
 
-// Which domains a Jev call group is asked for. Resource selection, conservation and the frontier
-// review are missing on purpose: each of them is a comparison of numbers, which a rule in code
-// decides here, so none of them can open a call.
+// Which domains a Jev call group is asked for. Resource selection and the frontier review are
+// missing on purpose: each of them is a comparison of numbers, which a rule in code decides here
+// (`teacher: 'code'` in routing-policy.js DOMAINS), so neither can open a call.
 const GROUP_DOMAINS = Object.freeze({
   task: ['task_classification', 'skill_selection'],
   resource: ['execution_strategy'],
@@ -96,6 +106,23 @@ export function heuristicProfile(task) {
     minimumCapability: 'standard', preferredCapability: 'strong', verification: ['checks'],
     needsSecondOpinion: 0.5, needsHumanReview: 0.3, needsTests: 0.7, heuristic: true,
   }
+}
+
+/**
+ * A provider's profile with the answers it marked too flat filled by the rules, field by field
+ * (docs/laya-auto.md 4.3). `answered` is the profile jev.js built, where a flat score or choice is
+ * left out; `heuristic` is heuristicProfile() of the same task. Every top-level field the provider
+ * answered is the provider's. The requirements are merged per dimension, so a flat one takes the
+ * heuristic's 0.7 where the task type exercises that dimension and is otherwise absent, which
+ * reads as not wanted. Flat tiers take the heuristic's fixed 'standard' and 'strong'. The result is
+ * not marked `heuristic`: it is mostly the provider's, and the skill it names is not a fallback.
+ */
+export function fillFlat(heuristic, answered = {}) {
+  const out = { ...heuristic }
+  for (const [k, v] of Object.entries(answered)) if (v !== undefined && k !== 'requirements') out[k] = v
+  out.requirements = { ...heuristic.requirements, ...answered.requirements }
+  delete out.heuristic
+  return out
 }
 
 /** Numeric parts of a profile, the only thing a training sample keeps of it. */
@@ -184,8 +211,9 @@ export function candidateTier(capabilities, requirements, policy) {
   const entries = Object.entries(requirements ?? {}).filter(([, r]) => typeof r === 'number' && r > 0)
   // The dimensions the task really leans on, or all of them when it leans on none strongly: an
   // easy task must still get a tier, otherwise every candidate reads 'unknown' and the floor,
-  // the strategy and the report all lose the one number they were about to use.
-  const strong = entries.filter(([, r]) => r >= 0.5)
+  // the strategy and the report all lose the one number they were about to use. What counts as
+  // leaning on one is the deciding provider's cut (a decision's per-run policy), Jev's by default.
+  const strong = entries.filter(([, r]) => r >= (policy.requirementWanted ?? 0.5))
   let sum = 0; let w = 0
   for (const [d, r] of (strong.length ? strong : entries)) {
     const cap = capabilities?.[d]
@@ -239,14 +267,54 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
    * `modelOf` and `versionOf` ((agent, model) => string | undefined) name the subject a profile is
    * read for, exactly as profiles.js keys the evidence it records. `economics` is
    * config.resources.economics (agent id -> { marginalCost }), for agents with no snapshot yet.
+   *
+   * `decider` is the client of whoever decides this run (createJev() of Jev or of Laya), `jev` the
+   * old name for it. `provider` is that decider's record (providers.js), always the one the router
+   * hands over and never read off the client, so a missing client can never make a Laya run use
+   * Jev's record; without one this is a Jev run on Jev's defaults and the policy's minimumReview.
+   * A client whose own record names another provider is refused, so a Laya client handed over
+   * without Laya's record never runs as Jev.
+   * `sink` is the store a run decided by a provider other than the teacher writes its samples to
+   * (laya-samples.jsonl); it is required for such a run, and a Jev run never writes to it.
    */
-  async function decide({ task, context, history, handoff, tools = [], agents = [], gated = [], snapshots = [], modelOf, versionOf, economics = configuredEconomics, answerOnly = false, modalities = ['text'], capabilitySet, availability, trackRecord, jev, jevUnavailableReason, signal, emit, runId, capableFor, everyAgent } = {}) {
+  async function decide({ task, context, history, handoff, tools = [], agents = [], gated = [], snapshots = [], modelOf, versionOf, economics = configuredEconomics, answerOnly = false, modalities = ['text'], capabilitySet, availability, trackRecord, jev: legacyJev, decider = legacyJev, provider, sink, jevUnavailableReason, signal, emit, runId, capableFor } = {}) {
+    const P = provider ?? DEFAULT_JEV
+    // A client is never run under another provider's record: a Laya client handed over without
+    // Laya's record, under either name, would otherwise be a Jev run, and its answers Jev's
+    // teaching in the store the local classifiers learn from.
+    if (decider?.provider && decider.provider.id !== P.id) throw new Error(`decision: ${decider.provider.name ?? decider.provider.id}'s client was handed ${P.name}'s record; a run is decided only under the record of the provider that answers it`)
+    // Rows 20 and 21 of docs/laya-auto.md 2.6 keep their one source for Jev, routing.minimumReview,
+    // whichever Jev record the run is handed: the router's default one carries fixed values.
+    const T = P.teacher ? { ...P.thresholds, riskForReview: policy.minimumReview.riskForReview, riskForFrontierReview: policy.minimumReview.riskForFrontierReview } : P.thresholds
+    // The deciding provider's cut-offs, in the policy object candidateTier and broker.js already
+    // receive: nothing new crosses into broker.js, and nothing is added to the stored profile.
+    const pol = {
+      ...policy,
+      minimumReview: { ...policy.minimumReview, riskForReview: T.riskForReview, riskForFrontierReview: T.riskForFrontierReview },
+      requirementWanted: T.requirementWanted,
+      easyComplexity: T.easyComplexity,
+      judgmentYes: T.judgmentYes,
+    }
+    // Who the domains hear the answers from, and which store this run's samples belong in: a Jev
+    // run's go to each domain's own store whatever `sink` says, so no wiring can send Jev's samples
+    // to a store that would refuse them.
+    const answeredBy = P.teacher ? TEACHER : P.id
+    const into = answeredBy === TEACHER ? {} : { sink }
     // Every sample this decision writes carries the run it belongs to, so a verdict given later
-    // about that run's answer can find and relabel them (index.js onVerdict).
+    // about that run's answer can find and relabel them (index.js onVerdict), and goes to the store
+    // of whoever decided it.
     const controller = (id) => {
       const c = controllerOf(id)
-      return c && runId ? { ...c, decide: (args = {}) => c.decide({ ...args, context: { ...(args.context ?? {}), runId } }) } : c
+      return c ? { ...c, decide: (args = {}) => c.decide({ ...args, answeredBy, ...into, context: runId ? { ...(args.context ?? {}), runId } : args.context }) } : c
     }
+    // Which store a sample of this run is in, for whoever labels it later (index.js learnFrom).
+    const storeKind = answeredBy
+    // The answer the domain decided on, whoever gave it: the provider's in a Laya run, else Jev's.
+    const rawOf = (d) => d?.provider?.raw ?? d?.teacher?.raw
+    // The route answer's own mark on a question it answered too flat to act on (jev.js).
+    const flat = (r, name) => !!r?.uninformative?.includes(name)
+    // A profile the provider answered only in part, filled by the rules where it was flat.
+    const filled = (p) => (p?.filledByRules?.length ? fillFlat(heuristicProfile(task), p) : p)
     const jevCalls = []
     const samples = []
     const domainReport = {}
@@ -315,19 +383,6 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     if (!pool.length) throw noCandidates(`no resource is available: ${excluded.map((e) => `${e.id} (${e.reason})`).join(', ') || 'no agents'}`, excluded)
     const names = anonymize(pool)
     for (const c of pool) c.key = names.keyOf(c.id)
-    // How jev.js re-keys the per-agent evidence (track record, availability, who ran it) onto the
-    // table's keys instead of dropping it. Every agent is listed, so an excluded one's name is
-    // masked too; only a pool agent has a key. The names are the ones the review call masks too
-    // (features.js identityNames): the id, the display name, the providers and the model ids. The
-    // masker keeps only the SPECIFIC ones, so a generic token ('local', 'spawn') is never masked
-    // inside values that have nothing to do with any agent, while a provider word that names one
-    // agent ('claude-code', 'openrouter') no longer rides out of this call when the review call
-    // already hid it.
-    const identities = (everyAgent?.length ? [...new Map([...everyAgent, ...agents].map((a) => [a.id, a])).values()] : agents).map((a) => ({
-      id: a.id,
-      key: names.keyOf(a.id),
-      names: [...new Set([a.id, ...identityNames(a, modelOf)].filter((n) => typeof n === 'string' && n.trim()))],
-    }))
 
     // --- the Jev calls ---------------------------------------------------------------------------
     // Two groups, and at most one call each. They cannot be one call: what the resource judgment
@@ -337,13 +392,19 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // insists must reach it. Within a group every question still rides together.
     //
     // A group whose domains have all matured locally is never asked, so a fully mature router
-    // makes no call at all, and a half-mature one makes exactly the call it still needs.
+    // makes no call at all, and a half-mature one makes exactly the call it still needs. In a run
+    // another provider decides every group is open: Jev's ladder says nothing about that run, and
+    // the provider is asked every question Jev would be asked at JEV_PRIMARY (docs/laya-auto.md 4.1).
     let profile = null
     let strategies = []
     const calls = new Map()
-    const groupOpen = (group) => GROUP_DOMAINS[group].some((id) => NOT_LOCAL.has(maturityOf(id)))
+    const groupOpen = (group) => answeredBy !== TEACHER || GROUP_DOMAINS[group].some((id) => NOT_LOCAL.has(maturityOf(id)))
+    // What a domain hears besides the answer: whether the provider marked it too flat to act on,
+    // and which model identity and script answered (the Laya client's, on the call's meta).
+    const marks = (r, name) => ({ informative: !flat(r, name), identity: r.meta?.identity, lang: r.meta?.lang })
+    // The decider's call, under its old name: whoever decides, it is asked once per group.
     const askJev = (group) => {
-      if (!jev) throw new Error(jevUnavailableReason ?? 'Jev unavailable')
+      if (!decider) throw new Error(jevUnavailableReason ?? `${P.name} unavailable`)
       const wanted = group === 'task' ? 'task' : 'resource'
       if (calls.has(wanted)) return calls.get(wanted)
       const ask = wanted === 'task'
@@ -361,11 +422,12 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
         marginalCost: c.marginalCost, expectedCost: c.expectedCost, latency: c.latency,
         availability: c.availability, reliability: c.reliability, evidenceSamples: c.evidenceSamples, cold: c.cold,
       }))
-      const promise = jev.route({
+      const promise = decider.route({
         task, context, history, tools, availability, trackRecord, handoff, capabilities: capabilitySet,
         candidates: wanted === 'resource' ? candidates : undefined,
-        identities: wanted === 'resource' ? identities : undefined,
-        strategies: strategies.length ? strategies : OPENING_STRATEGIES,
+        // Only what eligibleStrategies() says this pool can run: before the pool exists (the task
+        // call) there is nothing to offer, and jev.js asks no strategy question over an empty list.
+        strategies,
         taskProfile: wanted === 'resource' && profile ? profileNumbers(profile) : undefined,
         ask,
       }, signal).then((r) => { jevCalls.push({ group: wanted, ask, model: r.model }); return r })
@@ -379,28 +441,41 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     const taskCtl = controller('task_classification')
     const taskDecision = taskCtl ? await taskCtl.decide({
       features: textFeatures,
-      jev: jev ? async () => { const r = await askJev('task'); return r.profile ? { label: r.profile.taskType, probabilities: r.profile.taskTypeProbabilities ?? { [r.profile.taskType]: r.profile.taskTypeConfidence ?? 1 }, confidence: r.profile.taskTypeConfidence ?? 0.5, model: r.model, raw: r } : null } : null,
+      jev: decider ? async () => {
+        const r = await askJev('task')
+        if (!r.profile) return null
+        // A type too flat to use is left out of the profile, and so are its probabilities.
+        const probabilities = flat(r, 'taskType') ? {} : r.profile.taskTypeProbabilities ?? { [r.profile.taskType]: r.profile.taskTypeConfidence ?? 1 }
+        return { label: r.profile.taskType, probabilities, confidence: r.profile.taskTypeConfidence ?? 0.5, model: r.model, raw: r, ...marks(r, 'taskType') }
+      } : null,
       fallback: () => { const p = heuristicProfile(task); return { label: p.taskType, probabilities: { [p.taskType]: 1 }, confidence: p.taskTypeConfidence, raw: { profile: p } } },
       // The numbers the teacher put on this task ride the sample, so a task type decided locally
       // later can be turned back into a full profile from the class average rather than a
-      // generic one. Numbers only: no task text ever reaches the store.
+      // generic one. Numbers only: no task text ever reaches the store. Another provider's numbers
+      // are kept under a name of their own, which no class average reads, and only when it gave
+      // them: the rules' profile, when it gave none, is not its numbers.
       context: {
-        extra: ({ teacher: t, answer }) => {
-          const p = t?.raw?.profile ?? answer?.raw?.profile
-          return p ? { profile: profileNumbers(p), tiers: { minimum: p.minimumCapability, preferred: p.preferredCapability } } : {}
+        extra: ({ teacher: t, provider: given, answer }) => {
+          const p = P.teacher ? (t?.raw?.profile ?? answer?.raw?.profile) : given?.raw?.profile
+          return p ? { [P.teacher ? 'profile' : 'providerProfile']: profileNumbers(p), tiers: { minimum: p.minimumCapability, preferred: p.preferredCapability } } : {}
         },
       },
     }) : null
     let routed = null
-    if (taskDecision?.authority === 'jev' && taskDecision.teacher?.raw?.profile) { routed = taskDecision.teacher.raw; profile = routed.profile }
-    else if (taskDecision?.authority === 'fallback' && taskDecision.teacher?.raw?.profile) profile = taskDecision.teacher.raw.profile
+    const answered = rawOf(taskDecision)
+    if (taskDecision?.authority === P.id && answered?.profile) { routed = answered; profile = filled(routed.profile) }
+    // The provider's type was too flat to use: the rules give the type, and the provider still
+    // gives every field it did answer, the tool it picked and that tool's numbers included.
+    else if (taskDecision?.authority === 'fallback' && answered?.profile) { routed = answered; profile = filled(answered.profile) }
     else if (taskDecision?.authority === 'local') profile = profileFromClass(taskDecision.label, taskDecision.probabilities, classes, {})
     else if (taskDecision?.authority === 'fallback') profile = heuristicProfile(task)
-    else if (!taskCtl && jev) { try { routed = await askJev('task'); profile = routed.profile } catch (err) { if (signal?.aborted) throw err; profile = { ...heuristicProfile(task), fallbackReason: String(err?.message ?? err) } } }
+    else if (!taskCtl && decider) { try { routed = await askJev('task'); profile = filled(routed.profile) } catch (err) { if (signal?.aborted) throw err; profile = { ...heuristicProfile(task), fallbackReason: String(err?.message ?? err) } } }
     else profile = heuristicProfile(task)
     if (!profile) profile = heuristicProfile(task)
-    if (taskDecision?.sampleId) samples.push({ domain: 'task_classification', id: taskDecision.sampleId, profile: profileNumbers(profile) })
-    domainReport.task_classification = report(taskDecision, { label: profile.taskType })
+    if (taskDecision?.sampleId) samples.push({ domain: 'task_classification', id: taskDecision.sampleId, store: storeKind, profile: profileNumbers(profile) })
+    // With no controller wired (learning off) the report still says who answered, rather than
+    // 'none', so the run's "who decided" line names the decider when it read the task.
+    domainReport.task_classification = report(taskDecision ?? { authority: routed?.profile && !flat(routed, 'taskType') ? P.id : 'fallback', confidence: profile.taskTypeConfidence, model: routed?.model }, { label: profile.taskType })
 
     // Skill selection rides the same features and the same teacher answer. Skill is HOW the work
     // is done, not WHO does it, so it never touches the candidate pool: it is handed to the router
@@ -413,11 +488,12 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     if (skillCtl) {
       const d = await skillCtl.decide({
         features: textFeatures,
-        jev: jev ? async () => { const r = await askJev('task'); return r.profile?.skills ? { label: r.profile.skills.primary, probabilities: {}, confidence: r.profile.skillConfidence ?? 0.5, model: r.model, raw: { supporting: r.profile.skills.supporting ?? [] } } : null } : null,
+        // A skill too flat to use is no skill in the profile, and still an answer the domain hears.
+        jev: decider ? async () => { const r = await askJev('task'); return r.profile?.skills || flat(r, 'skill') ? { label: r.profile?.skills?.primary, probabilities: {}, confidence: r.profile?.skillConfidence ?? 0.5, model: r.model, raw: { supporting: r.profile?.skills?.supporting ?? [] }, ...marks(r, 'skill') } : null } : null,
         fallback: () => ({ label: resolveSkills(profile.skills, profile.taskType).primary, probabilities: {}, confidence: 0.3 }),
       })
       if (d?.label) {
-        const supporting = d.authority === 'jev' ? d.teacher?.raw?.supporting ?? profile.skills?.supporting : profile.skills?.supporting
+        const supporting = d.authority === P.id ? rawOf(d)?.supporting ?? profile.skills?.supporting : profile.skills?.supporting
         profile = { ...profile, skills: { primary: d.label, supporting: supporting ?? [] } }
         skillAuthority = d.authority
       }
@@ -435,7 +511,7 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
       // A mapped answer is not what the run used, so the run cannot confirm it: labelling it
       // would teach the skill domain an off-vocabulary label from runs that used another skill.
       // The sample stays teacher-only, as the resource pick does when conservation moves it.
-      if (skillDecision?.sampleId && skillMappedFrom === undefined) samples.push({ domain: 'skill_selection', id: skillDecision.sampleId })
+      if (skillDecision?.sampleId && skillMappedFrom === undefined) samples.push({ domain: 'skill_selection', id: skillDecision.sampleId, store: storeKind })
       domainReport.skill_selection = {
         ...report(skillDecision, { label: profile.skills.primary }),
         label: profile.skills.primary,
@@ -456,7 +532,7 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
       // resource that cannot do it (a local model with no network, asked to look something up) is
       // not a candidate to be weighed, and must not be picked as a parallel answerer either.
       if (canDoNamed && !canDoNamed.has(c.id)) { excluded.push({ id: c.id, reason: `cannot do what this request needs (${profile.capability})`, hard: true }); continue }
-      const t = candidateTier(c.capabilities, profile.requirements, policy)
+      const t = candidateTier(c.capabilities, profile.requirements, pol)
       c.tier = t.tier; c.tierScore = t.score
       c.fit = candidateFeatures(profile, c).numeric.fit
       kept.push(c)
@@ -512,69 +588,73 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // against expected cost against scarcity, and weighing numbers against each other is the one
     // thing a snap-judgment classifier cannot do. The ranking is this domain's authority, so it is
     // reported as `code` and never as `fallback`, which means the opposite: nobody could decide.
-    const codePick = () => {
-      const r = rankCandidates({ candidates: pool, profile, policy })
-      return { chosenKey: r.chosenKey, probabilities: r.probabilities, confidence: r.confidence }
-    }
-    // The domain controller speaks `chosenKey` (the contract's ranking shape); this file works in
-    // `key`. One conversion, so a fallback answer cannot arrive as an undefined pick.
-    const asPick = (answer, authority, extra = {}) => ({ key: answer.chosenKey ?? answer.key, probabilities: answer.probabilities ?? {}, confidence: answer.confidence ?? 0.5, authority, ...extra })
+    const ranking = rankCandidates({ candidates: pool, profile, policy: pol })
+    const pick = { key: ranking.chosenKey, probabilities: ranking.probabilities, confidence: ranking.confidence }
+    // The ranking decides at every rung of this domain's ladder, by the owner's decision, and the
+    // local classifier never outranks it. The domain has no teacher, so its classifier learns only
+    // from the runs that contradict the ranking (a rescue, a failure, a person's `good pick` tag):
+    // whatever rung it climbs to, it climbed on a diet of failures, and a classifier matured on
+    // that must not overrule arithmetic that is right. The controller still runs, so every pick is
+    // a sample and the classifier's own answer is recorded beside the ranking's for comparison (on
+    // the sample, and as `local` in the decision report), but it never decides the pick. The pick
+    // is taken from the ranking here, not from the controller's answer, so nothing a controller
+    // returns can move it.
     const resCtl = controller('resource_selection')
-    // The controller still runs, because the local classifier still learns this domain from what
-    // the runs do: it shadows the ranking, and once its own evidence earns it authority it decides.
     const resDecision = resCtl ? await resCtl.decide({
       features: pFeatures,
       candidates: candidateRows,
       jev: null,
-      fallback: codePick,
+      // The controller speaks `chosenKey`, the contract's ranking shape; this file works in `key`.
+      fallback: () => ({ chosenKey: pick.key, probabilities: pick.probabilities, confidence: pick.confidence }),
       codeAuthority: true,
+      // The domain says so itself (`localDecides: false` in routing-policy.js DOMAINS), which is
+      // what the Router tab reads; saying it here as well keeps the controller's record honest
+      // under a registry built from any policy.
+      localMayDecide: false,
     }) : null
-    let pick = null
-    if (resDecision?.chosenKey && idOf(resDecision.chosenKey)) pick = asPick(resDecision, resDecision.authority)
-    else if (!resCtl) pick = asPick(codePick(), 'code')
-    if (!pick || !idOf(pick.key)) {
-      // A key the post-filter removed: the best remaining by the same probabilities, else the ranking.
-      const best = Object.entries(pick?.probabilities ?? {}).filter(([k]) => idOf(k)).sort((a, b) => b[1] - a[1])[0]
-      pick = best
-        ? { key: best[0], probabilities: pick.probabilities, confidence: best[1], authority: pick.authority, narrowed: true }
-        : asPick(codePick(), pick?.authority ?? 'code', { narrowed: true })
-    }
-    domainReport.resource_selection = report(resDecision, { label: pick.key })
+    domainReport.resource_selection = report(resDecision ?? { authority: 'code', chosenKey: pick.key, confidence: pick.confidence }, { label: pick.key })
 
     // One yes/no judgment. With its domain controller wired the controller decides who answers;
     // without one (a fresh install, or a caller that passed no registry) the batched Jev answer is
     // read directly, and with no Jev either the deterministic rule stands in. The shape is the
-    // same on all three paths, so nothing downstream has to know which one answered.
-    // `labelled: false` keeps the sample teacher-only: the caller pushes it for outcome labelling
-    // itself, once it knows whether the answer changed anything the run could test.
-    // `code` is a rule that answers the judgment here with a probability, for the two that are
-    // comparisons of numbers rather than snap judgments. Where it is given no teacher is asked and
-    // the rule is the authority, exactly as the resource ranking is.
-    const judgment = async (domain, key, fallbackYes, { labelled = true, code = null } = {}) => {
-      const asJudgment = (p, authority, model) => ({ label: p >= 0.5 ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), authority, model })
-      const fallback = () => (code ? asJudgment(code()) : { label: fallbackYes ? 'yes' : 'no', probabilities: { yes: fallbackYes ? 1 : 0, no: fallbackYes ? 0 : 1 }, confidence: 0.5, authority: 'fallback' })
+    // same on all three paths, so nothing downstream has to know which one answered. The sample
+    // is left teacher-only here: the caller pushes it for outcome labelling itself, once it knows
+    // whether the answer changed anything the run could test.
+    // `rule` answers the judgment in code with a probability of yes. Where the domain says a rule
+    // in code teaches it (`teacher: 'code'` in routing-policy.js DOMAINS) the rule is the authority
+    // and no teacher is asked, exactly as the resource ranking is, for a judgment that is a
+    // comparison of numbers rather than a snap judgment. Otherwise the rule is only the
+    // deterministic fallback for when nobody else answers, and says so at half confidence.
+    // A provider's P(true) is read at its own `judgmentYes`; the rule's own outputs (0, 1, or the
+    // codeJudgments cuts) keep 0.5 whoever decides, since that is what their stored label means.
+    const judgment = async (domain, key, rule) => {
+      const code = DOMAINS[domain]?.teacher === 'code'
+      const asJudgment = (p, authority, model, cut = 0.5) => ({ label: p >= cut ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), authority, model })
+      const fallback = () => {
+        const p = rule()
+        return code ? asJudgment(p) : { label: p >= 0.5 ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: 0.5, authority: 'fallback' }
+      }
       const ctl = controller(domain)
       let d
       if (ctl) {
         d = await ctl.decide({
           features: pFeatures,
-          jev: jev && !code ? async () => { const r = await askJev('judgments'); const p = r[key]; return typeof p === 'number' ? { label: p >= 0.5 ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), model: r.model } : null } : null,
+          jev: decider && !code ? async () => { const r = await askJev('judgments'); const p = r[key]; return typeof p === 'number' ? { label: p >= pol.judgmentYes ? 'yes' : 'no', probabilities: { yes: p, no: 1 - p }, confidence: Math.max(p, 1 - p), model: r.model, ...marks(r, key) } : null } : null,
           fallback,
-          codeAuthority: !!code,
+          codeAuthority: code,
           context: { extra: { candidates: tierTable } },
         })
       } else if (code) {
-        d = { ...asJudgment(code()), authority: 'code' }
-      } else if (jev) {
+        d = { ...asJudgment(rule()), authority: 'code' }
+      } else if (decider) {
         try {
           const r = await askJev('judgments')
-          d = typeof r[key] === 'number' ? asJudgment(r[key], 'jev', r.model) : fallback()
+          d = typeof r[key] === 'number' && !flat(r, key) ? asJudgment(r[key], P.id, r.model, pol.judgmentYes) : fallback()
         } catch (err) {
           if (signal?.aborted) throw err
           d = fallback()
         }
       } else d = fallback()
-      if (d?.sampleId && labelled) samples.push({ domain, id: d.sampleId })
       domainReport[domain] = report(d, { label: d?.label })
       return d
     }
@@ -583,59 +663,47 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     const risk = profile.risk ?? 0.5
 
     // --- 4. conservation ------------------------------------------------------------------------
-    // Whether the scarce capacity of the most capable candidate should be kept for harder work
-    // than this. The governor only prices scarcity (it is a signal, never a rule); this is what
-    // acts on it, and it acts the way the weekly gate does: the conserved resource leaves the work
-    // pool and stays available to review. It comes after the resource pick and before the
-    // strategy, because it can change who works, and the strategy must be planned around whoever
-    // really does it.
+    // A hard limit, beside the weekly gate and the capability floor: when the most capable
+    // candidate's allowance is being used up and this task is easy enough to do elsewhere, that
+    // resource leaves the work pool and stays available to review. The governor only prices
+    // scarcity (it is a signal, never a rule); this is what acts on it. It comes after the resource
+    // pick and before the strategy, because it can change who works, and the strategy must be
+    // planned around whoever really does it.
     //
     // The ranking already declines to spend a pressing allowance on work a cheaper candidate
     // covers, so by the time this runs the work has often moved of its own accord. What is left is
     // to make that stick: taking the resource out of the pool is what stops a mid-run hand-over
     // from spending the very capacity the ranking just kept back, and it is still there to review.
+    // Nothing in it is a judgment, so no domain answers it and no run labels it.
     //
-    // The hard limits are code: a local model has nothing to conserve, nor does a resource whose
-    // allowance is healthy, and the work moves only to a candidate whose KNOWN tier meets the
-    // floor, because moving work off a resource known to be capable onto one nobody has measured
-    // is a gamble, not a saving. That one rule also covers an unmet floor and a gate that yielded
-    // to a frontier floor: in both, nothing else has a known tier at the floor, so the scarce
-    // resource keeps the work it alone can do. A coin flip (exactly 0.5) conserves nothing.
+    // Every condition is a fact. A local model has nothing to conserve, nor does a resource with no
+    // marginal cost, nor one the governor calls healthy: under its plan's first knee, sparing an
+    // allowance that is barely touched is not conservation but a second-best pick, and unknown
+    // usage argues for nothing either way. The work must be easy enough to move off, by the task's
+    // own complexity and its risk against the review cut the policy already sets, because hard or
+    // risky work is what the capacity is kept for. And the work moves only to a candidate whose
+    // KNOWN tier meets the floor, because moving it off a resource known to be capable onto one
+    // nobody has measured is a gamble, not a saving. That one rule also covers an unmet floor and a
+    // gate that yielded to a frontier floor: in both, nothing else has a known tier at the floor,
+    // so the scarce resource keeps the work it alone can do.
     let primary = pool.find((c) => c.id === idOf(pick.key))
     const mostCapable = strongestOf(pool)
-    const scarceTop = !!mostCapable && mostCapable.source !== 'local' && (mostCapable.scarcity ?? 0) >= CURVE_KNEES.aggressive
-    // Nothing is conserved that is not being used up: the governor calls a resource under its
-    // first knee "healthy, spend normally", and sparing an allowance that is barely touched is not
-    // conservation, it is a second-best pick. Unknown usage argues for nothing either way.
-    const worthConserving = typeof mostCapable?.scarcity === 'number' && mostCapable.scarcity >= CURVE_KNEES.start
-    const canConserve = !!mostCapable && mostCapable.source !== 'local' && mostCapable.marginalCost !== 'none' && worthConserving
+    const hint = conservationHint(signals.get(mostCapable?.id) ?? {}, profile, policy)
+    const canConserve = !!mostCapable && mostCapable.source !== 'local' && mostCapable.marginalCost !== 'none' && hint.level !== 'healthy'
+    const easyEnoughToMoveOff = (profile.complexity ?? 0.5) < pol.easyComplexity && risk < pol.minimumReview.riskForReview
     const ranked = pick.probabilities ?? {}
     const costOf = (c) => (typeof c.expectedCost?.total === 'number' ? c.expectedCost.total : 0.5)
     // Who does the work once the scarce one is out. When the ranking already chose somebody else
     // that is the answer; otherwise the best of the rest by the ranking, then the cheaper.
     const known = (c) => c.id !== mostCapable.id && c.tier !== 'unknown' && tierAtLeast(c.tier, minimum)
-    const target = !canConserve ? null
+    const target = !canConserve || !easyEnoughToMoveOff ? null
       : known(primary) ? primary
         : pool.filter(known).sort((a, b) => (ranked[b.key] ?? 0) - (ranked[a.key] ?? 0) || costOf(a) - costOf(b) || String(a.id).localeCompare(String(b.id)))[0] ?? null
-    // Answered in code, because it was never a snap judgment: the governor already read this
-    // resource's own allowance against its plan's curve and said how hard it is pressing, which is
-    // a comparison of numbers. All that is left is whether this task is the one worth spending it
-    // on, and that is the task's own complexity and risk against the cuts the policy already sets.
-    const easyEnoughToMoveOff = (profile.complexity ?? 0.5) < 0.5 && risk < policy.minimumReview.riskForReview
-    const conserveProbability = () => {
-      const cuts = policy.codeJudgments.conserve
-      const { level } = conservationHint(signals.get(mostCapable?.id) ?? {}, profile, policy)
-      // `exhausted` is past `high`, not below it. Nothing reaches here with that level today,
-      // because it means the resource is unavailable and an unavailable one is not a candidate at
-      // all, but read by its own name it would fall through to the cut meant for a healthy
-      // allowance, and the resource under the most pressure would be the one never conserved.
-      const band = level === 'exhausted' || level === 'high' ? cuts.high : level === 'increasing' ? cuts.increasing : null
-      return band ? (easyEnoughToMoveOff ? band.easy : band.hard) : cuts.otherwise
-    }
-    const conservation = await judgment('conservation', 'conserve', scarceTop && easyEnoughToMoveOff, { labelled: false, code: conserveProbability })
     let conserved = null
-    if ((prob(conservation) ?? 0) > 0.5 && target && target.id !== mostCapable.id) {
-      conserved = { from: mostCapable.id, to: target.id, confidence: r2(conservation.confidence), authority: conservation.authority ?? null }
+    if (target) {
+      // A limit has no probability behind it that could have come out the other way, so it is
+      // recorded as certain, and as code's: nothing else decided it.
+      conserved = { from: mostCapable.id, to: target.id, confidence: 1, authority: 'code' }
       excluded.push({ id: mostCapable.id, reason: 'conserved for harder work: kept for review only' })
       pool = pool.filter((c) => c.id !== mostCapable.id)
       primary = target
@@ -643,16 +711,10 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
       strategies = strategiesFor(pool)
       pFeatures = mergeFeatures(profileFeatures(profile), poolFeatures(profile, pool))
     }
-    // The conservation answer is labelled by the run only when it decided something the run
-    // tests: a yes that moved the work, or a no where a yes would have. A yes that could not act
-    // (the pick was not the most capable, or nothing measured could take the work) and a coin
-    // flip that reads 'yes' but moved nothing leave the run exactly as it would have been, so
-    // an accepted run would confirm a 'yes' that never happened. Those stay teacher-only.
-    if (conservation?.sampleId && (conserved || (target && !yes(conservation)))) samples.push({ domain: 'conservation', id: conservation.sampleId })
     // The pick is still the pick unless conservation took the work off it: a run that conserved a
     // resource the ranking had already passed over tests exactly the resource the ranking chose.
     const pickMoved = primary.id !== idOf(pick.key)
-    if (resDecision?.sampleId && !pickMoved) samples.push({ domain: 'resource_selection', id: resDecision.sampleId })
+    if (resDecision?.sampleId && !pickMoved) samples.push({ domain: 'resource_selection', id: resDecision.sampleId, store: storeKind })
     if (pickMoved) domainReport.resource_selection = { ...domainReport.resource_selection, movedBy: 'conservation' }
 
     // --- 5. strategy and the remaining judgments ------------------------------------------------
@@ -660,7 +722,7 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     const strategyFallback = () => {
       const risk = profile.risk ?? 0.5
       const cheapish = primary.marginalCost !== 'low' || primary.tier === 'standard' || primary.tier === 'weak'
-      const label = risk >= policy.minimumReview.riskForFrontierReview && cheapish && strategies.includes('CHEAP_EXECUTE_FRONTIER_REVIEW') ? 'CHEAP_EXECUTE_FRONTIER_REVIEW'
+      const label = risk >= pol.minimumReview.riskForFrontierReview && cheapish && strategies.includes('CHEAP_EXECUTE_FRONTIER_REVIEW') ? 'CHEAP_EXECUTE_FRONTIER_REVIEW'
         : primary.source === 'local' && strategies.includes('LOCAL_FIRST') ? 'LOCAL_FIRST'
           : primary.tier === 'frontier' ? 'PREMIUM_DIRECT' : cheapish && strategies.includes('CHEAP_DIRECT') ? 'CHEAP_DIRECT' : 'STANDARD_DIRECT'
       return { label, probabilities: { [label]: 1 }, confidence: 0.5 }
@@ -670,7 +732,7 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
       features: pFeatures,
       // One eligible strategy is nothing to choose between, and it is now the only question the
       // resource call carries: asking would buy a call whose answer is already known.
-      jev: jev && strategies.length > 1 ? async () => { const r = await askJev('resource'); return r.strategy?.choice ? { label: r.strategy.choice, probabilities: r.strategy.probabilities ?? {}, confidence: r.strategy.confidence ?? 0.5, model: r.model } : null } : null,
+      jev: decider && strategies.length > 1 ? async () => { const r = await askJev('resource'); return r.strategy?.choice ? { label: r.strategy.choice, probabilities: r.strategy.probabilities ?? {}, confidence: r.strategy.confidence ?? 0.5, model: r.model, ...marks(r, 'strategy') } : null } : null,
       fallback: strategyFallback,
       context: { allowed: strategies, extra: { candidates: tierTable } },
     }) : null
@@ -678,30 +740,30 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
       const label = strategies.includes(stratDecision.label) ? stratDecision.label
         : Object.entries(stratDecision.probabilities ?? {}).filter(([k]) => strategies.includes(k)).sort((a, b) => b[1] - a[1])[0]?.[0] ?? strategyFallback().label
       strategyPick = { label, confidence: stratDecision.confidence, authority: stratDecision.authority, restricted: label !== stratDecision.label }
-    } else if (!stratCtl && jev && strategies.length > 1) {
+    } else if (!stratCtl && decider && strategies.length > 1) {
       try {
         const r = await askJev('resource')
-        strategyPick = r.strategy?.choice && strategies.includes(r.strategy.choice) ? { label: r.strategy.choice, confidence: r.strategy.confidence, authority: 'jev' } : { ...strategyFallback(), authority: 'fallback' }
+        strategyPick = r.strategy?.choice && strategies.includes(r.strategy.choice) && !flat(r, 'strategy') ? { label: r.strategy.choice, confidence: r.strategy.confidence, authority: P.id } : { ...strategyFallback(), authority: 'fallback' }
       } catch (err) {
         if (signal?.aborted) throw err
         strategyPick = { ...strategyFallback(), authority: 'fallback' }
       }
     } else strategyPick = { ...strategyFallback(), authority: 'fallback' }
-    domainReport.execution_strategy = report(stratDecision, { label: strategyPick.label })
+    domainReport.execution_strategy = report(stratDecision ?? { authority: strategyPick.authority, confidence: strategyPick.confidence }, { label: strategyPick.label })
 
     // Both are labelled below, and only where their answer could change the run (see there).
-    const secondOpinion = await judgment('second_opinion', 'secondOpinion', risk >= policy.minimumReview.riskForReview, { labelled: false })
+    const secondOpinion = await judgment('second_opinion', 'secondOpinion', () => (risk >= pol.minimumReview.riskForReview ? 1 : 0))
     // Answered in code for the same reason: it read the task's risk against a threshold, and a
     // threshold is arithmetic. Risky work gets the strongest reviewer; work that is merely risky
     // enough to review gets one too when what it needs is frontier capability, which is where a
     // subtle mistake is least likely to be caught by the checks alone.
     const frontierProbability = () => {
       const cuts = policy.codeJudgments.frontierReview
-      if (risk >= policy.minimumReview.riskForFrontierReview) return cuts.risky
-      const wantsFrontier = profile.minimumCapability === 'frontier' || profile.preferredCapability === 'frontier' || (profile.requirements?.security_review ?? 0) >= 0.5
-      return risk >= policy.minimumReview.riskForReview && wantsFrontier ? cuts.frontierWork : cuts.otherwise
+      if (risk >= pol.minimumReview.riskForFrontierReview) return cuts.risky
+      const wantsFrontier = profile.minimumCapability === 'frontier' || profile.preferredCapability === 'frontier' || (profile.requirements?.security_review ?? 0) >= pol.requirementWanted
+      return risk >= pol.minimumReview.riskForReview && wantsFrontier ? cuts.frontierWork : cuts.otherwise
     }
-    const frontier = await judgment('frontier_escalation', 'frontierReview', risk >= policy.minimumReview.riskForFrontierReview, { labelled: false, code: frontierProbability })
+    const frontier = await judgment('frontier_escalation', 'frontierReview', frontierProbability)
 
     // --- 6. the plan and the routing object -----------------------------------------------------
     // Who may judge: everything that cleared the hard facts, not only what cleared the capability
@@ -713,20 +775,20 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // mapped to another because it was not eligible (after conservation, say), or one the broker
     // could not build with these candidates, would have the run confirm a strategy it never tried
     // - the same guard the resource and skill samples already have.
-    if (stratDecision?.sampleId && plan.strategy === stratDecision.label) samples.push({ domain: 'execution_strategy', id: stratDecision.sampleId })
+    if (stratDecision?.sampleId && plan.strategy === stratDecision.label) samples.push({ domain: 'execution_strategy', id: stratDecision.sampleId, store: storeKind })
     // The skill rides the plan because the plan is what the loop runs: the router writes it into
     // the instructions of every step that does the work (see router.js basePrompt).
     plan.skill = { ...profile.skills, description: SKILLS[profile.skills.primary], authority: skillAuthority, ...(skillMappedFrom !== undefined ? { mappedFrom: skillMappedFrom } : {}) }
     if (conserved) plan.notes.push(`${conserved.from} conserved for harder work: ${conserved.to} does it, ${conserved.from} stays available to review`)
-    // The same rule as conservation and the strategy: a judgment is labelled by the run only when
-    // its answer could have changed the run, or an accepted run confirms a 'yes' that never
-    // happened (and a failed one refutes it). A frontier review changes the run only when the plan
-    // did not already have one, the floor does not add one anyway, a reviewer exists, and the run
-    // reviews at all: an answer-only run never does.
+    // The same rule as the strategy: a judgment is labelled by the run only when its answer could
+    // have changed the run, or an accepted run confirms a 'yes' that never happened (and a failed
+    // one refutes it). A frontier review changes the run only when the plan did not already have
+    // one, the floor does not add one anyway, a reviewer exists, and the run reviews at all: an
+    // answer-only run never does.
     const strongestReviewer = strongestOf(reviewPool, { except: [primary.id] })
     const frontierCouldAct = !answerOnly && !plan.frontierReview && !belowFloor && !!strongestReviewer
     if (yes(frontier) && frontierCouldAct) { plan.reviewer = strongestReviewer.id; plan.forceReview = true; plan.frontierReview = true; plan.notes.push('frontier review added by the frontier-escalation domain') }
-    if (frontier?.sampleId && frontierCouldAct) samples.push({ domain: 'frontier_escalation', id: frontier.sampleId })
+    if (frontier?.sampleId && frontierCouldAct) samples.push({ domain: 'frontier_escalation', id: frontier.sampleId, store: storeKind })
     if (belowFloor) {
       if (strongestReviewer) { plan.reviewer = strongestReviewer.id; plan.forceReview = true; plan.frontierReview = true }
       plan.notes.push(`no candidate meets the ${minimum} floor; the strongest available reviews`)
@@ -734,14 +796,14 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // A second opinion is asked for only of accepted work that no review has seen (jev-review), so
     // a plan that already promises a review, or an answer-only run, which is never reviewed, gets
     // the same run whatever the answer was.
-    if (secondOpinion?.sampleId && !answerOnly && !plan.forceReview) samples.push({ domain: 'second_opinion', id: secondOpinion.sampleId })
+    if (secondOpinion?.sampleId && !answerOnly && !plan.forceReview) samples.push({ domain: 'second_opinion', id: secondOpinion.sampleId, store: storeKind })
     // One row per resource as the review call and the inspector read it: the numbers the choice
     // was made over, and never a name beyond the id the router maps back from.
     const rowOf = (c) => ({
       id: c.id, key: c.key, source: c.source, tier: c.tier, fit: r2(c.fit), scarcity: r2(c.scarcity), scarcityConfidence: r2(c.scarcityConfidence),
       resetInMinutes: c.resetInMinutes == null ? null : Math.round(c.resetInMinutes), marginalCost: c.marginalCost, expectedCost: c.expectedCost ? { total: r2(c.expectedCost.total), class: c.expectedCost.class } : null,
       latency: c.latency, availability: c.availability, cold: c.cold, evidenceSamples: c.evidenceSamples, plan: c.plan,
-      capabilities: Object.fromEntries(Object.entries(c.capabilities).filter(([d]) => (profile.requirements?.[d] ?? 0) >= 0.5 || d === 'reliability').map(([d, v]) => [d, { score: r2(v.score), confidence: r2(v.confidence), samples: v.samples }])),
+      capabilities: Object.fromEntries(Object.entries(c.capabilities).filter(([d]) => (profile.requirements?.[d] ?? 0) >= pol.requirementWanted || d === 'reliability').map(([d, v]) => [d, { score: r2(v.score), confidence: r2(v.confidence), samples: v.samples }])),
     })
     const agentProbabilities = Object.fromEntries(Object.entries(pick.probabilities ?? {}).map(([k, p]) => [idOf(k), p]).filter(([id]) => id))
     for (const c of pool) if (agentProbabilities[c.id] === undefined) agentProbabilities[c.id] = 0
@@ -749,8 +811,9 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
       model: routed?.model ?? jevCalls[0]?.model,
       primaryAgent: primary.id,
       // When conservation moved the work, the pick's confidence was about the resource it moved
-      // away from; what put this primary here is the conservation judgment, at its confidence.
-      agentConfidence: pickMoved ? conservation.confidence : pick.confidence,
+      // away from; what put this primary here is the conservation limit, which is certain. Read as
+      // the ranking's doubt instead, it could send the router's low-confidence tie-break after it.
+      agentConfidence: pickMoved ? conserved.confidence : pick.confidence,
       ...(conserved ? { conservedFrom: conserved.from } : {}),
       agentProbabilities,
       capability: profile.capability,
@@ -784,9 +847,12 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
         strategies,
         plan: { ...plan, notes: plan.notes },
         domains: domainReport,
-        judgments: { secondOpinion: prob(secondOpinion), conserve: prob(conservation), frontierReview: prob(frontier) },
+        judgments: { secondOpinion: prob(secondOpinion), frontierReview: prob(frontier) },
         jevCalls: jevCalls.length,
-        samples: samples.map(({ domain, id }) => ({ domain, id })),
+        // Who decided, so every line that counts `jevCalls` names the provider that was called.
+        decider: P.id,
+        // With the store each is in, so a verdict given later relabels it where it is.
+        samples: samples.map(({ domain, id, store }) => ({ domain, id, store })),
       },
     }
     emit?.('decision', { at: now(), decision: routing.decision, profile: profileNumbers(profile), taskType: profile.taskType, strategy: plan.strategy, primary: primary.id })
@@ -809,6 +875,8 @@ function report(d, { label } = {}) {
     reason: d.reason,
     jevCalled: !!d.jevCalled,
     teacher: d.teacher ? { label: d.teacher.label ?? d.teacher.chosenKey, confidence: r2(d.teacher.confidence) } : null,
+    // What another provider said, whether or not it decided (an answer too flat to act on).
+    ...(d.provider ? { provider: { label: d.provider.label ?? d.provider.chosenKey, confidence: r2(d.provider.confidence), informative: d.provider.informative !== false } } : {}),
     local: d.local ? { label: d.local.label ?? d.local.chosenKey, confidence: r2(d.local.confidence), ood: d.local.ood } : null,
     sampleId: d.sampleId ?? null,
   }

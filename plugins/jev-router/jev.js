@@ -5,20 +5,30 @@
 // Three judgment groups live here, each the teacher for one or more routing domains:
 //   task      what the request needs: type, complexity, risk, the capability dimensions it
 //             requires, skills, the minimum tier of model that could do it, verification
-//   resource  which anonymous candidate (RESOURCE_A, RESOURCE_B ...) should do the work and
-//             how (the execution strategy), judged from each candidate's machine-readable
-//             capability profile, scarcity and economics, never from a provider name
+//   resource  how the work should be organised (the execution strategy); which candidate does
+//             it is ranked in code (broker.js), and no candidate data rides the call
 //   outcome   what should happen after an attempt: the disposition, and the atomic yes/no
 //             judgments jev-review turns into a decision
 // `route()` batches whichever of the first two groups are still needed into one call, so a
 // domain that has matured locally costs no Jev tokens while the others still ask.
+//
+// The same questions go to whichever decision provider answers (providers.js): Jev, or Laya on
+// this PC through a client of its own. Nothing here knows which; the record handed to createJev
+// carries the model, the retries and the cut-offs, and a mark a provider sets on an answer is
+// read the same way whoever set it.
+import { randomUUID } from 'node:crypto'
 import { TypeSafeClient, choice, noul, score } from '@typesafe-ai/sdk'
 import { CAPABILITIES } from './capabilities.js'
 import { redactSecrets } from './export.js'
 import { identityNames, modelIdOf } from './features.js'
+import { JEV_THRESHOLDS, deepFreeze, jevRecord } from './providers.js'
 import { DISPOSITIONS, REQUIREMENT_DIMENSIONS, SKILLS, STRATEGIES } from './routing-policy.js'
 
-export const TASK_TYPES = {
+// The criteria constants below are frozen, all the way down. The SDK keeps a reference to them
+// in every question it builds, and a question is handed to other readers besides the call (the
+// Laya shadow renders the same objects for its own model): a reader that rewrote one in place
+// would change every later Jev request in this process.
+export const TASK_TYPES = deepFreeze({
   architecture: 'Designing structure, data flow, or a strategy across components before or instead of writing code',
   implementation: 'Writing new code or features to a known requirement',
   debugging: 'Finding and fixing the cause of incorrect behavior, a failing test, or an error',
@@ -31,32 +41,32 @@ export const TASK_TYPES = {
   performance: 'Work whose main concern is speed, memory, or resource usage',
   simple_change: 'A small, mechanical, low-judgment edit such as a typo, constant, or one-line fix',
   other: 'None of the above fits',
-}
+})
 
-const COMPLEXITY_LEVELS = [
+const COMPLEXITY_LEVELS = deepFreeze([
   'Trivial: a mechanical edit in one place with an obvious answer',
   'Small: a contained change in one or two files with a clear approach',
   'Moderate: several files or some design judgment, but a well-understood problem',
   'Hard: cross-cutting change, unclear root cause, or real design trade-offs',
   'Extremely complex: ambiguous requirements, many interacting systems, or concurrency and distributed-state reasoning',
-]
+])
 
-const RISK_LEVELS = [
+const RISK_LEVELS = deepFreeze([
   'Negligible: a mistake has no user-visible effect, for example docs or a test fixture',
   'Low: a mistake causes a minor, easily noticed and reverted defect',
   'Moderate: a mistake could break a feature for some users until fixed',
   'High: a mistake could corrupt data, break a core flow, or cause an outage',
   'Production-critical: a mistake could compromise security, authentication, money, or irreversible data',
-]
+])
 
 // One scale for every requirement dimension: how much the task leans on it.
-const REQUIREMENT_LEVELS = [
+const REQUIREMENT_LEVELS = deepFreeze([
   'Not needed: the task does not call on this at all',
   'Marginal: a little helps but a weak model would still manage',
   'Useful: noticeably better results with real strength here',
   'Important: a model weak at this would likely produce a wrong or poor result',
   'Central: the task is essentially this; only real strength here gives an acceptable result',
-]
+])
 
 const REQUIREMENT_TEXT = {
   general_reasoning: 'careful multi-step reasoning',
@@ -71,13 +81,13 @@ const REQUIREMENT_TEXT = {
   long_context: 'holding and reasoning over a large amount of project context at once',
 }
 
-const TIERS = {
+const TIERS = deepFreeze({
   standard: { what: 'A competent mid-range model: routine work with clear instructions' },
   strong: { what: 'A strong model: real judgment, several files, non-obvious fixes' },
   frontier: { what: 'The strongest models available: subtle multi-module reasoning, difficult design, security-sensitive or high-risk work' },
-}
+})
 
-export const VERDICTS = {
+export const VERDICTS = deepFreeze({
   accept: {
     what: 'The evidence shows the task is done: the result addresses the request and verification supports it',
     not_for: 'Results with failing required checks, unaddressed parts of the task, or open risk that deserves another look',
@@ -94,10 +104,10 @@ export const VERDICTS = {
     what: 'A person should decide: scope is unclear, the change is risky or destructive, agents failed repeatedly, or evidence is missing',
     not_for: 'Routine outcomes an agent can settle',
   },
-}
+})
 
 /** The outcome dispositions as Jev is asked to choose between them. Deterministic failures override the answer in code. */
-export const DISPOSITION_CRITERIA = {
+export const DISPOSITION_CRITERIA = deepFreeze({
   PASS: { what: 'The result is done and verified well enough to accept' },
   RETRY_SAME_TIER: { what: 'Wrong or incomplete, but a model of the same strength would likely fix it with the feedback' },
   RETRY_DIFFERENT_RESOURCE: { what: 'Wrong or incomplete in a way this resource keeps getting wrong: a different resource should try' },
@@ -105,7 +115,7 @@ export const DISPOSITION_CRITERIA = {
   FRONTIER_REVIEW: { what: 'Plausible but risky or subtle enough that only the strongest available resource should judge it before acceptance' },
   WRONG: { what: 'Clearly wrong and not worth retrying as is: the approach itself must change' },
   HUMAN: { what: 'A person must decide: unclear scope, a destructive or irreversible action, repeated failure, or missing evidence' },
-}
+})
 
 /**
  * Mask key-shaped strings on anything that goes to Jev, with the same scrubber the
@@ -117,13 +127,15 @@ export const DISPOSITION_CRITERIA = {
  */
 const scrub = (text) => (typeof text === 'string' ? redactSecrets(text) : text)
 /**
- * `scrub` every string inside a nested plain object or array. The track record is built from the
- * person's own feedback, including the free text they typed in the Why? box, so it is the one
- * payload on the routing call that can carry an arbitrary sentence. A key pasted into that box
- * must not ride out with it, and the README promises keys are masked in everything sent to Jev.
+ * `scrub` every string inside a nested plain object or array, object keys included. The track
+ * record is built from the person's own feedback, including the free text they typed in the Why?
+ * box, and the workspace facts are git's view of the files, so either can carry an arbitrary
+ * string. A key pasted into that box must not ride out with it, and the README promises keys are
+ * masked in everything sent to Jev. Keys too, because a map can be keyed by what was typed: the
+ * workspace counts its files by extension, and a file's extension is part of its name.
  */
 const scrubDeep = (v) => (Array.isArray(v) ? v.map(scrubDeep)
-  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, scrubDeep(x)]))
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [scrub(k), scrubDeep(x)]))
     : scrub(v))
 
 function clip(text, max) {
@@ -132,8 +144,10 @@ function clip(text, max) {
   return s.length <= max ? s : `${s.slice(0, max)}\n...[truncated ${s.length - max} chars]`
 }
 
+// A description is the person's own words from config, and it goes out as the option Jev reads,
+// so it is scrubbed like any other text sent to Jev.
 function agentCriteria(agents) {
-  return Object.fromEntries(agents.map((a) => [a.id, { what: a.description }]))
+  return Object.fromEntries(agents.map((a) => [a.id, { what: scrub(a.description) }]))
 }
 
 // --- anonymity -------------------------------------------------------------------------------
@@ -261,14 +275,14 @@ export function anonymity(entries = []) {
 /** A tool step in the attempt log: router.js records it as `tool:<tool id>`. */
 const isToolAttempt = (agent) => typeof agent === 'string' && agent.startsWith('tool:')
 
-/** The names a configured agent goes by, for the masker: the same list the routing call uses. */
+/** The names a configured agent goes by, for the masker (features.js identityNames). */
 const namesOf = identityNames
 
 /**
  * Why an agent outside the work table is not a candidate for the work, in the words Jev reads.
  * The decision record says why for everything it excluded, and says whether that was a hard fact
- * or not: a weekly gate, the capability floor and conservation are policy and judgment, and a
- * resource kept out by them is kept for review on purpose. Telling Jev a judgment was a hard fact
+ * or not: a weekly gate, the capability floor and conservation are limits the policy sets, not
+ * facts about the resource, and a resource kept out by them is kept for review on purpose. Telling Jev a judgment was a hard fact
  * made the resource conserved for harder work look unfit to judge. An agent a current record does
  * not mention never reached the engine: the router offers it only what the executor registry says
  * can take this request. A record from before `excluded` was kept says nothing either way, and
@@ -309,8 +323,8 @@ function reviewTable(decision, agents, { modelOf, attempts = [] } = {}) {
   }
   const pool = agents?.length ? agents : [...byId.keys()].map((id) => ({ id }))
   const used = new Set([...byId.values()].map((c) => c.key))
-  // A review-only resource keeps the key the routing call gave it, so one resource reads as one
-  // key across the run's calls; only an agent the engine never keyed gets a fresh one.
+  // A review-only resource keeps the key the decision engine gave it, so one resource reads as
+  // one key across the run's calls; only an agent the engine never keyed gets a fresh one.
   const adopted = new Map()
   for (const [id, r] of reviewOnly) if (r.key && labelIndex(r.key) >= 0 && !used.has(r.key)) { used.add(r.key); adopted.set(id, r.key) }
   let next = Math.max(-1, ...[...used].map(labelIndex)) + 1
@@ -401,13 +415,18 @@ function numbersState(c) {
     reliability: c.reliability ? { score: r2(c.reliability.score), confidence: r2(c.reliability.confidence) } : null,
     verified_runs: c.evidenceSamples ?? 0,
     new_resource: !!c.cold,
-    // Only the decision record has it (the fit for THIS task); the routing call's table does not.
+    // Only the decision record has it (the fit for THIS task).
     ...(typeof c.fit === 'number' ? { task_fit: r2(c.fit) } : {}),
   }
 }
 
-/** One Jev call as the Inspector shows it: timing, usage, every question and its full answer. */
-function traceOf(phase, questions, res, ms, used) {
+/**
+ * One decider call as the Inspector shows it: timing, usage, every question and its full answer.
+ * `callId` pairs it with the Laya shadow's answer to the same call, `provider` names who answered,
+ * and `meta` is whatever the client adds about the call (the Laya client's device, wait and
+ * identity). A provider's own marks on an answer ride along where the answer carries them.
+ */
+function traceOf(phase, questions, res, ms, used, { callId, provider }) {
   return {
     phase,
     ms,
@@ -417,135 +436,243 @@ function traceOf(phase, questions, res, ms, used) {
     // judgment looks wrong.
     requestId: res.requestId,
     usage: res.usage,
+    callId,
+    provider,
+    ...metaOf(res.meta),
     questions: Object.entries(questions).map(([name, q]) => {
+      // A question the response left out stays in the trace, with no answer and unused.
       const a = res.answers[name]
       return {
         name,
         type: q.type,
         question: typeof q.instructions === 'string' ? q.instructions : q.instructions.question,
         options: q.type === 'choice' ? Object.fromEntries(Object.entries(q.criteria).map(([k, v]) => [k, typeof v === 'string' ? v : v?.what])) : q.type === 'score' ? { ...q.criteria } : undefined,
-        answer: a.type === 'choice' ? a.choice : a.type === 'score' ? a.score : a.noul,
-        confidence: a.confidence,
-        probabilities: a.probabilities,
-        used: used(name, res.answers),
+        answer: a?.type === 'choice' ? a.choice : a?.type === 'score' ? a.score : a?.noul,
+        confidence: a?.confidence,
+        probabilities: a?.probabilities,
+        used: a ? used(name, res.answers) : false,
+        ...Object.fromEntries(ANSWER_MARKS.filter((k) => a?.[k] !== undefined).map((k) => [k, a[k]])),
       }
     }),
   }
 }
 
-/** The task profile from the task-group answers, in the shape the rest of the router reads. */
-export function profileFromAnswers(answers) {
+// What a provider may mark on an answer: too flat to use, re-tempered, and the confidence it
+// served before KzH read the top probability instead (docs/laya-auto.md 4.3). Jev marks none.
+const ANSWER_MARKS = ['informative', 'corrected', 'servedConfidence']
+
+/**
+ * The client's own word about the call (the Laya client's identity, script and device), handed
+ * back as the trace keeps it, so whoever records the answer can say which model gave it: an
+ * answer's samples name the identity they are read under (docs/laya-auto.md 6.2). Read
+ * generically, whoever sets it; Jev's client sets none, and its answers carry no `meta`.
+ */
+const metaOf = (meta) => (meta !== undefined ? { meta } : {})
+
+/**
+ * The names of the answers the provider marked too flat to mean anything. Read generically,
+ * whoever set the mark, so nothing provider-specific enters this file; always empty for Jev.
+ */
+const flatNames = (answers) => Object.keys(answers ?? {}).filter((n) => answers[n]?.informative === false)
+
+// The score and choice answers the profile is made of. A flat one is left out, so the routing
+// rules fill that field; a flat noul is kept, because every bar that reads one sits away from 0.5
+// and a flat answer simply falls under it.
+const PROFILE_ANSWERS = ['taskType', 'complexity', 'risk', 'skill', 'minimumCapability', 'preferredCapability', 'capability', ...REQUIREMENT_DIMENSIONS.map((d) => `req.${d}`)]
+
+/**
+ * The task profile from the task-group answers, in the shape the rest of the router reads.
+ * `thresholds` are the answering provider's (supportingSkill, verificationChecks), Jev's by
+ * default. `filledByRules` names the answers left out as too flat, and is there only when one was.
+ */
+export function profileFromAnswers(answers, thresholds = JEV_THRESHOLDS) {
+  const filledByRules = PROFILE_ANSWERS.filter((n) => answers[n]?.informative === false)
+  const a = (n) => (filledByRules.includes(n) ? undefined : answers[n])
   const requirements = {}
-  for (const d of REQUIREMENT_DIMENSIONS) if (answers[`req.${d}`]) requirements[d] = unit(answers[`req.${d}`], REQUIREMENT_LEVELS)
-  const primary = answers.skill?.choice
+  for (const d of REQUIREMENT_DIMENSIONS) if (a(`req.${d}`)) requirements[d] = unit(a(`req.${d}`), REQUIREMENT_LEVELS)
+  const primary = a('skill')?.choice
   // Supporting skills: the next strongest choices of the same question, above a floor. One
   // question instead of one per skill, and never more than three, so the prompt stays clean.
-  const supporting = Object.entries(answers.skill?.probabilities ?? {})
-    .filter(([k, p]) => k !== primary && p >= 0.15)
-    .sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k]) => k)
+  const floor = thresholds?.supportingSkill ?? JEV_THRESHOLDS.supportingSkill
+  const supporting = Object.entries(a('skill')?.probabilities ?? {})
+    .filter(([k, p]) => k !== primary && p >= floor)
+    .sort((x, y) => y[1] - x[1]).slice(0, 3).map(([k]) => k)
+  // 'always' lists checks whatever the answer, and whether there is one.
+  const checksAt = thresholds?.verificationChecks ?? JEV_THRESHOLDS.verificationChecks
   const verification = []
-  if ((answers.needsTests?.noul ?? 0) >= 0.5) verification.push('checks')
+  if (checksAt === 'always' || (answers.needsTests?.noul ?? 0) >= checksAt) verification.push('checks')
   return {
-    taskType: answers.taskType?.choice,
-    taskTypeConfidence: answers.taskType?.confidence,
-    taskTypeProbabilities: answers.taskType?.probabilities,
-    complexity: answers.complexity ? unit(answers.complexity, COMPLEXITY_LEVELS) : undefined,
-    risk: answers.risk ? unit(answers.risk, RISK_LEVELS) : undefined,
+    taskType: a('taskType')?.choice,
+    taskTypeConfidence: a('taskType')?.confidence,
+    taskTypeProbabilities: a('taskType')?.probabilities,
+    complexity: a('complexity') ? unit(a('complexity'), COMPLEXITY_LEVELS) : undefined,
+    risk: a('risk') ? unit(a('risk'), RISK_LEVELS) : undefined,
     requirements,
     skills: primary ? { primary, supporting } : undefined,
-    skillConfidence: answers.skill?.confidence,
-    capability: answers.capability?.choice,
-    capabilityConfidence: answers.capability?.confidence,
-    minimumCapability: answers.minimumCapability?.choice,
-    minimumCapabilityConfidence: answers.minimumCapability?.confidence,
-    preferredCapability: answers.preferredCapability?.choice,
+    skillConfidence: a('skill')?.confidence,
+    capability: a('capability')?.choice,
+    capabilityConfidence: a('capability')?.confidence,
+    minimumCapability: a('minimumCapability')?.choice,
+    minimumCapabilityConfidence: a('minimumCapability')?.confidence,
+    preferredCapability: a('preferredCapability')?.choice,
     verification,
     needsSecondOpinion: answers.secondOpinion?.noul,
     needsHumanReview: answers.humanReview?.noul,
     needsTests: answers.needsTests?.noul,
     continueHandoff: answers.continueHandoff?.noul,
+    ...(filledByRules.length ? { filledByRules } : {}),
   }
 }
 
-export function createJev({ apiKey, model, timeoutMs, onTrace }) {
-  const client = new TypeSafeClient({ apiKey, ...(model ? { defaultModel: model } : {}) })
-  const ask = async (phase, state, questions, signal, used = () => true) => {
+/** A hook's error or rejection never reaches the call it watches, and nothing waits for it. */
+function quietly(fn, arg) {
+  if (typeof fn !== 'function') return undefined
+  try {
+    const out = fn(arg)
+    if (typeof out?.then === 'function') out.then(undefined, () => {})
+    return out
+  } catch { return undefined }
+}
+
+/**
+ * What a failed call was, in fields a log line and the inspector can show: with how many questions
+ * it asked and where, when the provider's error says (the Laya client's timeout does).
+ */
+const errorOf = (err) => ({
+  class: err?.constructor?.name ?? typeof err, code: err?.code ?? null, status: err?.status ?? null, message: String(err?.message ?? err),
+  ...(Number.isInteger(err?.questions) ? { questions: err.questions } : {}),
+  ...(typeof err?.device === 'string' ? { device: err.device } : {}),
+})
+
+/**
+ * The typed-question client of one decision provider.
+ *
+ *   createJev({ provider, apiKey, client, onTrace, onError, onCall })  `provider` is the record
+ *     of the provider that answers (providers.js). `client` defaults to a TypeSafe client on the
+ *     record's model and retries; the Laya client is passed here instead, and nothing in this
+ *     file knows which one it is talking to. A local record (Laya's) has no default: without a
+ *     client, createJev throws.
+ *   createJev({ apiKey, model, timeoutMs, onTrace })  the old form: Jev, with these values.
+ *
+ * `onTrace(trace)` gets every call that answered, and only those; an answer the response left
+ * out is in the trace without one. `onError({ phase, callId, provider, ms, error })` gets every
+ * call that failed, a response with no answers included, before the error is rethrown to the
+ * caller. `onCall({ callId, phase, state, questions, used, context })` sees each call before it
+ * is sent, with its questions deep-frozen, and if it returns a function, that function gets
+ * `{ trace }` or `{ error }` once the call settles. None of them is awaited, and an error or a
+ * rejection in one never reaches the call.
+ */
+export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace, onError, onCall } = {}) {
+  const P = provider ?? jevRecord({ model, timeoutMs })
+  // A provider on this PC is asked through its own client, never TypeSafe's: handed over without
+  // one, it would send its questions to the TypeSafe host with whatever key the environment holds.
+  if (!client && P.local) throw new Error(`createJev: ${P.name} runs on this PC and needs its own client`)
+  const api = client ?? new TypeSafeClient({ apiKey, defaultModel: P.model, retry: { maxRetries: P.maxRetries } })
+  // `context` is the numbers-only object a caller hands in for the watchers (the review's attempt,
+  // risk and bars), null otherwise; it never goes out with the call.
+  const ask = async (phase, state, questions, signal, used = () => true, context = null) => {
+    const callId = randomUUID()
     const t0 = Date.now()
-    const call = client.systemOne({ state, questions }, { timeout: timeoutMs, signal })
-    // `.withResponse()` is how the SDK hands back the request id; without it the id never
-    // reaches the log. Falls back cleanly if a future SDK drops the method.
-    const { data: res, requestId } = typeof call?.withResponse === 'function'
-      ? await call.withResponse()
-      : { data: await call, requestId: undefined }
-    onTrace?.(traceOf(phase, questions, requestId ? { ...res, requestId } : res, Date.now() - t0, used))
+    // A watcher is handed these very objects, never a copy, so they are frozen first: nothing it
+    // does to them can reach this request or a later one.
+    deepFreeze(questions)
+    const settle = quietly(onCall, { callId, phase, state, questions, used, context })
+    let res
+    let trace
+    try {
+      // `phase` is no SDK option: the SDK copies only the options it knows, and the Laya client
+      // reads it.
+      const call = api.systemOne({ state, questions }, { timeout: P.timeoutMs?.[phase], signal, phase })
+      // `.withResponse()` is how the SDK hands back the request id; without it the id never
+      // reaches the log. Falls back cleanly if a future SDK drops the method, and the Laya client
+      // has none.
+      let requestId
+      ;({ data: res, requestId } = typeof call?.withResponse === 'function'
+        ? await call.withResponse()
+        : { data: await call, requestId: undefined })
+      // Built here, so a response no trace can be made of (one with no answers at all) fails the
+      // call as an error does, and the watchers still hear of it.
+      trace = traceOf(phase, questions, requestId ? { ...res, requestId } : res, Date.now() - t0, used, { callId, provider: P.id })
+    } catch (err) {
+      // A failed call answered no question and used no tokens, so it is never a trace.
+      quietly(onError, { phase, callId, provider: P.id, ms: Date.now() - t0, error: errorOf(err) })
+      if (typeof settle === 'function') quietly(settle, { error: err })
+      throw err
+    }
+    if (typeof settle === 'function') quietly(settle, { trace })
+    onTrace?.(trace)
     return res
   }
 
   return {
+    /** The record of the provider that answers: every consumer reads its thresholds and name here. */
+    provider: P,
+
     /**
      * Routing. One batched call over whichever judgment groups are still needed:
      *
      *   task      (default on)  what the request needs: type, complexity, risk, the requirement
      *                           dimensions, skills, minimum and preferred tier, verification,
      *                           capability category, tools
-     *   resource  (when `candidates` is given)  how the work should be organised across the
-     *                           anonymous candidates: the execution strategy. WHICH candidate does
-     *                           it is not asked, because that is a comparison of numbers
+     *   resource  (when `candidates` and `strategies` are given)  how the work should be
+     *                           organised: the execution strategy. WHICH candidate does it is not
+     *                           asked, because that is a comparison of numbers. The candidates
+     *                           decide which strategies the caller offers in `strategies`, and
+     *                           are not sent
      *   judgments (when `candidates` is given)  the second opinion: one yes/no judgment that
      *                           teaches a domain of its own. Conservation and the frontier review
      *                           were here too, and are rules in code now for the same reason
      *   agent     (legacy: `agents` without `candidates`)  the old named-agent choice
      *
      * `ask.task` false skips the task group when a local classifier already produced the
-     * profile; that profile then rides `state.task_profile` so the resource judgment can
+     * profile; that profile then rides `state.task_profile` so the strategy question can
      * read it. Every tool's parameter questions are asked speculatively in the same call.
      *
-     * `history`, `availability` and `trackRecord` arrive keyed by agent id. Only the legacy named
-     * question reads them that way. In a call with the anonymous table they are re-keyed through
-     * `identities` ([{ id, key, names }], from the decision engine), and without it they are left out.
+     * `history`, `availability` and `trackRecord` arrive keyed by agent id, and only the legacy
+     * named question reads them. A call about the anonymous candidates carries none of them: its
+     * questions read the task, not the resources, so there is nothing to re-key them for.
      */
-    async route({ task, context, agents = [], candidates, strategies, tools = [], history, availability, trackRecord, identities, handoff, capabilities, taskProfile, ask: want = {} }, signal) {
+    async route({ task, context, agents = [], candidates, strategies, tools = [], history, availability, trackRecord, handoff, capabilities, taskProfile, ask: want = {} }, signal) {
       const askTask = want.task !== false
       const askResource = !!candidates?.length && want.resource !== false
       // The judgment noul is its own group: it teaches a routing domain that matures on its own,
       // so it must be askable without the strategy choice and skippable when only the strategy is
       // still open.
       const askJudgments = !!candidates?.length && want.judgments !== false
-      const carriesTable = askResource || askJudgments
-      // The named-agent question never rides a call that carries the anonymous table: its
-      // options would print the very names the table exists to withhold.
-      const askAgent = !carriesTable && agents.length > 0 && want.agent !== false
-      const state = { task: scrub(task), workspace: context }
+      // The named-agent question never rides a call about the anonymous candidates: its options
+      // would print the very names the anonymity exists to withhold.
+      const askAgent = !(askResource || askJudgments) && agents.length > 0 && want.agent !== false
+      // The options are the strategies the caller says the pool can run (decision.js offers
+      // broker.js eligibleStrategies), and nothing else: the call carries nothing about the pool,
+      // so Jev cannot tell an option it can run from one it cannot. No list, no question. One
+      // eligible strategy is nothing to choose between, so the question needs two.
+      const strategyKeys = askResource ? (strategies ?? []).filter((s) => STRATEGIES[s]) : []
+      const askStrategy = strategyKeys.length > 1
+
+      // A call carries the state its questions read and nothing more: state no question reads
+      // costs tokens and loses accuracy on the state that is read, and each field of it is one
+      // more thing leaving the machine. Every question reads `task`. The task group judges it "in
+      // this workspace" and asks whether it continues `handoff`; the named-agent question reads
+      // `workspace` and the per-agent evidence; the strategy weighs the quality the task requires,
+      // which `task_profile` states when the task group is not asked beside it; the second opinion
+      // reads `task` alone. Nothing about the resources rides a call about them: the strategy
+      // question names no field of the candidate table, and every option it is offered is one the
+      // caller has already checked the pool can run.
+      const state = { task: scrub(task) }
+      // Git's view of the files (a file's name, its extension, the branch) and the project's own
+      // script and dependency names: whatever anyone typed into those goes out with them.
+      if ((askTask || askAgent) && context) state.workspace = scrubDeep(context)
+      // It quotes the earlier agent's answer, so it carries whatever that agent printed. clip()
+      // scrubs before it cuts; a caller must not cut before scrubbing, or a key split by its cut
+      // goes out in pieces (router.js scrubs the note before its own 3000 cut for that reason).
+      if (askTask && handoff) state.handoff = clip(handoff, 3000)
       if (askAgent) {
         // Legacy named routing: the question is asked over names, so its evidence is keyed by name.
-        state.recent_outcomes = history
+        state.recent_outcomes = scrubDeep(history)
         if (availability) state.agent_availability = availability
         if (trackRecord) state.agent_track_record = scrubDeep(trackRecord)
-      } else {
-        // `identities` ({ id, key, names }) is how an id becomes the key the table uses; only a key
-        // that is really in this call's table counts, so a resource the pool dropped reads as
-        // unnamed rather than as a key nothing describes. Without it (or in a call with no
-        // table, which asks nothing about resources) the per-agent maps have nothing they may be
-        // keyed by, so they are left out rather than sent under the real names.
-        const offered = new Set((candidates ?? []).map((c) => c.key))
-        const anon = carriesTable && identities?.length
-          ? anonymity(identities.map((e) => ({ ...e, key: offered.has(e.key) ? e.key : undefined })))
-          : null
-        if (Array.isArray(history)) {
-          state.recent_outcomes = history.map(({ first_agent: first, ...rest }) => {
-            const key = anon && first ? anon.keyOf(first) : undefined
-            return { ...(anon ? anon.maskFree(rest) : rest), ...(key ? { first_resource: key } : {}) }
-          })
-        }
-        // The per-candidate track record and availability used to ride this call under the same
-        // keys, for the resource question to read. That question is gone, and state no question
-        // reads costs tokens and loses accuracy on the rest of it, so they are not sent at all.
       }
-      if (handoff) state.handoff = clip(handoff, 3000)
-      // Only the call that asks the strategy question reads the table; a judgments-only call
-      // would be paying for a table nothing in it looks at.
-      if (askResource) state.candidates = candidateState(candidates)
-      if (!askTask && taskProfile) state.task_profile = scrubDeep(taskProfile)
+      if (askStrategy && !askTask && taskProfile) state.task_profile = scrubDeep(taskProfile)
       const questions = {}
       if (askAgent) {
         questions.agent = choice(
@@ -605,47 +732,50 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
           )
         }
         if (tools.length) {
+          // A tool's description and its parameter questions are config the person wrote, often
+          // about a script that calls an API, so they are scrubbed like the agents' descriptions.
+          // The option keys are not: they come back as the tool's arguments.
           questions.handler = choice(
             {
               question: 'Can a fixed tool fully handle `task`, or does it need an AI coding agent?',
               focus: 'Pick a tool only when it does exactly what `task` asks with no judgment, writing, or code changes. Anything else needs an agent.',
             },
-            { agent: { what: 'An AI coding agent is needed: the task involves reasoning, writing, or changing code' }, ...Object.fromEntries(tools.map((t) => [t.id, { what: t.description }])) },
+            { agent: { what: 'An AI coding agent is needed: the task involves reasoning, writing, or changing code' }, ...Object.fromEntries(tools.map((t) => [t.id, { what: scrub(t.description) }])) },
           )
           for (const t of tools) {
             // Atomic yes/no per tool (skill-suggestion cookbook); the handler choice alone is too broad.
             questions[`${t.id}.fits`] = noul({
               question: `Does the \`${t.id}\` tool do exactly what \`task\` asks, with nothing left for an AI agent?`,
-              focus: `The \`${t.id}\` tool: ${t.description}`,
+              focus: `The \`${t.id}\` tool: ${scrub(t.description)}`,
             })
             for (const [p, def] of Object.entries(t.params ?? {})) {
-              questions[`${t.id}.${p}`] = choice(def.question, Object.fromEntries(Object.entries(def.options).map(([k, v]) => [k, { what: v }])))
+              questions[`${t.id}.${p}`] = choice(scrubDeep(def.question), Object.fromEntries(Object.entries(def.options).map(([k, v]) => [k, { what: scrub(v) }])))
             }
           }
         }
       }
-      if (askResource) {
+      if (askStrategy) {
         // Which candidate does the work is not asked here. Ranking candidates means weighing
         // capability against cost against scarcity, all of them numbers, and comparing magnitudes
         // is the one thing a snap-judgment classifier cannot do: that decision is a rule in code
         // (broker.js rankCandidates). What is left for a judgment is the shape of the run, which
         // is a categorical choice over named strategies and nothing to do with arithmetic.
-        const strategyKeys = (strategies?.length ? strategies : Object.keys(STRATEGIES)).filter((s) => STRATEGIES[s])
-        if (strategyKeys.length > 1) {
-          questions.strategy = choice(
-            {
-              question: 'How should the work for `task` be organised across the candidates?',
-              focus: 'A direct strategy runs one candidate with the usual checks and review. The plan-then-execute and review strategies spend the strongest candidate only on planning or judging and a cheaper one on the bulk work. Prefer the least expensive strategy that still gives the required quality.',
-            },
-            Object.fromEntries(strategyKeys.map((s) => [s, { what: STRATEGIES[s] }])),
-          )
-        }
+        // The question reads only what rides the call: the task, and its profile when the task
+        // group is not asked beside it. It speaks of no candidates, because none are sent.
+        questions.strategy = choice(
+          {
+            question: 'How should the work for `task` be organised?',
+            focus: 'Every option is one the resources available for this task can run. A direct strategy runs one resource with the usual checks and review. The plan-then-execute and review strategies spend the strongest available resource only on planning or judging and a cheaper one on the bulk work. '
+              + (state.task_profile ? 'Prefer the least expensive strategy that still gives the quality `task_profile` says `task` requires.' : 'Prefer the least expensive strategy that still gives the quality `task` requires.'),
+          },
+          Object.fromEntries(strategyKeys.map((s) => [s, { what: STRATEGIES[s] }])),
+        )
       }
       if (askJudgments) {
         // Only the judgments a decision reads. Every question costs tokens and latency on every
         // routed run, so one whose answer nothing acts on is not asked: "is the cheapest enough"
-        // is what the conservation question already decides, and a consistency-review answer had
-        // no step that would carry it out.
+        // is what the ranking already decides in code, and a consistency-review answer had no
+        // step that would carry it out.
         // Conservation and the frontier review are not here either: both weighed a candidate's
         // scarcity or the task's risk against a threshold, which is arithmetic, and both are
         // decided in code now (decision.js). What is left is one judgment about the task itself.
@@ -654,12 +784,16 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
       if (!Object.keys(questions).length) throw new Error('jev.route: nothing to ask')
       // Per-tool fits/params are speculative; only the handler's pick is used.
       const used = (name, ans) => !name.includes('.') || name.startsWith('req.') || name.startsWith(`${ans.handler?.choice}.`)
-      const { answers, model: usedModel } = await ask('route', state, questions, signal, used)
+      const { answers, model: usedModel, meta } = await ask('route', state, questions, signal, used)
       const handler = answers.handler?.choice ?? 'agent'
       const params = handler === 'agent' ? [] : Object.keys(tools.find((t) => t.id === handler)?.params ?? {})
-      const profile = askTask ? profileFromAnswers(answers) : null
+      const profile = askTask ? profileFromAnswers(answers, P.thresholds) : null
       return {
         model: usedModel,
+        // The only way a caller learns that an answer outside the profile was flat: `strategy`
+        // and `secondOpinion` carry no flag of their own. decision.js reads it.
+        uninformative: flatNames(answers),
+        ...metaOf(meta),
         ...(askAgent ? {
           primaryAgent: answers.agent.choice,
           agentConfidence: answers.agent.confidence,
@@ -702,7 +836,7 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
      * instant), and Jev is the one that decides when it is worth waking a bigger model.
      */
     async intent({ message }, signal) {
-      const { answers } = await ask('intent', { message: scrub(message) }, {
+      const { answers, meta } = await ask('intent', { message: scrub(message) }, {
         kind: choice(
           { question: 'What does `message` ask for?', focus: 'Only work that reads or changes the project counts as a task. Questions about tools, accounts, concepts or this app are questions.' },
           {
@@ -729,6 +863,9 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
         depth: answers.depth?.choice,
         depthConfidence: answers.depth?.confidence,
         alsoWork: answers.alsoWork?.noul,
+        // `depth` flat here means the caller keeps the cheap default, as when it is missing.
+        uninformative: flatNames(answers),
+        ...metaOf(meta),
       }
     },
 
@@ -736,13 +873,17 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
      * Post-execution assessment over summarized, deterministic evidence. The disposition is the
      * teacher label for the outcome domain; the atomic Nouls are what jev-review decides from,
      * and deterministic facts (a failing required check) override both in code.
+     *
+     * `context` is what jev-review knows about this review and the state does not carry, numbers
+     * only (`{ attempt, risk, blockAccept, reviewed }`): it goes to the call's watchers, so the
+     * shadow can work out the review action either provider would have taken, and never out.
      */
-    async assess({ task, routing, attempts, checks, diff, agents = [], strategy, modelOf }, signal) {
+    async assess({ task, routing, attempts, checks, diff, agents = [], strategy, modelOf }, signal, context = null) {
       // With a decision record the review and retry picks are made over the same anonymous,
       // machine-readable candidate data the resource pick was, never over prose descriptions:
       // a description is a capability claim, and it would outvote the owner's priors and the
       // measured evidence on every review and every retry. `modelOf` (agent -> the model it runs)
-      // is how the masker learns a CLI agent's model id, as the routing call's does.
+      // is how the masker learns a CLI agent's model id.
       const table = reviewTable(routing?.decision, agents, { modelOf, attempts })
       const anon = table?.anon
       // jev-review hands over `{ results, regressed, fixed, failing }`; a bare array is accepted
@@ -765,12 +906,16 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
           ...(anon ? { resource: isToolAttempt(a.agent) ? a.agent : anon.keyOf(a.agent) ?? UNNAMED } : { agent: a.agent }),
           role: a.role,
           status: a.stopReason,
-          diagnostic: anon ? anon.maskFree(scrubDeep(a.diagnostic)) : scrub(a.diagnostic),
+          // An executor's error quotes what it was sent, a key included, and it can arrive as an
+          // object as well as a string, with or without a table to mask it against.
+          diagnostic: anon ? anon.maskFree(scrubDeep(a.diagnostic)) : scrubDeep(a.diagnostic),
           ...(i === attempts.length - 1 ? { answer: clip(a.answerText, 2500) } : {}),
-          changed_files: a.changedFiles,
+          // File names are scrubbed here and in the diff's file list for the same reason as in the
+          // routing call's workspace facts: a name is whatever the agent or the person typed.
+          changed_files: scrubDeep(a.changedFiles),
         })),
         verification: Array.isArray(checks) ? scrubbedResults : { ...checks, results: scrubbedResults },
-        diff: { stat: diff.stat, excerpt: clip(diff.patch, 6000) },
+        diff: { stat: scrub(diff.stat), excerpt: clip(diff.patch, 6000) },
       }
       if (table) state.candidates = candidateState(table.rows)
       const options = table ? Object.fromEntries(table.rows.map((r) => [r.key, { what: candidateLine(r) }])) : agentCriteria(agents)
@@ -783,7 +928,7 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
       // One snap judgment per question: atomic Nouls (yes = the thing named) decide
       // in jev-review; the broad verdict and the disposition are kept as displayed signals and
       // as the outcome domain's teacher label.
-      const { answers } = await ask('review', state, {
+      const { answers, model: usedModel, meta } = await ask('review', state, {
         verdict: choice(
           {
             question: 'Given the latest entry in `attempts`, `verification`, and `diff`, what should happen next for `task`?',
@@ -821,8 +966,13 @@ export function createJev({ apiKey, model, timeoutMs, onTrace }) {
           },
           options,
         ),
-      }, signal, (name) => name !== 'verdict')
+      }, signal, (name) => name !== 'verdict', context ?? null)
       return {
+        // The served model, so an outcome sample records who judged it.
+        model: usedModel,
+        // jev-review reads `disposition`, `reviewAgent` and `retryAgent` here.
+        uninformative: flatNames(answers),
+        ...metaOf(meta),
         verdict: answers.verdict.choice,
         verdictConfidence: answers.verdict.confidence,
         verdictProbabilities: answers.verdict.probabilities,

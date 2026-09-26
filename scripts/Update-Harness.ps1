@@ -34,6 +34,32 @@ foreach ($dir in 'plugins\jev-router', 'plugins\jev-review', 'app') {
   Write-Host "   ok: $dir"
 }
 
+Write-Host '== uv (for the optional Laya decision model)'
+# Kept at the version config\laya.json pins, checked by size and SHA-256, every time: a KzH version
+# that moves the pin gets the new uv here. Laya itself never updates on its own (Settings does it).
+$layaPins = Get-Content (Join-Path $root 'config\laya.json') -Raw | ConvertFrom-Json
+$uvDir = Join-Path $root 'engine\uv'
+$uvExe = Join-Path $uvDir 'uv.exe'
+$uvWant = "^uv $([regex]::Escape($layaPins.uv.version))\b"
+$uvHave = ''
+if (Test-Path $uvExe) { try { $uvHave = (& $uvExe --version) -join '' } catch { $uvHave = '' } }
+if ($uvHave -notmatch $uvWant) {
+  New-Item -ItemType Directory -Force $uvDir | Out-Null
+  $uvPart = Join-Path $uvDir 'uv.zip.part'
+  $uvZip = Join-Path $uvDir 'uv.zip'
+  & curl.exe -fL --retry 5 -C - -o $uvPart $layaPins.uv.source
+  if ($LASTEXITCODE) { throw 'uv: the download failed (run this again to resume)' }
+  if ((Get-Item $uvPart).Length -ne $layaPins.uv.size) { throw 'uv: the download is not the size config\laya.json pins (run this again to resume)' }
+  $uvHash = (Get-FileHash $uvPart -Algorithm SHA256).Hash.ToLower()
+  if ($uvHash -ne $layaPins.uv.sha256) { Remove-Item $uvPart; throw "uv: SHA256 $uvHash does not match config\laya.json; the file was deleted" }
+  Move-Item $uvPart $uvZip -Force
+  Expand-Archive $uvZip -DestinationPath $uvDir -Force
+  Remove-Item $uvZip
+  $uvHave = (& $uvExe --version) -join ''
+  if ($uvHave -notmatch $uvWant) { throw "uv reports '$uvHave', not $($layaPins.uv.version)" }
+}
+Write-Host "   ok: uv $($layaPins.uv.version)"
+
 Write-Host '== Config'
 # Install-Harness.ps1 writes the patch file once and skips it ever after, so a
 # later template change (a new gate percent, a newly disabled skill) never reaches

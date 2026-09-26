@@ -1,0 +1,16 @@
+{
+  "id": "refactor-1",
+  "skill": "refactor",
+  "level": 1,
+  "dimensions": ["coding"],
+  "folder": "temperature",
+  "prompt": "Every function in src/convert.js repeats the same input check.\nMove it into one function, assertTemperature, exported from a new file src/check.js, and call it from every function, so that the error message is written in one place only.\nBehaviour must not change.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/convert.test.js": 9
+    }
+  }
+}

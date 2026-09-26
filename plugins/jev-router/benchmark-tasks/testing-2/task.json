@@ -1,0 +1,14 @@
+{
+  "id": "testing-2",
+  "skill": "testing",
+  "level": 2,
+  "dimensions": ["testing", "coding"],
+  "folder": "money-split",
+  "prompt": "Write tests for src/split.js in test/split.test.js, using node:test, that check everything its doc comment promises.\nDo not change src/ or package.json.",
+  "protect": ["package.json", "src/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "mutants",
+    "file": "src/split.js"
+  }
+}

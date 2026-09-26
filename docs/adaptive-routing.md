@@ -14,24 +14,37 @@ your request
   -> task profile            what this needs: type, complexity, risk, which capabilities, how much
   -> hard eligibility        who could possibly do it: available, capable, allowed, big enough
   -> resource choice         which of those should, given what they cost and how scarce they are
-  -> conservation            whether the scarce strongest resource should be kept for harder work
+  -> conservation limit      a hard limit in code, not a domain: easy work kept off a scarce strongest resource
   -> execution strategy      one resource, or plan then implement, or implement then review
   -> the work                agents run, deterministic checks run
   -> outcome                 pass, retry, second opinion, frontier review, or a person
   -> what it taught          capability evidence, and a label for every decision above
 ```
 
-Each of those decisions belongs to a **routing domain**, and each domain answers its own question
-about who is allowed to make it: Jev, the local classifier, or a deterministic fallback.
-The domains mature separately, so task classification can be handled locally while the
-execution strategy is still asking Jev.
+Each judgment in those stages belongs to a **routing domain**, and each domain answers its own question about who is allowed to make it: Jev, a rule in code, the local classifier, or a deterministic fallback.
+In a run Laya decides (Laya Auto, [`laya-auto.md`](laya-auto.md)) the question has a fifth answer, `laya`: see [A second decider: Laya](#a-second-decider-laya).
+The hard eligibility and the conservation limit are not judgments, and belong to no domain.
+The domains mature separately, so task classification can be handled locally while the execution strategy is still asking Jev.
 
-Three domains never ask Jev at all. Resource selection, conservation and frontier escalation are
-decided in **code**, and carry `authority: 'code'` rather than `jev` or `local`. They weigh
-capability against cost against scarcity, which is arithmetic over numbers, and a snap-judgment
-classifier cannot compare magnitudes; asking one to would be several judgments in a single
-question besides. `rankCandidates()` in `broker.js` does the ranking, and the two yes/no answers
-are read from the governor's pressure reading and the policy's cuts.
+Two domains never ask Jev at all: resource selection and frontier escalation.
+They are decided in **code** (`teacher: 'code'` in `routing-policy.js` `DOMAINS`), and carry `authority: 'code'` rather than `jev` or `local`.
+Each is a comparison of numbers, and a snap-judgment classifier cannot compare magnitudes; asking one to would be several judgments in a single question besides.
+`rankCandidates()` in `broker.js` ranks the candidates.
+The frontier review is a rule that reads the task's risk against the `minimumReview` cuts, with the probabilities in `policy.codeJudgments.frontierReview`, the only code judgment left.
+It says yes at or above `riskForFrontierReview`, and at or above `riskForReview` when the task wants frontier capability: a minimum or preferred tier of `frontier`, or a `security_review` requirement of 0.5 or more (`decision.js` `frontierProbability`).
+The domain controller (`domains.js` `createDomainController`) holds a `teacher: 'code'` domain to code authority and ignores any teacher call a caller passes, and its `state()` reports `teacher: 'code'` or `teacher: 'jev'`.
+`resolvePolicy` refuses a teacher other than `jev` or `code` (`routing policy: domain <id>: teacher must be jev or code`), and refuses to change the teacher a shipped domain has (`routing policy: domain <id>: teacher cannot be changed; it is code`, or `jev`).
+
+The resource ranking is never outranked.
+`resource_selection` has `localDecides: false` in `DOMAINS`, so its local classifier never decides, at any rung.
+The controller holds a domain to that whatever a caller passes: `decide()`'s `localMayDecide` can narrow a classifier's authority, never widen it.
+`decision.js` also passes `localMayDecide: false`, and takes the pick from `rankCandidates()` directly rather than from the controller's answer.
+The classifier still climbs the ladder, so its standing stays measured.
+Its answer is recorded on the sample (`local`) and as `local` in `routing.decision.domains.resource_selection`, and the sample is stored under authority `code`.
+The per-decision view in the inspector does not render that local answer, because its shadow line needs a teacher answer to compare against.
+`resolvePolicy` refuses a domain `localDecides` that is not `true` or `false`, and refuses to switch it on for a domain that ships with it off: `routing.domains.resource_selection.localDecides: true` stops start-up with `routing policy: domain resource_selection: localDecides cannot be switched on; its local classifier never decides`.
+A policy may set `localDecides: false` on another domain, to take its classifier's authority away.
+The frontier review's classifier has no such bar: it may decide once it has earned a local rung, and a rule in code decides wherever it does not.
 
 A domain decided in code still has a ladder and still collects samples, because an outcome can
 contradict a rule as readily as it can contradict a judgment. What it does not collect is
@@ -45,7 +58,6 @@ tag alone.
 | `task_classification` | What kind of work this is, and what it needs | LOW |
 | `skill_selection` | Which skill the work mainly calls for: how it is done, never who does it | LOW |
 | `resource_selection` | Which resource does the work | MEDIUM |
-| `conservation` | Whether the most capable resource's scarce capacity is kept for harder work, which moves this work off it | MEDIUM |
 | `execution_strategy` | How the work is organised across resources | MEDIUM |
 | `second_opinion` | Whether an independent review is worth its cost | MEDIUM |
 | `frontier_escalation` | Whether the strongest resource must review | HIGH |
@@ -61,18 +73,20 @@ The report's `- Skill:` line then shows the skill the run really used, and its `
 The raw answer is kept only in the run record, as `mappedFrom` on `plan.skill` and on `routing.decision.domains.skill_selection`; neither the report nor the inspector shows it.
 That sample is left out of the samples the run labels (`routing.decision.samples`), and a verdict given later about the run relabels only the samples in that list, so nothing ever labels it.
 
-Conservation acts when its answer is yes (a probability above 0.5; exactly 0.5 does not act).
-It only moves work off a pick that is the most capable candidate, is not local, has a marginal cost and is actually being used up (its scarcity is at least the governor's first knee, 0.2, where the governor stops saying "spend normally"), and only onto another candidate whose known capability tier meets the task's floor.
-Whether there is anything to conserve is a fact and stays in code; a judgment only decides whether to conserve a resource that is scarce, so a confident "conserve" can never send easy work off a healthy allowance to a second-best resource.
-Because it can act only under real scarcity, conservation also learns only from runs with real scarcity: on healthy allowances its samples stay teacher-only and the domain stays at `JEV_PRIMARY`.
-The conserved resource leaves the work pool and stays available to review, the same way the weekly gate moves work, and the run records it in `routing.conservedFrom` and `decision.conservation`.
-The resource pick it overrode is not labelled by that run, because the run tested a different resource.
-The conservation answer itself is labelled by the run only when it decided something the run tests: a yes that moved the work, or a no where a yes could have moved it; a yes that could not act, and a coin flip, stay teacher-only.
+Conservation is not a domain.
+It is a hard limit in `decision.js`, beside the weekly gate and the capability floor, applied after the resource ranking and before the strategy.
+It acts when all of these hold: the most capable candidate is not local, has a marginal cost (not `none`), and its governor conservation level (`governor.js` `conservationHint`) is not `healthy`, which means its scarcity is at or above the curve's first knee, 0.2, with unknown usage counted as healthy; the task is easy enough to move off, with complexity under 0.5 and risk under `minimumReview.riskForReview`; and another candidate whose KNOWN capability tier meets the task's floor exists.
+The work then goes to the ranking's own pick if that candidate qualifies, and otherwise to the best of the rest by the ranking's probability, then the one with the lower expected cost, then by id.
+The limit has no probability, no 0.5 threshold, no domain, no sample and no label, and `decision.judgments` has no `conserve`.
+The conserved resource leaves the work pool and stays available to review, the same way the weekly gate moves work.
+The run records it in `routing.conservedFrom`, in `routing.decision.conservation` as `{ from, to, confidence: 1, authority: 'code' }`, as the excluded reason `conserved for harder work: kept for review only`, and as the plan note `<from> conserved for harder work: <to> does it, <from> stays available to review`.
+When the limit moves the ranking's own pick, `routing.agentConfidence` is 1, `routing.decision.domains.resource_selection.movedBy` is `conservation`, and the pick's sample is not labelled by that run, because the run tested a different resource.
+A `domains/conservation.state.json`, a `classifiers/conservation.json` or conservation samples left by an older version are ignored at start-up, and never trained or labelled.
 The router does not hand the work back: its low-confidence tie-break, the feedback re-read (a Like or a `should have been` suggestion) and the weekly-gate swap all pass over `routing.conservedFrom`, and the report says `Work kept off <id> to conserve it for harder work; it stays available to review`.
-The capability swap is the one exception: a capability is a hard fact and conservation a judgment, so when nothing else can do what Jev named, the conserved resource takes the work.
+The capability swap is the one exception: a capability is a hard fact and conservation a spending limit, so when nothing else can do what Jev named, the conserved resource takes the work.
 A retry after a failed attempt is not barred from the conserved resource.
 
-The second-opinion and frontier-escalation answers are labelled by the same rule: only where the answer could change the run.
+The second-opinion and frontier-escalation answers are labelled only where the answer could change the run.
 A frontier-escalation answer can, and is labelled, when the plan has no frontier review of its own, the capability floor does not add one anyway, a reviewer exists, and the run reviews at all (an answer-only run never does); only then does a yes add the review.
 A second-opinion answer can when nothing else reviews the run: not on an answer-only run, and not when the plan already promises a review.
 With a decision record, the second-opinion domain's own yes or no is what `jev-review` acts on, the same answer the run labels, whether or not files changed, so a yes asks for a review of any accepted work result (a primary or retry attempt).
@@ -91,21 +105,20 @@ The report and the inspector name each move with its own target, so after a capa
 A record from before `moves` was kept is read from its `capabilityFrom`, `tiebrokeFrom`, `gatedFrom` and `feedbackFrom` fields.
 
 Every one of those moves - the capability swap, the tie-break, the weekly-gate swap, the feedback re-read, the retry, the hand-over - goes only to an agent that can do what the run needs: the attached input, write access when it changes files, and the capability Jev named.
-A capability is a hard fact, so it outranks both conservation (a judgment) and the weekly gate (a cost rule).
+A capability is a hard fact, so it outranks both the conservation limit (a spending limit) and the weekly gate (a cost rule).
 The weekly gate is the operator's cost policy, not unavailability: gated agents are still counted as able to do the work, the router keeps them out of the work pool, and the gate yields - visibly, as `routing.gateYielded` and a report line - only when nothing ungated can do the job, or every agent is past its gate.
 The decision engine sees a gated resource that could do the work, so its frontier-floor exception (`gateOverride`) can fire in a real install, and the router honours that override rather than swapping the work back off it.
 
 The risk class sets how much evidence a domain needs before it decides anything alone.
 The promotion, calibration, drift and rollback thresholds live in `plugins/jev-router/routing-policy.js` and can be changed from config.
-A few numbers are fixed in code rather than policy: the conservation curve's knees (scarcity 0.2 and 0.7), the reset-discount exponent, the per-source usage confidences in `resources.js`, the 45-day window for an unpinned model version, and the feedback prior's weight in `router.js`.
+A few numbers are fixed in code rather than policy: the conservation curve's knees (scarcity 0.2 and 0.7), the conservation limit's complexity cut (0.5), the reset-discount exponent, the per-source usage confidences in `resources.js`, the 45-day window for an unpinned model version, and the feedback prior's weight, window and other-task-type share in `router.js`.
 
 ## What is a fact and what is a judgment
 
 This split is the spine of the design and it is enforced in code, not in a prompt.
 
 **Facts, decided in code, never delegated.**
-A resource that is signed out, at its limit, switched off, or not allowed is removed before any
-judgment happens.
+A resource that is signed out, at its limit, switched off, or not allowed is removed before any judgment happens.
 The disabled and allowed lists (`routing.disabledResources`, `routing.allowedResources`) are applied to the router's own pool, so no router-side swap, fallback or retry can bring an excluded resource back, and they apply whether or not adaptive routing is on.
 So is one whose context window is known and cannot hold the request, and one whose capability tier on the dimensions the task requires is known to be below the floor the task asks for.
 An unknown tier is not excluded: unknown is not the same as insufficient.
@@ -116,9 +129,11 @@ When every candidate fails a hard fact, the run stops with the list of who was e
 A resource the disabled or allowed list rules out is also unavailable in the capability registry (`router.js` `unavailableIds`), so its capabilities are neither offered to Jev nor counted by the "nothing here can do this request" guard: when only such a resource could do what Jev named, the run refuses instead of going ahead on one that cannot.
 The run stops with `every agent is excluded by the routing policy` only when the policy alone emptied the pool; when another reason also played a part (a usage limit, a sign-in, local-only), that reason's message is given instead, with the earliest reset time when it is a usage limit.
 A failing required check is a fact: no classifier can accept work the tests reject.
+Keeping easy work off a most capable resource whose allowance is being used up is a limit in code too, not a judgment: the conservation limit above.
 
 **Judgments, which is what the domains learn.**
-Whether this task is worth scarce capacity, and so whether a cheaper resource is enough (the conservation judgment: Jev is not asked a separate question for it).
+What kind of work this is, and which skill it mainly calls for.
+How the work is organised across resources.
 Whether a review earns its cost.
 Whether the strongest resource should look at the result before it is accepted.
 
@@ -209,9 +224,14 @@ Belief can come from three places, combined as a precision-weighted mean rather 
 1. **Priors**, in `config/capability-priors.json`.
    These are the owner's observations, stated as machine-readable numbers with their own confidence.
    They are evidence, not rules: they seed a family's profile and real evidence overtakes them.
-2. **Benchmark evidence.**
-   The source, a reliability of 0.7 and a 180-day half-life exist in the schema, but nothing produces it: no importer, fetcher or job writes a `benchmark` row or a `benchmark_prior`.
-   Today the effective capability is the prior plus execution evidence.
+2. **Benchmark evidence**, weighed at a reliability of 0.7 with a 180-day half-life.
+   Its producer is the capability benchmark in the Router tab ([`benchmark.md`](benchmark.md) section 3), which writes, for every agent that finishes all its tasks, one row per task and credited dimension, score 1 or 0, confidence 0.9.
+   Each row's `n` is 3 over the number of the set's tasks that credit its dimension, so a whole run weighs on a dimension as three observations at reliability 0.7, 1.89 when fresh.
+   A task that does not fit the window KzH gives a local model is not run and gives no row, not even a `long_context` one, so such a run weighs less on the dimensions those tasks credit ([`benchmark.md`](benchmark.md) 3.9).
+   The rows are not runs: they are left out of `samples`, and so out of `evidenceSamples`, the ranking's `evidenceRuns` and the Router tab's observations, and reported as the dimension's `benchmark` summary, `{ score, tasks, passed, weight }`.
+   A benchmark row with a `runId` counts only when that `runId` is the newest recorded for its subject and benchmark id, by file order, also after a reload; older rows stay on file and count in `explain()`'s `notCounted`.
+   The 180-day half-life and the 45-day window for unpinned names apply, and a benchmark alone leaves a model cold.
+   Nothing writes a `benchmark_prior`: no importer brings in published benchmarks.
 3. **Execution evidence** from real runs here: did the work get accepted, did the checks pass, did a
    reviewer agree.
    A person's Like or Dislike counts here too, as `human_outcome` evidence recorded when the verdict is given: `POST /jev-router/feedback` stores it and hands it to `index.js` `onVerdict`, while a run's end records the run's own evidence and no verdict (`runEvidence`), because nobody can judge an answer before it exists.
@@ -248,35 +268,34 @@ Recent verified failures pull a score down even when the lifetime record is stro
 
 ### Resources are anonymous in the candidate table
 
-Jev and the local classifier see candidates as `RESOURCE_A`, `RESOURCE_B` and so on, each with its capability
-scores, tier, scarcity, cost class, latency, reliability and how many verified runs stand behind its
-profile.
+The local classifier and the review call see candidates as `RESOURCE_A`, `RESOURCE_B` and so on, each with its capability scores, tier, scarcity, cost class, latency, reliability and how many verified runs stand behind its profile.
+Jev sees that table only in the review call, where the reviewer and the fixer are picked over it.
+No routing call carries candidate data: the ranking is code's, and the strategy question is offered only strategies the pool can run, so it has nothing about the candidates to read.
 The table itself never carries a provider or model name.
 This is enforced where the candidate list is built, not by scrubbing afterwards, and tests fail if a provider name reaches the table or any per-resource channel of the call that carries it.
 
-In a Jev call that carries the table, every per-resource channel speaks the same keys or is left out:
-past runs in `recent_outcomes` lose the agent they ran on and carry its key as `first_resource` when that resource is in the call's table, the availability and track record are sent as `candidate_availability` and `candidate_track_record` under the keys, and in the review call the attempts name a `resource` key (a tool attempt keeps its `tool:<id>`, because a tool is not an anonymous resource) and the reviewer and fixer are chosen over the same anonymous candidate data.
-The decision engine passes the id-to-key mapping on the resource call (`identities`, one `{ id, key, names }` per agent it was handed), so the per-candidate evidence is re-keyed rather than dropped; a resource outside this call's table gets no key, so its entries are left out and its names read `[resource]`.
-The task call carries no mapping, so it sends no track record and no availability, and its past runs carry no resource at all.
-Only the maps keyed by agent id are re-keyed, and only at their top level; nothing under them is renamed, so a `here_by_task_type` map stays keyed by task type.
-Free text in those channels (a reason typed in the Why? box, a note, a price note, an executor's diagnostic) is masked: a specific name becomes that resource's key when exactly one candidate owns it, and `[resource]` otherwise, and a vendor or family word (`claude`, `gpt`, `qwen`, `grok`, `glm`, `kimi` and the like) that is not one candidate's own name becomes `[resource]` too.
+No adaptive routing call carries `recent_outcomes`, `first_resource`, `candidate_availability` or `candidate_track_record`, and nothing in one is re-keyed to `RESOURCE_x`: those calls have no per-resource channel at all.
+`jev.js` `route()` reads the history, the availability and the track record only for the legacy named question, and reads no id-to-key mapping.
+Re-keying happens only in the review call: its attempts name a `resource` key (a tool attempt keeps its `tool:<id>`, because a tool is not an anonymous resource), and the reviewer and fixer are chosen over the anonymous candidate data.
+Free text in the review call's identity channels (an executor's diagnostic, and the reason a resource is outside the work table) is masked: a specific name becomes that resource's key when exactly one candidate owns it, and `[resource]` otherwise, and a vendor or family word (`claude`, `gpt`, `qwen`, `grok`, `glm`, `kimi` and the like) that is not one candidate's own name becomes `[resource]` too.
 A vendor or family word followed by a version (`qwen2.5`, `llama3`, `gpt4o`, `gpt-4o`, `claude3`) is masked whole, and a word that merely begins with those letters (`gptext`, `llamas`) is left alone.
 A point release after any name is a longer version, not that name, and is masked whole as `[resource]`: `gpt-5.6` with only `gpt-5` configured, `grok-2.1` with `grok-2`, `o3.1`, `claude.2`.
-The names that count are specific ones only, and both calls count the same ones (`features.js` `identityNames`): the agent's id, its display name, its `provider` and `llm.provider`, and its model ids.
+The names that count are specific ones only (`features.js` `identityNames`): the agent's id, its display name, its `provider` and `llm.provider`, and its model ids.
 So a provider word that names one agent (`claude-code`, `openrouter`) reads as that agent's key, and one several agents share reads `[resource]`.
 Generic words are refused as names even when a caller passes them: the task types, tiers, skills, strategies, cost tiers such as `local` and `free-local`, words such as `spawn`, `agent` and `model`, and short all-letter words (`ab`, `ok`).
 A short model id is a name: `o3`, `o1` and `r1` mix letters and digits, and are masked like any other.
 A model setting is often an alias rather than an id (`best`, `default`, `opus`, `sonnet`), so a model string counts as a name only when it is shaped like an id, with a digit or a separator (`features.js` `modelIdOf`); `best` as a name would be masked inside every reason that says "the best fit", and the brand words among the aliases are masked anyway, as brand terms.
-The routing call and the review call apply that rule to the same strings: the configured `llm.model` and the model a CLI agent really runs by its own config (`modelOf`); the review call also masks the model each attempt recorded, so an agent that ran and was removed from config since is still masked.
-In the review call a resource outside the work table carries why it is out and whether that was a hard fact, as `kept_out_by`: `hard_fact`, `policy_or_judgment` (the weekly gate, the capability floor, conservation), `not_offered_for_this_request` (the router never offered it to the engine), or `unrecorded` for a record from before the engine kept its exclusions, which claims no reason.
+The review call applies that rule to the configured `llm.model`, to the model a CLI agent really runs by its own config (`modelOf`), and to the model each attempt recorded, so an agent that ran and was removed from config since is still masked.
+In the review call a resource outside the work table carries why it is out and whether that was a hard fact, as `kept_out_by`: `hard_fact`, `policy_or_judgment` (the weekly gate, the capability floor, the conservation limit), `not_offered_for_this_request` (the router never offered it to the engine), or `unrecorded` for a record from before the engine kept its exclusions, which claims no reason.
 One that cleared the hard facts but does not do the work (past its gate, under the floor, conserved) also carries the numbers it would be judged on, from `decision.reviewOnly`, under the key the decision engine assigned it over the pool of this run, before the floor, the gate and conservation narrowed that pool.
-One past its gate or under the floor was never in the routing call's table, so that call left its evidence out and read its names as `[resource]`, and the review call is the first call to show its key.
-A conserved one was in that table under the same key when the resource pick or the conservation judgment asked Jev, because conservation comes after both.
+No routing call shows any key, so the review call is the only call in which Jev sees one.
 Object keys are never touched.
 Every string value is masked, including one in a field that looks categorical: a category the router wrote (a cost tier, a task type, an outcome) cannot be a name, so masking leaves it as it was, while a `status` or `source` inside an executor's diagnostic, which the router does not define, is exactly where a name would otherwise ride out.
 A tool attempt keeps its `tool:<id>`, because a tool is not an anonymous resource, and the review prompt says so.
 
 What the calls do not anonymise is the work itself: the task text, the workspace facts (branch, changed file names, dependency names), the folder's handoff note (a note the harness wrote lists earlier attempts by agent id), and in the review call the latest answer, the diff and the check output.
+Key-shaped strings in them are masked before any cut the router makes on the way to Jev, with one exception: a configured tool's output (`index.js` `runTool`) is cut first and scrubbed after.
+Nothing in them is anonymised; the README's privacy section lists every cut.
 So Jev never sees a name in the table, but it can see one wherever the work or the handoff note mentions it.
 With `routing.enabled: false` none of this applies: Jev picks named agents from their descriptions, with the history, availability and track record keyed by agent id.
 The default descriptions say only which CLI or API each agent runs and how it is paid for, and a local agent's say only which model it is, that it runs on this PC through llama.cpp, and that it is free, private and works offline, so on default config the legacy pick has little but cost and the track record to tell agents apart; write your own descriptions if you route that way.
@@ -305,6 +324,19 @@ The router's low-confidence tie-break decides by marginal cost (the run's decisi
 `index.js` passes the override to the decision engine and to `executorsFrom`, so it reaches every one of those readers, not only the ones that go through a resource snapshot.
 The `cost_tier` in the track record Jev reads follows the same override (`none` reads `free-local`, or `free` for an agent that is not local, `low` reads `subscription`, `metered` reads `api`), then the billing kind (`router.js` `trackRecord`).
 
+### The feedback bias
+
+A person's Like and Dislike move the pick a little after the decision engine has answered, in the `router.js` block that opens with the comment `// The feedback prior, applied.`, through `feedbackPrior`.
+The bias reads verdicts from every session and every workspace, and `verdictWeight` weights each by how well the task type of the run it judged matches the task being routed: 1 for the same `routing.taskType`, 0.25 (`FEEDBACK_OTHER_TYPE`) for any other.
+Related types are not told apart, and the 0.25 is a fixed copy of `evidence.similarity.other` that install config does not move.
+The run a verdict judged is found by `index.js` `runOfVerdict`: the `runId` the client sends; else the run the capability registry credited the verdict to (`creditedRun`); else the newest run of the verdict's session that ended at or before the answer was first judged.
+An edited verdict is dated by its first judgment (`effectiveVerdicts`), the same way its capability evidence and labels are.
+A verdict whose kind of work cannot be told (no run found, a manual-pick run with no `taskType`, or no task type for the task at hand) counts by session alone: fully in its own session, and not at all from another.
+The window is 20 verdicts' worth of weight, newest first: at full weight that is still the newest 20 rows, a verdict about another task type takes a quarter of a place, and a row that weighs nothing is skipped before the window is counted.
+The bias moves a probability by at most 0.15 either way, ramped over 3 verdicts.
+It applies only to a run whose `routing.mode` is `jev`: never to a forced agent, a **Jev Auto · Local** run, an offline run or a fallback.
+The counts and typed reasons that ride the legacy named call's track record, and the `suggestedAgent` correction that can switch a pick outright, still come only from this session.
+
 ## How a domain earns the right to decide
 
 ```
@@ -320,6 +352,8 @@ One rung at a time, never skipped.
 - **GUARDED_LOCAL.** The local classifier decides cases it is confident about and that look like what it was trained on.
   Everything else goes to Jev.
 - **LOCAL_ONLY.** The local classifier decides normal cases with no Jev call at all; an unconfident or unfamiliar case still goes to Jev.
+
+For the two domains a rule in code decides, the rule stands wherever Jev would, and the resource ranking's classifier never decides at any rung.
 
 `ROLLBACK` is also a defined maturity value, but with the default policy nothing puts a domain in it: a rollback moves the domain straight to a lower rung and marks it with the reason, the severity and when it happened.
 
@@ -422,7 +456,7 @@ Recorded, in `~/.kzh/jev-router/` (the folder of `historyFile`):
 
 | File | What |
 | --- | --- |
-| `routing-samples.jsonl` | One row per routing decision: the feature vectors, the candidates' keys, agent ids and features, the teacher's answer, the local classifier's answer, who was authoritative. Then an outcome row when the run proves something. |
+| `routing-samples.jsonl` | One row per routing decision: the feature vectors, the candidates' keys, agent ids and features, the teacher's answer, the local classifier's answer, who was authoritative. Then an outcome row when the run proves something. Capped per domain (below). |
 | `capability-evidence.jsonl` | One row per piece of capability evidence: subject (provider, model, version), dimension, score, source, confidence, task type, and for a verdict its session and message ids, its run and the batch it was recorded in; plus a retraction line when a verdict is cleared or stops saying anything about capability. |
 | `classifiers/` | The trained artifacts, one per domain, plus the previous one. |
 | `domains/` | Each domain's maturity state. |
@@ -430,7 +464,10 @@ Recorded, in `~/.kzh/jev-router/` (the folder of `historyFile`):
 | `history.jsonl` | One row per routed run, written by the router, not by the learning store: the **task text as typed**, the workspace's absolute path, the routing context (branch, up to 30 uncommitted file paths, file-type counts, script and dependency names), the routing decision, each attempt's error diagnostic and changed file paths, and the **first 1000 characters of each attempt's answer**. |
 | `tasks.jsonl` | The last 100 background tasks: the **task text** again, and the finished **report**, clipped to 20,000 characters, which includes up to 4000 characters of the answer and the changed file names. |
 | `feedback.jsonl` | Each Like or Dislike, its tag, the reason the person typed, the answer's agent and model, the run it came from (`runId`), and `learningOff` when it was given with learning off. |
-| `usage.jsonl` | One row per agent attempt and per Jev call: ids, the workspace path, tokens, cost and quota. |
+| `usage.jsonl` | One row per agent attempt and per answered Jev or Laya call (`agent: 'laya'`, at $0): ids, the workspace path, tokens, cost and quota. A direct answer's row names the row's `decider`. |
+| `laya-samples.jsonl` | One row per domain decision of a run Laya decided, in the same shape as `routing-samples.jsonl` with `teacher: null` and Laya's answer as `provider`, then its outcome rows. Same cap and compaction. No classifier reads it. |
+| `laya-shadow.jsonl` | One row per Jev call in Jev Auto that Laya answered beside Jev, or was skipped for: both sides' answers as numbers and option keys (a tool parameter's as its index), the call's timings and why a comparison was skipped. Newest 10,000 rows. |
+| `laya-standing.jsonl` | Laya's standing per domain, appended at most once a minute after a run: a reading, never an authority. |
 
 Nothing redacts a key out of `history.jsonl`, `tasks.jsonl` or `feedback.jsonl`: a key pasted into a task or a reason is stored there as typed.
 
@@ -444,11 +481,29 @@ cannot be read back out of it, and it is worth being exact about rather than cal
 There are tests that write a marker string into a task, its answer, a diagnostic and a feedback reason and fail if it
 appears in the routing samples or the capability evidence.
 
+`routing-samples.jsonl` is capped per domain at `samplesCap(policy)` (`training.js`).
+Each domain keeps its newest cap samples and its newest cap verified samples, each with its newest outcome row; newest is by `ts`, then by place in the file.
+With the shipped gates the cap is 10000: HIGH needs 6000 samples for LOCAL_ONLY, a holdout of 1200 at a 15% holdout share needs 8000 rows, and 8000 x 1.25 is 10000.
+The cap follows the resolved config, so raising `routing.gates` raises it.
+When `routing.split` has a holdout share of 0 the validation share carves the holdout (a split of 0.8/0.2/0 gives 7500), and a split with neither counts only `localOnlySamples`; the cap is always finite.
+The file is compacted once it holds `slack` rows past what the cap keeps, and the slack defaults to the cap; the check runs on load and after every `slack` appended rows.
+Compaction writes a temporary file, fsyncs it and renames it over the file, trying the rename up to 7 times in all while it fails with `EPERM`, `EACCES` or `EBUSY`.
+A rename that still fails leaves the file untouched and logs `[jev] routing samples not compacted: ...`.
+A file that exists but cannot be read (any error but `ENOENT`) is never rewritten, and `[jev] routing samples not read: ...` is logged.
+Once the cap has let anything go, a compacted file starts with a row `{"dropped": {<domain>: {"samples": n, "verified": n}}}` holding running totals of what it let go of; the store reads it back through the synchronous `dropped(domain)`, and `GET /jev-router/routing` reports it as `training.dropped`.
+Every domain evaluation, and the state's `samples`, carries `samples.seen`: the verified rows held plus the verified rows the cap let go of.
+The counts of what arrived since something are all taken on `seen`: `sinceRollback`, `sinceArtifact`, the retrain trigger (`everyNewSamples`), the rollback point, the good and bad window counts, `challenger.verified`, and the artifact's `extras.verifiedSamples` and `trainingDataVersion`.
+`samples.verified` still counts the rows held, and the sample gates read it.
+Domain state files need no migration: `stateVersion` stays 3.
+With a split whose holdout share is 0, every row the training slice leaves goes to validation (`domains.js` `splitRows`); flooring both shares used to leave one row over as a one-row holdout slice that the holdout gate was scored on.
+
 What goes to Jev changed with this work in three ways.
-The task call asks more (the requirement dimensions, skills, the minimum and preferred tier, verification).
-A second call carries the anonymous candidate table with capability scores, scarcity and cost per resource, and the task profile's numbers (`task_profile`) always ride it in place of the task questions, whether Jev produced the profile in the first call, the local classifier did, or the heuristic fallback did.
+The task call asks more (the requirement dimensions, skills, the minimum and preferred tier, verification), and it is the only routing call that carries the workspace facts and the handoff note.
+A second call asks how to organise the work and whether a second opinion is worth it, and carries only `task`, plus the task profile's numbers (`task_profile`) when it asks the strategy question, since the task group is never asked in the same call.
+A judgments-only call carries `task` alone.
+The strategy question reads ``How should the work for `task` be organised?``, and its options are exactly the strategies `decision.js` passes from `broker.js` `eligibleStrategies()`; a call given fewer than two asks no strategy question.
 When the task classification and skill selection domains have both matured locally there is no task call, and this is the only call.
-And the per-agent maps the old named routing call carried are anonymised or dropped, as described above.
+And the per-agent maps the old named routing call carried (`recent_outcomes`, `agent_availability`, `agent_track_record`) ride no call under adaptive routing: only the review call names resources, and only by key.
 The README's privacy section is the full account.
 
 ## Configuration
@@ -461,7 +516,7 @@ default in `routing-policy.js`.
   config:
     routing:
       enabled: true          # false: Jev routes every task over named agents, the way it did before
-      learn: true            # false: Jev decides every routing question; no samples, no local authority
+      learn: true            # false: no samples, no local authority; Jev and the rules in code decide
       disabledResources: []  # never pick these (agent ids)
       allowedResources: []   # when set, pick only these
       gates:
@@ -480,7 +535,9 @@ default in `routing-policy.js`.
 The `routing` values shown are the defaults; `resources.plans` is empty by default, so a Claude plan is unknown until it is named there.
 The schema passes the `gates`, `governor`, `retrain` and `drift` blocks through as free-form objects and `resolvePolicy` merges them over the defaults, so a misspelt key inside them is accepted and does nothing; check a change against `routing-policy.js`.
 `minimumReview` takes `riskForReview` (default 0.6) and `riskForFrontierReview` (default 0.8).
-They are the deterministic fallback for the second-opinion and frontier-review judgments when neither Jev nor a trusted local classifier answers, and the same risk cuts steer the fallback resource pick, the fallback conservation answer and the fallback strategy; they do not force a review on their own.
+They are the deterministic fallback for the second-opinion judgment when neither Jev nor a trusted local classifier answers, and the rule that decides the frontier review wherever its local classifier does not.
+`riskForFrontierReview` also decides when the fallback strategy is `CHEAP_EXECUTE_FRONTIER_REVIEW`, and `riskForReview` is where the conservation limit stops.
+They steer no resource pick, because the ranking makes the pick at any risk, and they do not force a review on their own.
 `resolvePolicy` refuses to start on a value the arithmetic cannot use, the way it refuses a bad gate: a `governor` that is not an object, a conservation curve outside 0..1 or with `startAt` above `aggressiveAt`, `resetProximityWeight` outside 0..1, a negative `staleAfterMinutes`, `staleConfidence` outside 0..1, a negative cost weight or marginal, a `budgetSoftMultiple` not above 1, and a rollback destination that is not below every rung it rolls back from (`minorTo` below LOCAL_ONLY, `significantTo` and `severeTo` below GUARDED_LOCAL; `ROLLBACK` is allowed).
 `minClassRecall` (default 0.85) is the per-class recall floor; a domain is held to its own risk class's `gates.<LOW|MEDIUM|HIGH>.minClassRecall` when one is set, else to the global value (`domains.js` `gatesOf`).
 
@@ -500,29 +557,73 @@ node scripts/kzh-routing-demo.mjs --learn 45   route 45 tasks, then show which d
 
 Every routing module in that script is the real one.
 Only the agents and Jev are stood in for, and it says so on screen.
-It prints the candidate table, the decision, who decided it and what the reasoning block would have
-shown, which is the same information the Jev inspector's **Decisions** tab renders.
+It prints the candidate table, the decision, who decided it and what the reasoning block would have shown, which is the same information the Jev inspector's **Decisions** tab renders.
+The reasoning block's decision line names every authority that decided a domain (`adapter.js` `decidedBy`), in a fixed order: `the local router (<the domains it decided>)`, `Jev`, `routing rules`, then `the safe fallback (<domains>)` when some domains fell back.
+When every domain fell back it reads `safe fallback, nothing could decide`, and only a run with no per-domain report (legacy named routing) reads `Jev decided`.
+A typical run on a cold router reads `Jev and routing rules decided; 2 Jev calls; 3 candidates considered`: the task call, then the strategy and second-opinion call.
+Once both task domains answer locally there is no task call, and it reads `the local router (task classification, skill selection), Jev and routing rules decided; 1 Jev call; 3 candidates considered`.
+The report header (`router.js` `formatReport`) uses the short form without the domain lists, such as `AUTO (Jev and routing rules decided)` or `AUTO (the local router, Jev and routing rules decided)`, because the `Decided by` line right under it lists each domain.
+The agent strip under the answer (`router.js` `answeredSteps`) opens with the same router: `Jev` when Jev answered any domain or there is no per-domain report, else `Local router`, else `Routing rules`.
+With learning off there is no domain registry, and the report still names who answered each domain (Jev or the fallback for the task and the strategy, the ranking for the pick) rather than `none`.
 The inspector shows each `RESOURCE_x` key with the agent id next to it: the person sees the mapping, Jev does not.
 
-In the app, the inspector's **Router** tab shows each domain's maturity, which gate it is waiting
-on, what each provider adapter currently reports, and what the registry believes about each
-resource with the evidence behind every number.
+In the app, the inspector's **Router** tab shows each domain's maturity, which gate it is waiting on, what each provider adapter currently reports, and what the registry believes about each resource with the evidence behind every number.
+A dimension's line adds `benchmark 75% (9 of 12 tasks)` when benchmark rows count for it, and a dimension only a benchmark has measured is listed too; the Capability benchmark card follows ([`benchmark.md`](benchmark.md) 3.11).
+Under the maturity pill it says what the rung means for who decides (`client.js` `maturityWords`), and a domain decided in code says so.
+A domain whose state reports `localDecides: false` (the resource ranking) shows `a rule in code decides at every rung; the local router is recorded beside it for comparison and never decides` in place of the rung's words, while the pill still shows the rung.
+A domain Jev teaches whose local authority a policy took away (`localDecides: false` set in config) reads `Jev decides at every rung; ...` instead, because no rule in code decides it.
+With learning off the tab's heading reads `Learning is switched off: Jev and the rules in code decide, and nothing is recorded`.
+A `teacher: 'code'` domain whose classifier may decide (the frontier review) names the rule where the other domains name Jev:
+
+| Rung | Words for the frontier review |
+| --- | --- |
+| JEV_PRIMARY | a rule in code decides; the local router is not trained yet |
+| SHADOW | a rule in code decides; the local router predicts alongside it and is being scored |
+| GUARDED_LOCAL | the local router decides when it is confident and the case is familiar; a rule in code decides the rest |
+| LOCAL_ONLY | the local router decides normal cases; a rule in code decides the rest |
+| ROLLBACK | local authority suspended; a rule in code decides until it is earned back |
+
+When a code-decided domain is at a local rung and its classifier does not decide, the decision's reason keeps why (out of distribution, too little confidence, a classifier that never decides) and appends `; a rule in code decides this one`.
 It prints every limit figure with its own provenance and confidence, so a DeepSeek balance reads, for example, `balance 60.0% used (estimated, little evidence), 40 USD left (from the provider, well evidenced)`, and scarcity is shown at its own confidence.
 The run view says when the weekly gate yielded or the decision engine kept a gated frontier resource, on the decision card or, where that card is not shown (the Overview ledger, a stored run), on the run itself, and it names every move the router made, each with where it went.
 
+## A second decider: Laya
+
+Laya, a decision model on this PC, answers the same questions as Jev ([`laya-auto.md`](laya-auto.md) is the design).
+Who decides a run is `routing.decider` on its record (`'jev'`, or `'laya'` for a Laya Auto run and `/laya`; a record without it was Jev's), and every cut-off the run reads comes from that provider's record (`providers.js`), never from a constant both share.
+The teacher stays Jev: `routing-policy.js` still refuses any teacher but `jev` or `code`, and a domain's `state().teacher` is unchanged.
+
+In a run Laya decides, every domain Jev would be asked about is answered by Laya, whatever rung its ladder holds, and records authority `laya`; the code-taught domains (`resource_selection`, `frontier_escalation`) are decided by their rules exactly as in Jev Auto; a domain whose Laya answer failed, or was too flat to use, takes its deterministic answer (`code` or `fallback`), never the local classifier and never Jev.
+The one exception is `outcome_disposition`, where a flat disposition still gives authority `laya` and only the sample says `informative: false`, because the review's action comes from Laya's yes/no answers, not from the disposition.
+The local classifier's answer is recorded beside Laya's and never decides, so Jev's teaching never enters a Laya run, and every domain reports `maturity: null` there: the local ladder's rung says nothing about a Laya run.
+
+The stores are kept apart by construction, not by filters:
+
+- `training.js` `createTrainingStore` takes a `kind`. The Jev store, `routing-samples.jsonl`, throws on authority `laya` and on any `provider` field; the Laya store, `laya-samples.jsonl`, throws on a teacher. `AUTHORITIES` is unchanged (the Jev store's list); `ALL_AUTHORITIES` adds `laya`, and `STORE_AUTHORITIES` gives each store its own.
+- A Laya run's decisions write to the Laya store only (`decide({ answeredBy: 'laya', sink })`), and never touch a domain's ladder: no out-of-distribution note, no maturity change, no state write. The review's `outcome_disposition` is decided behind a facade in `index.js` that sends it to the Laya store, so `jev-review` knows nothing of stores.
+- The labels a finished run earns are resolved in the store each sample was written to (`decisionSamples` entries carry `store`), and a person's verdict relabels in the store `routing.decider` names (`index.js` `onVerdict`). An accepted run confirms only the teacher's pick, so an accepted Laya run labels nothing; evidence against a Laya pick (a rescue, a negative outcome, a person's tag) is labelled as it is for any pick.
+- After a Laya-decided run the Jev evaluation pass (`maybeRetrain`) does not run: it stamps and saves every Jev domain state, and a Laya run gives those domains nothing new. Laya's own pass appends its standing to `laya-standing.jsonl`, outside `domains/`.
+- No local classifier reads `laya-samples.jsonl`, so their training, evaluation windows, drift and out-of-distribution statistics, `classProfiles` and `stats().localAgreement` cannot see a Laya answer.
+- A Laya-decided run's capability evidence is only whether each attempt completed (`reliability`), with no task type, because every other row would rest on Laya's own judgment; a person's verdict on such a run gives no capability evidence, and weighs in the feedback prior as a verdict on a run of unknown type.
+
+The decision line and the report name Laya where they name Jev: `Laya and routing rules decided; 2 Laya calls; 3 candidates considered`, and `AUTO (Laya and routing rules decided)`.
+
 ## What this does not do yet
 
-- **No benchmark source.** The evidence pipeline accepts benchmark rows and weighs them, but
-  nothing here runs, fetches or imports benchmarks; that evidence class is empty until something writes to it.
+- **No published benchmarks.** The capability benchmark in the Router tab is the source of `benchmark` rows now (see Benchmark evidence under "Capability, as evidence rather than rules").
+  What stays empty is `benchmark_prior`: nothing imports published benchmarks.
 - **Only local models have a real version.** Claude Code, Codex and API agents report no served version, so they are keyed by their configured model name and protected only by the 45-day window, unless that name is itself a dated snapshot.
 - **Most limit kinds and scopes have no producer.** Only `rolling_window` and `monetary_budget` limits, all at scope `account`, come from a shipped adapter; the governor ignores scope.
 - **A reply with no run mark.** A verdict on an answer that carries no `[jev-run]` mark (one from before the mark existed) is credited by time, so a first verdict on an older answer, given after a newer run in the same session had already ended, is credited to that newer run, and every later form of that verdict follows it there.
 - **Keys are positional; familiarity is not.** `RESOURCE_x` is assigned over the current pool, so a resource's key can shift when the pool changes.
   The ranker learns from each candidate's features, never its key, so its choices do not depend on the shift, and the familiar-candidate check counts resources by their stable id (in code; the classifier never sees an id), so a new resource that inherits an old key is still flagged unfamiliar.
   An artifact trained before that change is read by key until its next retrain.
-- **Conservation learns slowly.** It can act only on a resource that is actually being used up, and it is labelled only by runs where it could act, so on healthy allowances it stays at `JEV_PRIMARY` with nothing verified.
-- **Local models are not measured, only declared.** Tokens per second and context size come from the
-  manifest and the machine's hardware, not from timing real runs.
+- **Routing does not read a local model's speed.**
+  The resource snapshot routing reads carries no tokens per second (`resources.js`, `tokensPerSecond: null`), and the latency class comes from whether a resource is local, an API or a subscription.
+  The speed benchmark measures a local model's tokens per second for the Local models card and the install picker ([`benchmark.md`](benchmark.md) section 2), and routing does not read that reading either.
+  Its memory is measured once it has run (`local.js` `readMemoryUsage`), and estimated until then.
+  Its context is the plugin config's `local.contextSize` when set, else the manifest's (16,384 when the manifest names none), or 12,288 on a PC with under 12 GB RAM, and never above the manifest's `maxContext`.
+  A RAM budget sizes it down to the largest whole k that fits, to 12,288 at least (`local.js` `planFor`).
 - **Anthropic reports no plan name**, so `pro` against `max` has to be configured by hand in `resources.plans`; unconfigured, the default curve applies.
   Codex reports its plan; DeepSeek has no plan concept at all.
 - **A monetary budget without a provider total** is read against the soft and hard floors plus an estimated share, so its

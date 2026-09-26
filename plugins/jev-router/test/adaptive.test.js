@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,7 +19,7 @@ import { createReview } from '../../jev-review/index.js'
 import { createDomainRegistry } from '../domains.js'
 import { createCapabilityRegistry, loadPriors, subjectOf } from '../profiles.js'
 import { snapshotResources } from '../resources.js'
-import { formatReport, runRouted } from '../router.js'
+import { HANDOFF, answeredSteps, formatReport, runRouted } from '../router.js'
 import { mergePolicy, resolvePolicy } from '../routing-policy.js'
 import { createTrainingStore, labelFromRun } from '../training.js'
 
@@ -116,7 +116,9 @@ function stack({ policy = testPolicy(), root = mkdtempSync(join(tmpdir(), 'kz-st
   const profiles = createCapabilityRegistry({ file: join(root, 'evidence.jsonl'), priors: PRIORS, policy })
   const store = createTrainingStore({ file: join(root, 'samples.jsonl') })
   const domains = learn ? createDomainRegistry({ policy, store, artifactsDir: join(root, 'classifiers'), stateDir: root }) : null
-  const engine = createDecisionEngine({ policy, domains, profiles, priors: PRIORS, store })
+  // The engine reads the clock the snapshots were taken at: its scarcity and job costs count the
+  // time left to each window's reset, and the real clock would move those resets closer every day.
+  const engine = createDecisionEngine({ policy, domains, profiles, priors: PRIORS, store, now: () => NOW })
   const snapshots = snapshotResources({ agents: AGENTS, usage, ready, config: {}, now: NOW, modelOf, policy })
   return { policy, root, profiles, store, domains, engine, snapshots }
 }
@@ -327,7 +329,10 @@ test('scenario AC: once the routing domains have matured, a normal run makes no 
   assert.equal(asked.filter((c) => c.ask?.task).length, 0, 'no task-classification call was made')
   assert.ok(asked.every((c) => !c.questions?.resource), 'and no call asked which resource should do the work')
   assert.equal(r.finalStatus, 'accepted')
-  assert.match(formatReport(r), /local router decided|Jev and the local router decided/)
+  assert.equal(r.routing.decision.jevCalls, 0, 'the setting: every domain Jev teaches answered locally')
+  assert.match(formatReport(r), /AUTO \(the local router and routing rules decided\)/, 'the report names both, and does not credit Jev with the pick')
+  // The agent strip under the same message says the same: the router step is the local router.
+  assert.equal(answeredSteps(r)[0].agent, 'Local router')
 })
 
 test('routing switched off leaves the old behaviour exactly as it was', async () => {
@@ -424,8 +429,11 @@ test('no Jev call of an adaptive run names a resource anywhere: route and review
   })
   assert.ok(r.routing.decision, 'the decision engine routed this run')
   const tableCalls = sent.filter((c) => Array.isArray(c.state.candidates))
-  assert.ok(tableCalls.some((c) => c.questions.strategy), 'the strategy call carried the anonymous table')
-  assert.ok(tableCalls.some((c) => c.questions.reviewAgent), 'and so did the review call')
+  // The review call picks between the candidates by their data; the strategy call reads only the
+  // task, and its options are already the ones the table allows, so it carries no table.
+  assert.ok(sent.some((c) => c.questions.strategy), 'the decision engine asked the strategy question')
+  assert.ok(!tableCalls.some((c) => c.questions.strategy), 'the strategy call carried the anonymous table')
+  assert.ok(tableCalls.some((c) => c.questions.reviewAgent), 'the review call carried the anonymous table')
   for (const call of sent) {
     const kind = Object.keys(call.questions).includes('verdict') ? 'review' : 'route'
     assert.deepEqual(leaks(call), [], `the ${kind} call named a resource`)
@@ -434,11 +442,12 @@ test('no Jev call of an adaptive run names a resource anywhere: route and review
   assert.equal(r.assessments[0].mode, 'jev', JSON.stringify(r.assessments[0]))
 })
 
-test('the production strategy call carries the evidence under the anonymous keys, and still names nothing', async (t) => {
-  // The guard above proves nothing leaks, and an empty call passes it too: without the decision
-  // engine's id-to-key mapping jev.js drops who ran each earlier task, and the teacher answers
-  // with no history at all. This walks the real stack (router, decision engine, jev.js) and checks
-  // the evidence arrived, keyed right, as well as anonymous.
+test('the production strategy call carries what its question reads, and still names nothing', async (t) => {
+  // The guard above proves nothing leaks, and an empty call passes it too. This walks the real
+  // stack (router, decision engine, jev.js) with evidence naming the agents in every channel, and
+  // checks the strategy call carried the task and its profile and nothing else: its question reads
+  // the task, not the resources, so the table, the history keyed to it, the track record and the
+  // availability all stay on this machine.
   const { sent, restore } = transport()
   t.after(restore)
   const dir = repo()
@@ -448,25 +457,77 @@ test('the production strategy call carries the evidence under the anonymous keys
     task: 'make the failing test pass', cwd: dir, config: namedConfig, signal,
     deps: deps(s, jev, async () => fixer(dir), { history: namedHistory(dir), quota: namedQuota }),
   })
+  assert.ok(r.routing.decision, 'the decision engine routed this run')
   const call = sent.find((c) => c.questions.strategy)
   assert.ok(call, 'the decision engine asked the strategy question')
   assert.deepEqual(leaks(call), [], 'the strategy call named a resource')
-  const { state } = call
-  // Which key is which agent, from the run's own decision record: the test reads it, Jev never does.
-  const keyOf = Object.fromEntries(r.routing.decision.candidates.map((c) => [c.id, c.key]))
-  const offered = state.candidates.map((c) => c.key)
-  assert.deepEqual(Object.keys(keyOf).sort(), ['claude', 'codex', 'deepseek'])
+  assert.deepEqual(Object.keys(call.state).filter((k) => call.state[k] !== undefined).sort(), ['task', 'task_profile'])
+  assert.equal(call.state.task, 'make the failing test pass')
+  assert.equal(typeof call.state.task_profile.complexity, 'number', 'the profile the decision engine built rode along')
+})
 
-  assert.ok(offered.length >= 2, 'the anonymous table rode the call')
+// ---------------------------------------------------------------- a key split by a cut
 
-  // Who ran each earlier task, as the key of the agent that ran it.
-  assert.deepEqual(state.recent_outcomes.map((h) => h.first_resource), [keyOf.claude, keyOf.codex, keyOf.claude, keyOf.deepseek, keyOf.claude])
-  assert.ok(state.recent_outcomes.every((h) => h.task_type === 'implementation' && !('first_agent' in h)))
-  assert.equal(state.agent_track_record, undefined)
-  // The per-candidate track record and availability were read by the resource question alone, and
-  // that question is decided in code now, so nothing carries them any more.
-  assert.equal(state.candidate_track_record, undefined)
-  assert.equal(state.candidate_availability, undefined)
+// One key per cut the router makes before a text reaches Jev, each placed so the cut splits it.
+const SPLIT = {
+  handoff: 'ghp_Nr9NBe0OkNlaQ1Ao3KBfAxIPtRIxKGoJb3No', // the earlier agent printed it at character 2980 of its note
+  diagnostic: 'sk-proj-yjysZeV8tHU8EGYPT5rkxNWmiV7BlPtGDlV0ZYx8', // an executor's error quoted it 17 characters before the 300 cut
+  checks: 'AIzaSyg35AUOydBLFOo1YJlxnrc3rsMdCXe09VJ', // the test script printed it where the kept tail of its output starts
+}
+/** Which keys left in a piece of ten characters or more: enough of a key to be worth something. */
+const splitLeaks = (call) => {
+  const s = JSON.stringify(call)
+  return Object.entries(SPLIT).filter(([, key]) => Array.from({ length: key.length - 9 }, (_, i) => key.slice(i, i + 10)).some((p) => s.includes(p))).map(([channel]) => channel)
+}
+/** A repo whose failing test prints the checks key so that the 500-character tail starts inside it. */
+function splitRepo() {
+  const dir = repo()
+  const lead = 'request to the maps API failed: key='
+  // 506 characters from the key's first one to the end, so the kept tail starts 6 characters in.
+  const out = `${lead}${SPLIT.checks} rejected. ${'The API key is not valid for this project. '.repeat(12)}`.slice(0, lead.length + 506)
+  writeFileSync(join(dir, 'check.js'), `process.stdout.write(${JSON.stringify(out)}); process.exit(1)\n`)
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'node check.js' } }))
+  execFileSync('git', ['add', '-A'], { cwd: dir })
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'checks'], { cwd: dir })
+  mkdirSync(join(dir, '.kz-harness'))
+  const lines = 'Step 2 of 3 done: the parser is fixed and the printer is next.\n'.repeat(47).padEnd(2980)
+  writeFileSync(join(dir, HANDOFF), `${lines}${SPLIT.handoff} is the token the release step used.\n`)
+  return dir
+}
+// The executor's error. 'Error: ' and 276 characters put the key at 283, so describeError's 300
+// cut keeps 'sk-' and 14 more: two short of the 16 the scrubber needs to know it for a key.
+const splitError = () => new Error(`${'the agent process exited before it answered; '.repeat(6).padEnd(276)}${SPLIT.diagnostic} was rejected`)
+
+test('a key a cut would split is scrubbed before the cut, so no piece of it leaves in any call, on either routing path', async (t) => {
+  // Jev's scrubber knows a key by its prefix and its length. The router cut three texts before
+  // jev.js scrubbed them: the handoff note to 3000 characters, an executor's error to 300, and
+  // each check's output to its last `outputChars`. A key the cut splits loses the prefix or the
+  // length it is known by, so its piece went out as ordinary text. Each is scrubbed first now.
+  const { sent, restore } = transport()
+  t.after(restore)
+  const jev = createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 })
+  const execute = async () => { throw splitError() }
+  const history = { recent: async () => [], records: async () => [], append: async () => {} }
+  // The decision engine's path, then the named call routing.enabled false still makes.
+  const adaptive = splitRepo()
+  const r1 = await runRouted({ task: 'finish the release script', cwd: adaptive, config, signal, deps: deps(stack(), jev, execute) })
+  assert.ok(r1.routing.decision, 'the decision engine routed the first run')
+  const legacy = splitRepo()
+  const r2 = await runRouted({ task: 'finish the release script', cwd: legacy, config, signal, deps: { jev, execute, history } })
+  assert.equal(r2.routing.decision, undefined, 'and the second went through the legacy call')
+
+  for (const call of sent) assert.deepEqual(splitLeaks(call), [], `a piece of a key rode out in the ${call.questions.verdict ? 'review' : 'route'} call`)
+  // Each channel really carried its text, with the key masked in it: nothing was dropped to pass.
+  const routes = sent.filter((c) => !c.questions.verdict)
+  const reviews = sent.filter((c) => c.questions.verdict)
+  // The masked key ends at character 2997, so the 3000 cut keeps it whole and three more.
+  assert.equal(routes.filter((c) => / ghp_Nr\.\.\.REDACTED is$/.test(c.state.handoff ?? '')).length, 2, 'the note rode both calls that read it')
+  assert.ok(reviews.length >= 2, 'the failed attempts were reviewed on both paths')
+  for (const review of reviews) {
+    // The masked key is 17 characters too, so the cut now falls right after it.
+    assert.ok(review.state.attempts.some((a) => / sk-pro\.\.\.REDACTED$/.test(a.diagnostic)), JSON.stringify(review.state.attempts))
+    assert.match(review.state.verification.results[0].output, /key=AIzaSy\.\.\.REDACTED rejected\./)
+  }
 })
 
 test('the retry pick is made over the anonymous machine data and lands on the agent that key stands for', async (t) => {

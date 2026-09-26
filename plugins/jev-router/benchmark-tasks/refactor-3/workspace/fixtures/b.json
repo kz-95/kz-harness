@@ -1,0 +1,5 @@
+{
+  "server": { "port": 9090, "tls": { "enabled": true, "cert": "certs/shop.pem" } },
+  "features": ["search", "cart"],
+  "debug": true
+}

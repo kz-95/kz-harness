@@ -3,7 +3,7 @@
 // up as a declining trend, and a run record turns into evidence rows with none of its text.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { appendFileSync, existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,6 +11,9 @@ import { DIMENSIONS, TASK_DIMENSIONS, resolvePolicy } from '../routing-policy.js
 import {
   EVIDENCE_SOURCES, PRIOR_SOURCES, UNPINNED_WINDOW_DAYS, agreementOf, createCapabilityRegistry, evidenceFromFeedback, evidenceFromRun, loadPriors, priorFor, subjectKey, subjectOf, validatePriors, versionPinned,
 } from '../profiles.js'
+// A namespace as well, for what the capability benchmark added (benchmarkEvidence), so this file
+// loads where the plugin lacks it and each of those tests fails by its own assertion.
+import * as profilesModule from '../profiles.js'
 
 const PRIORS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'config', 'capability-priors.json')
 const DAY = 86_400_000
@@ -238,7 +241,8 @@ test('evidence decay: an old benchmark weighs less than a new one, and slower th
   assert.ok(old.weight < fresh.weight)
   assert.ok(ex.score > 0.5, 'the new benchmark wins')
   assert.ok(close(ex.score, fresh.weight / (fresh.weight + old.weight)))
-  assert.deepEqual(ex.benchmark, { score: ex.score, n: 2 })
+  // The benchmark summary is the plain pass rate over its rows, one per task, and the weight they carry now.
+  assert.deepEqual(ex.benchmark, { score: 0.5, tasks: 2, passed: 1, weight: old.weight + fresh.weight })
   assert.equal(ex.execution, null)
   assert.equal(reg.cold(s), true, 'a benchmark alone does not warm a subject')
   // Execution evidence of the same age has decayed further: a shorter half-life.
@@ -410,6 +414,29 @@ test('evidenceFromRun: a like or dislike becomes a human_outcome row when it mat
   assert.equal(codex.length, 6, 'the like by provider and model, plus the like by runId for the last work attempt; other sessions and models do not match')
   assert.ok(codex.every((x) => x.score === 1))
   assert.doesNotMatch(JSON.stringify(rows), new RegExp(MARKER), 'the reason text never rides along')
+})
+
+test('evidenceFromRun: a run Laya decided gives only whether each attempt completed, with no task type, and no verdict about it counts', async () => {
+  const { answererUnconfigured, evidenceWeight } = await import('../profiles.js')
+  const layaRun = run({
+    routing: { taskType: 'security', decider: 'laya', primaryAgent: 'claude' },
+    attempts: [attempt('claude', 'primary', { stopReason: 'error', checks: [{ name: 'test', passed: false }] }), attempt('codex', 'review'), attempt('deep', 'retry')],
+    assessments: [{ mode: 'laya', action: 'retry' }, { mode: 'laya', action: 'retry' }, { mode: 'laya', action: 'accept' }],
+  })
+  const rows = evidenceFromRun(layaRun, { modelOf, agents, priors })
+  assert.deepEqual(rows.map((r) => [r.subject.provider, r.dimension, r.source, r.score, r.confidence]), [['claude-code', 'reliability', 'objective_deterministic', 0, 0.9], ['deepseek', 'reliability', 'objective_deterministic', 1, 0.9]], 'completed or not, which rests on no judgment of Laya\'s')
+  assert.ok(rows.every((r) => !('taskType' in r) && r.runId === 'run-1'), 'Laya\'s task type never rides a row')
+  assert.equal(evidenceWeight(rows[1], { policy, nowMs: NOW, taskType: 'documentation' }).similarity, 1, 'so it never sets how much the row weighs when Jev Auto reads a profile')
+  // The same record, decided by Jev, gives everything it always did.
+  const taught = { ...layaRun, routing: { taskType: 'security', primaryAgent: 'claude' }, assessments: layaRun.assessments.map((a) => ({ ...a, mode: 'jev' })) }
+  const all = evidenceFromRun(taught, { modelOf, agents, priors })
+  assert.ok(pick(all, 'independent_review').length > 0 && all.every((r) => r.taskType === 'security'))
+  // A verdict is credited on the dimensions of the run's task type, which was Laya's: nothing.
+  const verdict = { ts: T0, runId: 'run-1', sessionId: 'sess-1', messageId: 'm1', verdict: 'dislike', provider: 'deep' }
+  assert.deepEqual(evidenceFromFeedback(verdict, layaRun, { modelOf, agents, priors }), [])
+  assert.ok(evidenceFromFeedback(verdict, taught, { modelOf, agents, priors }).length > 0, 'while about the Jev run it is a person\'s evidence')
+  assert.equal(answererUnconfigured(verdict, layaRun, { agents: [] }), false, 'an uninstalled agent is never the reason a Laya run gives a verdict no rows')
+  assert.equal(answererUnconfigured(verdict, taught, { agents: [] }), true)
 })
 
 test('registry persistence: rows append as JSONL, load reads them back, and a truncated line or a foreign line is dropped', () => {
@@ -776,9 +803,11 @@ test('an upgrade without known-resources.json seeds from history as well as samp
   assert.deepEqual(await fresh.note([{ id: 'claude' }, { id: 'zeta' }]), [])
 })
 
-test('shipped text: no benchmark claim in the priors, and the local agents say what they are, not what they are good at', () => {
+test('shipped text: the priors say where benchmark evidence comes from and how much it weighs, and the local agents say what they are, not what they are good at', () => {
   assert.doesNotMatch(priors.about, /benchmarks overtakes/)
-  assert.match(priors.about, /nothing imports or records any benchmark/)
+  assert.doesNotMatch(priors.about, /nothing imports or records any benchmark/)
+  assert.match(priors.about, /capability benchmark in the Router tab/)
+  assert.match(priors.about, /as three observations/)
   const manifest = JSON.parse(readFileSync(join(dirname(PRIORS_FILE), 'local-models.json'), 'utf8'))
   const descriptions = (Array.isArray(manifest) ? manifest : manifest.modules ?? Object.values(manifest).find(Array.isArray) ?? []).filter((m) => m.agent).map((m) => m.agent.description)
   assert.ok(descriptions.length >= 2)
@@ -1085,4 +1114,255 @@ test('the feedback route with learning off stores the verdict and still applies 
   const again = createCapabilityRegistry({ file, priors, policy, now: () => NOW })
   again.load()
   assert.equal(humanOf(again, claudeSubject()).length, 0, 'after a restart too')
+})
+
+// ---------- POST /jev-router/feedback, the route itself ----------
+// apply() needs the whole plugin runtime, so the route's handling is a function of its own
+// (createFeedbackRoute) that apply() serves the route with. These drive it with the request body
+// as text, over a real feedback log, capability registry and training store, wired as apply() does.
+async function routeHarness({ slowLike = false, failOnce = false } = {}) {
+  const { createFeedbackRoute } = await import('../index.js')
+  const { createFeedback } = await import('../feedback.js')
+  const { createTrainingStore, labelFromRun } = await import('../training.js')
+  const file = tmp()
+  const reg = createCapabilityRegistry({ file, priors, policy, now: () => NOW })
+  const fb = createFeedback({ file: join(dirname(file), 'feedback.jsonl') })
+  const training = createTrainingStore({ file: join(dirname(file), 'routing-samples.jsonl') })
+  const r1 = run({ runId: 'run-1', ts: T0 })
+  // The run's task-classification sample, labelled from the run alone, as it is when a run ends.
+  const sample = await training.append({ domain: 'task_classification', runId: 'run-1', input: { features: { numeric: { x: 1 }, categorical: {} } }, teacher: { label: 'implementation', probabilities: { implementation: 0.9 }, confidence: 0.9, model: 'jev-1' }, local: null, authority: 'jev' })
+  await training.resolveOutcome(sample.id, labelFromRun('task_classification', await training.get(sample.id), r1))
+  let learn = true
+  // A like that takes a while to reach the disk, so a verdict posted after it could overtake it.
+  // Or one whose first write fails (a full disk, say), and every write after it succeeds.
+  let failed = false
+  const log = slowLike ? { ...fb, append: async (r) => { if (r.verdict === 'like') await new Promise((ok) => setTimeout(ok, 50)); return fb.append(r) } }
+    : failOnce ? { ...fb, append: async (r) => { if (!failed) { failed = true; throw new Error('ENOSPC: no space left on device') } return fb.append(r) } }
+      : fb
+  const post = createFeedbackRoute({ feedback: log, records: async () => [r1], capabilities: reg, training, agents: async () => agents, priors, learn: () => learn })
+  const body = (over) => JSON.stringify({ sessionId: 'sess-1', messageId: 'm1', provider: 'claude', runId: 'run-1', ...over })
+  const labelSource = async () => (await training.get(sample.id)).outcome.labelSource
+  return { reg, fb, training, sample, post, body, labelSource, setLearn: (on) => { learn = on } }
+}
+
+test('POST /jev-router/feedback: a verdict is stored, credited to its run and relabels it, and the reply is the stored row', async () => {
+  const h = await routeHarness()
+  const res = await h.post(h.body({ verdict: 'dislike', tag: 'misread my question', reason: 'I asked for a plan' }))
+  assert.equal(res.status, 200)
+  assert.equal(res.body.ok, true)
+  assert.deepEqual(await h.fb.list('sess-1'), [res.body.record], 'stored, and the reply carries exactly what was stored')
+  assert.equal(res.body.record.runId, 'run-1')
+  const label = (await h.training.get(h.sample.id)).outcome
+  assert.deepEqual([label.label, label.negativeLabel, label.labelSource], [null, 'implementation', 'human'], 'the run\'s routing sample now carries the person\'s label')
+  assert.ok(humanOf(h.reg, claudeSubject()).length > 0, 'and the verdict is capability evidence')
+  assert.ok(humanOf(h.reg, claudeSubject()).every((x) => x.runId === 'run-1' && x.score === 0), 'a dislike, about run 1')
+})
+
+test('POST /jev-router/feedback: a bad body is a 400 with the reason, and changes nothing', async () => {
+  const h = await routeHarness()
+  for (const [raw, reason] of [
+    ['{not json', /JSON/],
+    ['[]', /expected an object/],
+    [h.body({ verdict: 'meh' }), /verdict: like, dislike, or clear/],
+    [h.body({ verdict: 'dislike', tag: 'wrong model' }), /tag: one of/],
+    [h.body({ verdict: 'like', runId: 'run 1' }), /runId/],
+    [h.body({ verdict: 'like', sessionId: '' }), /sessionId/],
+  ]) {
+    const res = await h.post(raw)
+    assert.equal(res.status, 400, raw)
+    assert.match(res.body.error, reason)
+  }
+  assert.deepEqual(await h.fb.history(), [], 'nothing was stored')
+  assert.equal(humanOf(h.reg, claudeSubject()).length, 0, 'nothing was credited')
+  assert.equal(await h.labelSource(), 'teacher_confirmed', 'nothing was relabelled')
+  assert.equal((await h.post(h.body({ verdict: 'like' }))).status, 200, 'and the route still takes a good one after them')
+})
+
+test('POST /jev-router/feedback with learning off: stored and marked, nothing learnt, and a clear still withdraws', async () => {
+  const h = await routeHarness()
+  assert.equal((await h.post(h.body({ verdict: 'like' }))).status, 200)
+  const counted = humanOf(h.reg, claudeSubject()).length
+  assert.ok(counted > 0, 'the setting: with learning on the like counted')
+  h.setLearn(false)
+  const off = await h.post(h.body({ messageId: 'm2', verdict: 'dislike', tag: 'misread my question' }))
+  assert.equal(off.status, 200)
+  assert.equal(off.body.record.learningOff, true, 'stored, and marked as given while learning was off')
+  assert.equal(humanOf(h.reg, claudeSubject()).length, counted, 'no new evidence')
+  assert.equal(await h.labelSource(), 'teacher_confirmed', 'and no new label')
+  assert.equal((await h.post(h.body({ verdict: 'clear' }))).status, 200)
+  assert.equal(humanOf(h.reg, claudeSubject()).length, 0, 'the like withdrawn with learning off no longer counts')
+  assert.deepEqual((await h.fb.list('sess-1')).map((r) => r.messageId), ['m2'], 'the log reads back what the person thinks now')
+})
+
+test('POST /jev-router/feedback: verdicts posted together are applied in the order they are stored', async () => {
+  const h = await routeHarness({ slowLike: true })
+  // A quick like then dislike on one answer, the second posted before the first has answered,
+  // and the like slow to store: only the one queue keeps the dislike from landing first.
+  const [a, b] = await Promise.all([h.post(h.body({ verdict: 'like' })), h.post(h.body({ verdict: 'dislike' }))])
+  assert.deepEqual([a.status, b.status], [200, 200])
+  assert.deepEqual((await h.fb.history('sess-1')).map((r) => r.verdict), ['like', 'dislike'], 'stored in the order given')
+  const scores = humanOf(h.reg, claudeSubject()).map((x) => x.score)
+  assert.ok(scores.length > 0 && scores.every((s) => s === 0), `what counts is the dislike, the newest: ${scores}`)
+})
+
+test('POST /jev-router/feedback: a verdict that could not be stored fails alone, and the next one is taken', async () => {
+  const h = await routeHarness({ failOnce: true })
+  // The route throws, and the HTTP handler answers that as it answers any other failure.
+  await assert.rejects(h.post(h.body({ verdict: 'like' })), /ENOSPC/)
+  assert.deepEqual(await h.fb.history(), [], 'nothing was stored')
+  assert.equal(humanOf(h.reg, claudeSubject()).length, 0, 'and nothing credited')
+  // One failed write must not become the queue: every verdict after it would fail too.
+  const next = await h.post(h.body({ verdict: 'dislike' }))
+  assert.equal(next.status, 200)
+  assert.deepEqual((await h.fb.list('sess-1')).map((r) => r.verdict), ['dislike'], 'the next verdict is stored')
+  assert.ok(humanOf(h.reg, claudeSubject()).length > 0, 'and applied')
+})
+
+// ---------- the history deps apply() gives the router ----------
+// createHistoryDeps is what apply() hands runRouted as deps.history. Its runOfVerdict is the one
+// place the registry's credit (creditedRun) reaches the router's feedback prior, so it is driven
+// here over the same registry the route credits verdicts in.
+test('createHistoryDeps: a verdict with no runId is placed on the run the route credited it to, whatever ended since', async () => {
+  const { createHistoryDeps } = await import('../index.js')
+  const h = await routeHarness()
+  // The first form names its run, so the route credits it to run 1.
+  const first = await h.post(h.body({ verdict: 'dislike' }))
+  assert.equal(first.status, 200)
+  // A newer run of the session, of another kind, ended before a later form that names no run.
+  const historyFile = join(dirname(tmp()), 'history.jsonl')
+  const runs = [run({ runId: 'run-1', ts: T0 }), run({ runId: 'run-2', ts: daysAgo(-1), routing: { taskType: 'documentation', primaryAgent: 'claude' } })]
+  writeFileSync(historyFile, runs.map((r) => `${JSON.stringify(r)}\n`).join(''))
+  const later = { ...first.body.record, runId: undefined, ts: daysAgo(-2) }
+  const deps = createHistoryDeps({ historyFile, feedback: h.fb, capabilities: h.reg })
+  assert.equal(deps.runOfVerdict(later, await deps.records())?.runId, 'run-1', 'the run its evidence is on')
+  const blind = createHistoryDeps({ historyFile, feedback: h.fb })
+  assert.equal(blind.runOfVerdict(later, await blind.records())?.runId, 'run-2', 'without the registry it would be read as the newer run')
+})
+
+// ---------- the capability benchmark's evidence (docs/benchmark.md 3.9) ----------
+
+// The task set's shape: nine skills of three tasks each, crediting what 3.2 says.
+const BENCH = { id: 'kzh-capability', version: '1' }
+const BENCH_CREDITED = {
+  implementation: ['coding', 'instruction_following'], debugging: ['debugging', 'coding', 'general_reasoning'], refactor: ['coding'],
+  testing: ['testing', 'coding'], review: ['code_review'], security: ['security_review', 'code_review'],
+  performance: ['debugging', 'general_reasoning'], simple_change: ['instruction_following'], investigation: ['general_reasoning'],
+}
+const BENCH_TASKS = Object.entries(BENCH_CREDITED).flatMap(([skill, dimensions]) => [1, 2, 3].map((level) => ({ id: `${skill}-${level}`, skill, level, dimensions })))
+/** One agent's task rows of a run, the preflight's first, each task's outcome as `outcome` says. */
+const benchRows = (outcome = () => 'passed', { model = 'gpt-5', modelVersion = null, ts = T0 } = {}) => [
+  { task: 'preflight', outcome: 'passed', ts, model, modelVersion },
+  ...BENCH_TASKS.map((t) => ({ task: t.id, outcome: outcome(t), ts, model, modelVersion })),
+]
+const benchEvidence = (agent, runId, outcome, over = {}, benchmark = BENCH) => profilesModule.benchmarkEvidence(benchRows(outcome, over), { tasks: BENCH_TASKS, agent, priors, benchmark, runId })
+const CODEX = { id: 'codex', provider: 'codex' }
+
+test('benchmarkEvidence: a row per task and credited dimension, of the model the attempts recorded, with n of 3 over the tasks crediting the dimension, so a whole run weighs 1.89 on coding when fresh', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  // 9 of the 12 coding tasks pass: the three level-3 ones of implementation, refactor and testing fail.
+  const failing = new Set(['implementation-3', 'refactor-3', 'testing-3'])
+  const rows = benchEvidence(CODEX, 'bench-1', (t) => (failing.has(t.id) ? 'failed' : 'passed'))
+  const s = subjectOf(CODEX, { modelOf: () => 'gpt-5', priors })
+  assert.equal(rows.length, 45, 'one row per task and dimension it credits')
+  assert.deepEqual(rows.find((r) => r.note === 'debugging-2' && r.dimension === 'debugging'), {
+    ts: T0, subject: s, dimension: 'debugging', score: 1, source: 'benchmark', confidence: 0.9, n: 0.5, taskType: 'debugging', benchmark: BENCH, runId: 'bench-1', note: 'debugging-2',
+  })
+  assert.equal(rows.find((r) => r.note === 'refactor-3').score, 0)
+  const nOf = (dim) => [...new Set(rows.filter((r) => r.dimension === dim).map((r) => r.n))]
+  assert.deepEqual(
+    Object.fromEntries(['coding', 'general_reasoning', 'debugging', 'instruction_following', 'code_review', 'testing', 'security_review'].map((d) => [d, nOf(d)])),
+    { coding: [3 / 12], general_reasoning: [3 / 9], debugging: [3 / 6], instruction_following: [3 / 6], code_review: [3 / 6], testing: [3 / 3], security_review: [3 / 3] },
+  )
+  // Recorded, a whole run weighs on coding as three observations at the benchmark's reliability do.
+  const reg = registry()
+  reg.recordMany(rows)
+  const coding = reg.explain(s, 'coding')
+  assert.equal(coding.items.length, 12)
+  assert.ok(close(coding.evidenceWeight, 3 * 0.9 * policy.evidence.reliability.benchmark), `weight ${coding.evidenceWeight}`)
+  assert.ok(close(coding.evidenceWeight, 1.89))
+  assert.ok(close(coding.score, (coding.priorStrength * coding.prior.score + coding.evidenceWeight * 0.75) / (coding.priorStrength + coding.evidenceWeight)), 'the pass rate pulls the prior by the run\'s capped weight')
+})
+
+test('benchmarkEvidence: a task that did not fit the window KzH gives a local model gives no row at all, since the window is KzH\'s setting and not the model; the others keep their weight', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const rows = benchEvidence(CODEX, 'bench-1', (t) => (t.id === 'implementation-3' ? 'did_not_fit' : 'passed'))
+  assert.deepEqual(rows.filter((r) => r.note === 'implementation-3'), [], 'nothing of the task that did not fit')
+  assert.deepEqual(rows.filter((r) => r.dimension === 'long_context'), [], 'and no long context row')
+  assert.equal(rows.length, 45 - 2, 'every other task keeps its rows: implementation-3 credits coding and instruction following')
+  assert.deepEqual([...new Set(rows.filter((r) => r.dimension === 'coding').map((r) => r.n))], [3 / 12], 'n is still over the set\'s tasks, so a run with a task that did not fit weighs less')
+})
+
+test('benchmarkEvidence: a timed-out task scores 0, and a run that describes no one model or holds an unscored task gives nothing', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const rows = benchEvidence(CODEX, 'bench-1', (t) => (t.id === 'debugging-1' ? 'timed_out' : 'passed'))
+  assert.deepEqual(rows.filter((r) => r.note === 'debugging-1').map((r) => r.score), [0, 0, 0])
+  const mixed = benchRows()
+  mixed[3] = { ...mixed[3], model: 'gpt-4.1' }
+  assert.throws(() => profilesModule.benchmarkEvidence(mixed, { tasks: BENCH_TASKS, agent: CODEX, priors, benchmark: BENCH, runId: 'bench-2' }), /codex ran on more than one model during the benchmark \(gpt-5, gpt-4\.1\)/)
+  assert.throws(() => benchEvidence(CODEX, 'bench-3', (t) => (t.id === 'review-2' ? 'errored' : 'passed')), /codex's review-2 was not scored \(errored\)/)
+})
+
+test('benchmark rows are not runs: they are left out of samples and evidenceSamples, reported as the dimension\'s benchmark summary with its tasks, passes and weight, and leave the model cold', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const reg = registry()
+  const s = subjectOf(CODEX, { modelOf: () => 'gpt-5', priors })
+  reg.recordMany(benchEvidence(CODEX, 'bench-1', (t) => (t.level === 3 ? 'failed' : 'passed')))
+  const profile = reg.profileOf(s)
+  assert.equal(profile.samples, 0, 'no verified run behind the profile: what the ranking and Jev read as evidenceSamples')
+  assert.equal(profile.dimensions.coding.samples, 0)
+  assert.equal(reg.effective(s, ['coding']).coding.samples, 0)
+  assert.deepEqual(profile.dimensions.coding.benchmark, { score: 0.667, tasks: 12, passed: 8, weight: 1.89 }, 'the pass rate, the tasks, the passes and the weight now')
+  assert.deepEqual(profile.dimensions.testing.benchmark, { score: 0.667, tasks: 3, passed: 2, weight: 1.89 })
+  assert.equal(reg.cold(s), true, 'a benchmark alone leaves a model cold')
+  // A run's own row does count as a sample beside them.
+  reg.record(row(s, 'coding', 1, { n: 1 }))
+  assert.equal(reg.profileOf(s).dimensions.coding.samples, 1)
+  assert.equal(reg.profileOf(s).dimensions.coding.benchmark.tasks, 12)
+})
+
+test('a newer benchmark run replaces an older one for the same model and benchmark, also after a reload, and explain() counts the older rows as not counted', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const file = tmp()
+  const reg = registry({ file })
+  const s = subjectOf(CODEX, { modelOf: () => 'gpt-5', priors })
+  const other = subjectOf(CODEX, { modelOf: () => 'gpt-4.1', priors })
+  reg.recordMany(benchEvidence(CODEX, 'bench-1', () => 'passed', { ts: daysAgo(3) }))
+  reg.recordMany(benchEvidence(CODEX, 'bench-2', () => 'failed', { ts: daysAgo(1) }))
+  // Another model's run, and a run of another benchmark on this model, are not replaced by it.
+  reg.recordMany(benchEvidence(CODEX, 'bench-9', () => 'passed', { model: 'gpt-4.1', ts: daysAgo(2) }))
+  reg.recordMany(benchEvidence(CODEX, 'other-1', () => 'passed', { ts: daysAgo(2) }, { id: 'another-benchmark', version: '1' }))
+  const check = (r, label) => {
+    const ex = r.explain(s, 'coding')
+    assert.deepEqual([...new Set(ex.items.map((it) => it.runId))].sort(), ['bench-2', 'other-1'], `${label}: only the newest run of each benchmark counts`)
+    assert.equal(ex.notCounted, 12, `${label}: the older run's rows stay on file, not counted`)
+    assert.deepEqual(r.explain(other, 'coding').items.map((it) => it.runId), Array(12).fill('bench-9'), `${label}: another model keeps its own`)
+  }
+  check(reg, 'as recorded')
+  const again = createCapabilityRegistry({ file, priors, policy, now: () => NOW })
+  again.load()
+  check(again, 'after a reload')
+  assert.equal(readFileSync(file, 'utf8').trim().split('\n').length, 4 * 45, 'nothing is deleted from the file')
+})
+
+test('benchmark rows of a model known only by a name stop counting 45 days after the run, and those of a local model pinned by its weights do not', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const reg = registry()
+  const claude = { id: 'claude', provider: 'claude-code' }
+  const qwen = { id: 'qwen-local', provider: 'spawn', llm: { provider: 'local', model: 'qwen3-8b' } }
+  const SHA = 'c'.repeat(64)
+  const old = daysAgo(UNPINNED_WINDOW_DAYS + 1)
+  reg.recordMany(benchEvidence(claude, 'bench-c', () => 'passed', { model: 'opus', ts: old }))
+  reg.recordMany(benchEvidence(qwen, 'bench-q', () => 'passed', { model: 'qwen3-8b', modelVersion: SHA, ts: old }))
+  const opus = subjectOf(claude, { modelOf: () => 'opus', priors })
+  const local = subjectOf(qwen, { modelOf: () => 'qwen3-8b', versionOf: () => SHA, priors })
+  assert.deepEqual([versionPinned(opus.version), versionPinned(local.version)], [false, true])
+  const byName = reg.explain(opus, 'coding')
+  assert.deepEqual([byName.items.length, byName.notCounted, byName.benchmark], [0, 12, null], 'opus may be another model by now')
+  const pinned = reg.explain(local, 'coding')
+  assert.equal(pinned.items.length, 12, 'the same weights are the same model')
+  assert.ok(pinned.items.every((it) => it.decay < 1 && it.decay > 0.8), 'and its rows age on the benchmark\'s half-life')
+  // Inside the window a name's rows count.
+  const fresh = registry()
+  fresh.recordMany(benchEvidence(claude, 'bench-d', () => 'passed', { model: 'opus', ts: daysAgo(UNPINNED_WINDOW_DAYS - 1) }))
+  assert.equal(fresh.explain(opus, 'coding').items.length, 12)
 })

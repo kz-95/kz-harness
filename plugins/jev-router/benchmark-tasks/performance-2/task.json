@@ -1,0 +1,16 @@
+{
+  "id": "performance-2",
+  "skill": "performance",
+  "level": 2,
+  "dimensions": ["debugging", "general_reasoning"],
+  "folder": "word-count",
+  "prompt": "count() in src/search.js is too slow when it is asked many times about the same text.\nMake many calls fast while every call returns exactly what it returns now.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/search.test.js": 3
+    }
+  }
+}

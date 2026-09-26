@@ -1,0 +1,16 @@
+{
+  "id": "simple_change-1",
+  "skill": "simple_change",
+  "level": 1,
+  "dimensions": ["instruction_following"],
+  "folder": "greeting",
+  "prompt": "Change the default greeting from Hello to Welcome.\nChange only src/config.js.",
+  "protect": [],
+  "onlyChanged": ["src/config.js"],
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/greeting.test.js": 2
+    }
+  }
+}
