@@ -18,6 +18,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { runAsScript } from './run-as-script.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(here, '..', 'plugins', 'jev-router')
@@ -154,7 +155,7 @@ export async function layaExport({ dataDir = defaultDataDir(), harnessDir = reso
   return { file, bytes: Buffer.byteLength(text), holds }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (runAsScript(import.meta.url)) {
   const args = process.argv.slice(2)
   const opt = (name) => { const at = args.indexOf(name); return at >= 0 ? resolve(args[at + 1] ?? '') : undefined }
   let r

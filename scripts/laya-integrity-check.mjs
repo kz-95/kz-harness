@@ -23,6 +23,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { runAsScript } from './run-as-script.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(here, '..', 'plugins', 'jev-router')
@@ -138,7 +139,7 @@ export async function integrityCheck({ dataDir = defaultDataDir(), historyFile =
   return { dataDir, layaRuns: layaRuns.size, jevRuns, checks, unreadable }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (runAsScript(import.meta.url)) {
   const args = process.argv.slice(2)
   const at = args.indexOf('--data')
   const dataDir = at >= 0 ? resolve(args[at + 1] ?? '') : defaultDataDir()

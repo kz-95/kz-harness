@@ -16,11 +16,11 @@ branch        main                         977e39e, pushed; adaptive routing mer
               fix/routing-self-labelling   merged into main, pushed, safe to delete
               feat/routing-stability-local-context   parked by the owner, not merged
               feat/laya-auto               Laya Auto, built group by group (docs/laya-auto.md 11); G1 to G9 integrated, the cloud end-to-end test run but for its install step, the final review done and fixed, and the end-to-end test run again on the fixed code; pushed (see the Laya section)
-              feat/benchmark               from feat/laya-auto at a1e42b4; the benchmark designed (docs/benchmark.md); step B1, speed and memory of local models, built and reviewed, not observed; step B2, capability, built in d71b76c, its review fixed in 1363776 and its second review in 5f19588, tested with stub agents, a fake Codex command and a fake llama-server, not yet run with real agents; not pushed
+              feat/benchmark               from feat/laya-auto at a1e42b4; the benchmark designed (docs/benchmark.md); step B1, speed and memory of local models, built and reviewed, run against the real llama-server b10964 on a CPU with tiny test models on 26 Sep, not observed on a GPU or with the real models; step B2, capability, built in d71b76c, its review fixed in 1363776 and its second review in 5f19588, tested with stub agents, a fake Codex command and a fake llama-server, not yet run with real agents; all of it squashed into f88947a and pushed on 26 Sep; the speed run from a shell (Speed-Run.bat), streamed speed requests, the generation speed over n - 1, the speed run logs and scripts/run-as-script.mjs in the commit after f88947a, pushed on 26 Sep
 remote        origin github.com/kz-95/kz-harness, PUBLIC
 tests         820 tests, 819 pass, 0 fail, 1 skipped on fix/roadmap-open-items  (npm --prefix plugins/jev-router test)
               1200 tests, 1199 pass, 0 fail, 1 skipped on feat/laya-auto at a1e42b4 (1196 before the compaction commit)
-              1325 tests, 1324 pass, 0 fail, 1 skipped on feat/benchmark at 5f19588 (1231 at c0ef03c, 1276 at d71b76c, 1286 at 1363776)
+              1353 tests, 1352 pass, 0 fail, 1 skipped on feat/benchmark at the commit after f88947a (1325 at f88947a, whose code is 5f19588's; 1231 at c0ef03c, 1276 at d71b76c, 1286 at 1363776)
 app           NOT rebuilt; the running app is on older plugin code than either branch
 ```
 
@@ -39,6 +39,7 @@ feature is silently gone.
 
 One line per finished workflow step, newest first, written by `scripts/doc-queue.mjs log` when the step ends.
 
+- 2026-09-26 05:47 UTC, Speed-Run.bat and the speed run logs: Speed-Run.bat runs the local speed benchmark with KzH closed and every speed run, from the card or the .bat, is logged in speed-runs.log with a detail log per run; the first run against the real llama-server b10964 (CPU, tiny test models) found and fixed the non-streamed HTTP 500 and a 0.8 percent high generation speed; a code reviewer and a four-lens review workflow with verifiers confirmed issues in every part, each fixed; red-check finds all 28 new tests failing at f88947a (1353 tests, 1352 pass, 0 fail, 1 skipped).
 - 2026-09-26 02:56 UTC, Benchmark review and fixes: Second review of benchmark step B2 fixed on feat/benchmark: a stop is a stop however the run returns, a task folder's git repository kept outside the scratch root and every benchmark git call run with no key of KzH's, a task that does not fit a local window records nothing, plan ids start one run within 30 minutes, the card's reads, tables, confirmation, progress and last-run words say what happened, and Cancel during the speed run's restore says why; red-check against da08532 finds 32 of the 43 new tests failing at the base and 11 passing there (commit 5f19588; 1325 tests, 1324 pass, 0 fail, 1 skipped).
 - 2026-09-26 00:04 UTC, B2: Benchmark step B2 built and reviewed on feat/benchmark: the capability benchmark, 27 fixed Node.js tasks in nine skills plus a preflight, run one at a time on each picked agent, forced at high effort, in the KzH scratch workspace through the normal run path, graded by code, and recorded as capped benchmark evidence of which only the newest run counts, behind a confirmation that says what it spends; tested with stub agents, a fake Codex command and the fake llama-server only (commit 1363776; 1286 tests, 1285 pass, 0 fail, 1 skipped).
 - 2026-09-25 20:36 UTC, B1: Benchmark step B1 built and reviewed on feat/benchmark: local models' speed measured at an 8,192-token depth with llama-server's own timings, kept in local.json beside the memory readings, shown as measured in the install picker and the Local models card, local agents held back off their time limit meanwhile; tested against a fake llama-server only (commit c0ef03c; 1231 tests, 1230 pass, 0 fail, 1 skipped).
@@ -278,8 +279,11 @@ These need the Windows machine, the running app or the owner, and could not be d
    Jev is offered only the capabilities some agent in the pool can carry out (the "Still open" bullet under the 23 Sep fix rounds); offering the whole vocabulary so code can refuse is a design choice.
    Done when the owner has chosen and the choice is in roadmap §5.
 10. **Run the speed benchmark against the real llama-server** (`feat/benchmark`, docs/benchmark.md step B1; see "Built but NOT observed").
+    It has run against the real llama-server only on a Linux CPU with tiny test models, so what is left is the GPU, the Windows CUDA build and the real models.
     Where: Settings → Jev setup → Local models, with both local models (Qwen3 8B and Gemma 4 E4B) installed; run **Benchmark all**.
     Check that each model gets a reading whose three runs agree, that the card's lines and the install picker's measured labels read as docs/benchmark.md 2.9 says, that a local agent task started during the run waits with its line, and that the model loaded before is loaded again after.
+    The measuring can also be done with KzH closed: double-click `Speed-Run.bat` in the harness folder (docs/benchmark.md 2.12), which has never run on Windows, and check that it measures both models, prints its table and ends with exit code 0.
+    Bring back what the runs wrote in `%USERPROFILE%\.kzh\jev-router\speed-runs` (docs/benchmark.md 2.13), from the card and from `Speed-Run.bat` alike: `speed-runs.log` and the newest `speed-run-<time>.log`.
     Done when every item reads as described, and any reading refused says why in words of docs/benchmark.md 2.7.
 11. **Run the capability benchmark with real agents** (`feat/benchmark`, docs/benchmark.md step B2; see "Built but NOT observed").
     Where: restart KzH so `Start-KzH.ps1` adds **KzH scratch** to the project list, open a chat in it, then the Jev inspector's Router tab, Capability benchmark card; pick Claude Code, Codex, DeepSeek and one local agent, read the confirmation, and run.
@@ -465,8 +469,10 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
   Before, a check that ran past its time left its grandchildren running, which in this repository's own suite left looping test processes behind after every run.
   `test/workspace.test.js` proves it on Linux; nobody has run it on macOS, and Windows was not affected, since `taskkill /t` already ended the tree.
 - **The speed benchmark** (docs/benchmark.md step B1, `feat/benchmark`).
-  It is built and tested against a fake llama-server only (`plugins/jev-router/test/fixtures/fake-llama-server.mjs`).
-  Nobody has run Benchmark all against the real llama-server b10964 with Qwen3 8B and Gemma 4 E4B, so its reads of the `timings` object of `/completion`, of `/tokenize` behind the engine's API key, and of `prompt_n` on a prompt served from the cache (taken to be at least 1, as llama.cpp reads the last token again) are unconfirmed.
+  It is built and tested against a fake llama-server (`plugins/jev-router/test/fixtures/fake-llama-server.mjs`).
+  On 26 Sep it ran against the real llama-server b10964, its Linux CPU build, through `scripts/speed-run.mjs`, with two tiny random-weight test models on a cloud machine with no GPU: both were measured, their readings stood for the next load, and no llama-server was left running (docs/benchmark.md, the status at the top).
+  That run confirmed, on a CPU, its reads of `/tokenize` behind the engine's API key, of the `timings` in a streamed `/completion`'s last event, and of `prompt_n` on a prompt served from the cache (at least 1, as llama.cpp reads the last token again); it also found that llama-server's output parser can refuse a `/completion` that is not streamed, so every one is now streamed.
+  What is left is the GPU and the real models: nobody has run Benchmark all or `Speed-Run.bat` on the RTX 3080, with the Windows CUDA build, or with Qwen3 8B and Gemma 4 E4B, so the GPU split and their real speeds are unobserved, and `Speed-Run.bat` itself has never run on Windows.
   Nobody has looked at the Local models card's speed lines or the install picker's measured labels either, and the attempt clock that keeps a local agent's wait off its time limit (`router.js` `attemptClock()`) has run only in tests.
   The desktop check is item 10 of "For the desktop agent".
 - **Laya Auto and the Laya comparison in Jev Auto** (`feat/laya-auto`).
@@ -560,6 +566,14 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
   fix for it passed its tests against the old code. The lesson has two halves: a map over a mixed
   array of objects and strings fails silently, and a new test is not a regression test until it has
   been run against the code it claims to fix and seen to fail.
+- **A script run through a link did nothing and exited 0.**
+  Scripts decided whether they were run as a command by comparing `resolve(process.argv[1])` with `fileURLToPath(import.meta.url)`, but Node gives the main module its real path, links resolved, while `process.argv[1]` keeps the path it was asked for.
+  So through a link to the harness folder (a junction on Windows) the script did nothing and exited 0, which a scheduled task reads as success; this was reproduced with `doc-queue.mjs` through a symlink.
+  `scripts/run-as-script.mjs` compares real paths, case-blind on Windows, and `speed-run`, `doc-queue`, `laya-export`, `laya-integrity-check`, `laya-render-check` and `jev-triage` use it; `ensure-no-project.mjs` already had its own correct copy.
+  `test/run-as-script.test.js` starts every such script through a link to the harness.
+- **A shell tool rewrote the Windows null device.**
+  An agent's shell tool in the cloud turned `nul` in a `.bat` it wrote into `/dev/null`, so every run of `Speed-Run.bat` would have said Node.js is missing: in cmd.exe that redirect fails when `C:\dev` does not exist, and the command it guards does not run.
+  Write `.bat` and `.cmd` files with a file-writing tool, never through a shell heredoc or `printf`, and keep the test in `test/speed-run.test.js` that rejects a Unix redirect.
 
 1. **`requestAnimationFrame` NEVER fires in this renderer.** The window reports `document.hidden`
    true, `visibilityState hidden`, `outerWidth 0`, and a scheduled callback is never called, while

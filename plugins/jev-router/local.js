@@ -5,11 +5,11 @@
 // so other programs on the PC cannot use the server.
 import { spawn as nodeSpawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { createReadStream, readFileSync } from 'node:fs'
-import { mkdir, open, readFile, rename, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises'
+import { appendFileSync, createReadStream, mkdirSync, readFileSync } from 'node:fs'
+import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { cpus, freemem, totalmem } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { localAgentFor, quickestLocal } from './effort.js'
 import { createBudgetWatchdog, createResidency } from './residency.js'
 
@@ -353,7 +353,7 @@ export async function detectSpecs({ dir, probe = {} } = {}) {
 }
 
 /**
- * "RTX 3050 Laptop 4 GB · 24 GB RAM · i5-11400H 6 cores · 52 GB free". A GPU sized from AdapterRAM's
+ * "RTX 3050 Laptop 4 GB · 24 GB RAM · Core i5-11400H 6 cores · 52 GB free". A GPU sized from AdapterRAM's
  * ceiling says its size is unknown, "Radeon RX 6600 (memory unknown, 4 GB or more)", rather than print
  * the ceiling as if it were the size.
  */
@@ -608,16 +608,24 @@ export const SPEED_TEXT = (() => {
  * field fails here instead of reading as zero. A request must have generated exactly `nPredict`
  * tokens, or two models would be timed over different lengths.
  *
- * @returns {{ ok: true, tokensPerSec: number, promptTokensPerSec: number, promptTokens: number } | { ok: false, reason: string }}
+ * The first generated token comes out of the prompt pass, so `predicted_ms` times the other
+ * `predicted_n - 1`: llama-server b10964 gives 207.99 ms for 128 tokens, 1.6377 ms a token, and its
+ * own 610.61 tokens/s, all of them over 127 (seen against the real server on 26 Sep 2026). The
+ * generation speed is worked out the same way; over all 128 it would read 0.8% fast. A one-token
+ * answer (the fill) times no generation at all: its `tokensPerSec` is null and its `predicted_ms`
+ * may be zero.
+ *
+ * @returns {{ ok: true, tokensPerSec: number|null, promptTokensPerSec: number, promptTokens: number } | { ok: false, reason: string }}
  */
 export function readTimings(body, { nPredict }) {
   const t = body?.timings
   const positive = (x) => typeof x === 'number' && Number.isFinite(x) && x > 0
-  if (!t || typeof t !== 'object' || !['prompt_n', 'prompt_ms', 'predicted_n', 'predicted_ms'].every((k) => positive(t[k]))) {
+  const timed = nPredict > 1 ? ['prompt_n', 'prompt_ms', 'predicted_n', 'predicted_ms'] : ['prompt_n', 'prompt_ms', 'predicted_n']
+  if (!t || typeof t !== 'object' || !timed.every((k) => positive(t[k])) || !(typeof t.predicted_ms === 'number' && Number.isFinite(t.predicted_ms) && t.predicted_ms >= 0)) {
     return { ok: false, reason: 'llama-server did not report its timings' }
   }
   if (t.predicted_n !== nPredict) return { ok: false, reason: `llama-server generated ${t.predicted_n} tokens, not ${nPredict}` }
-  return { ok: true, tokensPerSec: (t.predicted_n / t.predicted_ms) * 1000, promptTokensPerSec: (t.prompt_n / t.prompt_ms) * 1000, promptTokens: t.prompt_n }
+  return { ok: true, tokensPerSec: nPredict > 1 ? ((t.predicted_n - 1) / t.predicted_ms) * 1000 : null, promptTokensPerSec: (t.prompt_n / t.prompt_ms) * 1000, promptTokens: t.prompt_n }
 }
 
 const layersWords = (g) => (g === 'auto' ? 'auto' : `pinned to ${g}`)
@@ -676,6 +684,35 @@ export function speedFor(s, id, next) {
   if (!reading) return { reading: null, stands: false, why: null }
   const why = speedDiffers({ ...reading, ctx: ctxOf(key) }, next)
   return { reading, stands: !why, why }
+}
+
+// ---------- the speed run logs (docs/benchmark.md 2.13) ----------
+
+/** Every speed run's summary, one after another, in the speed logs' folder. */
+export const SPEED_HISTORY = 'speed-runs.log'
+/** Speed-Run.bat's lock beside it: the pid of the Speed-Run going (scripts/speed-run.mjs). */
+export const SPEED_LOCK = 'speed-run.lock'
+/** The name of a run's detail log: every phase, request and engine line of the run, each with its time. */
+// To the millisecond, so no two runs share one, however quickly the second starts.
+export const speedDetailName = (at) => `speed-run-${at.toISOString().slice(0, 23).replace(/[:.]/g, '-')}Z.log`
+const utcMinute = (d) => `${d.toISOString().replace('T', ' ').slice(0, 16)} UTC`
+/** specsLine in plain ASCII, for a log a Windows editor or console reads. */
+export const specsText = (s) => specsLine(s).replaceAll(' \u00b7 ', ', ')
+/** The history entry of a speed run that never started, such as Speed-Run.bat while KzH runs. */
+export function speedRefusalEntry({ at, by, why }) {
+  return `${utcMinute(at)}, ${by}: did not run. ${String(why).replace(/\s+/g, ' ').trim()}\n\n`
+}
+/** One measured model's figures, as the history and the shell's table give them. */
+export function speedFigures(line) {
+  const r = line.reading
+  const layers = r.layersOnGpu ? `${r.layersOnGpu.gpu}/${r.layersOnGpu.total} layers on the GPU` : 'layers on the GPU not reported'
+  const memory = line.memory ? `${line.memory.vramGB.toFixed(1)} GB VRAM + ${line.memory.ramGB.toFixed(1)} GB RAM` : 'memory not reported'
+  const prompt = r.promptTokensPerSec == null ? 'reading speed not measured (prompt cache)' : `${Math.round(r.promptTokensPerSec)} tokens/s reading`
+  const ctx = line.ctx % 1024 === 0 ? `${line.ctx / 1024}k context` : `${line.ctx}-token context`
+  // A figure the reading does not carry is said to be missing, never shown as a zero.
+  const load = Number.isFinite(r.loadMs) ? `loaded in ${(r.loadMs / 1000).toFixed(1)} s` : 'load time not reported'
+  const threads = Number.isInteger(r.threads) ? threadWords(r.threads) : 'threads not reported'
+  return `${r.tokensPerSec.toFixed(1)} tokens/s generating, ${prompt}, ${ctx}, ${layers}, ${memory}, ${load}, ${threads}`
 }
 
 /** Default context and GPU layers for a model on this PC (manifest values unless the PC is small). */
@@ -937,8 +974,13 @@ function unzip(zip, dir, spawn) {
  * @param {() => boolean} [p.capabilityBusy]  whether a capability benchmark still has a local agent's
  *   task to run (benchmark.js localPending()): a speed benchmark is refused while it has
  *   (docs/benchmark.md 2.7).
+ * @param {string|null} [p.speedLogDir]  the folder of the speed run logs (docs/benchmark.md 2.13): each
+ *   run's summary appended to speed-runs.log, and its detail log beside it; null keeps none.
  */
-export function createLocalModels({ modules, engineDir, modelsDir, settingsFile, port: basePort = 8081, contextSize, specs: getSpecs = async () => null, spawn = nodeSpawn, fetch = globalThis.fetch, log = () => {}, onChange = () => {}, onSettings = () => {}, readWorkingSet = workingSetOf, now = Date.now, watchEveryMs = 5000, residency = createResidency({ log }), layaBusy = () => false, capabilityBusy = () => false }) {
+export function createLocalModels({ modules, engineDir, modelsDir, settingsFile, port: basePort = 8081, contextSize, specs: getSpecs = async () => null, spawn = nodeSpawn, fetch = globalThis.fetch, log: consoleLog = () => {}, onChange = () => {}, onSettings = () => {}, readWorkingSet = workingSetOf, now = Date.now, watchEveryMs = 5000, residency = createResidency({ log: consoleLog }), layaBusy = () => false, capabilityBusy = () => false, speedLogDir = null }) {
+  // Every line goes to the console, and while a speed run goes to its detail log too (docs/benchmark.md 2.13).
+  let speedNote = null
+  const log = (t) => { consoleLog(t); speedNote?.(t) }
   const exe = join(engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server')
   const engines = modules.filter((m) => m.kind === 'engine')
   const models = modules.filter((m) => m.kind === 'model')
@@ -951,6 +993,8 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   // Set by dispose(): from then on nothing is loaded, since a model loaded after it would have no
   // exit hook and nobody to stop it, and would outlive KzH with its VRAM and RAM.
   let disposed = false
+  // What the restore of a speed run says when dispose() cut it short (restoreAfter): KzH closing, unless the caller says otherwise.
+  let disposedWhy = null
   let busy = 0
   let idleTimer = null
   // Models the RAM watchdog unloaded: why, and the context it was running with. Loading one again at
@@ -1363,6 +1407,20 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     }
     child.stdout.on('data', onLine)
     child.stderr.on('data', onLine)
+    // While a speed run goes, llama-server's own lines go to its detail log too (2.13): the load
+    // report (the device, how the layers and buffers were fitted) and each request's timing lines.
+    // Whole lines only, since a chunk can end inside one; each stream keeps its own unfinished line.
+    const toDetail = () => {
+      let rest = ''
+      return (chunk) => {
+        if (!speedNote) { rest = ''; return }
+        const parts = (rest + String(chunk)).split('\n')
+        rest = parts.pop()
+        for (const l of parts) if (l.trim()) speedNote(`llama-server: ${l.trimEnd()}`)
+      }
+    }
+    child.stdout.on('data', toDetail())
+    child.stderr.on('data', toDetail())
     // An engine that exits on its own (a CUDA error, an access violation, a kill from Task Manager)
     // leaves the shared residency with it, or the RAM and VRAM of a dead process would stay counted
     // against the budget beside Laya until the next local model starts. Only its own entry: a late
@@ -1374,7 +1432,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     })
     child.once('error', (err) => { e.tail.push(err.message); if (engine === e) engine = null })
     engine = e
-    log(`local: engine starting ${m.id} on 127.0.0.1:${port} (ctx ${ctx}, GPU layers ${gpuLayers}, ${limits.threads} threads, ${limits.fitTargetMiB} MiB kept free on the GPU${vision ? ', vision' : ''})`)
+    log(`local: engine starting ${m.id} on 127.0.0.1:${port} (ctx ${ctx}, GPU layers ${gpuLayers}, ${threadWords(limits.threads)}${gpuLayers === 0 ? '' : `, ${limits.fitTargetMiB} MiB kept free on the GPU`}${vision ? ', vision' : ''})`)
     e.ready = (async () => {
       const deadline = Date.now() + 5 * 60_000
       while (Date.now() < deadline) {
@@ -1527,6 +1585,43 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   // The speed run going, or null, and what the last one left for the card until the next one starts.
   let speedRun = null
   let speedLast = { done: [], restore: null }
+
+  /**
+   * A run cut off before its end (KzH ended with taskkill for a restart or an update, or a crash)
+   * wrote its detail log as it went but never its history entry, which only its end writes (2.13).
+   * Each such detail log, one with no 'Ended after' line whose name the history never gives, gets
+   * its entry here, when the local models are next made: when it started, who started it, each
+   * model's line it had reached, and that it was cut off. A Speed-Run going now in another process
+   * (its lock held by a live pid) is left alone, since its log is still being written.
+   */
+  async function recoverSpeedLogs() {
+    if (!speedLogDir) return
+    const names = (await readdir(speedLogDir).catch(() => [])).filter((n) => /^speed-run-.+Z\.log$/.test(n)).sort()
+    if (!names.length) return
+    const holder = Number(String(await readFile(join(speedLogDir, SPEED_LOCK), 'utf8').catch(() => '')).trim())
+    if (holder && holder !== process.pid && pidAlive(holder)) return
+    let history = await readFile(join(speedLogDir, SPEED_HISTORY), 'utf8').catch(() => '')
+    for (const name of names) {
+      if (history.includes(`Details: ${name}`)) continue
+      const text = await readFile(join(speedLogDir, name), 'utf8').catch(() => null)
+      if (text == null || /\nEnded after /.test(text)) continue
+      const head = /^KzH speed run, started (\d{4}-\d\d-\d\d \d\d:\d\d):\d\d UTC from (.+)$/m.exec(text)
+      const lines = [...text.matchAll(/^\d\d:\d\d:\d\d\.\d{3} {2}(.+)$/gm)].map((x) => x[1]).filter((l) => /^[^:]+: \d+(\.\d+)? tokens\/s generating\b/.test(l) || /^.+? not measured: /.test(l))
+      const entry = [
+        `${head ? `${head[1]} UTC` : 'At a time its log does not give'}, ${head ? head[2] : 'a speed run'}: cut off before it ended (KzH was closed, restarted or updated during it, or it stopped); found when the local models next started`,
+        ...(lines.length ? lines.map((l) => `  ${l}`) : ['  No model had been measured.']),
+        '  Readings of the models it had finished are kept.',
+        `  Details: ${name} (it ends where the run was cut off)`,
+        '', '',
+      ].join('\n')
+      await appendFile(join(speedLogDir, SPEED_HISTORY), entry)
+      history += entry
+      consoleLog(`local: a speed run cut off before its end is now in ${SPEED_HISTORY} (${name})`)
+    }
+  }
+  const pidAlive = (pid) => { try { process.kill(pid, 0); return true } catch (err) { return err.code === 'EPERM' } }
+  // Before any run of this process begins, so a new detail log is never taken for a cut-off one.
+  const speedLogsRecovered = recoverSpeedLogs().catch((err) => consoleLog(`local: the speed run logs could not be checked for a run cut off (${err.code ?? err.message})`))
   // Waiting for the speed run to move on: a new model or phase, or its end.
   let speedWaiters = []
   const speedMoved = () => { const w = speedWaiters; speedWaiters = []; for (const done of w) done() }
@@ -1537,6 +1632,8 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   const heldLaya = () => layaDevice(besideLlama().filter((r) => r.held()))
   const refusal = (status, message) => Object.assign(new Error(message), { status })
   const nameOf = (id) => mod(id)?.name ?? id
+  /** Each phase as the detail log says it (2.13). */
+  const SPEED_PHASE = { loading: 'loading at the context its runs get', warming: 'warm-up request, not timed', reading: `reading the ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt`, measuring: 'timed request', restoring: 'putting the engine back as it was' }
   /** Why one model records nothing, carried up from wherever in its measurement it was found. */
   class NotMeasured extends Error {}
 
@@ -1548,18 +1645,31 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    * reason (2.7). The refusals that depend on what is in flight are read after every wait, in the one
    * turn that starts the run, so no request and no local agent can slip in between.
    */
-  async function benchmark({ ids } = {}) {
+  async function benchmark({ ids, by = 'Settings, Local models' } = {}) {
     if (speedRun) throw refusal(409, 'A speed benchmark is already running.')
+    if (!(typeof by === 'string' && by.trim() && by.length <= 60)) throw refusal(400, 'by: who started the speed run, in up to 60 characters')
     if (ids !== undefined && !(Array.isArray(ids) && ids.length && ids.every((id) => typeof id === 'string'))) throw refusal(400, 'ids: the local chat models to measure, or none for every installed one')
+    await speedLogsRecovered
     if (!(await engineInstalled())) throw refusal(400, 'The llama.cpp engine is not installed (type /install-llm).')
+    // A chat model whose file is on disk but cannot be measured: one whose SHA256 does not match the
+    // manifest, or one still being hashed. Benchmark all names each as not measured, with why, rather
+    // than leaving it out unsaid; named, it is refused with the same why.
+    const states = await Promise.all(models.map(stateOf))
+    const unusable = new Map(models.flatMap((m, i) => (states[i] === 'corrupt'
+      ? [[m.id, `its file does not match the manifest's SHA256; install it again (type /install-llm ${m.id})`]]
+      : states[i] === 'verifying' ? [[m.id, 'its file is still being checked (SHA256); benchmark it when that is done']] : [])))
     const chat = await installed()
-    if (!chat.length) throw refusal(400, 'No local chat model is installed (type /install-llm).')
+    if (!chat.length && !unusable.size) throw refusal(400, 'No local chat model is installed (type /install-llm).')
     const picked = ids === undefined ? chat : [...new Set(ids)].map((id) => {
       const m = models.find((x) => x.id === id)
       if (!m) throw refusal(400, `No local chat model is named ${id}.`)
+      if (unusable.has(m.id)) throw refusal(400, `${m.name ?? m.id} cannot be measured: ${unusable.get(m.id)}.`)
       if (!chat.includes(m)) throw refusal(400, `${m.name ?? m.id} is not installed (type /install-llm ${m.id}).`)
       return m
     })
+    const skipped = ids === undefined ? models.filter((m) => unusable.has(m.id)) : []
+    // What the logs' head says of the machine, read before the last checks so nothing is awaited between them and the start.
+    const [specs, settings, variant] = await Promise.all([getSpecs().catch(() => null), readSettings(), engineVariant()])
     if (speedRun) throw refusal(409, 'A speed benchmark is already running.')
     if (busy > 0) throw refusal(400, 'A local model is answering right now; a speed benchmark would unload it mid-answer. Try again when it is idle.')
     if (agentsAtWork > 0) throw refusal(400, 'A local agent is working on a task; start the speed benchmark when it has finished.')
@@ -1567,10 +1677,16 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     if (capabilityBusy()) throw refusal(400, "A capability benchmark is running a local model's tasks; start the speed benchmark when they have finished.")
     const before = engine?.loaded ? engine.modelId : null
     const queue = [...picked.filter((m) => m.id !== before), ...picked.filter((m) => m.id === before)]
-    const run = { order: queue.map((m) => m.id), queue, current: null, index: 0, done: [], before, controller: new AbortController(), cancelled: false }
+    const startedAt = new Date()
+    const logs = speedLogDir ? { dir: speedLogDir, history: join(speedLogDir, SPEED_HISTORY), detail: join(speedLogDir, speedDetailName(startedAt)) } : null
+    // The models it cannot measure come first, already done, so the count of the ones it measures reads on from them.
+    const pre = skipped.map((m) => ({ id: m.id, ok: false, text: `${m.name ?? m.id} not measured: ${unusable.get(m.id)}`, why: unusable.get(m.id) }))
+    const run = { order: [...pre.map((d) => d.id), ...queue.map((m) => m.id)], queue, current: null, index: pre.length, done: pre, before, controller: new AbortController(), cancelled: false, by: by.trim(), startedAt, logs, logError: null, write: () => {} }
     speedRun = run
-    speedLast = { done: run.done, restore: null }
+    speedLast = { done: run.done, order: run.order, restore: null, logs, logError: null }
+    openSpeedLog(run, { specs, settings, variant })
     log(`local: speed benchmark of ${run.order.join(', ')}`)
+    for (const d of pre) log(`local: ${d.text}`)
     runSpeed(run)
       .catch((err) => log(`local: speed benchmark failed: ${err.message}`))
       .finally(() => { speedRun = null; speedMoved() })
@@ -1582,15 +1698,17 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    * dropped; the restore still runs. With nothing running, or a run already cancelled, there is
    * nothing more to do. During the restore it is refused with 409 and why: every model is done,
    * there is nothing to stop, and the restore must run, so a press is answered, never ignored.
+   * Returns true when it cancelled a run, false when there was none to cancel.
    */
   function cancelBenchmark() {
     const run = speedRun
-    if (!run || run.cancelled) return
+    if (!run || run.cancelled) return false
     if (run.current?.phase === 'restoring') throw refusal(409, 'The speed benchmark has measured every model it will and is putting the engine back as it was before it; that cannot be cancelled.')
     run.cancelled = true
     run.queue.length = 0
     run.controller.abort(new Error('cancelled'))
     speedMoved()
+    return true
   }
 
   async function runSpeed(run) {
@@ -1607,15 +1725,84 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       const restore = await restoreAfter(run)
       speedLast.restore = run.cancelled ? `Stopped. Readings already taken are kept; ${restore.after}` : restore.line
       log(`local: ${speedLast.restore}`)
+      closeSpeedLog(run)
     }
+  }
+
+  /**
+   * The run's detail log is begun with what decides its figures: the machine, the engine build, the
+   * budget, and the Laya held beside the models. From here until closeSpeedLog every line of the
+   * local models' log is written to it too, with its time, beside the phases and the requests
+   * (2.13). A log that cannot be written never stops the run: the first failure is kept, said on
+   * the card and in the console, and nothing more is tried.
+   */
+  function openSpeedLog(run, { specs, settings, variant }) {
+    if (!run.logs) return
+    run.write = (text) => {
+      if (run.logError) return
+      try { appendFileSync(run.logs.detail, text) } catch (err) {
+        run.logError = `${basename(run.logs.detail)}: ${err.code ?? err.message}`
+        consoleLog(`local: the speed run log could not be written (${run.logError})`)
+      }
+    }
+    try { mkdirSync(run.logs.dir, { recursive: true }) } catch (err) { run.logError = `${run.logs.dir}: ${err.code ?? err.message}`; consoleLog(`local: the speed run log could not be written (${run.logError})`) }
+    const build = variant ? engineBuild(variant) : null
+    const budget = [
+      settings.maxVramGB != null && `VRAM at most ${settings.maxVramGB} GB`,
+      settings.maxRamGB != null && `RAM at most ${settings.maxRamGB} GB`,
+      settings.maxCores != null && `at most ${settings.maxCores} cores`,
+      `GPU layers ${settings.gpuLayers ?? (variant === 'cpu' ? 0 : 'auto')}`,
+    ].filter(Boolean).join(', ')
+    const laya = heldLaya()
+    run.context = `PC: ${specs ? specsText(specs) : 'not detected'}; engine: ${build ? `${build.variant} build ${build.sha256.slice(0, 12)}` : 'not installed'}; budget: ${budget}; ${laya ? `Laya held on ${laya === 'cuda' ? 'the GPU' : 'the CPU'}` : 'no Laya held'}`
+    run.write([
+      `KzH speed run, started ${run.startedAt.toISOString().replace('T', ' ').slice(0, 19)} UTC from ${run.by}`,
+      `PC: ${specs ? specsText(specs) : 'not detected'}`,
+      `Engine: ${build ? `llama.cpp ${build.variant} build, sha256 ${build.sha256}` : 'not installed'}`,
+      `Budget: ${budget}`,
+      `Laya: ${laya ? `held on ${laya === 'cuda' ? 'the GPU' : 'the CPU'}` : 'none held'}`,
+      `Models, in this order: ${run.order.map((id) => `${nameOf(id)} (${id})`).join(', ')}`,
+      `Each: a warm-up, the ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt read once, then ${SPEED_PREDICT} tokens generated three times; the median is kept.`,
+      '', '',
+    ].join('\n'))
+    speedNote = (t) => run.write(`${new Date().toISOString().slice(11, 23)}  ${String(t).replace(/^local: /, '')}\n`)
+  }
+
+  /** The detail log's last line, and the run's summary added to the history (2.13). */
+  function closeSpeedLog(run) {
+    speedNote = null
+    if (!run.logs) return
+    const secs = ((Date.now() - run.startedAt.getTime()) / 1000).toFixed(1)
+    run.write(`\nEnded after ${secs} s. The summary is in ${SPEED_HISTORY}.\n`)
+    const width = Math.max(...run.order.map((id) => nameOf(id).length))
+    const rows = run.order.map((id) => {
+      const line = run.done.find((d) => d.id === id)
+      const name = nameOf(id).padEnd(width)
+      if (!line) return `  ${name}  not measured: cancelled before its turn`
+      return `  ${name}  ${line.ok ? speedFigures(line) : `not measured: ${line.why}`}`
+    })
+    const measured = run.done.filter((d) => d.ok).length
+    const entry = [
+      `${utcMinute(run.startedAt)}, ${run.by}: ${measured} of ${run.order.length} measured${run.cancelled ? ', stopped' : ''}`,
+      `  ${run.context}`,
+      ...rows,
+      `  ${speedLast.restore}`,
+      `  Details: ${basename(run.logs.detail)}${run.logError ? ` (incomplete: ${run.logError})` : ''}`,
+      '', '',
+    ].join('\n')
+    try { mkdirSync(run.logs.dir, { recursive: true }); appendFileSync(run.logs.history, entry) } catch (err) {
+      run.logError ??= `${SPEED_HISTORY}: ${err.code ?? err.message}`
+      consoleLog(`local: the speed run history could not be written (${SPEED_HISTORY}: ${err.code ?? err.message})`)
+    }
+    speedLast.logError = run.logError
   }
 
   /** One model's measurement (2.1): its line for the card, `ok` when a reading was recorded. Never throws. */
   async function measure(run, m) {
     const name = m.name ?? m.id
-    const no = (why) => ({ id: m.id, ok: false, text: `${name} not measured: ${why}` })
+    const no = (why) => ({ id: m.id, ok: false, text: `${name} not measured: ${why}`, why })
     const { signal } = run.controller
-    const at = (phase, n = null) => { run.current = { id: m.id, phase, run: n }; speedMoved() }
+    const at = (phase, n = null) => { run.current = { id: m.id, phase, run: n }; speedNote?.(`${name}: ${SPEED_PHASE[phase]}${n ? ` ${n} of 3` : ''}`); speedMoved() }
     at('loading')
     try {
       const specs = await getSpecs().catch(() => null)
@@ -1636,13 +1823,13 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       try { conn = await reload(m.id, { signal }) } catch (err) { return no(signal.aborted ? 'cancelled' : `it did not load (${String(err.message).replace(/[\s.:|]+$/, '')})`) }
       const e = engine
       try {
-        const reading = await measureLoaded(m, e, conn, { signal, at })
+        const reading = await measureLoaded(m, e, conn, { signal, at, note: (t) => speedNote?.(`${name}: ${t}`) })
         await mutate((s) => ({ ...s, speed: { ...s.speed, [`${m.id}@${e.ctx}`]: reading } }))
         const prompt = reading.promptTokensPerSec == null
           ? '; its reading speed was not measured, because llama-server reused its prompt cache'
           : ` and ${Math.round(reading.promptTokensPerSec)} tokens/s reading`
         const ctx = e.ctx % 1024 === 0 ? `${e.ctx / 1024}k` : `${e.ctx} tokens of`
-        return { id: m.id, ok: true, text: `${name}: ${reading.tokensPerSec.toFixed(1)} tokens/s generating${prompt}, ${SPEED_DEPTH.toLocaleString('en-US')} tokens into a conversation, at ${ctx} context.` }
+        return { id: m.id, ok: true, text: `${name}: ${reading.tokensPerSec.toFixed(1)} tokens/s generating${prompt}, ${SPEED_DEPTH.toLocaleString('en-US')} tokens into a conversation, at ${ctx} context.`, ctx: e.ctx, reading, memory: e.memory ?? null }
       } finally { conn.release() }
     } catch (err) {
       if (signal.aborted) return no('cancelled')
@@ -1654,7 +1841,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    * The requests of 2.1 to 2.3 against the engine `e` just loaded and held, and the reading they
    * make. Throws NotMeasured with the reason the model records nothing.
    */
-  async function measureLoaded(m, e, conn, { signal, at }) {
+  async function measureLoaded(m, e, conn, { signal, at, note = () => {} }) {
     // The engine went away mid-measurement: the RAM watchdog unloaded it, or it exited.
     const gone = () => {
       const t = tripped.get(m.id)
@@ -1667,8 +1854,16 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     // compared as entries, so one that went and came back is a change too.
     const besideMoved = () => { const now = besideLlama(); return now.length !== e.beside.length || now.some((r) => !e.beside.includes(r)) }
     const steady = () => { if (besideMoved()) throw new NotMeasured('Laya was loaded or unloaded beside it while it was measured') }
+    // A /completion is streamed, as an agent's call is, and its last event read. llama-server b10964
+    // runs an answer through its chat output parser at the end, and refuses text that is not whole
+    // UTF-8: an answer that is not streamed then comes back HTTP 500, even when the text was only cut
+    // inside its last character, as 128 tokens of a byte-level tokenizer can be. A streamed answer
+    // holds such a cut character back and ends with its timings all the same. Text with a broken
+    // character inside it is refused either way, as an error event after HTTP 200, and records
+    // nothing, in llama-server's own words.
     const completion = async (path, body, minutes) => {
       const limit = AbortSignal.timeout(minutes * 60_000)
+      const streamed = body.stream === true
       try {
         const r = await fetch(`${conn.url}${path}`, {
           method: 'POST',
@@ -1678,8 +1873,34 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
         })
         if (engine !== e) throw gone()
         steady()
-        if (!r.ok) throw new NotMeasured(`llama-server answered HTTP ${r.status}${await r.text().then((t) => (t ? `: ${t.slice(0, 200)}` : ''), () => '')}`)
-        return await r.json().catch(() => { throw new NotMeasured('llama-server answered with something that is not JSON') })
+        if (!r.ok) {
+          const text = await r.text().catch(() => '')
+          let said = text.slice(0, 200)
+          try {
+            const e = JSON.parse(text)?.error
+            if (typeof e === 'string') said = e
+            else if (typeof e?.message === 'string') said = e.message
+          } catch { /* not JSON: the text as it came */ }
+          throw new NotMeasured(`llama-server answered HTTP ${r.status}${said ? `: ${String(said).replace(/[\s.]+$/, '')}` : ''}`)
+        }
+        if (!streamed) return await r.json().catch(() => { throw new NotMeasured('llama-server answered with something that is not JSON') })
+        let last = null
+        for await (const data of sseData(r.body)) {
+          if (!data || data === '[DONE]') continue
+          let event
+          try { event = JSON.parse(data) } catch { throw new NotMeasured('llama-server answered with something that is not JSON') }
+          if (event?.error) {
+            // `{ error: { message } }` as llama.cpp sends it, or an error given as text alone.
+            const e = event.error
+            const said = typeof e === 'string' ? e : typeof e?.message === 'string' ? e.message : JSON.stringify(e)
+            throw new NotMeasured(`llama-server stopped with an error: ${said.replace(/[\s.]+$/, '')}`)
+          }
+          last = event
+        }
+        if (engine !== e) throw gone()
+        steady()
+        if (!last?.stop) throw new NotMeasured('llama-server ended its answer before it finished')
+        return last
       } catch (err) {
         if (err instanceof NotMeasured || signal.aborted) throw err
         if (limit.aborted) throw new NotMeasured(`took longer than ${minutes} minutes`)
@@ -1687,7 +1908,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
         throw new NotMeasured(`llama-server did not answer (${err.message})`)
       }
     }
-    const request = (prompt, nPredict) => ({ prompt, n_predict: nPredict, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: false })
+    const request = (prompt, nPredict) => ({ prompt, n_predict: nPredict, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: true })
 
     // A warm-up, whose timings are thrown away: it pays the one-time costs of a first request.
     at('warming')
@@ -1704,6 +1925,9 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     if (!fill.ok) throw new NotMeasured(fill.reason)
     // One slot (-np 1) keeps the prompt cached, so each measured request below times generation alone.
     const promptTokensPerSec = fill.promptTokens >= FILL_MIN_TOKENS ? fill.promptTokensPerSec : null
+    note(promptTokensPerSec == null
+      ? `llama-server read only ${fill.promptTokens} tokens of the prompt, the rest from its cache, so its reading speed is not measured`
+      : `read ${fill.promptTokens} tokens of prompt at ${Math.round(promptTokensPerSec)} tokens/s`)
 
     // Three measured requests. One run again when another request reached the engine during it, or
     // Laya answered a call; after three such repeats, nothing is recorded.
@@ -1716,8 +1940,13 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       const calmBefore = calm()
       const t = readTimings(await completion('/completion', request(prompt, SPEED_PREDICT), PROMPT_MINUTES), { nPredict: SPEED_PREDICT })
       if (!t.ok) throw new NotMeasured(t.reason)
-      if (calmBefore && served === seen && calm()) runs.push(t.tokensPerSec)
-      else if (++repeats > SPEED_REPEATS) throw new NotMeasured('other requests kept arriving while it was measured')
+      if (calmBefore && served === seen && calm()) {
+        runs.push(t.tokensPerSec)
+        note(`timed request ${runs.length} of 3: ${t.tokensPerSec.toFixed(1)} tokens/s generating`)
+      } else {
+        note(`timed request run again: ${served !== seen ? 'another request reached the engine during it' : 'Laya answered a call during it'} (${t.tokensPerSec.toFixed(1)} tokens/s, not counted)`)
+        if (++repeats > SPEED_REPEATS) throw new NotMeasured('other requests kept arriving while it was measured')
+      }
     }
     const [low, median, high] = [...runs].sort((a, b) => a - b)
     if (high - low > SPEED_SPREAD * median) throw new NotMeasured('the three runs disagreed; something else was using the machine')
@@ -1740,8 +1969,11 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    */
   async function restoreAfter(run) {
     run.current = { id: run.before, phase: 'restoring', run: null }
+    speedNote?.(SPEED_PHASE.restoring)
     speedMoved()
-    const closed = { line: 'KzH closed during the speed benchmark, so nothing was loaded again.', after: 'KzH closed during the speed benchmark, so nothing was loaded again.' }
+    // Why nothing is loaded again once dispose() has been called: KzH closing, or what its caller said.
+    const why = disposedWhy ?? 'KzH closed during the speed benchmark'
+    const closed = { line: `${why[0].toUpperCase()}${why.slice(1)}, so nothing was loaded again.`, after: `${why}, so nothing was loaded again.` }
     if (disposed) return closed
     if (run.before) {
       const name = nameOf(run.before)
@@ -1795,10 +2027,12 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     try { return await work() } finally { agentsAtWork-- }
   }
 
+  /** A model's line as the card has it; its figures stay in speedResults(). */
+  const doneLine = ({ id, ok, text }) => ({ id, ok, text })
   /** status().speedRun: the run going, or what the last one left (2.5). */
   const speedStatus = () => (speedRun
-    ? { state: 'running', current: speedRun.current, queue: speedRun.queue.map((m) => m.id), done: [...speedRun.done], restore: null, cancelled: !!speedRun.cancelled }
-    : { state: 'idle', current: null, queue: [], done: [...speedLast.done], restore: speedLast.restore, cancelled: false })
+    ? { state: 'running', current: speedRun.current, queue: speedRun.queue.map((m) => m.id), done: speedRun.done.map(doneLine), restore: null, cancelled: !!speedRun.cancelled, log: speedRun.logs ? { history: speedRun.logs.history, detail: speedRun.logs.detail } : null, logError: speedRun.logError }
+    : { state: 'idle', current: null, queue: [], done: speedLast.done.map(doneLine), restore: speedLast.restore, cancelled: false, log: speedLast.logs ? { history: speedLast.logs.history, detail: speedLast.logs.detail } : null, logError: speedLast.logError ?? null })
 
   /** Download, verify (size + SHA256) and place one module. */
   async function installOne(m) {
@@ -1950,6 +2184,13 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     benchmark, cancelBenchmark, localAgentAttempt,
     /** Whether a speed benchmark is going now: a capability benchmark with local agents is refused meanwhile (3.8). */
     speedRunning: () => !!speedRun,
+    /** Settles once a run cut off before its end has been written in the history (2.13). */
+    speedLogsRecovered: () => speedLogsRecovered,
+    /**
+     * The last speed run's lines with what the logs give of each (2.13): a measured one's `ctx`,
+     * `reading` and `memory`, and why another recorded nothing. For Speed-Run.bat's table.
+     */
+    speedResults: () => ({ order: speedRun?.order ?? speedLast.order ?? [], done: (speedRun ?? speedLast).done.map((d) => ({ ...d })) }),
     /** The engine's loads and RAM-watchdog unloads so far, as { loads, unloads } (docs/benchmark.md 3.6). */
     engineCounters: () => ({ ...counters }),
     /** True when `modelId` is loaded and answering (no cold start). */
@@ -1963,8 +2204,9 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     // A speed run going ends with the rest, and nothing is loaded from here on, its restore included:
     // start() refuses once `disposed` is set, right before it would spawn, since a model loaded
     // after this would have no exit hook and nobody to stop it.
-    dispose: async () => {
+    dispose: async ({ why = null } = {}) => {
       disposed = true
+      disposedWhy = why
       if (speedRun) { speedRun.cancelled = true; speedRun.queue.length = 0; speedRun.controller.abort(new Error('KzH is closing')) }
       process.off('exit', onExit); watchdog.stop(); await stop()
     },

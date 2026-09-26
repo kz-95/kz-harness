@@ -13,22 +13,31 @@ Line references are to commit `a1e42b4`, the base of `feat/benchmark`, and engin
 What B1 and B2 added is named by its functions rather than by line, since it moved the lines around it.
 A review of this design was applied on 25 Sep; section 8 says what it changed and which parts of it were rejected, and why.
 
-**Status, 25 Sep:** step B1 (section 2) is built on `feat/benchmark`, in commit `914d8d4` with the fixes of its review in `c0ef03c`, and tested against a fake llama-server only (`plugins/jev-router/test/fixtures/fake-llama-server.mjs`).
-It has not run against the real llama-server, so its status is built, not verified.
+**Status, 26 Sep:** step B1 (section 2) is built on `feat/benchmark`, in commit `914d8d4` with the fixes of its review in `c0ef03c`, and tested against a fake llama-server (`plugins/jev-router/test/fixtures/fake-llama-server.mjs`).
+On 26 Sep it ran for the first time against the real llama-server, build b10964 (the Linux CPU build of the release the manifest pins), through `scripts/speed-run.mjs` (2.12), on a cloud machine with no GPU and two tiny random-weight llama models made for the test, one with a printable ASCII vocabulary and one with byte tokens.
+Before the fix of 2.2 the byte-token model was not measured, because llama-server answered its non-streamed request HTTP 500 from its output parser.
+After it both were measured, at 188.6 and 216.3 tokens/s generating and 1,583 and 1,527 tokens/s reading, CPU only; their readings stood for the next load in `status()`, whose rating, made by `rateModule()` as the install picker's is, read `CPU only: 189 tokens/s measured on this PC`, and no llama-server was left running.
+Those generation figures were taken before the fix of 2.3 and read about 0.8 percent high; a run after it, at 05:33, gave 177.6 and 195.2 (2.13, "Recorded runs").
+So B1 is verified against the real llama-server on a CPU, where its reads of `/tokenize` behind the engine's key, of the `timings` in a streamed answer's last event, and of a `prompt_n` of at least 1 on a prompt served from the cache (2.3) all held.
+The GPU split, the RTX 3080, the Windows builds of the engine, the real Qwen3 8B and Gemma 4 E4B, the Local models card's speed lines and `Speed-Run.bat` itself are still not observed.
+The fixes of 2.2 and 2.3, `scripts/speed-run.mjs` with `Speed-Run.bat` (2.12) and the speed run logs (2.13) are the commit after `f88947a` on `feat/benchmark`, pushed on 26 Sep.
 Section 2 describes B1 as it was built, where the build settled what the design left open or corrected it.
 Step B2 (section 3) is built on `feat/benchmark`, in commit `d71b76c` with the fixes of its review in `1363776` and of its second review in `5f19588` (26 Sep), and tested with stub agents, a fake Codex command-line tool and the fake llama-server only.
 No real Claude Code, Codex, DeepSeek or local agent has run a task of it, so its status is built, not verified.
 Section 3 describes B2 as it was built, where the build settled what the design left open or corrected it.
+The branch's commits after `a1e42b4` up to `5f19588`, every one this document names among them, were squashed into `f88947a`, which was pushed on 26 Sep.
 
 ---
 
 ## 0. The design on one page
 
 - B1 measures a model by reloading it through a new `reload()` in `local.js`, which waits until nothing holds the engine and then runs the ordinary `stop()` and `start()`, so the context, the threads, the GPU split and the budget are exactly what a real run gets.
-  It sends a warm-up, one fill that reads an 8,192-token prompt, about the depth of an agent's first call, and three requests that each generate 128 tokens after it with `ignore_eos`, to llama-server's native `/completion` endpoint, and reads the engine's own `timings`.
+  It sends a warm-up, one fill that reads an 8,192-token prompt, about the depth of an agent's first call, and three requests that each generate 128 tokens after it with `ignore_eos`, to llama-server's native `/completion` endpoint, each streamed as an agent's call is, and reads the engine's own `timings` from the last event of each answer.
 - A speed reading lives in `local.json` under `speed`, keyed `<model>@<context>` like the memory readings under `measured`, and stands only for a load of the same weights with the same context, GPU room, GPU layers setting, thread count, engine build, depth and Laya beside it; where it does not stand, the page says why and shows the estimate.
 - B1 leaves the engine as it found it: the model that was loaded is loaded again, and an engine that was stopped is stopped.
   It refuses while a local model or Laya is answering or a local agent is working on a task, holds local agents back while it runs without counting the wait against their time limit, and skips a model over the budget with the budget's own refusal.
+- The same speed run goes from a shell with KzH closed: `Speed-Run.bat` at the harness root runs `scripts/speed-run.mjs`, which refuses while KzH, a llama-server or a Laya left behind, or another Speed-Run runs, reads the context from the profile, and ends with an exit code a scheduled task can check (2.12).
+  Every speed run, from the card or from the shell, is logged in a `speed-runs` folder beside `local.json`: a short entry in `speed-runs.log`, and a detail log of its own (2.13).
 - B2's task set is 27 tasks, three levels in each of nine skills taken from the router's task types, plus a one-file preflight task that is never scored and that proves the agent can run a command.
   A task that does not fit the window KzH gives a local model is not run on it and records nothing.
   Every task is a tiny Node 22 project with no dependencies, graded by checks that never enter the agent's folder, and the repository holds one or more reference solutions for each that the suite proves pass while the untouched task fails.
@@ -106,7 +115,7 @@ Section 3 describes B2 as it was built, where the build settled what the design 
    `acquire()` alone would not do, because for the model already loaded it reuses the running engine, loaded perhaps under an older budget.
    The load time from spawn to a healthy `/health` is kept too.
 3. With the engine held for the whole measurement, one warm-up request goes to `<url>/completion`, shaped as the requests of 2.2 but with the text prompt `Write one short sentence about the sea.`, `n_predict` 16 and `cache_prompt: false`.
-   Its answer must come back with an OK status and parse as JSON, and its timings are not read.
+   It is streamed, as every `/completion` of the run is (2.2): its answer must come back with an OK status, every event must parse as JSON and the last must be marked `stop`, and its timings are not read.
    It pays the one-time costs of a first request (buffers allocated, kernels chosen) that no later request pays.
 4. The fill: `SPEED_TEXT` is turned into the model's own tokens with llama-server's `/tokenize`, its first 8,192 tokens go to `/completion` as the prompt with `n_predict` 1 and `cache_prompt: true`, and its timings give the prompt speed.
    It sends `ignore_eos: true`, `temperature` 0 and `seed` 1 as the measured requests do, so it generates exactly its one token, and `readTimings()` holds it to `n_predict` 1.
@@ -116,11 +125,20 @@ Section 3 describes B2 as it was built, where the build settled what the design 
 ### 2.2 The requests
 
 ```json
-{ "prompt": ["<the first 8,192 token ids of SPEED_TEXT>"], "n_predict": 128, "ignore_eos": true, "cache_prompt": true, "temperature": 0, "seed": 1, "stream": false }
+{ "prompt": ["<the first 8,192 token ids of SPEED_TEXT>"], "n_predict": 128, "ignore_eos": true, "cache_prompt": true, "temperature": 0, "seed": 1, "stream": true }
 ```
 
 - They go to llama-server's native `/completion`, with the engine's own key as a bearer token, because that endpoint takes `n_predict`, `ignore_eos` and a prompt of token ids: every model generates exactly 128 tokens whatever it would say, at the same depth counted in its own tokens.
   `/v1/chat/completions` stops at the model's end of turn and wraps the prompt in each model's own chat template, so two models would be timed on different lengths.
+- Every `/completion` of a speed run, the warm-up, the fill and the three timed requests, is sent with `stream: true`, and its last event is read (2.3); `/tokenize` stays a plain JSON request.
+  llama-server b10964 runs an answer through its chat output parser at its end, streamed or not, and the parser refuses text that is not whole UTF-8.
+  An answer that is not streamed then comes back HTTP 500 with `The model produced output that does not match the expected Content-only format`, even when the text was only cut inside its last character, as 128 tokens of a byte-level tokenizer can be.
+  A streamed answer holds such a cut character back, and ends with `stop` and its timings all the same.
+  This was reproduced on 26 Sep against the real llama-server b10964 with a tiny model whose vocabulary is byte tokens: the non-streamed request failed every time, and the streamed one ended with `stop` and full timings.
+  Text with a broken character inside it is refused either way: streamed, it comes as an error event after HTTP 200, and the model records nothing, with `llama-server stopped with an error: The model produced output that does not match the expected Content-only format` (2.3).
+  That was checked against the real server with a logit bias on a lone continuation byte.
+  Streaming is also how an agent's own calls reach the model.
+  B1 as first built sent `stream: false`, and its first run against the real llama-server (the status at the top) is how this was found.
 - The depth is 8,192 tokens because an agent's first call already carries about 8,600 tokens of system prompt and tool list (local.js:523), and generation slows as the context fills, most of all on a CPU or a split load, so a speed taken after a short prompt would promise more than a local agent gets.
   The budget never sizes a load's context below 12,288 tokens (`MIN_CTX`, local.js:524), which holds 8,192 tokens and 128 generated ones.
   The design took that for a floor under every load, and it is not one: the plugin config's `local.contextSize` (down to 2048, index.js) or a manifest's `maxContext` can start a model below it, and `contextSteps()` leaves such a context as it is.
@@ -137,14 +155,28 @@ Section 3 describes B2 as it was built, where the build settled what the design 
 
 ### 2.3 Reading llama-server's own timings
 
-llama-server answers `/completion` with a `timings` object, and B1 reads four of its fields: `prompt_n`, `prompt_ms`, `predicted_n` and `predicted_ms`.
-Generation speed is `predicted_n / predicted_ms * 1000` and prompt speed is `prompt_n / prompt_ms * 1000`, which is what `predicted_per_second` and `prompt_per_second` report.
+llama-server ends a streamed `/completion` (2.2) with an event marked `stop: true`, which carries the same `timings` object a non-streamed answer has, and B1 reads the timings from that last event.
+It reads four of their fields: `prompt_n`, `prompt_ms`, `predicted_n` and `predicted_ms`.
+Generation speed is `(predicted_n - 1) / predicted_ms * 1000`, since the first generated token comes out of the prompt pass and `predicted_ms` times the other n - 1, and prompt speed is `prompt_n / prompt_ms * 1000`; these are what `predicted_per_second` and `prompt_per_second` report.
+llama-server b10964 gives 207.99 ms for 128 tokens, 1.6377 ms a token, and its own 610.61 tokens/s, all of them over 127 (seen against the real server on 26 Sep).
+Every reading B1 took before this was fixed on 26 Sep read 128/127 of the speed, about 0.8 percent fast.
+Since the fix, each timed request's line in the detail log, `timed request <k> of 3: 177.9 tokens/s generating`, equals llama-server's own `eval time = 713.89 ms / 128 tokens (... 177.90 tokens per second)` printed beside it (2.13).
 They are worked out from the counts and the milliseconds rather than read from the rate fields, so a build that drops or renames a rate fails the check below instead of reading as zero.
 
 A pure exported `readTimings(body, { nPredict })` in `local.js` returns `{ tokensPerSec, promptTokensPerSec, promptTokens }`, or a reason:
 
 - no `timings` object, or one of the four fields missing or not a positive finite number: `llama-server did not report its timings`;
+  the fill's one token times no generation, so for it `tokensPerSec` is null and `predicted_ms` may be 0, and only the other three fields must be positive;
 - `predicted_n` other than `n_predict`: `llama-server generated <n> tokens, not <n_predict>`.
+
+An answer that never reaches its timings records nothing too, each reason after `<name> not measured: ` (2.7):
+
+- an event that carries an error: `llama-server stopped with an error: ` and then its message, the text itself when llama-server sends the error as text alone, or the error's JSON when it has no text message;
+- a stream whose last event is not marked `stop`: `llama-server ended its answer before it finished`;
+- an event that is not JSON: `llama-server answered with something that is not JSON`;
+- an error status: `llama-server answered HTTP <status>: ` and then llama-server's own error message rather than its JSON body, or the error itself when it is text alone, or the body as it came, cut to 200 characters, when it is not JSON or its error has no text message, with trailing spaces and full stops dropped, and nothing after the status when the body is empty.
+
+Neither the error line nor the HTTP line ever reads `[object Object]` or puts the message in quotes.
 
 The prompt speed is the fill's, kept when it processed at least 8,000 prompt tokens; otherwise the prompt speed reads `not measured: llama-server reused its prompt cache`, and generation speed is still recorded.
 The generation speed is the median of the three measured requests, with all three kept.
@@ -155,7 +187,8 @@ A Laya process loaded or unloaded beside the model at any point from its load to
 Such a model records nothing, with `<name> not measured: Laya was loaded or unloaded beside it while it was measured`.
 The residents are compared as residency entries, so a Laya that stopped and started again on the same device counts as a change.
 A request refused by `readTimings` records nothing for that model and says why; there is no fallback to a wall clock.
-The timed requests rely on llama.cpp reading the last prompt token again when it serves a prompt from the cache, so that their `prompt_n` is at least 1: a `prompt_n` of 0 would be refused as `llama-server did not report its timings`, and that has not been checked on the real llama-server (docs/handoff.md, "Built but NOT observed").
+The timed requests rely on llama.cpp reading the last prompt token again when it serves a prompt from the cache, so that their `prompt_n` is at least 1: a `prompt_n` of 0 would be refused as `llama-server did not report its timings`.
+The real llama-server b10964 did so on 26 Sep, on its Linux CPU build: every timed request of both test models was measured (the status at the top); its Windows CUDA build has not been checked (docs/handoff.md, "Built but NOT observed").
 
 ### 2.4 What is stored, where, and how it is keyed
 
@@ -205,11 +238,16 @@ The timed requests rely on llama.cpp reading the last prompt token again when it
 
 - One speed run at a time, holding a queue of model ids.
 - **Benchmark** on a model's row queues that one model; **Benchmark all** queues every installed chat model, in manifest order, with the model loaded now last, so the run ends with it loaded and the restore of 2.6 needs no load of its own; it is still reloaded once, to be measured.
+- Benchmark all does not leave out a chat model whose file is on disk but cannot be measured: one whose SHA256 does not match the manifest, `<name> not measured: its file does not match the manifest's SHA256; install it again (type /install-llm <id>)`, or one still being hashed, `<name> not measured: its file is still being checked (SHA256); benchmark it when that is done`.
+  Each is put first in the run's order as a `done` line that is not measured, in the card, the detail log and the history, and the count of the models measured reads on from them, so the card's `<k> of <n>` and a waiting local agent's line (2.6) name the right model.
+  With only such models installed, Benchmark all runs and records each as not measured, rather than refusing with `No local chat model is installed`.
+  Named in `ids`, by Benchmark on its row or `Speed-Run.bat --models`, such a model is refused instead (2.7).
 - A second request while a run is going is refused: `A speed benchmark is already running.`
 - The run reports itself in `status().speedRun`: `state` (`idle` or `running`), `current` (`{ id, phase, run }`, phase `loading`, `warming`, `reading` or `measuring`, run 1 to 3), `queue`, `done` (`{ id, ok, text }` per model, in order) and `restore`.
   While the restore of 2.6 runs, `current` has phase `restoring`, with the id of the model loaded before, or null.
   `cancelled` says whether Cancel has been pressed on the run going, and is false once none goes (2.8).
   Once the run has ended, `state` is `idle` and `done` and `restore` keep what it left until the next run starts.
+  `log` and `logError` say where the run is logged and what could not be written (2.13).
 - A measured model's `done` line reads `Qwen3 8B: 21.2 tokens/s generating and 413 tokens/s reading, 8,192 tokens into a conversation, at 16k context.`, the context given in tokens when it is no whole number of k.
   When the fill was served from the prompt cache, `; its reading speed was not measured, because llama-server reused its prompt cache` stands in place of the reading speed.
   A model that recorded nothing has `ok` false and the line `<name> not measured: <why>` (2.7).
@@ -220,6 +258,7 @@ The timed requests rely on llama.cpp reading the last prompt token again when it
 - At the end, whether the run finished, failed or was cancelled, a model that was loaded and is not the one loaded now is loaded again through `acquire()`, so it waits for anything in flight, and an engine that was stopped at the start is stopped again if nothing holds it.
 - The last line says which: `Qwen3 8B is loaded again, as it was before.`, `The engine is stopped again, as it was before.`, or `Could not load Qwen3 8B again: <error>.`
   Two more lines cover what the design did not name: `The engine was stopped before; <model> stays loaded, because a request is using it now.` when a request holds the engine at the end, and `KzH closed during the speed benchmark, so nothing was loaded again.` when the local models are disposed mid-run, which aborts the run and loads nothing after it (2.8).
+  `Speed-Run.bat` disposes of them with its own words when it has to stop at once (2.12), and the line then reads `The speed run was stopped at once, so nothing was loaded again.`
 - Local agents wait for the whole run.
   The count of local-agent attempts in flight and their wait live in `local.js` (`localAgentAttempt()`), which `index.js` wraps around `execute` for every agent of kind local (the `execute` `route()` builds, index.js:1334, which B2 moves into `runDepsFor()`, so benchmark tasks share the count), so the refusal of 2.7 and the wait read one count.
   While a speed run goes, a local agent's attempt waits before it starts its subagent, with the line `Waiting for the speed benchmark to finish (<model>, <k> of <n>).`, said again each time the run moves on to another model.
@@ -242,8 +281,9 @@ The whole run is refused, with the reason as the route's error, when:
 - a speed run is going (2.5): `A speed benchmark is already running.`, with status 409;
 - `ids` is given and is not a non-empty list of strings: `ids: the local chat models to measure, or none for every installed one`;
 - the engine is not installed: `The llama.cpp engine is not installed (type /install-llm).`;
-- no chat model is installed: `No local chat model is installed (type /install-llm).`;
+- no chat model is installed, and none whose file is on disk but cannot be measured (2.5): `No local chat model is installed (type /install-llm).`;
 - an id names no local chat model, a vision add-on's id included: `No local chat model is named <id>.`;
+- an id names a chat model whose file is on disk but cannot be measured (2.5): `<name> cannot be measured: ` and then the same why as its line in Benchmark all;
 - an id names a chat model that is not installed: `<name> is not installed (type /install-llm <id>).`
 
 A single model is skipped with its reason, and the run goes on to the next, when:
@@ -256,7 +296,7 @@ A single model is skipped with its reason, and the run goes on to the next, when
 - the RAM watchdog unloads it mid-measurement: `<name> not measured: the RAM watchdog unloaded it: <its reason>`;
 - a Laya is loaded or unloaded beside it during its measurement (2.3): `<name> not measured: Laya was loaded or unloaded beside it while it was measured`;
 - the speed text is too short for its tokenizer, a request's timings are refused (2.3), the three runs disagree, requests keep arriving, or a request runs past its time: `<name> not measured: <why>`, with the words of 2.2 and 2.3;
-- llama-server answers a request with an error status, with something that is not JSON, with no token list for the speed text, or not at all: `llama-server answered HTTP <status>: <up to 200 characters of its answer>`, `llama-server answered with something that is not JSON`, `llama-server did not tokenize the speed text` or `llama-server did not answer (<error>)` after `<name> not measured: `;
+- llama-server answers a request with an error status, with something that is not JSON, with a streamed answer that carries an error or ends before its last event, with no token list for the speed text, or not at all: `llama-server answered HTTP <status>: <its error message>`, `llama-server answered with something that is not JSON`, `llama-server stopped with an error: <its message>`, `llama-server ended its answer before it finished`, `llama-server did not tokenize the speed text` or `llama-server did not answer (<error>)` after `<name> not measured: `, with the words of 2.3;
 - anything else goes wrong: `<name> not measured: something went wrong (<error>)`.
 
 ### 2.8 Cancel
@@ -272,7 +312,7 @@ The second review of B2 made it so: before, a press during the restore was ignor
 
 Once the local models are disposed (KzH closing, or the plugin reloading), a speed run going is cancelled, and `start()` refuses right before it would spawn llama-server, with `KzH is closing, so <name> was not loaded`.
 So nothing that was already on its way loads a model with no exit hook: not a speed run's restore that waited behind a chat title, not the title itself.
-A restore that was waiting then ends the run with `Stopped. Readings already taken are kept; KzH closed during the speed benchmark, so nothing was loaded again.`
+A restore that was waiting then ends the run with `Stopped. Readings already taken are kept; KzH closed during the speed benchmark, so nothing was loaded again.`, or, from `Speed-Run.bat`, `...; the speed run was stopped at once, so nothing was loaded again.` (`dispose({ why })`).
 
 ### 2.9 How the numbers are shown
 
@@ -330,7 +370,8 @@ The run shows in a status region under the card's intro:
 - while it goes, the line of 2.6 on local agents, and **Cancel**;
   during the restore Cancel is shown disabled, with the sentence of 2.8 as its title, and once pressed it reads `Cancelling…` and stays disabled until the run has ended, which `status().speedRun`'s `cancelled` tells it;
   the second review of B2 made it so, since before Cancel stayed enabled after a press;
-- then the `done` lines, a model not measured in the error colour, and the restore line, which stay until the next run.
+- then the `done` lines, a model not measured in the error colour, and the restore line, which stay until the next run;
+- once the run has ended, where it is logged, and at once, in the error colour, a log that could not be written (2.13).
 
 The card polls every 1.5 seconds while a run goes, as it does during an install.
 
@@ -354,6 +395,171 @@ Running Benchmark all is how every installed model's figure there becomes measur
   The reading keeps the split it ran with, which the card prints, and the agreement rule of 2.3 catches load that comes and goes during it.
 - Any cloud agent's speed, the vision add-on's image reading, or Laya's own speed, which Laya's card measures.
 - Models that are not installed: their figures stay the bandwidth estimate, marked `est.`.
+
+### 2.12 From a shell: Speed-Run.bat
+
+`Speed-Run.bat` at the harness root runs `node scripts/speed-run.mjs`: the same speed run as Benchmark all, with KzH closed, double-clicked or started by a Task Scheduler entry the owner makes (6).
+The script runs `local.js`'s own speed run (`createLocalModels().benchmark()`), so each model is loaded, measured, refused or skipped as 2.1 to 2.8 say, and its reading goes to `local.json` exactly as the in-app run stores it (2.4), where the Local models card and the install picker find it when KzH starts.
+Nothing in KzH starts it or schedules it.
+
+```
+Speed-Run.bat                          every installed local chat model
+Speed-Run.bat --models qwen3-8b        only the models named, comma separated
+Speed-Run.bat --context 24576          the context KzH starts local models with, when the
+                                       profile sets one this cannot read
+Speed-Run.bat --no-pause               no key press at the end (Task Scheduler)
+Speed-Run.bat --verbose                the engine log as it runs
+```
+
+- `--models <id>,<id>` measures only those models, each id refused as Benchmark's `ids` are (2.7).
+  It also takes the words that follow it, up to the next `--` argument, since PowerShell hands `--models a,b` to a .bat as `--models a b`.
+- `--context <tokens>`, a whole number of 2048 or more, says outright the context KzH starts local models with, and always wins over the profile's (below).
+- `--verbose` prints the engine log as it runs, and `--no-pause` leaves out the key press at the end.
+  The .bat reads `--no-pause` word by word with a `for` loop, so an `&` or a `|` in the arguments breaks no pipe.
+- `--harness <dir>` and `--data <dir>` point elsewhere; they default to the harness the script sits in and `<DSH_HOME>/jev-router`, with `DSH_HOME` `~/.kzh` when it is not set, as `Start-KzH.ps1` sets it.
+
+**What it checks before anything is loaded.**
+One Speed-Run goes at a time, and that is checked first, so a second Speed-Run meets `Another speed run is going (Speed-Run.bat, pid <n>). Let it finish, or end it, and run this again.` with exit code 3 rather than the first one's llama-server.
+`speed-run.lock` in the `speed-runs` folder holds the pid of the one going, and is given back when the script ends.
+A lock whose pid is not alive, or now names a program that is not a speed run, is one a crash left, and is taken over; one whose program cannot be read is taken for a speed run.
+A lock that cannot be taken for any other reason ends the run with exit code 2.
+
+Then `machineCheck()` reads the running processes, with their pids: on Windows from CIM, with their command lines, or tasklist's names alone when PowerShell fails, and from `ps` elsewhere.
+It refuses the run, with exit code 3, while:
+
+- KzH's engine runs (node running `@deepseek-ai/dsh` with `web`, the test `app/main.js` uses), or `Kz-harness.exe` does: `KzH is running (its engine, <name>).` or `KzH is running (Kz-harness.exe).`, then `Close KzH and run this again: the speed run and KzH would load models over each other on one GPU, and both write local.json.`;
+- a `llama-server` runs with KzH closed, one a crash left behind, say, which holds memory the readings would lose;
+- a `laya.serve` an earlier KzH left running holds memory the same way, found from the pids in Laya's `sidecar.json` that are alive and run `laya.serve`: `Start KzH and close it again, which stops it, or end pid <n> in Task Manager, and run this again.`
+
+Whatever answers on `127.0.0.1:3080` is found by its pid, from `netstat -ano` on Windows and `ss` elsewhere, and looked up in the process list.
+On Windows a listening socket is read by its far end, `0.0.0.0:0` or `[::]:0`, so netstat's output is read in any Windows language.
+The run goes ahead only when that program's command line can be read and is not KzH's engine: it is another program (LibreChat and GNS3 use that port too), and a note names it and its pid.
+Otherwise it is refused, since nobody can tell whether KzH is running: when the owner cannot be found or looked up, and when its command line reads empty, as KzH's engine's does when it runs as administrator.
+Every refusal is written in `speed-runs.log` with why (2.13).
+Once the checks pass, it prints `Keep KzH closed until this ends: it would load models beside the ones measured.`; a KzH started during a run is not stopped by it.
+
+**The context.**
+KzH starts a local model at the plugin config's `local.contextSize` when the profile sets one, and a reading stands only for a load at the context it was taken at (2.4).
+So without `--context`, the script reads jev-router's `config.local.contextSize` from `<DSH_HOME>/profiles/web/cordis.patch.yml` and then `<DSH_HOME>/cordis.patch.yml`, the later winning, and uses it, printing `Context: <n> tokens, jev-router's local.contextSize in <file>.`
+Only a `contextSize` key under a jev-router entry's `config.local` counts, in the block form or the one-line forms; a comment, a line commented out, another plugin's `contextSize` and an agent's `llm.contextSize` do not.
+When a patch file gives jev-router's `local.contextSize` in a form this cannot read (`24k`, or an `!include`), the run is refused with exit code 2 and `<file> gives jev-router's local.contextSize in a form this cannot read. Run this again with --context <the number KzH starts local models with>: ...`.
+`<DSH_HOME>` here is the folder above the data folder, so it follows `--data`.
+
+**What it prints and writes.**
+A model file placed by hand is hashed once first, as the Local models card does, and Ctrl+C ends that wait.
+One whose SHA256 does not match the manifest is then named by the run itself as not measured (2.5), so the run ends with exit code 1 and a scheduled check sees it.
+It prints the PC as the install picker does, then names only the models it will measure: `Measuring <names>: a warm-up, the 8,192-token prompt, then three timed requests each.`, or `No model can be measured; each says why below.`
+A model the run already knows it cannot measure (2.5) is left out of that line and has its own `NO` line.
+Then come each phase, its timed requests said as `timed request <k> of 3` as in the detail log, each model's line as the card has it (2.5), the restore line (2.6), and a table in plain ASCII, whose figures come from `local.speedResults()`: generate and read tokens/s (`cached` where the reading speed was not measured), context, layers on the GPU, VRAM and RAM from the load's memory reading, load seconds and threads.
+`local.js` logs the run as it logs the card's runs (2.13), with `Speed-Run.bat` as who started it, in `<data>/speed-runs`, which is `%USERPROFILE%\.kzh\jev-router\speed-runs` on Windows by default.
+The script ends with `<n> speed readings saved in local.json, where KzH reads them.` (`1 speed reading` for one), or `No speed reading was saved.`; it does not say that `local.json` is unchanged, since a load writes its memory reading there whatever became of the speed.
+Then, only when the logs hold the run, `Every speed run on this PC: <the path of speed-runs.log>` and `This run in detail: <the path of the run's detail log>`.
+When a log could not be written it says `The speed run log could not be written: <file>: <code>. This run is not in it, or not all of it.` instead.
+When Laya is installed, it says that Laya was not loaded during the run, so the readings stand while no Laya is held beside the model (2.4); with Laya held, Benchmark in the card is the run to make.
+A bad argument, or an error nobody foresaw, is written in the history too, its first line, while the console gets the whole of it, since a scheduled run shows nobody its console.
+
+**Stopping it.**
+Ctrl+C is answered for the step it lands in.
+Before any model is loaded it prints `Cancelling: no model has been loaded yet, so the run ends here.`, ends the wait on a hand-placed file's SHA256 check too, loads nothing, exits with 130 and writes `did not run. Cancelled with Ctrl+C before any model was loaded.` in the history.
+The script then exits within a second, even while that hash would go on.
+A press while `local.js` is starting the run cancels the run as soon as it exists.
+While the run goes, it cancels the run as Cancel does (2.8), and only when there is something to cancel; during the restore it prints why that cannot be cancelled (2.8), and once the run has ended it prints `The run has ended; there is nothing to cancel.`, and the exit code is the run's own.
+A second Ctrl+C prints `Stopping at once.` and gives the cancelled model up to 10 seconds to let go of the engine, so the run can end itself and say so.
+Only then is the engine stopped from the script, and the restore line then says `the speed run was stopped at once, so nothing was loaded again` rather than that KzH closed (2.8).
+cmd then asks `Terminate batch job (Y/N)?`, and N keeps the window open on the results.
+Closing the console window (SIGHUP on Windows), Ctrl+Break (SIGBREAK) or SIGTERM would end node without its exit event, and llama-server, which has no console of its own, would outlive the script with its memory.
+Each is turned into an exit with 128 plus the signal's number, which runs `local.js`'s exit hook and so stops llama-server.
+When that happens while a run goes, the history first gets `<UTC minute>, Speed-Run.bat: ended by <signal> while it measured (its console was closed, or it was stopped). Readings already taken are kept.` with the detail log's name, and the lock is given back.
+This ran for real on 26 Sep in the cloud: SIGHUP mid-run gave exit code 129 and left no llama-server running (2.13, "Recorded runs").
+
+Exit codes, for a scheduled run:
+
+- 0: every model was measured;
+- 1: a model was not measured, and its line says why, a model whose file does not match the manifest's SHA256 included;
+- 2: it could not run: no engine, no model, an unknown model, a bad argument, a manifest that did not load, a context it cannot tell, a lock it cannot take, or Node.js not on the `PATH`, where the .bat says `Install Node.js 22.19 or newer` (the plugin's `engines`); a missing install also names `scripts\Install-Harness.ps1 -LocalModels <id,id|all>`;
+- 3: KzH, a llama-server, a Laya left behind or another Speed-Run is running, or a program on KzH's port cannot be told from KzH;
+- 130: cancelled with Ctrl+C;
+- 128 plus the signal's number, 129 for SIGHUP: its console was closed, or it was ended.
+
+`test/speed-run.test.js` drives the script over the fake llama-server (5.1), and on 26 Sep `node scripts/speed-run.mjs` ran against the real llama-server b10964 on Linux (the status at the top).
+`Speed-Run.bat` itself has only been read by its test (plain ASCII, CRLF line ends, cmd.exe's `nul` rather than any Unix redirect, the `for` loop, the line that runs the script and the exit code it passes on) and has never run on Windows.
+
+### 2.13 Speed run logs
+
+Every speed run is logged, from the card and from `Speed-Run.bat` alike, in `<data>/speed-runs` beside `local.json`, which is `%USERPROFILE%\.kzh\jev-router\speed-runs` on the owner's PC.
+`index.js` passes that folder to `createLocalModels()` as `speedLogDir`, and `scripts/speed-run.mjs` passes the one under its own data folder.
+Who started a run is `local.js` `benchmark()`'s `by`, up to 60 characters: `Settings, Local models` for the card, and `Speed-Run.bat` for the shell.
+
+**The history.**
+`speed-runs.log` holds one entry per run, appended when the run ends and never rewritten, in plain text with a blank line after each:
+
+```
+<UTC minute>, <who started it>: <k> of <n> measured[, stopped]
+  PC: <the PC>; engine: <variant> build <12 hex digits>; budget: <limits set>, GPU layers <setting>; <Laya held on the GPU | no Laya held>
+  <model>  <x> tokens/s generating, <y> tokens/s reading, <context>, <g>/<n> layers on the GPU, <v> GB VRAM + <r> GB RAM, loaded in <s> s, <t> threads
+  <model>  not measured: <why>
+  <the restore line>
+  Details: speed-run-<time>.log
+```
+
+- The first line says when the run started, to the minute in UTC, who started it, how many of its models were measured, and `, stopped` when it was cancelled.
+- The second gives the PC as `specsLine()` does, with commas for its middle dots so the line stays ASCII; the engine build, its variant and the first 12 hex digits of its SHA-256; the budget, that is the VRAM, RAM and cores limits when set and the GPU layers setting; and whether Laya was held, and on which device.
+- Then comes a row per model, in the run's order, from `speedFigures()`: generation speed, reading speed or `reading speed not measured (prompt cache)`, context, the layers on the GPU or `layers on the GPU not reported`, VRAM and RAM from the load's memory reading or `memory not reported`, load seconds or `load time not reported`, and threads or `threads not reported`.
+  A model not measured has `not measured: <why>`, and one a Cancel dropped from the queue has `not measured: cancelled before its turn`.
+- Then the restore line of 2.6, or 2.8's `Stopped. ...` line, and `Details: ` with the name of the run's detail log, followed by ` (incomplete: <what failed>)` when it could not all be written.
+
+A run from `Speed-Run.bat` that never starts (another Speed-Run going, a lock it cannot take, KzH running, a llama-server or a Laya left behind, a program on KzH's port that cannot be told from KzH, no engine, no model, an unknown model or one that cannot be measured, a manifest that does not load, a context it cannot tell, Ctrl+C before any model was loaded, a bad argument or an error nobody foresaw, of which the first line) gets one line, `<UTC minute>, Speed-Run.bat: did not run. <why>`, a blank line after it, and no detail log, so a scheduled run that did nothing says why where the runs are kept.
+A run from `Speed-Run.bat` whose console is closed, or that is ended, mid-run gets `<UTC minute>, Speed-Run.bat: ended by <signal> while it measured (its console was closed, or it was stopped). Readings already taken are kept.` and a `Details:` line in place of its entry, since `local.js` cannot finish one (2.12).
+A run the card's route refuses is answered in the card's alert (2.7) and is not logged.
+
+A run cut off before its end, KzH ended with taskkill for a restart or an update, or a crash, wrote its detail log as it went but never its history entry, which only its end writes.
+So when the local models are next made, at KzH's next start or the next `Speed-Run.bat`, each detail log with no `Ended after` line whose name the history does not give gets its entry:
+
+```
+<its start minute> UTC, <who started it>: cut off before it ended (KzH was closed, restarted or updated during it, or it stopped); found when the local models next started
+  <each model's line it had reached, or: No model had been measured.>
+  Readings of the models it had finished are kept.
+  Details: <its name> (it ends where the run was cut off)
+```
+
+The console says so too: `local: a speed run cut off before its end is now in speed-runs.log (<name>)`.
+While `speed-run.lock` is held by a live pid, a Speed-Run going in another process, the detail logs are left alone, since that one's is still being written.
+A run starts only after that check, so a new detail log is never taken for a cut-off one.
+
+**The detail log.**
+Each run also gets its own `speed-run-<UTC time to the millisecond>.log` beside the history, for example `speed-run-2026-09-26T04-44-32-561Z.log`, named to the millisecond so no two runs share one.
+Its head gives the start time and who started it, the PC, the engine build with its whole SHA-256, the budget, the Laya held, the models in order, and what each gets: a warm-up, the 8,192-token prompt read once, then 128 tokens generated three times, the median kept.
+Then comes every step, each with its UTC time to the millisecond: each phase; every line of the local models' log while the run goes, which holds the engine's start with its context, GPU layers and threads, the memory the load took, the layer split and each stop; every line llama-server itself prints, whole lines only, as `llama-server: <its line>`, which holds its load report (the device, how the layers and buffers were fitted, the layer split) and each request's timing lines; the prompt read, with its tokens and tokens/s, or that llama-server read only part of it and took the rest from its cache; each timed request's tokens/s; a request run again, and why; each model's line; the restore; and at the end `Ended after <s> s. The summary is in speed-runs.log.`
+It is written line by line as the run goes, so a run that dies leaves what it got to.
+llama-server's own lines are about 170 a load and 20 a request on b10964, so a two-model run's detail log is some 600 lines, 65 KB for the run of 05:33 below, where the run's own lines alone were 2.4 KB at 04:44.
+Nothing prunes either log.
+
+**When a log cannot be written.**
+A log that cannot be written never stops the run, and the readings are stored all the same.
+The first failure is kept and nothing more is written to the detail log: the console says `local: the speed run log could not be written (<file>: <code>)`, or `local: the speed run history could not be written (speed-runs.log: <code>)`, `status().speedRun.logError` carries it, the card says at once, while the run still goes, `The speed run log could not be written (<why>); the readings are kept all the same.`, and the history entry's `Details:` line says the detail log is incomplete.
+
+**Where it shows.**
+`status().speedRun` gains `log`, `{ history, detail }` with both paths, and `logError`; its `done` lines keep `id`, `ok` and `text`, and `local.speedResults()` gives each line's `ctx`, `reading` and `memory`, or its `why`.
+Once a run has ended, the card adds `Logged in <history path>, with this run in detail in <detail name> beside it.` to its status region (2.9), and `Speed-Run.bat` prints both paths (2.12).
+
+**Recorded runs.**
+All were in the cloud container on 26 Sep 2026, with the real llama-server b10964 (its Linux CPU build), 1 thread, 16k context and the two 11 MB random-weight test models of the status at the top:
+
+The runs up to 05:00 were taken before the fix of 2.3, so their generation figures read about 0.8 percent high.
+
+- 04:27 UTC, before the fix of 2.2: the byte-token model not measured, HTTP 500 with `The model produced output that does not match the expected Content-only format`;
+- 04:29 UTC: Tiny 204.8 tokens/s generating and 1,617 reading;
+- 04:32 UTC: Tiny 188.6 and 1,583, Bytes 216.3 and 1,527;
+- 04:44 UTC, with the logs: Tiny 205.5 and 1,573, Bytes 199.6 and 1,557, the run 16.3 s end to end, with a history entry and a detail log as this section describes, the detail log then named to the second;
+- 04:59 UTC, with the machine check, the lock and the logs: Tiny 218.4 and 1,599, Bytes 212.9 and 1,562, exit code 0;
+- 05:00 UTC, SIGHUP sent to the script mid-run, while Bytes read its prompt: exit code 129, the history got `ended by SIGHUP while it measured`, no llama-server was left running, and the lock was given back.
+
+After the fix of 2.3:
+
+- 05:33 UTC: Tiny 177.6 and 1,469, Bytes 195.2 and 1,551, each timed request equal to llama-server's own `eval time` line beside it in the detail log (177.90 and 177.9, 165.95 and 166.0, 177.62 and 177.6 for Tiny), the detail log some 600 lines with llama-server's own.
+
+They show that the machinery works against the real server.
+They say nothing about the owner's RTX 3080 or the real models, whose runs belong in the owner's own `speed-runs.log`.
 
 ---
 
@@ -1170,7 +1376,7 @@ The second review of B2 made it so: before, the card kept reading with the inspe
 - No agent is started in one of the person's projects: capability runs happen in the scratch workspace (3.7), and the benchmark reads and writes none of `history.jsonl`, the feedback, the track record or a project's handoff note.
 - No Jev or Laya call is made and no connectivity probe is sent, so nothing reaches TypeSafe.
 - A cloud agent receives the task's files and prompt, the router's usual lines and the scratch folder's path, which the card says when it holds the account name, plus its own global setup (`~/.claude`, `~/.codex`) exactly as in every run of that command-line tool.
-- What is kept, all on this PC: `benchmark.jsonl` (ids, numbers, outcomes, short reasons, the patch and up to 1,000 characters of the agent's answer, all about synthetic tasks), `usage.jsonl` rows as for any run, marked, the evidence rows (ids, numbers and the task id), and the speed readings in `local.json` (numbers).
+- What is kept, all on this PC: `benchmark.jsonl` (ids, numbers, outcomes, short reasons, the patch and up to 1,000 characters of the agent's answer, all about synthetic tasks), `usage.jsonl` rows as for any run, marked, the evidence rows (ids, numbers and the task id), the speed readings in `local.json` (numbers), and the speed run logs (2.13: the PC's hardware line, the engine build, the figures and the local models' own log lines during each run).
 - No key of KzH's is in the environment of the agent's code: Claude Code's and Codex's processes get the engine's scrubbed environment, as a local agent's commands do by the engine's documented rule (1.3), the run's checks get the same (3.8), and the grader gets five variables and nothing else (3.6).
 - Every git call the benchmark makes, on a task folder and in the scratch root, runs with the agents' scrubbed environment (`benchmark.js` `gitEnv()`: KzH's less every name holding KEY, PASSWORD, SECRET or TOKEN, every `DSH_` name and every `GIT_` name of KzH's own) and with `core.fsmonitor` off, so nothing git starts there, a filter of the person's own git config included, has a key of KzH's.
   A task folder's repository is kept outside the scratch root (3.7), so no filter an agent names in its folder runs at all.
@@ -1223,6 +1429,16 @@ The test of a prompt read again scales time by replacing `AbortSignal.timeout` i
 
 Checked on 25 Sep at `c0ef03c`: `node scripts/red-check.mjs plugins/jev-router/test/local.test.js plugins/jev-router/test/budgetpanel.test.js plugins/jev-router/test/speed-routes.test.js plugins/jev-router/test/router.test.js --base 9d21fae` finds 31 new tests (21, 5, 4 and 1), and all 31 fail at the base by an accepted kind; the same files against `914d8d4` find the review's 10, and all 10 fail there.
 The full suite at `c0ef03c` is 1231 tests, 1230 pass, 0 fail, 1 skipped on Linux.
+
+The streamed requests (2.2, 2.3), the speed run from a shell (2.12), the speed run logs (2.13) and the reviews of that work added 28 tests by name: 18 in `test/speed-run.test.js`, 7 in `test/local.test.js`, 1 in `test/budgetpanel.test.js` and 2 in `test/run-as-script.test.js`.
+`test/speed-run.test.js`, new, the own test file of `scripts/speed-run.mjs`, has 18, driven through `main()` over a harness of its own and the fake llama-server: the whole run, with the readings in `local.json`, the table and the logs; `--models` and its refusals, each written in `speed-runs.log`; a model not measured giving exit 1; the refusal while KzH runs, before anything is loaded, with why written in `speed-runs.log`; `machineCheck()`, where KzH's engine or app, a llama-server or a Laya left behind each stop the run and a program on KzH's port is looked up by its pid; `processList()` from CIM, tasklist and `ps`, and `portOwner()` from netstat and `ss`; Ctrl+C before any model is loaded; the lock; the console closed mid-run; a model whose file does not match the manifest, named as not measured so the run exits 1; Ctrl+C mid-run; the arguments, PowerShell's split `--models` among them; the profile's context, where a comment or another `contextSize` is not it; a bad argument or an error nobody foresaw written in the history; Ctrl+C once every model is done, and a second Ctrl+C mid-run that lets the run end itself; a speed run log that cannot be written, said at the end with no paths given as if the logs held the run; the ASCII table; and `Speed-Run.bat` being plain ASCII with CRLF line ends, cmd.exe's `nul` and its `for` loop, running the script from the folder it sits in and passing its exit code on.
+`test/local.test.js` has 7: every `/completion` of a speed run is streamed, so a model is measured against a server whose parser refuses non-streamed answers, and the failure lines of 2.3 read word for word, an error sent as text alone and one with no text message among them; the engine's start line, which now says `1 thread` or `3 threads` and leaves out the GPU room when GPU layers is 0; every run logged in the history and in its detail log; a log that cannot be written never stopping the run; Benchmark all naming a model whose file does not match the manifest as not measured, first, and counting the models it measures on from it (2.5); a run cut off before its end getting its history entry when the local models next start; and a history row saying a figure its reading lacks is missing, never a zero.
+The test of the requests' shape now expects `stream: true`, and the `readTimings()` test works generation out over n - 1, with a fill whose `predicted_ms` is 0.
+The fake llama-server answers a streamed `/completion` as llama-server does, with events ending in one marked `stop` that carries the timings, answers a non-streamed one HTTP 500 with the parser's words when `parserRefuses(entry)` says so, times generation over n - 1 as llama-server does, and exports `answerOf(response)`, the JSON body or the last event of a streamed answer, which the test of a prompt read again now reads its timings through.
+`test/budgetpanel.test.js` has 1: the card's log line once a run has ended, and at once when its log could not be written.
+`test/run-as-script.test.js`, new, the own test file of `scripts/run-as-script.mjs`, has 2: a script runs when node was asked for it by its own path or through a link to its folder, and not when it is imported; and every script of the harness that runs as a command answers when started through a link to the harness.
+`scripts/red-check.mjs` against `f88947a` finds the 28 new tests, and all 28 fail at the base by an accepted kind: the 18 in `test/speed-run.test.js` on a missing export, the 2 in `test/run-as-script.test.js` on the missing module `scripts/run-as-script.mjs`, and the 7 in `test/local.test.js` and the 1 in `test/budgetpanel.test.js` by assertion.
+Its first pass flagged two tests in `test/local.test.js` that failed at the base by TypeError; each now asserts first that the new function exists, and passes the rule.
 
 ### 5.2 B2, with stub agents
 
@@ -1316,7 +1532,9 @@ The full suite at `5f19588` is 1325 tests, 1324 pass, 0 fail, 1 skipped on Linux
 - Tasks in any language but JavaScript, and tasks for architecture, documentation, frontend, backend, database, tool use, long context or vision.
 - Any task judged by a model; each would make the score that model's opinion.
 - A second attempt, a review or a plan step inside the benchmark, and scores per effort level: rows are keyed by model, as all evidence is.
-- Scheduled or automatic runs, which the owner ruled out.
+- Any run that KzH starts or schedules by itself, of either kind.
+  The owner's ruling in 1.1 is about the capability benchmark: cloud agents cost real usage, so B2 is never automatic and nothing starts it by itself.
+  Speed runs are free, and on 26 Sep the owner asked for one that can run by itself for checking: `Speed-Run.bat` (2.12), which a Task Scheduler entry the owner makes may start, with `--no-pause` and exit codes for that.
 - `benchmark_prior` rows imported from published benchmarks.
 - A task folder as the agent's own working directory, and runs from any workspace: the pinned engine takes no working directory in a subagent start (3.7).
   When an engine that takes one is pinned, the task folder becomes the agent's workspace, and the one-task-at-a-time rule and the listing of the scratch root can be reconsidered.
@@ -1341,7 +1559,11 @@ Tests: `test/local.test.js` and `test/budgetpanel.test.js`, extended, and `test/
 
 Docs queued: this document's status (B1 built, what was verified), README.md's Local models section (the speed benchmark and what it measures, at what depth), and docs/handoff.md's open work.
 
-Built on 25 Sep in `914d8d4`, with the fixes of its review in `c0ef03c`, which also touched `plugins/jev-router/router.js` for the attempt clock (1.3, 2.6); tested against a fake llama-server only, and not yet run against the real one.
+Built on 25 Sep in `914d8d4`, with the fixes of its review in `c0ef03c`, which also touched `plugins/jev-router/router.js` for the attempt clock (1.3, 2.6), and tested against a fake llama-server.
+On 26 Sep it ran against the real llama-server b10964 on a CPU with two tiny test models (the status at the top), which found that llama-server's output parser can refuse a `/completion` that is not streamed.
+Every `/completion` of a speed run is now streamed (2.2, 2.3), `scripts/speed-run.mjs` with `Speed-Run.bat` runs the speed run from a shell (2.12), with `test/speed-run.test.js`, new (5.1), and every speed run is logged in `speed-runs.log` and a detail log of its own (2.13).
+A review of that work found the generation speed about 0.8 percent fast, since it counted a token the prompt pass makes, and it is now worked out over the other n - 1 (2.3).
+That change is the commit after `f88947a` on `feat/benchmark`, pushed on 26 Sep; the GPU and the real models are still not observed.
 
 ### Step B2: capability
 

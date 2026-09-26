@@ -26,11 +26,11 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import { parseEnv } from '../plugins/jev-router/accounts.js'
 import { redactSecrets } from '../plugins/jev-router/export.js'
 import { JEV_USD_PER_INPUT_TOKEN } from '../plugins/jev-router/usage.js'
+import { runAsScript } from './run-as-script.mjs'
 
 // The SDK is the plugin's dependency, not this folder's, so a bare import from scripts/
 // would not resolve. Anchored at the plugin's package.json it resolves exactly as it does
@@ -276,7 +276,7 @@ export async function triage(findings, { ask } = {}) {
   }
 }
 
-const invokedDirectly = process.argv[1] && resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase()
+const invokedDirectly = runAsScript(import.meta.url)
 if (invokedDirectly) {
   let text = ''
   for await (const chunk of process.stdin) text += chunk

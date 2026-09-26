@@ -7,7 +7,9 @@
 //     `tokens(model)` token ids, and /completion keeps its one slot's prompt cache, so a prompt of
 //     token ids that starts with the cached one reads only its last token again, and answers with a
 //     `timings` object worked out from `speed(model)` ({ generate, read } in tokens a second), which
-//     `timings(entry, worked)` may replace for one request;
+//     `timings(entry, worked)` may replace for one request; a request with `stream` is answered as
+//     llama-server streams, events ending in one with `stop` and the timings, and one without is
+//     answered HTTP 500 when `parserRefuses(entry)`, as llama-server's chat output parser does;
 //   - every request is kept, with its path, headers, body, the model loaded and the engine's key;
 //     `hold(match)` holds the next request it picks until the function it returns is called, and a
 //     held request that is aborted rejects with its signal's reason, as fetch does; `healthy(run)`
@@ -16,7 +18,14 @@ import { EventEmitter } from 'node:events'
 
 export const FAKE_PID = 2147483647
 
-export function fakeLlamaServer({ report = () => [], tokens = () => 20_000, speed = () => ({ generate: 20, read: 400 }), timings = null, onRequest = null, healthy = () => true } = {}) {
+/** What a /completion answered: its JSON body, or the last event of a streamed answer. */
+export async function answerOf(response) {
+  const text = await response.text()
+  if (!/event-stream/.test(response.headers.get('content-type') ?? '')) return JSON.parse(text)
+  return JSON.parse(text.split('\n').filter((l) => l.startsWith('data: ')).at(-1).slice(6))
+}
+
+export function fakeLlamaServer({ report = () => [], tokens = () => 20_000, speed = () => ({ generate: 20, read: 400 }), timings = null, onRequest = null, healthy = () => true, parserRefuses = () => false } = {}) {
   const started = []
   const requests = []
   const holds = []
@@ -67,9 +76,18 @@ export function fakeLlamaServer({ report = () => [], tokens = () => 20_000, spee
       const promptN = cached ? Math.max(1, prompt.length - run.cache.length + 1) : prompt.length
       run.cache = body.cache_prompt ? prompt : []
       const { generate, read } = speed(run.model)
-      const worked = { prompt_n: promptN, prompt_ms: (promptN / read) * 1000, predicted_n: body.n_predict, predicted_ms: (body.n_predict / generate) * 1000 }
+      // As llama-server times it: the first token comes out of the prompt pass, and predicted_ms is the other n - 1.
+      const worked = { prompt_n: promptN, prompt_ms: (promptN / read) * 1000, predicted_n: body.n_predict, predicted_ms: (Math.max(0, body.n_predict - 1) / generate) * 1000 }
       const t = timings ? timings(entry, worked) : worked
-      return json({ content: 'x'.repeat(Math.max(0, body.n_predict)), ...(t === undefined ? {} : { timings: t }) })
+      const content = 'x'.repeat(Math.max(0, body.n_predict))
+      // What llama-server b10964 does with text cut inside its last character, which its chat output
+      // parser refuses: an answer that is not streamed comes back HTTP 500, and a streamed one holds
+      // the cut character back and ends with its timings all the same.
+      if (!body.stream && parserRefuses(entry)) return json({ error: { code: 500, message: 'The model produced output that does not match the expected Content-only format', type: 'server_error' } }, 500)
+      if (!body.stream) return json({ content, ...(t === undefined ? {} : { timings: t }) })
+      // Streamed: an event per piece of text, then the last one, with stop and the timings.
+      const events = [...(content ? [{ index: 0, content, stop: false }] : []), { index: 0, content: '', stop: true, tokens_predicted: body.n_predict, ...(t === undefined ? {} : { timings: t }) }]
+      return new Response(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } })
     }
     return json({ error: 'not found' }, 404)
   }

@@ -502,7 +502,7 @@ A decimal comma is read as a point only with one or two digits after it, so `4,0
 A model the budget refuses shows an **over budget** pill with the refusal word for word and reads `(over budget)` in the model pickers; it cannot be picked as the chat model, and with no model left that fits, the chat model select says `None fits the budget`.
 A context below 12k (12,288 tokens) gets a warning, because the system prompt and the tool list take about 8.6k tokens, and below roughly 12k a local model stops mid-chat with a context-exceeded error that looks like a fault in the model.
 
-**Speed benchmark** (Settings → Jev setup → Local models; built and tested against a fake llama-server only, not yet run against the real one): **Benchmark** on a model's row measures that model, and **Benchmark all** in the card's head measures every installed chat model, one after another.
+**Speed benchmark** (Settings → Jev setup → Local models; run against the real llama-server on a CPU with tiny test models, not yet on a GPU or with Qwen3 8B and Gemma 4 E4B): **Benchmark** on a model's row measures that model, and **Benchmark all** in the card's head measures every installed chat model, one after another.
 Each is loaded afresh at the context its runs get, llama-server reads an 8,192-token prompt, about the size of an agent's first call, and 128 generated tokens after it are timed three times with llama-server's own timings.
 The median generation speed and the prompt reading speed are kept in `local.json` under `speed`, per model and context, beside the memory reading of the same load, and the model loaded before is loaded again after.
 A speed run is free and asks for no confirmation.
@@ -514,6 +514,15 @@ A speed reading stands only for a load of the same weights (the manifest's SHA-2
 When one of them changes, the model's speed line on the card says which, asks for a new run, and gives the estimate for the next load until then.
 Each installed model's row on the card has a speed line: the measured speeds with the day, the GPU split and the threads, or why the reading does not stand, or the estimate.
 It does not measure generation deeper than 8,192 tokens, prompt reading with a warm cache, speed while another program uses the GPU, cloud agents, Laya, or models that are not installed.
+Every speed run, from the card or from `Speed-Run.bat` (below), is logged in `%USERPROFILE%\.kzh\jev-router\speed-runs`: `speed-runs.log` keeps one short entry per run (when, who started it, the PC and the engine, and each model's speed, context, GPU layers, VRAM and RAM, or why it was not measured), and a `speed-run-<time>.log` beside it has every step of that run with its time.
+The card says where the log is once a run has ended.
+The same run works without opening KzH: close KzH and double-click `Speed-Run.bat` in the harness folder, or run `Speed-Run.bat --models qwen3-8b` for only the models named.
+It prints each model's speed and memory, saves the readings in `local.json` where KzH reads them, logs the run as above, and returns an exit code a scheduled task can check: 0 all measured, 1 a model not measured, 2 could not run, 3 KzH, a leftover llama-server or Laya, or another speed run is running, 130 cancelled.
+It refuses to start while KzH is running; another program on KzH's port 3080 does not stop it, as long as it can tell that program is not KzH.
+Ctrl+C cancels at any point, and closing its window stops the engine too.
+A `Speed-Run.bat` run that could not start is in `speed-runs.log` too, with why.
+A reading stands only for a load at its own context, so it reads the plugin config's `local.contextSize` from your profile, and asks for `--context <tokens>` when it cannot.
+`Speed-Run.bat` itself has not been run on Windows yet.
 The design and every line it writes are in [`docs/benchmark.md`](docs/benchmark.md) section 2.
 
 **Offline:** KzH checks `api.typesafe.ai` (2.5 s timeout, cached 30 s). When it does not answer:

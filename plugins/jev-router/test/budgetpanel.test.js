@@ -12,7 +12,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -992,6 +992,28 @@ test('the Benchmark button says what it does, and how long it takes by the model
   assert.equal(helpers.speedButtonTitle({ speed: { reading, stands: true } }), `${what} About 3 minutes by its last measurement; a model you had loaded is loaded again after.`)
   assert.equal(helpers.speedButtonTitle({ speed: { reading: { ...reading, tokensPerSec: 40, promptTokensPerSec: 800, loadMs: 3000 }, stands: false } }), `${what} About 1 minute by its last measurement; a model you had loaded is loaded again after.`)
   assert.equal(helpers.speedButtonTitle({ speed: { reading: { ...reading, promptTokensPerSec: null }, stands: true } }), `${what} About 2 minutes by its last measurement, and longer by the time it takes to read the prompt, which was not measured; a model you had loaded is loaded again after.`)
+})
+
+test('once a speed run has ended the card says where it is logged, and at once when its log could not be written', async (t) => {
+  assert.equal(typeof helpers.speedRunText, 'function', 'the budget helpers word the speed run')
+  const log = { history: 'C:\\Users\\kz\\.kzh\\jev-router\\speed-runs\\speed-runs.log', detail: 'C:\\Users\\kz\\.kzh\\jev-router\\speed-runs\\speed-run-2026-09-26T04-32-54-561Z.log' }
+  const ended = { state: 'idle', current: null, queue: [], done: [{ id: 'big', ok: true, text: 'Big: 20.0 tokens/s generating.' }], restore: 'The engine is stopped again, as it was before.', cancelled: false, log, logError: null }
+  assert.deepEqual(helpers.speedRunText(ended, []).log, { text: 'Logged in C:\\Users\\kz\\.kzh\\jev-router\\speed-runs\\speed-runs.log, with this run in detail in speed-run-2026-09-26T04-32-54-561Z.log beside it.', err: false })
+  const running = { ...ended, state: 'running', current: { id: 'big', phase: 'loading', run: null }, done: [], restore: null }
+  assert.equal(helpers.speedRunText(running, []).log, null, 'nothing is said of the log while the run goes')
+  assert.deepEqual(helpers.speedRunText({ ...running, logError: 'speed-runs: ENOSPC' }, []).log, { text: 'The speed run log could not be written (speed-runs: ENOSPC); the readings are kept all the same.', err: true })
+  assert.equal(helpers.speedRunText({ ...ended, log: null }, []).log, null, 'no log kept, nothing said')
+  assert.equal(helpers.speedRunText(null, []).log, null)
+
+  // From a real run on the card, as the person reads it.
+  const server = fakeLlamaServer({ report: () => SPLIT })
+  const logRoot = mkdtempSync(join(tmpdir(), 'kz-speedlog-'))
+  t.after(() => rmSync(logRoot, { recursive: true, force: true }))
+  const { local } = await installed({ spawn: server.spawn, fetch: server.fetch, speedLogDir: join(logRoot, 'speed-runs') })
+  await local.benchmark({ ids: ['big'] })
+  const run = await speedEnded(local)
+  assert.match(helpers.speedRunText(run, []).log.text, /^Logged in .*speed-runs[\\/]speed-runs\.log, with this run in detail in speed-run-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z\.log beside it\.$/)
+  await local.dispose()
 })
 
 test('a model\'s memory line says the day a measured figure was taken', async () => {

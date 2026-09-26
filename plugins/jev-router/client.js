@@ -4534,7 +4534,7 @@ window.__ModuleLoader__.load({
      * or why none was recorded; and, once it has ended, what became of the model that was loaded.
      */
     const speedRunText = (run, modules) => {
-      if (!run) return { running: false, status: [], done: [], restore: null, cancel: null }
+      if (!run) return { running: false, status: [], done: [], restore: null, cancel: null, log: null }
       const name = (id) => (modules ?? []).find((m) => m.id === id)?.name ?? id
       const status = []
       const c = run.current
@@ -4558,7 +4558,13 @@ window.__ModuleLoader__.load({
       const restoring = run.state === 'running' && c?.phase === 'restoring'
       const cancelled = run.state === 'running' && !!run.cancelled
       const cancel = { disabled: restoring || cancelled, label: cancelled ? 'Cancelling…' : 'Cancel', title: restoring ? 'The speed benchmark has measured every model it will and is putting the engine back as it was before it; that cannot be cancelled.' : undefined }
-      return { running: run.state === 'running', status, done: (run.done ?? []).map((d) => ({ text: d.text, ok: !!d.ok })), restore: run.restore ?? null, cancel }
+      // Where the run is logged (2.13), once it has ended, and at once a log that could not be written.
+      const log = run.logError
+        ? { text: `The speed run log could not be written (${run.logError}); the readings are kept all the same.`, err: true }
+        : run.log && run.state !== 'running' && run.restore
+          ? { text: `Logged in ${run.log.history}, with this run in detail in ${run.log.detail.split(/[\\/]/).pop()} beside it.`, err: false }
+          : null
+      return { running: run.state === 'running', status, done: (run.done ?? []).map((d) => ({ text: d.text, ok: !!d.ok })), restore: run.restore ?? null, cancel, log }
     }
 
     /**
@@ -4875,10 +4881,11 @@ window.__ModuleLoader__.load({
             h('button', { className: 'btn primary', onClick: () => openLlm('install') }, 'Install…'),
             h('button', { className: 'btn danger', disabled: !rows.length, onClick: () => openLlm('remove') }, 'Remove…'))),
         h('p', { className: 'why', style: { margin: '4px 0 8px' } }, 'Free, private models on this PC (llama.cpp, 127.0.0.1 only). Used when you are offline, as a fallback chat model, and as cheap agents Jev may pick. Type /install-llm in any chat to add one.'),
-        speed.status.length || speed.done.length || speed.restore ? h('div', { role: 'status', 'aria-label': 'Speed benchmark', style: { margin: '0 0 8px' } },
+        speed.status.length || speed.done.length || speed.restore || speed.log ? h('div', { role: 'status', 'aria-label': 'Speed benchmark', style: { margin: '0 0 8px' } },
           ...speed.status.map((t, i) => h('div', { key: `s${i}`, className: i === 0 ? null : 'why' }, t)),
           ...speed.done.map((d, i) => h('div', { key: `d${i}`, className: cx('why', !d.ok && 'err') }, d.text)),
           speed.restore ? h('div', { className: 'why' }, speed.restore) : null,
+          speed.log ? h('div', { className: cx('why', speed.log.err && 'err') }, speed.log.text) : null,
           speed.running ? h('button', { className: 'btn', style: { marginTop: 4 }, disabled: speed.cancel.disabled, title: speed.cancel.title, onClick: () => run(() => post('/jev-router/local/benchmark/cancel', {})) }, speed.cancel.label) : null) : null,
         h('div', null, h('span', { className: cx('dot', e.running ? 'on' : 'off') }),
           !e.installed ? 'Engine not installed.' : e.running ? `Running ${e.model}${e.ready ? '' : ' (loading…)'} · 127.0.0.1:${e.port} · context ${e.ctx}${e.gpuLayers ? ` · ${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : ''}${e.vision ? ' · vision' : ''}` : `Stopped (engine: ${e.variant}). Starts by itself when a local model is needed.`),

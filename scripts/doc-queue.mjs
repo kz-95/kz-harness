@@ -15,8 +15,8 @@
 import { execFileSync } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, normalize, relative, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
+import { runAsScript } from './run-as-script.mjs'
 
 export const QUEUE = '.doc-queue.jsonl'
 const LOCK = '.doc-queue.lock'
@@ -220,6 +220,6 @@ export function main(argv = process.argv.slice(2), { cwd = process.cwd(), print 
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (runAsScript(import.meta.url)) {
   try { process.exitCode = main() } catch (err) { process.stderr.write(`doc-queue: ${err.message}\n`); process.exitCode = 1 }
 }

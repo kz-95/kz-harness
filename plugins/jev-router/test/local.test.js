@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { badgesOf, buildCatalog, contextSteps, defaultThreads, estimateMemory, parsePsRss, parseTasklistMemory, workingSetOf, kvGbPerToken, readMemoryUsage, createConnectivity, createLocalModels, defaultsFor, detectSpecs, downloadVerified, installLlmCommand, llamaArgs, localAdapter, looksLikeQuestion, offlinePick, parseLlmArgs, pickEngineVariant, rateModule, readManifest, removeLlmCommand, specsLine, suggest, toWire, translate } from '../local.js'
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url'
 // then still loads where local.js lacks it, and each of those tests fails by its own assertion.
 import * as localJs from '../local.js'
 import { waitFor } from './wait-for.js'
-import { fakeLlamaServer } from './fixtures/fake-llama-server.mjs'
+import { answerOf, fakeLlamaServer } from './fixtures/fake-llama-server.mjs'
 import { formatReport, runRouted } from '../router.js'
 import { kindOf, keyProviderOf } from '../accounts.js'
 import { jevAdapter } from '../adapter.js'
@@ -718,6 +718,21 @@ test('llama-server always gets a thread count: the core budget when set, else a 
   await local.start('big')
   assert.equal(argOf(eng.started[2].args, '-t'), '12', 'the PC above has 12 logical processors')
   assert.equal((await local.status()).budget.threads, 12, 'and the page shows the count it will really get')
+  await local.dispose()
+})
+
+test('the engine\'s start line counts its threads in words and speaks of GPU room only when the model has layers on a GPU', async () => {
+  const eng = fakeEngine()
+  const logs = []
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, log: (t) => logs.push(t) })
+  await local.setSettings({ maxCores: 1 })
+  await local.start('big')
+  assert.ok(logs.some((l) => /^local: engine starting big on 127\.0\.0\.1:\d+ \(ctx \d+, GPU layers auto, 1 thread, 256 MiB kept free on the GPU\)$/.test(l)), logs.join('\n'))
+  await local.stop()
+  // GPU layers 0: the whole model on the CPU, so there is no GPU room to speak of.
+  await local.setSettings({ maxCores: 3, gpuLayers: 0 })
+  await local.start('big')
+  assert.ok(logs.some((l) => /^local: engine starting big on 127\.0\.0\.1:\d+ \(ctx \d+, GPU layers 0, 3 threads\)$/.test(l)), logs.join('\n'))
   await local.dispose()
 })
 
@@ -1582,9 +1597,13 @@ test('readTimings works both speeds out from llama-server\'s own counts and mill
   assert.equal(typeof localJs.readTimings, 'function', 'local.js exports readTimings')
   const { readTimings } = localJs
   // The rate fields are there, and wrong: the speeds come from the counts and the milliseconds.
-  const body = (t = {}) => ({ content: '...', timings: { prompt_n: 8192, prompt_ms: 20480, predicted_n: 128, predicted_ms: 6400, prompt_per_second: 1, predicted_per_second: 1, ...t } })
+  // predicted_ms times the 127 tokens after the first, which the prompt pass gives (llama-server b10964).
+  const body = (t = {}) => ({ content: '...', timings: { prompt_n: 8192, prompt_ms: 20480, predicted_n: 128, predicted_ms: 6350, prompt_per_second: 1, predicted_per_second: 1, ...t } })
   assert.deepEqual(readTimings(body(), { nPredict: 128 }), { ok: true, tokensPerSec: 20, promptTokensPerSec: 400, promptTokens: 8192 })
-  assert.deepEqual(readTimings(body({ predicted_n: 1, predicted_ms: 40 }), { nPredict: 1 }), { ok: true, tokensPerSec: 25, promptTokensPerSec: 400, promptTokens: 8192 })
+  // The real server's own figures of one timed request: 207.99 ms for 128 tokens is its 610.61 tokens/s.
+  assert.equal(readTimings({ timings: { prompt_n: 1, prompt_ms: 2.52, predicted_n: 128, predicted_ms: 207.99 } }, { nPredict: 128 }).tokensPerSec.toFixed(2), '610.61')
+  // The fill generates one token, from the prompt pass: no generation is timed, and its predicted_ms may be 0.
+  assert.deepEqual(readTimings(body({ predicted_n: 1, predicted_ms: 0 }), { nPredict: 1 }), { ok: true, tokensPerSec: null, promptTokensPerSec: 400, promptTokens: 8192 })
   // No timings, or one of the four fields missing or no positive finite number: never read as zero.
   const untrusted = { ok: false, reason: 'llama-server did not report its timings' }
   assert.deepEqual(readTimings({ content: '...' }, { nPredict: 128 }), untrusted)
@@ -1636,7 +1655,7 @@ test('a speed run sends a warm-up, a fill of exactly the first 8,192 tokens of t
   const tps = [19.5, 21, 20]
   const server = fakeLlamaServer({
     report: () => SPLIT_REPORT,
-    timings: (entry, worked) => (entry.body.n_predict === 128 ? { ...worked, predicted_ms: (128 / tps[measured++]) * 1000 } : worked),
+    timings: (entry, worked) => (entry.body.n_predict === 128 ? { ...worked, predicted_ms: (127 / tps[measured++]) * 1000 } : worked),
   })
   let measured = 0
   const { local } = await speedIn({ server })
@@ -1650,8 +1669,8 @@ test('a speed run sends a warm-up, a fill of exactly the first 8,192 tokens of t
   assert.deepEqual(server.to('/tokenize')[0].body, { content: localJs.SPEED_TEXT })
   const [, fill, ...timed] = server.to('/completion')
   const first = Array.from({ length: 8192 }, (_, n) => 1000 + n)
-  assert.deepEqual(fill.body, { prompt: first, n_predict: 1, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: false })
-  for (const t of timed) assert.deepEqual(t.body, { prompt: first, n_predict: 128, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: false })
+  assert.deepEqual(fill.body, { prompt: first, n_predict: 1, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: true })
+  for (const t of timed) assert.deepEqual(t.body, { prompt: first, n_predict: 128, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: true })
   // The speed text is synthetic, fixed and long: far more than 8,192 tokens in any tokenizer.
   assert.ok(localJs.SPEED_TEXT.length > 60_000 && localJs.SPEED_TEXT.length < 70_000, String(localJs.SPEED_TEXT.length))
   assert.match(localJs.SPEED_TEXT, /^\/\/ Step 1 of the pipeline\.\nfunction step1\(value\) \{/)
@@ -1670,6 +1689,226 @@ test('a speed run sends a warm-up, a fill of exactly the first 8,192 tokens of t
   assert.ok(Math.abs(Date.parse(r.at) - Date.now()) < 60_000)
   assert.deepEqual(run.done, [{ id: 'big', ok: true, text: 'Big: 20.0 tokens/s generating and 400 tokens/s reading, 8,192 tokens into a conversation, at 12k context.' }])
   await local.dispose()
+})
+
+test('every speed run is logged: its summary appended to speed-runs.log, and every phase, request and engine line of it in its own detail log', async () => {
+  assert.equal(localJs.SPEED_HISTORY, 'speed-runs.log', 'local.js names the speed run history')
+  const logs = join(tmp(), 'speed-runs')
+  // Small's timed requests come back short, so it records nothing, with the reason.
+  const server = fakeLlamaServer({ report: () => SPLIT_REPORT, timings: (entry, worked) => (entry.model === 'small' && entry.body.n_predict === 128 ? { ...worked, predicted_n: 100 } : worked) })
+  const { local } = await speedIn({ ids: ['big', 'small'], server, speedLogDir: logs })
+  await local.benchmark({ by: 'Speed-Run.bat' })
+  const run = await speedEnded(local)
+  // Where they are, for the card, and each model's figures for the shell's table.
+  const detail = readdirSync(logs).filter((f) => /^speed-run-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z\.log$/.test(f))
+  assert.equal(detail.length, 1)
+  assert.deepEqual(run.log, { history: join(logs, 'speed-runs.log'), detail: join(logs, detail[0]) })
+  assert.equal(run.logError, null)
+  const results = local.speedResults()
+  assert.deepEqual(results.order, ['big', 'small'])
+  assert.deepEqual(results.done.map((d) => [d.id, d.ok, d.ctx ?? null, d.why ?? null]), [['big', true, 12288, null], ['small', false, null, 'llama-server generated 100 tokens, not 128']])
+  assert.deepEqual(results.done[0].memory, { vramGB: 3.5, ramGB: 1, totalGB: 4.5, gpuFraction: 0.8 })
+  assert.equal(results.done[0].reading.tokensPerSec, 20)
+
+  // The history: one entry, the machine it ran on, each model's figures or why, the restore, the detail log's name.
+  const history = readFileSync(join(logs, 'speed-runs.log'), 'utf8')
+  const lines = history.split('\n')
+  assert.match(lines[0], /^\d{4}-\d\d-\d\d \d\d:\d\d UTC, Speed-Run\.bat: 1 of 2 measured$/)
+  assert.equal(lines[1], '  PC: RTX 3050 Laptop 4 GB, 24 GB RAM, Core i5-11400H 6 cores, 52 GB free; engine: cuda12 build ' + sha('e').slice(0, 12) + '; budget: GPU layers auto; no Laya held')
+  assert.equal(lines[2], '  Big    20.0 tokens/s generating, 400 tokens/s reading, 12k context, 29/37 layers on the GPU, 3.5 GB VRAM + 1.0 GB RAM, loaded in ' + (results.done[0].reading.loadMs / 1000).toFixed(1) + ' s, 4 threads')
+  assert.equal(lines[3], '  Small  not measured: llama-server generated 100 tokens, not 128')
+  assert.equal(lines[4], '  The engine is stopped again, as it was before.')
+  assert.equal(lines[5], `  Details: ${detail[0]}`)
+  assert.deepEqual(lines.slice(6), ['', ''], 'a blank line after each entry')
+  assert.ok(/^[\x20-\x7e\n]*$/.test(history), 'plain ASCII, for any editor on Windows')
+
+  // The detail log: the head, then every step with its time, in order.
+  const text = readFileSync(join(logs, detail[0]), 'utf8')
+  assert.match(text, /^KzH speed run, started \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC from Speed-Run\.bat\nPC: RTX 3050 Laptop 4 GB, 24 GB RAM, Core i5-11400H 6 cores, 52 GB free\nEngine: llama\.cpp cuda12 build, sha256 [0-9a-f]{64}\nBudget: GPU layers auto\nLaya: none held\nModels, in this order: Big \(big\), Small \(small\)\n/)
+  const steps = text.split('\n').filter((l) => /^\d\d:\d\d:\d\d\.\d{3} {2}/.test(l)).map((l) => l.slice(14))
+  const want = [
+    /^speed benchmark of big, small$/,
+    /^Big: loading at the context its runs get$/,
+    /^engine starting big on 127\.0\.0\.1:\d+ \(ctx 12288, GPU layers auto, 4 threads, \d+ MiB kept free on the GPU\)$/,
+    /^Big: warm-up request, not timed$/,
+    /^Big: reading the 8,192-token prompt$/,
+    /^Big: read 8192 tokens of prompt at 400 tokens\/s$/,
+    /^Big: timed request 1 of 3$/, /^Big: timed request 1 of 3: 20\.0 tokens\/s generating$/,
+    /^Big: timed request 2 of 3$/, /^Big: timed request 2 of 3: 20\.0 tokens\/s generating$/,
+    /^Big: timed request 3 of 3$/, /^Big: timed request 3 of 3: 20\.0 tokens\/s generating$/,
+    /^Big: 20\.0 tokens\/s generating and 400 tokens\/s reading, 8,192 tokens into a conversation, at 12k context\.$/,
+    /^Small: loading at the context its runs get$/,
+  ]
+  let at = 0
+  for (const line of steps) if (at < want.length && want[at].test(line)) at++
+  assert.equal(at, want.length, `every step in order; stopped before ${want[at]}:\n${steps.join('\n')}`)
+  assert.ok(steps.includes('Small not measured: llama-server generated 100 tokens, not 128'))
+  // llama-server's own lines, whole, as it printed them: its load report among them.
+  for (const l of SPLIT_REPORT) assert.ok(steps.includes(`llama-server: ${l}`), l)
+  assert.ok(steps.includes('putting the engine back as it was'))
+  assert.equal(steps.at(-1), 'The engine is stopped again, as it was before.')
+  assert.match(text, /\nEnded after \d+\.\d s\. The summary is in speed-runs\.log\.\n$/)
+
+  // A second run adds an entry and a detail log of its own; lines logged after a run go to neither.
+  await local.benchmark({ ids: ['big'] })
+  await speedEnded(local)
+  const after = readFileSync(join(logs, 'speed-runs.log'), 'utf8')
+  assert.ok(after.startsWith(history), 'the history is appended to, never rewritten')
+  assert.match(after.slice(history.length), /^\d{4}-\d\d-\d\d \d\d:\d\d UTC, Settings, Local models: 1 of 1 measured\n/)
+  const second = readdirSync(logs).filter((f) => f.startsWith('speed-run-') && f !== detail[0])
+  assert.equal(second.length, 1)
+  // The second run measured Big alone; Small loaded after it has ended is in neither detail log.
+  const secondText = readFileSync(join(logs, second[0]), 'utf8')
+  await local.start('small')
+  assert.equal(readFileSync(join(logs, second[0]), 'utf8'), secondText, 'a finished run\'s detail log takes nothing more')
+  assert.ok(!secondText.includes('engine starting small'))
+  await local.dispose()
+
+  // Who started it is a short text; anything else is refused before the run starts.
+  const { local: other } = await speedIn({ speedLogDir: join(tmp(), 'speed-runs') })
+  for (const by of ['', '   ', 'x'.repeat(61), 7]) await assert.rejects(other.benchmark({ by }), (err) => err.status === 400 && /^by: /.test(err.message))
+  await other.dispose()
+})
+
+test('Benchmark all names a model whose file does not match the manifest as not measured, first, and counts the models it measures on from it', async () => {
+  const server = fakeLlamaServer({ report: () => SPLIT_REPORT })
+  const { local, modelsDir } = await speedIn({ ids: ['big'], server })
+  writeFileSync(join(modelsDir, 'small.gguf'), 'not small')
+  await local.status()
+  await local.settled()
+  const held = server.hold((e) => e.body?.n_predict === 128)
+  assert.deepEqual(await local.benchmark(), ['small', 'big'])
+  await held.arrived
+  const run = (await local.status()).speedRun
+  assert.deepEqual(run.done, [{ id: 'small', ok: false, text: "Small not measured: its file does not match the manifest's SHA256; install it again (type /install-llm small)" }])
+  assert.equal(run.current.id, 'big')
+  // A local agent waiting on the run is told which model of how many it is on: Big, the second.
+  const said = []
+  const waiting = local.localAgentAttempt(async () => 'ran', { onWait: (t) => said.push(t) })
+  await new Promise((r) => setTimeout(r, 20))
+  assert.deepEqual(said, ['Waiting for the speed benchmark to finish (Big, 2 of 2).'])
+  held.release()
+  const ended = await speedEnded(local)
+  assert.equal(await waiting, 'ran')
+  assert.deepEqual(ended.done.map((d) => [d.id, d.ok]), [['small', false], ['big', true]])
+  // Named, it is refused with the same why.
+  await assert.rejects(local.benchmark({ ids: ['small'] }), (err) => err.status === 400 && err.message === "Small cannot be measured: its file does not match the manifest's SHA256; install it again (type /install-llm small).")
+  await local.dispose()
+})
+
+test('a speed run cut off before its end (KzH killed for a restart or an update) gets its history entry when the local models next start', async () => {
+  const logs = join(tmp(), 'speed-runs')
+  mkdirSync(logs, { recursive: true })
+  const cut = 'speed-run-2026-09-26T05-18-59-100Z.log'
+  writeFileSync(join(logs, cut), [
+    'KzH speed run, started 2026-09-26 05:18:59 UTC from Settings, Local models', 'PC: RTX 3080 10 GB', '',
+    '05:18:59.515  speed benchmark of big, small',
+    '05:18:59.516  Big: loading at the context its runs get',
+    '05:19:30.001  Big: 71.3 tokens/s generating and 2210 tokens/s reading, 8,192 tokens into a conversation, at 16k context.',
+    '05:19:30.002  Small: loading at the context its runs get',
+    '05:19:31.100  llama-server: load_tensors: offloaded 37/37 layers to GPU',
+    '',
+  ].join('\n'))
+  // One that ended, and one the history already has (Speed-Run.bat's own "ended by" entry): both left alone.
+  writeFileSync(join(logs, 'speed-run-2026-09-25T10-00-00-000Z.log'), 'KzH speed run, started 2026-09-25 10:00:00 UTC from Speed-Run.bat\n\nEnded after 12.0 s. The summary is in speed-runs.log.\n')
+  writeFileSync(join(logs, 'speed-run-2026-09-25T11-00-00-000Z.log'), 'KzH speed run, started 2026-09-25 11:00:00 UTC from Speed-Run.bat\n')
+  const had = '2026-09-25 11:00 UTC, Speed-Run.bat: ended by SIGHUP while it measured (its console was closed, or it was stopped). Readings already taken are kept.\n  Details: speed-run-2026-09-25T11-00-00-000Z.log\n\n'
+  writeFileSync(join(logs, 'speed-runs.log'), had)
+  const said = []
+  const { local } = localIn(tmp(), { speedLogDir: logs, log: (t) => said.push(t) })
+  assert.equal(typeof local.speedLogsRecovered, 'function', 'the local models look for a speed run cut off before its end')
+  await local.speedLogsRecovered()
+  assert.equal(readFileSync(join(logs, 'speed-runs.log'), 'utf8'), had + [
+    '2026-09-26 05:18 UTC, Settings, Local models: cut off before it ended (KzH was closed, restarted or updated during it, or it stopped); found when the local models next started',
+    '  Big: 71.3 tokens/s generating and 2210 tokens/s reading, 8,192 tokens into a conversation, at 16k context.',
+    '  Readings of the models it had finished are kept.',
+    `  Details: ${cut} (it ends where the run was cut off)`, '', '',
+  ].join('\n'))
+  assert.ok(said.includes(`local: a speed run cut off before its end is now in speed-runs.log (${cut})`))
+  await local.dispose()
+  // Once written, never again.
+  const again = localIn(tmp(), { speedLogDir: logs })
+  await again.local.speedLogsRecovered()
+  assert.equal(readFileSync(join(logs, 'speed-runs.log'), 'utf8').split(cut).length - 1, 1)
+  await again.local.dispose()
+
+  // A Speed-Run going in another process holds the lock: its detail log is still being written.
+  const busy = join(tmp(), 'speed-runs')
+  mkdirSync(busy, { recursive: true })
+  writeFileSync(join(busy, 'speed-run-2026-09-26T06-00-00-000Z.log'), 'KzH speed run, started 2026-09-26 06:00:00 UTC from Speed-Run.bat\n')
+  writeFileSync(join(busy, localJs.SPEED_LOCK), String(process.ppid))
+  const held = localIn(tmp(), { speedLogDir: busy })
+  await held.local.speedLogsRecovered()
+  assert.ok(!existsSync(join(busy, 'speed-runs.log')))
+  await held.local.dispose()
+})
+
+test('a model\'s row in the speed run history says a figure its reading lacks is missing, never a zero', () => {
+  assert.equal(typeof localJs.speedFigures, 'function', 'local.js words a model\'s row in the speed run history')
+  const { speedFigures } = localJs
+  const line = { ctx: 16384, memory: { vramGB: 6, ramGB: 0.5 }, reading: { tokensPerSec: 64, promptTokensPerSec: 2048, layersOnGpu: { gpu: 37, total: 37 }, loadMs: 4200, threads: 1 } }
+  assert.equal(speedFigures(line), '64.0 tokens/s generating, 2048 tokens/s reading, 16k context, 37/37 layers on the GPU, 6.0 GB VRAM + 0.5 GB RAM, loaded in 4.2 s, 1 thread')
+  const bare = { ctx: 12500, memory: null, reading: { tokensPerSec: 3.25, promptTokensPerSec: null, layersOnGpu: null, loadMs: null, threads: undefined } }
+  assert.equal(speedFigures(bare), '3.3 tokens/s generating, reading speed not measured (prompt cache), 12500-token context, layers on the GPU not reported, memory not reported, load time not reported, threads not reported')
+})
+
+test('a speed run log that cannot be written never stops the run: the readings are kept, and the status says what failed', async () => {
+  const root = tmp()
+  // A file where the logs' folder should be: neither log can be made.
+  writeFileSync(join(root, 'speed-runs'), 'in the way')
+  const said = []
+  const { local } = await speedIn({ speedLogDir: join(root, 'speed-runs'), log: (t) => said.push(t) })
+  await local.benchmark()
+  const run = await speedEnded(local)
+  assert.equal(run.done[0].ok, true, run.done[0].text)
+  assert.ok((await local.readSettings()).speed['big@12288'], 'the reading is kept')
+  assert.match(run.logError, /^.*speed-runs: (EEXIST|ENOTDIR)$/)
+  assert.ok(said.some((l) => /^local: the speed run log could not be written \(/.test(l)), said.join('\n'))
+  await local.dispose()
+  // With no folder given, nothing is logged and nothing is said of it.
+  const { local: none } = await speedIn()
+  await none.benchmark()
+  const bare = await speedEnded(none)
+  assert.deepEqual([bare.log, bare.logError], [null, null])
+  await none.dispose()
+})
+
+test('every /completion of a speed run is streamed, so text llama-server\'s output parser refuses is measured all the same, and an error says what llama-server said', async () => {
+  // llama-server b10964 parses the whole of an answer that is not streamed at the end and answers
+  // HTTP 500 when its parser refuses the text; a streamed answer ends with its timings all the same.
+  const refusing = fakeLlamaServer({ report: () => SPLIT_REPORT, parserRefuses: () => true })
+  const { local } = await speedIn({ server: refusing })
+  await local.benchmark()
+  const run = await speedEnded(local)
+  assert.equal(run.done[0].ok, true, run.done[0].text)
+  assert.ok(refusing.to('/completion').every((r) => r.body.stream === true), 'the warm-up, the fill and the timed requests are streamed')
+  await local.dispose()
+
+  // What each failure says, in llama-server's own words rather than its JSON.
+  const failing = async (answer) => {
+    const base = fakeLlamaServer({ report: () => SPLIT_REPORT })
+    const fetch = async (url, init = {}) => {
+      const body = init.body ? JSON.parse(init.body) : null
+      if (String(url).endsWith('/completion') && body?.n_predict === 128) return answer()
+      return base.fetch(url, init)
+    }
+    const { local: l } = await speedIn({ server: { ...base, fetch } })
+    await l.benchmark()
+    const [line] = (await speedEnded(l)).done
+    await l.dispose()
+    return line
+  }
+  const sse = (...events) => () => new Response(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } })
+  const json = (status, body) => () => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+  assert.equal((await failing(json(503, { error: { code: 503, message: 'Loading model', type: 'unavailable_error' } }))).text, 'Big not measured: llama-server answered HTTP 503: Loading model')
+  assert.equal((await failing(sse({ content: 'x', stop: false }, { error: { code: 500, message: 'The model produced output that does not match the expected Content-only format.' } }))).text, 'Big not measured: llama-server stopped with an error: The model produced output that does not match the expected Content-only format')
+  assert.equal((await failing(sse({ content: 'x', stop: false }))).text, 'Big not measured: llama-server ended its answer before it finished')
+  // An error given as text alone, or with no message, is said as it is, never as "[object Object]" or in quotes.
+  assert.equal((await failing(sse({ error: 'slot unavailable' }))).text, 'Big not measured: llama-server stopped with an error: slot unavailable')
+  assert.equal((await failing(sse({ error: { code: 500, message: { detail: 'x' } } }))).text, 'Big not measured: llama-server stopped with an error: {"code":500,"message":{"detail":"x"}}')
+  assert.equal((await failing(json(503, { error: 'busy' }))).text, 'Big not measured: llama-server answered HTTP 503: busy')
+  assert.equal((await failing(json(500, { error: { code: 500 } }))).text, 'Big not measured: llama-server answered HTTP 500: {"error":{"code":500}}')
+  assert.equal((await failing(() => new Response('data: {nope\n\n', { headers: { 'content-type': 'text/event-stream' } }))).text, 'Big not measured: llama-server answered with something that is not JSON')
 })
 
 test('a reading takes its key and its conditions from the engine that ran, never from a plan made after it', async () => {
@@ -1718,7 +1957,7 @@ test('three generation speeds more than 15 percent apart record nothing; a reque
   // 20, 20 and 24 tokens a second: 4 apart, over 15 percent of the median 20.
   const tps = [20, 20, 24]
   let n = 0
-  const spread = fakeLlamaServer({ timings: (entry, worked) => (entry.body.n_predict === 128 ? { ...worked, predicted_ms: (128 / tps[n++]) * 1000 } : worked) })
+  const spread = fakeLlamaServer({ timings: (entry, worked) => (entry.body.n_predict === 128 ? { ...worked, predicted_ms: (127 / tps[n++]) * 1000 } : worked) })
   const { local } = await speedIn({ server: spread })
   assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
   await local.benchmark()
@@ -2271,7 +2510,7 @@ test('a timed request that has to read the whole prompt again, because a request
     // Each /completion answers when llama-server would, scaled: once it has read the prompt and generated.
     const fetch = async (url, init = {}) => {
       const r = await base.fetch(url, init)
-      const t = String(url).endsWith('/completion') && r.ok ? (await r.clone().json()).timings : null
+      const t = String(url).endsWith('/completion') && r.ok ? (await answerOf(r.clone())).timings : null
       if (t) {
         await new Promise((resolve, reject) => {
           const timer = setTimeout(resolve, (t.prompt_ms + t.predicted_ms) * scale)

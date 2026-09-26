@@ -953,6 +953,9 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     engineDir: join(harnessDir, 'engine', 'llama'),
     modelsDir: join(harnessDir, 'models'),
     settingsFile: join(dataDir, 'local.json'),
+    // Every speed run's summary and its detail log (docs/benchmark.md 2.13), beside local.json,
+    // where Speed-Run.bat writes its runs too.
+    speedLogDir: join(dataDir, 'speed-runs'),
     port: config.local.port,
     contextSize: config.local.contextSize,
     specs,
