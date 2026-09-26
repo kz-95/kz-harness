@@ -3,7 +3,7 @@
 // its confirmation, and the runner with a fake task runner over the real lanes.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { availableParallelism, tmpdir, userInfo } from 'node:os'
@@ -127,7 +127,8 @@ test('the digest is the one task-set.json records, over forward-slash paths in c
   cpSync(TASKS_DIR, copy, { recursive: true })
   const one = join(copy, 'debugging-1', 'workspace', 'src', 'cart.js')
   const text = readFileSync(one, 'utf8')
-  writeFileSync(one, text.replace(/\n/g, '\r\n'))
+  // \r?\n, not \n: on a CRLF checkout the file already has them, and \n -> \r\n makes \r\r\n.
+  writeFileSync(one, text.replace(/\r?\n/g, '\r\n'))
   assert.equal(taskSetDigest(copy), digest, 'CRLF reads as LF')
   writeFileSync(one, text.replace('100 - percentOff', '100 - percentOf'))
   assert.notEqual(taskSetDigest(copy), digest, 'a changed byte')
@@ -223,14 +224,32 @@ test('checks that run past their time fail with that reason, and the grade envir
   assert.equal(r.passed, false)
   assert.equal(r.reason, 'the checks did not finish in 1.5 seconds')
   // The grade runs the agent's code with PATH, SystemRoot, TEMP, TMP and BENCH_WORKSPACE only (node:test
-  // adds its own NODE_TEST_CONTEXT to the processes of its files).
+  // adds its own NODE_TEST_ names to the processes of its files: NODE_TEST_CONTEXT, and
+  // NODE_TEST_WORKER_ID on newer Node, so they are matched by prefix rather than listed).
+  //
+  // Windows does not take that list as final: libuv adds USERNAME, USERPROFILE and six more to any
+  // child that leaves them unset, so this promise was false there until `gradeEnv` began passing
+  // each of them as an empty string. A variable set to an empty string is the platform's way of
+  // saying "not this one", which is why the filter below reads values rather than keys - on
+  // Windows the keys are present and empty, and on Linux they are absent, and the point is that
+  // neither reaches the agent's code with anything in it.
   process.env.KZH_TEST_API_KEY = 'sk-not-for-the-agent'
   process.env.DSH_TEST_SECRET_THING = 'nor-this'
   try {
-    const env = ownTask({ grade: { 'grade/own.test.js': "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\ntest('env', () => { assert.deepEqual(Object.keys(process.env).filter((k) => k !== 'NODE_TEST_CONTEXT' && !['PATH', 'SystemRoot', 'TEMP', 'TMP', 'BENCH_WORKSPACE'].includes(k)), []) })\n" } })
+    const env = ownTask({ grade: { 'grade/own.test.js': "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\ntest('env', () => { assert.deepEqual(Object.entries(process.env).filter(([k, v]) => v !== '' && !k.startsWith('NODE_TEST_') && !['PATH', 'SystemRoot', 'TEMP', 'TMP', 'BENCH_WORKSPACE'].includes(k)).map(([k]) => k), []) })\n" } })
     const e = await graded(env)
     assert.equal(e.passed, true, e.reason)
-    assert.deepEqual(Object.keys(gradeEnv('/w', { PATH: '/bin', HOME: '/h', OPENAI_API_KEY: 'x', TEMP: '/t' })).sort(), ['BENCH_WORKSPACE', 'PATH', 'TEMP'])
+    const only = (o) => Object.entries(o).filter(([, v]) => v !== '').map(([k]) => k).sort()
+    assert.deepEqual(only(gradeEnv('/w', { PATH: '/bin', HOME: '/h', OPENAI_API_KEY: 'x', TEMP: '/t' })), ['BENCH_WORKSPACE', 'PATH', 'TEMP'])
+    // Named one by one, and asserted on every platform rather than only where they exist: this is
+    // the list Windows puts back, and it is worth reading in a review on a machine that cannot run it.
+    for (const name of ['USERNAME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'USERDOMAIN', 'SYSTEMDRIVE', 'WINDIR']) {
+      assert.equal(gradeEnv('/w', { PATH: '/bin', [name]: 'someone' })[name], '', `${name} is suppressed, not passed through`)
+    }
+    // The real thing, on the platform that adds them: a child given this environment sees no
+    // account name. On Linux nothing is added and this passes for the ordinary reason.
+    const child = spawnSync(process.execPath, ['-e', 'const e = process.env; console.log(Object.entries(e).filter(([, v]) => v !== \'\').map(([k]) => k).sort().join(\' \'))'], { env: gradeEnv('/w'), encoding: 'utf8' })
+    assert.deepEqual(child.stdout.trim().split(' ').sort(), ['BENCH_WORKSPACE', 'PATH', 'SystemRoot', 'TEMP', 'TMP'], child.stdout)
     // The run's checks get the engine's scrubbed environment: no name holding KEY, PASSWORD, SECRET or TOKEN, and no DSH_ name.
     const scrubbed = agentEnv()
     assert.equal(scrubbed.KZH_TEST_API_KEY, undefined)

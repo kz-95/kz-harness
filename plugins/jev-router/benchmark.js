@@ -218,12 +218,27 @@ export async function writeFiles(files, dest) {
 // ---------- environments (3.6, 3.8) ----------
 
 /**
+ * Variables Windows puts back. libuv adds these to any child process that does not set them, so a
+ * `spawn` handed five variables really delivers thirteen, three of them naming the person whose
+ * account KzH runs under. Passing each as an empty string suppresses it; leaving it out does not.
+ * Harmless on every other platform, where nothing is added and these are simply unset.
+ */
+const WINDOWS_ADDS = Object.freeze(['USERNAME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'USERDOMAIN', 'SYSTEMDRIVE', 'WINDIR'])
+
+/**
  * The environment a grade runs the agent's code with: the five variables it needs and nothing else,
  * so no key of KzH's is within reach of what the agent wrote.
+ *
+ * `TEMP` and `TMP` are kept because the agent's code needs somewhere to write, and on a normal
+ * Windows install they spell the account name, as `PATH` often does too. Those three are the
+ * remaining way a name reaches the graded process, and they are kept deliberately: point `TEMP` at
+ * the run's own scratch root to close them, which is a change to what a grade may assume about its
+ * workspace rather than a fix to this function.
  */
 export function gradeEnv(workspace, env = process.env) {
   const out = {}
   for (const name of ['PATH', 'SystemRoot', 'TEMP', 'TMP']) if (env[name] !== undefined) out[name] = env[name]
+  for (const name of WINDOWS_ADDS) out[name] = ''
   out.BENCH_WORKSPACE = workspace
   return out
 }

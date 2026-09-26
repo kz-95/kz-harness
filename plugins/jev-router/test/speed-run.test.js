@@ -13,9 +13,11 @@ import { fileURLToPath } from 'node:url'
 import { fakeLlamaServer } from './fixtures/fake-llama-server.mjs'
 import { SPEED_LOCK as LOCK } from '../local.js'
 
-const SCRIPT = fileURLToPath(new URL('../../../scripts/speed-run.mjs', import.meta.url))
+const SCRIPT_URL = new URL('../../../scripts/speed-run.mjs', import.meta.url)
+const SCRIPT = fileURLToPath(SCRIPT_URL)
 const BAT = fileURLToPath(new URL('../../../Speed-Run.bat', import.meta.url))
-const { EXIT, isKzhEngine, jevContextSize, machineCheck, main, parseArgs, portOwner, processList, profileContext, table } = await import(SCRIPT)
+// import() takes a URL, never a path: a bare `C:\...` is read as the scheme `c:` and throws.
+const { EXIT, isKzhEngine, jevContextSize, machineCheck, main, parseArgs, portOwner, processList, profileContext, table } = await import(SCRIPT_URL.href)
 
 const made = []
 process.on('exit', () => { for (const dir of made) rmSync(dir, { recursive: true, force: true }) })

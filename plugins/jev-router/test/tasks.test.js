@@ -387,7 +387,8 @@ test('index.js serves how many runs hold a slot with the local models\' status, 
   // The route is inside apply(), which needs the whole plugin runtime, so its line is read from the
   // source. localStatus() itself is run over real lanes in test/budgetpanel.test.js.
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
-  assert.match(index, /url\.pathname === '\/jev-router\/local'\) \{\n\s*return send\(200, await localStatus\(\{ local, lanes, online: connectivity\.last\(\)\?\.online \?\? null \}\)\)/)
+  // \r?\n throughout: this reads the file as checked out, and on Windows that is CRLF.
+  assert.match(index, /url\.pathname === '\/jev-router\/local'\) \{\r?\n\s*return send\(200, await localStatus\(\{ local, lanes, online: connectivity\.last\(\)\?\.online \?\? null \}\)\)/)
   assert.match(index, /export const localStatus = async \(\{ local, lanes, online \}\) => \(\{ \.\.\.\(await local\.status\(\)\), online, slots: lanes\.slots\(\) \}\)/)
 })
 
@@ -405,7 +406,9 @@ test('index.js takes the cap on tasks at once from the local settings, at start 
   // Every way into a lane says so when it has to wait: the background runner, route() for /auto,
   // /<agent> and jev_route, which used to wait on the cap in silence, and a task of the capability
   // benchmark, which tells its card (docs/benchmark.md 3.8).
-  const ways = index.match(/lanes\.acquire\([^\n]*/g)
+  // Captured without the line ending rather than trimmed in each pattern below: on a CRLF
+  // checkout every line ends in \r, and an anchored pattern would never match one.
+  const ways = index.match(/lanes\.acquire\([^\r\n]*/g)
   assert.equal(ways.length, 3, 'the background runner, route() and the capability benchmark')
   assert.match(ways[0], /^lanes\.acquire\(key, `route-\$\{randomUUID\(\)\}`, signal, \{ onWait: \(why\) => \{ emit\?\.\(\{ type: 'queued', text: WAITING\[why\] \}\); process\.stdout\.write\(`\[jev\] \$\{WAITING\[why\]\}\\n`\) \} \}\)$/, 'a foreground run tells its live lines and the log')
   assert.ok(index.indexOf(ways[0]) > index.indexOf('async function route('), 'that one is route()')

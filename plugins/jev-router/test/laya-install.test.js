@@ -669,7 +669,8 @@ test('the repo pins: uv by version, size and SHA-256 for Windows and for the Lin
   assert.match(lock, /^laya==0\.3\.20 \\$/m)
   assert.ok(!/^torch==/m.test(lock), 'torch is left out of the lock')
   assert.match(lock, /^#\s+\(uv 0\.12\.18, from PyPI/m, 'the lock says which uv made it')
-  assert.ok(lock.split('\n').filter((l) => /^[a-z0-9][\w.-]*==/i.test(l)).every((l) => l.endsWith('\\')), 'every package has its hashes')
+  // Split on either ending and drop the \r: on a CRLF checkout every line would end in it, not in the continuation.
+  assert.ok(lock.split(/\r?\n/).filter((l) => /^[a-z0-9][\w.-]*==/i.test(l)).every((l) => l.endsWith('\\')), 'every package has its hashes')
   const bad = (patch) => { const dir = mkdtempSync(join(tmpdir(), 'laya-pins-')); mkdirSync(join(dir, 'config')); writeFileSync(join(dir, 'config', 'laya.json'), JSON.stringify({ ...PINS, ...patch })); return () => readPins(dir) }
   assert.throws(bad({ uv: { ...PINS.uv, source: 'https://example.com/uv.zip' } }), /config\/laya\.json: uv\.source/)
   assert.throws(bad({ uv: { ...PINS.uv, sha256: 'abc' } }), /uv\.sha256/)

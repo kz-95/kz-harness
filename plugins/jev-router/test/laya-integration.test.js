@@ -334,7 +334,8 @@ function filesUnder(dir, out = []) {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name)
     if (e.isDirectory()) filesUnder(p, out)
-    else { const s = statSync(p); out.push(`${p}:${s.size}:${s.mtimeMs}`) }
+    // A tab, not a colon: `C:\path` splits on a colon and every reader would open `...\C`.
+    else { const s = statSync(p); out.push(`${p}\t${s.size}\t${s.mtimeMs}`) }
   }
   return out
 }
@@ -362,7 +363,7 @@ async function until(label, read, ok, { timeoutMs = 10_000, everyMs = 25 } = {})
   }
 }
 /** The bytes of every file under `dir`, by path. */
-const bytesUnder = (dir) => Object.fromEntries(filesUnder(dir).map((l) => l.split(':')[0]).map((p) => [p, readFileSync(p, 'utf8')]))
+const bytesUnder = (dir) => Object.fromEntries(filesUnder(dir).map((l) => l.split('\t')[0]).map((p) => [p, readFileSync(p, 'utf8')]))
 
 const laya = (p) => p.http('GET', '/jev-router/laya').then((r) => r.body)
 const started = async (p) => { const r = await p.http('POST', '/jev-router/laya/start', {}); assert.equal(r.status, 200, JSON.stringify(r.body)); return laya(p) }

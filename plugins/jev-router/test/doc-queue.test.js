@@ -8,8 +8,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const SCRIPT = fileURLToPath(new URL('../../../scripts/doc-queue.mjs', import.meta.url))
-const { QUEUE, addNote, listNotes, logProgress, markDone, progressLine, withLock } = await import(SCRIPT)
+const SCRIPT_URL = new URL('../../../scripts/doc-queue.mjs', import.meta.url)
+const SCRIPT = fileURLToPath(SCRIPT_URL)
+// import() takes a URL, never a path: a bare `C:\...` is read as the scheme `c:` and throws.
+const { QUEUE, addNote, listNotes, logProgress, markDone, progressLine, withLock } = await import(SCRIPT_URL.href)
 const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')))
 
 const HANDOFF = '# KzH handoff\n\nIntro.\n\n## State\n\n```\nbranch x\n```\n\n## Where this was left\n\nText.\n'

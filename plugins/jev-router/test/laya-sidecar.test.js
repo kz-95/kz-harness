@@ -20,6 +20,11 @@ import { createJev } from '../jev.js'
 import { resolveProviders } from '../providers.js'
 import { createResidency } from '../residency.js'
 import { defaultThreads, killTree } from '../local.js'
+
+// The copy hint names a path the reader is meant to act on, so it is written the platform's own
+// way: `verifyWeights` in laya-install.js emits backslashes on win32. Built the same way here, so
+// this asserts the message rather than the platform the suite happens to run on.
+const COPY_HINT = process.platform === 'win32' ? 'models\laya\hf' : 'models/laya/hf'
 import { startFakeLaya } from './fixtures/fake-laya-serve.mjs'
 import { waitFor } from './wait-for.js'
 
@@ -683,7 +688,8 @@ test('the weights are verified before anything is spawned', async (t) => {
   const fake = interpreter()
   const { sidecar } = await sidecarFor(t, h, { spawn: fake.spawn })
   rmSync(join(snapshotDir(h.paths.hf, PINS.weights.repo, COMMIT), 'model.safetensors'))
-  const why = "Laya's model files are not complete on this PC (model.safetensors is missing). Choose Repair, or copy models/laya/hf from another PC."
+  // The hint names a path the reader can act on, so it is the platform's own (laya-install.js verifyWeights).
+  const why = `Laya's model files are not complete on this PC (model.safetensors is missing). Choose Repair, or copy ${COPY_HINT} from another PC.`
   await assert.rejects(sidecar.ensureReady(), { message: LAYA_TEXT.couldNotStart(why) })
   assert.equal(fake.spawned.length, 0)
   assert.deepEqual([sidecar.status().state, sidecar.status().why], ['failed', why])
@@ -1047,7 +1053,7 @@ test('a start the budget or the GPU turned down is refused with its own reason: 
   const hw = await harness()
   const { sidecar: broken } = await sidecarFor(t, hw, { spawn: interpreter().spawn })
   rmSync(join(snapshotDir(hw.paths.hf, PINS.weights.repo, COMMIT), 'model.safetensors'))
-  await assert.rejects(broken.ensureReady(), { message: "Laya Auto did not run this: Laya could not start (Laya's model files are not complete on this PC (model.safetensors is missing). Choose Repair, or copy models/laya/hf from another PC). Press Start in Settings → Jev setup → Laya decision model, where the log is. Nothing was run." })
+  await assert.rejects(broken.ensureReady(), { message: `Laya Auto did not run this: Laya could not start (Laya's model files are not complete on this PC (model.safetensors is missing). Choose Repair, or copy ${COPY_HINT} from another PC). Press Start in Settings → Jev setup → Laya decision model, where the log is. Nothing was run.` })
 })
 
 test('why the supervisor restarted Laya stays in status() once it is ready again, until the person presses Start or Stop', async (t) => {
