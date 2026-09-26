@@ -1,0 +1,16 @@
+{
+  "id": "debugging-1",
+  "skill": "debugging",
+  "level": 1,
+  "dimensions": ["debugging", "coding", "general_reasoning"],
+  "folder": "cart-total",
+  "prompt": "The cart total is wrong for some orders; test/cart.test.js has one that fails.\nFind the cause in src/ and fix it.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/cart.test.js": 8
+    }
+  }
+}

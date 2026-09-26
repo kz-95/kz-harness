@@ -1,0 +1,16 @@
+{
+  "id": "implementation-1",
+  "skill": "implementation",
+  "level": 1,
+  "dimensions": ["coding", "instruction_following"],
+  "folder": "duration-format",
+  "prompt": "Implement formatDuration(ms) in src/duration.js.\nIt turns a number of milliseconds into text such as 1h 02m 03s.\nIgnore any part of a second.\nLeave hours out when they are 0, and leave minutes out as well when hours and minutes are both 0, so 62000 is 1m 02s and 5000 is 5s.\nWrite minutes and seconds with two digits whenever a larger unit comes before them.\nHours keep counting past 24, so 90000000 is 25h 00m 00s.\nA negative number, NaN or Infinity throws a RangeError.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/duration.test.js": 14
+    }
+  }
+}

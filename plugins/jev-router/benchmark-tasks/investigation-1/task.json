@@ -1,0 +1,17 @@
+{
+  "id": "investigation-1",
+  "skill": "investigation",
+  "level": 1,
+  "dimensions": ["general_reasoning"],
+  "folder": "app-config",
+  "prompt": "With the environment variable APP_TIMEOUT set to 2500 and config.json as it is in this folder, what timeout in milliseconds does loadConfig() in src/config.js return, and where does that value come from?\nWrite the answer to ANSWER.json as {\"timeout\": <number>, \"source\": \"env\" or \"file\" or \"default\"}.\nDo not change any other file.",
+  "protect": [],
+  "onlyChanged": ["ANSWER.json"],
+  "grade": {
+    "kind": "answer",
+    "expect": {
+      "timeout": 4000,
+      "source": "file"
+    }
+  }
+}

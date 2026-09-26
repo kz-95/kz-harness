@@ -12,7 +12,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { badgesOf, buildCatalog, contextSteps, defaultThreads, estimateMemory, parsePsRss, parseTasklistMemory, workingSetOf, kvGbPerToken, readMemoryUsage, createConnectivity, createLocalModels, defaultsFor, detectSpecs, downloadVerified, installLlmCommand, llamaArgs, localAdapter, looksLikeQuestion, offlinePick, parseLlmArgs, pickEngineVariant, rateModule, readManifest, removeLlmCommand, specsLine, suggest, toWire, translate } from '../local.js'
 import { fileURLToPath } from 'node:url'
+// A namespace as well, for what the speed benchmark adds to local.js (docs/benchmark.md 5): the file
+// then still loads where local.js lacks it, and each of those tests fails by its own assertion.
+import * as localJs from '../local.js'
 import { waitFor } from './wait-for.js'
+import { fakeLlamaServer } from './fixtures/fake-llama-server.mjs'
 import { formatReport, runRouted } from '../router.js'
 import { kindOf, keyProviderOf } from '../accounts.js'
 import { jevAdapter } from '../adapter.js'
@@ -301,10 +305,10 @@ test('a GPU sized from the AdapterRAM ceiling is rated, suggested and described 
   const capped = on({ name: 'AMD Radeon RX 6600', vendor: 'amd', vramGB: 4293918720 / 1024 ** 3, sizeCapped: true })
 
   // rateModule. On a real 4 GB card Big splits, at about 6 words/s.
-  assert.deepEqual(rateModule(big, four, 'vulkan'), { fit: 'split', label: 'Splits GPU + CPU (slower, ~6 words/s est.)', wordsPerSec: 6 })
+  assert.deepEqual(rateModule(big, four, 'vulkan'), { fit: 'split', label: 'Splits GPU + CPU (slower, ~6 words/s est.)', wordsPerSec: 6, source: 'estimated' })
   // On the capped card it may split like that, or run fully on the GPU. Which is not known, so the
   // rating says so and gives the speed of each, not one of them as if it were the answer.
-  assert.deepEqual(rateModule(big, capped, 'vulkan'), { fit: 'unknown', label: "Runs on the GPU as far as its memory allows (this GPU's memory is unknown, 4 GB or more: ~6 to ~20 words/s est.)", wordsPerSec: null, wordsPerSecRange: [6, 20] })
+  assert.deepEqual(rateModule(big, capped, 'vulkan'), { fit: 'unknown', label: "Runs on the GPU as far as its memory allows (this GPU's memory is unknown, 4 GB or more: ~6 to ~20 words/s est.)", wordsPerSec: null, wordsPerSecRange: [6, 20], source: 'estimated' })
   // What 4 GB is enough for runs fully on the GPU whatever more the card has, and is rated as before.
   assert.deepEqual(rateModule(small, capped, 'vulkan'), rateModule(small, four, 'vulkan'))
   assert.equal(rateModule(small, capped, 'vulkan').fit, 'gpu')
@@ -1161,6 +1165,38 @@ test('the RAM watchdog unloads a model whose working set stays over the budget f
   await local.dispose()
 })
 
+test('the engine counts its loads and the RAM watchdog\'s unloads, which a capability benchmark reads around a local agent\'s task, and nothing else moves the counts', async () => {
+  const GIB = 1024 ** 3
+  let clock = 1_000_000
+  let rss = 3 * GIB
+  const eng = fakeEngine()
+  const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, now: () => clock, readWorkingSet: async () => rss, watchEveryMs: 3_600_000 })
+  assert.equal(typeof local.engineCounters, 'function')
+  const counts = () => local.engineCounters()
+  assert.deepEqual(counts(), { loads: 0, unloads: 0 })
+  await local.start('big')
+  assert.deepEqual(counts(), { loads: 1, unloads: 0 }, 'a load')
+  await local.start('big')
+  await local.status()
+  await local.checkMemory()
+  assert.deepEqual(counts(), { loads: 1, unloads: 0 }, 'a start of the model that is loaded, a status and a reading under the budget move nothing')
+  await local.stop()
+  assert.deepEqual(counts(), { loads: 1, unloads: 0 }, 'a stop is not the watchdog\'s unload')
+  await local.setSettings({ maxRamGB: 4 })
+  await local.start('big')
+  assert.deepEqual(counts(), { loads: 2, unloads: 0 }, 'a second load')
+  rss = 5 * GIB
+  await local.checkMemory()
+  clock += 30_000
+  await local.checkMemory()
+  assert.equal((await local.status()).engine.running, false)
+  assert.deepEqual(counts(), { loads: 2, unloads: 1 }, 'the watchdog\'s unload')
+  const copy = counts()
+  copy.loads = 99
+  assert.equal(counts().loads, 2, 'a reader gets a copy')
+  await local.dispose()
+})
+
 test('a model the watchdog unloaded loads again once what decides its RAM changes, and not when the same value is saved again', async () => {
   const GIB = 1024 ** 3
   let clock = 0
@@ -1505,4 +1541,792 @@ test('killTree stops a process and every process it started, by pid; on Windows 
   assert.ok(alive(parent.pid) && alive(childPid))
   assert.equal(killTree(parent.pid), true)
   await waitFor('the parent and its child have exited', () => [parent.exitCode === null && parent.signalCode === null, alive(childPid)], (x) => !x[0] && !x[1], { timeoutMs: 10_000 })
+})
+
+// ---------- the speed benchmark (docs/benchmark.md 2 and 5.1) ----------
+
+// The load report of a split run: 29 of Big's 37 layers on the 4 GB GPU, the rest in RAM.
+const SPLIT_REPORT = ['load_tensors: offloaded 29/37 layers to GPU', 'CUDA0 model buffer size = 3584.00 MiB', 'CPU model buffer size = 1024.00 MiB']
+const MONTH = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+/** Today as a reading taken in this test is dated: "25 Sep". */
+const today = (d = new Date()) => `${d.getDate()} ${MONTH[d.getMonth()]}`
+
+/**
+ * The CUDA engine build and the models `ids` in place, as a hand install leaves them, on the PC above,
+ * over the fake llama-server `server` (test/fixtures/fake-llama-server.mjs).
+ */
+async function speedIn({ ids = ['big'], modules = MANIFEST_MODULES, server = fakeLlamaServer({ report: () => SPLIT_REPORT }), ...extra } = {}) {
+  const made = localIn(tmp(), { specs: async () => PC, port: 0, modules, spawn: server.spawn, fetch: server.fetch, ...extra })
+  writeFileSync(join(made.engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'), '')
+  mkdirSync(join(made.engineDir, '.installed'))
+  writeFileSync(join(made.engineDir, '.installed', 'eng.json'), JSON.stringify({ sha256: sha('e') }))
+  for (const id of ids) writeFileSync(join(made.modelsDir, modules.find((m) => m.id === id).file), id)
+  await made.local.installed()
+  await made.local.settled()
+  return { ...made, server }
+}
+/** Until the speed run has ended; its status then. */
+async function speedEnded(local, { timeoutMs = 10_000 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const run = (await local.status()).speedRun
+    if (run?.state === 'idle') return run
+    if (Date.now() > deadline) throw new Error(`the speed run did not end: ${JSON.stringify(run)}`)
+    await new Promise((r) => setTimeout(r, 10))
+  }
+}
+const modelIn = async (local, id) => (await local.status()).modules.find((m) => m.id === id)
+const measuredRequests = (server) => server.to('/completion').filter((r) => r.body.n_predict === 128)
+
+test('readTimings works both speeds out from llama-server\'s own counts and milliseconds, and refuses timings it cannot trust, each with its reason', () => {
+  assert.equal(typeof localJs.readTimings, 'function', 'local.js exports readTimings')
+  const { readTimings } = localJs
+  // The rate fields are there, and wrong: the speeds come from the counts and the milliseconds.
+  const body = (t = {}) => ({ content: '...', timings: { prompt_n: 8192, prompt_ms: 20480, predicted_n: 128, predicted_ms: 6400, prompt_per_second: 1, predicted_per_second: 1, ...t } })
+  assert.deepEqual(readTimings(body(), { nPredict: 128 }), { ok: true, tokensPerSec: 20, promptTokensPerSec: 400, promptTokens: 8192 })
+  assert.deepEqual(readTimings(body({ predicted_n: 1, predicted_ms: 40 }), { nPredict: 1 }), { ok: true, tokensPerSec: 25, promptTokensPerSec: 400, promptTokens: 8192 })
+  // No timings, or one of the four fields missing or no positive finite number: never read as zero.
+  const untrusted = { ok: false, reason: 'llama-server did not report its timings' }
+  assert.deepEqual(readTimings({ content: '...' }, { nPredict: 128 }), untrusted)
+  assert.deepEqual(readTimings(null, { nPredict: 128 }), untrusted)
+  for (const t of [{ prompt_n: undefined }, { prompt_ms: 0 }, { predicted_n: -128 }, { predicted_ms: 'fast' }, { predicted_ms: Infinity }, { prompt_ms: Number.NaN }]) {
+    assert.deepEqual(readTimings(body(t), { nPredict: 128 }), untrusted, JSON.stringify(t))
+  }
+  // Every model generates exactly the tokens asked for, or two would be timed on different lengths.
+  assert.deepEqual(readTimings(body({ predicted_n: 100 }), { nPredict: 128 }), { ok: false, reason: 'llama-server generated 100 tokens, not 128' })
+})
+
+test('a speed run loads the model afresh through reload(), which waits until nothing holds the engine, at the planned context, also when that model is loaded already', async () => {
+  const server = fakeLlamaServer()
+  const { local } = await speedIn({ ids: ['wide'], modules: [...MANIFEST_MODULES, WIDE], server })
+  assert.equal(typeof local.reload, 'function', 'the local models reload a model')
+  assert.equal(typeof local.benchmark, 'function', 'and run a speed benchmark')
+  // Loaded at the 32k it asks for; then a budget sizes its next load to 21k while it stays loaded.
+  await local.start('wide')
+  await local.setSettings({ maxRamGB: 1.25 })
+  assert.equal((await modelIn(local, 'wide')).ctx, 21504)
+  await local.start('wide')
+  assert.equal(server.started.length, 1, 'acquire() reuses the running engine and the context it was started with')
+  // reload() waits while a request holds the engine: it would unload the model mid-answer.
+  const conn = await local.acquire('wide')
+  let reloaded = false
+  const reloading = local.reload('wide').then((c) => { reloaded = true; return c })
+  await new Promise((r) => setTimeout(r, 50))
+  assert.deepEqual([reloaded, server.started.length], [false, 1], 'nothing is stopped while a request holds the engine')
+  conn.release()
+  const again = await reloading
+  assert.equal(server.started.length, 2, 'then it is stopped and started again')
+  assert.equal(server.started[0].child.exitCode, 0, 'the old load was stopped')
+  assert.equal(server.started[1].ctx, 21504, 'at the context the plan gives today')
+  assert.equal(local.isBusy(), true, 'and it holds the engine until released')
+  again.release()
+  assert.equal(local.isBusy(), false)
+  // A speed run does the same for the model loaded now: loaded again, under today's settings.
+  await local.setSettings({ maxRamGB: 1.05 })
+  assert.deepEqual(await local.benchmark({ ids: ['wide'] }), ['wide'])
+  await speedEnded(local)
+  assert.equal(server.started.length, 3)
+  assert.equal(server.started[2].ctx, 19456)
+  assert.deepEqual(Object.keys((await local.readSettings()).speed), ['wide@19456'])
+  await local.dispose()
+})
+
+test('a speed run sends a warm-up, a fill of exactly the first 8,192 tokens of the speed text, and three timed generations of 128 tokens, all with the engine\'s key, and keeps the median and all three', async () => {
+  // The three timed generations at 19.5, 21 and 20 tokens a second: the median is 20.
+  const tps = [19.5, 21, 20]
+  const server = fakeLlamaServer({
+    report: () => SPLIT_REPORT,
+    timings: (entry, worked) => (entry.body.n_predict === 128 ? { ...worked, predicted_ms: (128 / tps[measured++]) * 1000 } : worked),
+  })
+  let measured = 0
+  const { local } = await speedIn({ server })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  assert.deepEqual(await local.benchmark(), ['big'], 'Benchmark all: every installed chat model')
+  const run = await speedEnded(local)
+  const [started] = server.started
+  // In order: the warm-up, the speed text in the model's own tokens, the fill, three generations.
+  assert.deepEqual(server.requests.map((r) => [r.path, r.body.n_predict ?? null]), [['/completion', 16], ['/tokenize', null], ['/completion', 1], ['/completion', 128], ['/completion', 128], ['/completion', 128]])
+  for (const r of server.requests) assert.equal(r.headers.authorization, `Bearer ${started.key}`, `${r.path} carries the engine's own key`)
+  assert.deepEqual(server.to('/tokenize')[0].body, { content: localJs.SPEED_TEXT })
+  const [, fill, ...timed] = server.to('/completion')
+  const first = Array.from({ length: 8192 }, (_, n) => 1000 + n)
+  assert.deepEqual(fill.body, { prompt: first, n_predict: 1, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: false })
+  for (const t of timed) assert.deepEqual(t.body, { prompt: first, n_predict: 128, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: false })
+  // The speed text is synthetic, fixed and long: far more than 8,192 tokens in any tokenizer.
+  assert.ok(localJs.SPEED_TEXT.length > 60_000 && localJs.SPEED_TEXT.length < 70_000, String(localJs.SPEED_TEXT.length))
+  assert.match(localJs.SPEED_TEXT, /^\/\/ Step 1 of the pipeline\.\nfunction step1\(value\) \{/)
+  // Kept under the model and the context it ran at, beside the memory reading of the same load.
+  const s = await local.readSettings()
+  assert.deepEqual(Object.keys(s.speed), ['big@12288'])
+  assert.deepEqual(Object.keys(s.measured), ['big@12288'])
+  const r = s.speed['big@12288']
+  assert.deepEqual({ ...r, at: null, loadMs: null }, {
+    at: null, tokensPerSec: 20, promptTokensPerSec: 400, depth: 8192, nPredict: 128,
+    runs: [{ tokensPerSec: 19.5 }, { tokensPerSec: 21 }, { tokensPerSec: 20 }],
+    loadMs: null, roomGB: 4, gpuLayers: 'auto', threads: 4,
+    engine: { variant: 'cuda12', sha256: sha('e') }, weights: { file: 'big.gguf', sha256: sha('big') }, layersOnGpu: { gpu: 29, total: 37 }, vision: false, laya: null,
+  })
+  assert.ok(Number.isFinite(r.loadMs) && r.loadMs >= 0, 'the load time from spawn to a healthy /health')
+  assert.ok(Math.abs(Date.parse(r.at) - Date.now()) < 60_000)
+  assert.deepEqual(run.done, [{ id: 'big', ok: true, text: 'Big: 20.0 tokens/s generating and 400 tokens/s reading, 8,192 tokens into a conversation, at 12k context.' }])
+  await local.dispose()
+})
+
+test('a reading takes its key and its conditions from the engine that ran, never from a plan made after it', async () => {
+  const server = fakeLlamaServer()
+  const { local } = await speedIn({ ids: ['wide'], modules: [...MANIFEST_MODULES, WIDE], server })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  const held = server.hold((e) => e.body?.n_predict === 1)
+  await local.benchmark({ ids: ['wide'] })
+  await held.arrived
+  // While it is measured, the budget changes: its next load would get 21k and two threads.
+  await local.setSettings({ maxRamGB: 1.25, maxCores: 2 })
+  held.release()
+  await speedEnded(local)
+  const { speed } = await local.readSettings()
+  assert.deepEqual(Object.keys(speed), ['wide@32768'], 'under the context it really ran with')
+  assert.deepEqual([speed['wide@32768'].threads, speed['wide@32768'].roomGB, speed['wide@32768'].gpuLayers], [4, 4, 'auto'])
+  // And for the next load it does not stand, and the card is told why.
+  const next = (await modelIn(local, 'wide')).speed
+  assert.deepEqual([next.stands, next.why], [false, 'it was measured at 32k context and the next load gets 21k'])
+  assert.equal(next.reading.tokensPerSec, 20)
+  await local.dispose()
+})
+
+test('a speed text shorter than the depth records nothing and says so; a fill served from the prompt cache keeps the generation speed and says the reading speed was not measured', async () => {
+  const short = fakeLlamaServer({ tokens: () => 8000 })
+  const { local } = await speedIn({ server: short })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  await local.benchmark()
+  assert.deepEqual((await speedEnded(local)).done, [{ id: 'big', ok: false, text: 'Big not measured: the speed text is shorter than 8,192 tokens for this model' }])
+  assert.deepEqual((await local.readSettings()).speed, {})
+  assert.equal(short.to('/completion').filter((r) => r.body.n_predict !== 16).length, 0, 'nothing is timed on a prompt it cannot fill')
+  await local.dispose()
+
+  // The fill reads 100 tokens: llama-server had most of the prompt in its cache already.
+  const cached = fakeLlamaServer({ timings: (entry, worked) => (entry.body.n_predict === 1 ? { ...worked, prompt_n: 100 } : worked) })
+  const { local: again } = await speedIn({ server: cached })
+  await again.benchmark()
+  const run = await speedEnded(again)
+  const r = (await again.readSettings()).speed['big@12288']
+  assert.deepEqual([r.tokensPerSec, r.promptTokensPerSec], [20, null])
+  assert.equal(run.done[0].text, 'Big: 20.0 tokens/s generating; its reading speed was not measured, because llama-server reused its prompt cache, 8,192 tokens into a conversation, at 12k context.')
+  await again.dispose()
+})
+
+test('three generation speeds more than 15 percent apart record nothing; a request that had company is run again, and after three repeats nothing is recorded', async () => {
+  // 20, 20 and 24 tokens a second: 4 apart, over 15 percent of the median 20.
+  const tps = [20, 20, 24]
+  let n = 0
+  const spread = fakeLlamaServer({ timings: (entry, worked) => (entry.body.n_predict === 128 ? { ...worked, predicted_ms: (128 / tps[n++]) * 1000 } : worked) })
+  const { local } = await speedIn({ server: spread })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  await local.benchmark()
+  assert.deepEqual((await speedEnded(local)).done.map((d) => d.text), ['Big not measured: the three runs disagreed; something else was using the machine'])
+  assert.deepEqual((await local.readSettings()).speed, {})
+  await local.dispose()
+
+  // A chat title for the model being measured reaches the engine during the first timed request,
+  // and Laya is answering a call as the second starts: each is run again, and three are kept.
+  let layaBusy = false
+  const company = fakeLlamaServer()
+  const { local: busy } = await speedIn({ server: company, layaBusy: () => layaBusy })
+  const first = company.hold((e) => e.body?.n_predict === 128)
+  await busy.benchmark()
+  await first.arrived
+  await busy.start('big')
+  layaBusy = true
+  const second = company.hold((e) => e.body?.n_predict === 128)
+  first.release()
+  await second.arrived
+  layaBusy = false
+  second.release()
+  const run = await speedEnded(busy)
+  assert.equal(run.done[0].ok, true, run.done[0].text)
+  assert.equal(measuredRequests(company).length, 5, 'three timed requests and the two that had company')
+  assert.equal((await busy.readSettings()).speed['big@12288'].runs.length, 3)
+  await busy.dispose()
+
+  // Laya answers through every one of them: the first and three repeats, then nothing is recorded.
+  layaBusy = false
+  const always = fakeLlamaServer()
+  const { local: noisy } = await speedIn({ server: always, layaBusy: () => layaBusy })
+  const hold = always.hold((e) => e.body?.n_predict === 128)
+  await noisy.benchmark()
+  await hold.arrived
+  layaBusy = true
+  hold.release()
+  assert.deepEqual((await speedEnded(noisy)).done.map((d) => d.text), ['Big not measured: other requests kept arriving while it was measured'])
+  assert.equal(measuredRequests(always).length, 4)
+  assert.deepEqual((await noisy.readSettings()).speed, {})
+  await noisy.dispose()
+})
+
+test('a speed reading stands only for a load of the same weights with the same context, GPU room, GPU layers, threads, engine build, depth and Laya, and each difference says so in its own words', async () => {
+  assert.equal(typeof localJs.speedFor, 'function', 'local.js exports speedFor')
+  const { speedFor } = localJs
+  const weights = { file: 'big.gguf', sha256: sha('big') }
+  const reading = { at: '2026-09-25T10:00:00.000Z', tokensPerSec: 21.2, promptTokensPerSec: 412.7, depth: 8192, nPredict: 128, roomGB: 4, gpuLayers: 'auto', threads: 6, engine: { variant: 'cuda12', sha256: sha('e') }, weights, layersOnGpu: { gpu: 29, total: 37 }, vision: false, laya: null }
+  const s = { speed: { 'big@16384': reading, 'small@16384': { ...reading, tokensPerSec: 47 } } }
+  const next = { ctx: 16384, roomGB: 4, gpuLayers: 'auto', threads: 6, engine: { variant: 'cuda12', sha256: sha('e') }, weights, depth: 8192, laya: null }
+  assert.deepEqual(speedFor(s, 'big', next), { reading, stands: true, why: null })
+  assert.deepEqual(speedFor({ speed: {} }, 'big', next), { reading: null, stands: false, why: null })
+  assert.deepEqual(speedFor({}, 'big', next), { reading: null, stands: false, why: null }, 'a local.json from before there were speed readings')
+  for (const [change, why] of [
+    [{ ctx: 14336 }, 'it was measured at 16k context and the next load gets 14k'],
+    [{ ctx: 16000 }, 'it was measured at a context of 16384 tokens and the next load gets 16000'],
+    [{ threads: 4 }, 'it was measured with 6 threads and the next load gets 4'],
+    [{ roomGB: 2 }, 'it was measured with 4 GB of GPU room and the VRAM budget now leaves 2 GB'],
+    [{ gpuLayers: 20 }, 'it was measured with GPU layers auto and they are now pinned to 20'],
+    [{ engine: { variant: 'cuda12', sha256: sha('newer') } }, 'it was measured on another engine build'],
+    [{ engine: { variant: 'vulkan', sha256: sha('e') } }, 'it was measured on another engine build'],
+    [{ engine: null }, 'it was measured on another engine build'],
+    [{ laya: 'cuda' }, 'it was measured without Laya beside it and Laya is now on the GPU beside it'],
+    [{ depth: 4096 }, 'it was measured at another depth'],
+    // Another quantisation under the same model id, as a manifest update ships it: another file and SHA-256.
+    [{ weights: { file: 'big-q5.gguf', sha256: sha('big-q5') } }, 'it was measured on other weights of this model'],
+    [{ weights: { file: 'big.gguf', sha256: sha('big-rebuilt') } }, 'it was measured on other weights of this model'],
+  ]) {
+    const got = speedFor(s, 'big', { ...next, ...change })
+    assert.deepEqual([got.stands, got.why], [false, why], JSON.stringify(change))
+    assert.equal(got.reading, reading, 'the reading is still given, with why it does not stand')
+  }
+  assert.equal(speedFor({ speed: { 'big@16384': { ...reading, gpuLayers: 20 } } }, 'big', next).why, 'it was measured with GPU layers pinned to 20 and they are now auto')
+  assert.equal(speedFor({ speed: { 'big@16384': { ...reading, laya: 'cuda' } } }, 'big', next).why, 'it was measured with Laya on the GPU beside it and the next load will not have Laya beside it')
+  // A reading that does not say which weights it was taken on stands for none.
+  assert.equal(speedFor({ speed: { 'big@16384': { ...reading, weights: undefined } } }, 'big', next).why, 'it does not say which weights of this model it was measured on')
+  assert.equal(speedFor({ speed: { 'big@16384': { ...reading, laya: 'cpu' } } }, 'big', { ...next, laya: 'cuda' }).why, 'it was measured with Laya on the CPU beside it and Laya is now on the GPU')
+  assert.equal(speedFor({ speed: { 'big@16384': { ...reading, laya: 'cuda' } } }, 'big', { ...next, laya: 'cuda' }).stands, true)
+  // The newest reading at another context is the one given, when there is none at the next load's.
+  const older = { ...reading, at: '2026-09-20T10:00:00.000Z', tokensPerSec: 9 }
+  assert.equal(speedFor({ speed: { 'big@12288': older, 'big@14336': reading } }, 'big', next).why, 'it was measured at 14k context and the next load gets 16k')
+  // A model whose id is another's with more after it is not that model.
+  assert.equal(speedFor({ speed: { 'big-2@16384': reading } }, 'big', next).reading, null)
+
+  // In status(), from the real conditions of the next load; a plain load after the reading keeps it.
+  const { local } = await speedIn()
+  await local.benchmark()
+  await speedEnded(local)
+  let big = await modelIn(local, 'big')
+  assert.deepEqual([big.speed.stands, big.speed.why, big.speed.reading.tokensPerSec], [true, null, 20])
+  await local.stop()
+  await local.start('big')
+  await local.stop()
+  big = await modelIn(local, 'big')
+  assert.equal(big.speed.stands, true, 'a load that did not measure speed never erases a speed reading')
+  assert.deepEqual(Object.keys((await local.readSettings()).speed), ['big@12288'])
+  // And each setting that decides the speed takes the reading away from the next load, with its words.
+  await local.setSettings({ maxCores: 3 })
+  assert.equal((await modelIn(local, 'big')).speed.why, 'it was measured with 4 threads and the next load gets 3')
+  await local.setSettings({ maxCores: null, maxVramGB: 2 })
+  assert.equal((await modelIn(local, 'big')).speed.why, 'it was measured with 4 GB of GPU room and the VRAM budget now leaves 2 GB')
+  await local.setSettings({ maxVramGB: null, gpuLayers: 20 })
+  assert.equal((await modelIn(local, 'big')).speed.why, 'it was measured with GPU layers auto and they are now pinned to 20')
+  await local.dispose()
+})
+
+test('a speed run is refused, each with its reason, while a local model answers, while a local agent works between its model calls and while Laya answers; a model over the budget is skipped with the budget\'s refusal word for word', async () => {
+  let layaBusy = false
+  const { local, server } = await speedIn({ ids: ['big', 'small'], layaBusy: () => layaBusy })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  const refused = async (message, status = 400) => {
+    const err = await local.benchmark().then(() => null, (e) => e)
+    assert.ok(err, `refused: ${message}`)
+    assert.deepEqual([err.message, err.status], [message, status])
+  }
+  const conn = await local.acquire('big')
+  await refused('A local model is answering right now; a speed benchmark would unload it mid-answer. Try again when it is idle.')
+  conn.release()
+  // A local agent between its model calls: nothing holds the engine, and it is at work all the same.
+  let finish
+  const working = local.localAgentAttempt(() => new Promise((r) => { finish = r }))
+  await new Promise((r) => setImmediate(r))
+  assert.equal(local.isBusy(), false, 'no request holds the engine')
+  await refused('A local agent is working on a task; start the speed benchmark when it has finished.')
+  finish('done')
+  assert.equal(await working, 'done')
+  layaBusy = true
+  await refused('Laya is answering a call right now, and would slow the measurement. Try again when it is idle.')
+  layaBusy = false
+  // What cannot be measured at all.
+  for (const [ids, message] of [
+    [['nope'], 'No local chat model is named nope.'],
+    [['small-vision'], 'No local chat model is named small-vision.'],
+    [['exp'], 'Exp is not installed (type /install-llm exp).'],
+    [[], 'ids: the local chat models to measure, or none for every installed one'],
+  ]) {
+    const err = await local.benchmark({ ids }).then(() => null, (e) => e)
+    assert.deepEqual([err?.message, err?.status], [message, 400], JSON.stringify(ids))
+  }
+  // A model over the RAM budget is skipped with the refusal a load would throw, and the others are
+  // measured. One run at a time: a second is refused while the first goes.
+  await local.setSettings({ maxVramGB: 2, maxRamGB: 4 })
+  const over = (await modelIn(local, 'big')).overBudget
+  assert.match(over, /^Big needs about 4\.7 GB of RAM/)
+  const hold = server.hold((e) => e.body?.n_predict === 1)
+  await local.benchmark()
+  await hold.arrived
+  await refused('A speed benchmark is already running.', 409)
+  hold.release()
+  const run = await speedEnded(local)
+  // Big was loaded before the run, so it comes last; and the budget that skipped it keeps it from
+  // being loaded again, which the last line says rather than claim the engine is as it was.
+  assert.deepEqual(run.done.map((d) => [d.id, d.ok, d.ok ? null : d.text]), [['small', true, null], ['big', false, `Big not measured: ${over}`]])
+  assert.equal(run.restore, `Could not load Big again: ${over.replace(/\.$/, '')}.`)
+  assert.deepEqual(Object.keys((await local.readSettings()).speed), ['small@12288'])
+  // With nothing installed there is nothing to measure.
+  const { local: bare } = await speedIn({ ids: [] })
+  const none = await bare.benchmark().then(() => null, (e) => e)
+  assert.deepEqual([none?.message, none?.status], ['No local chat model is installed (type /install-llm).', 400])
+  await bare.dispose()
+  await local.dispose()
+})
+
+test('while a speed run goes, a local agent\'s attempt waits before it starts, says what it waits for as the run moves on, and starts when the run ends', async () => {
+  const { local, server } = await speedIn({ ids: ['big', 'small'] })
+  assert.equal(typeof local.localAgentAttempt, 'function', 'the local models hold a local agent\'s attempt back during a speed run')
+  const bigFill = server.hold((e) => e.model === 'big' && e.body?.n_predict === 1)
+  const smallFill = server.hold((e) => e.model === 'small' && e.body?.n_predict === 1)
+  await local.benchmark()
+  await bigFill.arrived
+  const said = []
+  let started = false
+  const attempt = local.localAgentAttempt(async () => { started = true; return 'worked' }, { onWait: (t) => said.push(t) })
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(started, false, 'it has not started its subagent')
+  assert.deepEqual(said, ['Waiting for the speed benchmark to finish (Big, 1 of 2).'])
+  bigFill.release()
+  await smallFill.arrived
+  assert.equal(started, false)
+  assert.deepEqual(said, ['Waiting for the speed benchmark to finish (Big, 1 of 2).', 'Waiting for the speed benchmark to finish (Small, 2 of 2).'], 'a new line when the run moves on to the next model')
+  smallFill.release()
+  assert.equal(await attempt, 'worked', 'and it runs once the run has ended')
+  assert.equal((await local.status()).speedRun.state, 'idle')
+  assert.equal(said.length, 2)
+
+  // Stopped, or out of time, while it waits: it ends with an error that says it was waiting.
+  const held = server.hold((e) => e.body?.n_predict === 1)
+  await local.benchmark({ ids: ['small'] })
+  await held.arrived
+  const stop = new AbortController()
+  const waiting = local.localAgentAttempt(async () => 'never', { signal: stop.signal })
+  stop.abort(new Error('stopped by the user'))
+  await assert.rejects(waiting, { message: 'stopped while it waited for the speed benchmark to finish (stopped by the user)' })
+  held.release()
+  await speedEnded(local)
+  await local.dispose()
+})
+
+test('a speed run leaves the engine as it found it: the model that was loaded is measured last and stays loaded, and an engine that was stopped is stopped again', async () => {
+  const { local, server } = await speedIn({ ids: ['big', 'small'] })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  // Big loaded: Benchmark all measures Small first and Big last, so the run ends with Big loaded,
+  // reloaded once, to be measured.
+  await local.start('big')
+  assert.deepEqual(await local.benchmark(), ['small', 'big'])
+  let run = await speedEnded(local)
+  assert.deepEqual(server.started.map((s) => s.model), ['big', 'small', 'big'])
+  assert.equal(run.restore, 'Big is loaded again, as it was before.')
+  assert.equal((await local.status()).engine.model, 'big')
+  assert.equal(local.isLoaded('big'), true)
+  // Only Small measured, with Big loaded: Big is loaded again after it.
+  await local.benchmark({ ids: ['small'] })
+  run = await speedEnded(local)
+  assert.deepEqual(server.started.map((s) => s.model).slice(3), ['small', 'big'])
+  assert.equal(run.restore, 'Big is loaded again, as it was before.')
+  assert.equal(local.isLoaded('big'), true)
+  // Nothing loaded: stopped again at the end.
+  await local.stop()
+  await local.benchmark()
+  run = await speedEnded(local)
+  assert.deepEqual(run.done.map((d) => [d.id, d.ok]), [['big', true], ['small', true]], 'manifest order')
+  assert.equal(run.restore, 'The engine is stopped again, as it was before.')
+  assert.equal((await local.status()).engine.running, false)
+  await local.dispose()
+})
+
+test('Cancel aborts the request in flight, records nothing for that model, keeps the readings taken, and restores; during a load it stops the engine at once', async () => {
+  const { local, server } = await speedIn({ ids: ['big', 'small'] })
+  assert.equal(typeof local.cancelBenchmark, 'function', 'the local models cancel a speed run')
+  const held = server.hold((e) => e.model === 'small' && e.body?.n_predict === 128)
+  await local.benchmark()
+  const request = await held.arrived
+  local.cancelBenchmark()
+  const run = await speedEnded(local)
+  assert.deepEqual(run.done.map((d) => [d.id, d.ok, d.ok ? null : d.text]), [['big', true, null], ['small', false, 'Small not measured: cancelled']])
+  assert.equal(run.restore, 'Stopped. Readings already taken are kept; the engine is stopped again, as it was before.')
+  assert.deepEqual(Object.keys((await local.readSettings()).speed), ['big@12288'], "Big's reading is kept")
+  assert.ok(request, 'the request was on its way')
+  assert.equal(measuredRequests(server).filter((r) => r.model === 'small').length, 1, 'and it was not run again')
+  assert.equal((await local.status()).engine.running, false)
+  held.release()
+  await local.dispose()
+
+  // During a load there is no request to abort: the loading engine is stopped at once, rather than
+  // left to load for minutes before the restore.
+  let loads = false
+  const slow = fakeLlamaServer({ healthy: () => loads })
+  const { local: loading } = await speedIn({ server: slow })
+  await loading.benchmark()
+  await waitFor('the engine is loading', () => slow.started.length, (n) => n === 1, { timeoutMs: 5000 })
+  const t0 = Date.now()
+  loading.cancelBenchmark()
+  const stopped = await speedEnded(loading)
+  assert.ok(Date.now() - t0 < 2000, `stopped in ${Date.now() - t0} ms`)
+  assert.equal(slow.started[0].child.exitCode, 0, 'the loading engine was stopped')
+  assert.deepEqual(stopped.done.map((d) => d.text), ['Big not measured: cancelled'])
+  assert.equal(stopped.restore, 'Stopped. Readings already taken are kept; the engine is stopped again, as it was before.')
+  assert.equal(slow.to('/completion').length, 0)
+  loads = true
+  // And a Cancel with nothing running changes nothing.
+  loading.cancelBenchmark()
+  assert.equal((await loading.status()).speedRun.state, 'idle')
+  await loading.dispose()
+})
+
+test('a settings change and a memory reading that land while a speed reading is written are all kept in local.json', async () => {
+  const writes = []
+  let local = null
+  const server = fakeLlamaServer({
+    // The load report is read as the model becomes ready, right before its memory reading is kept:
+    // a settings change sent then lands beside that write.
+    report: () => { writes.push(local.setSettings({ idleMinutes: 7 })); return SPLIT_REPORT },
+    // The last timed request answers right before the speed reading is written.
+    timings: (entry, worked) => { if (entry.body.n_predict === 128 && measuredRequests(server).length === 3) writes.push(local.setSettings({ keepWarm: true })); return worked },
+  })
+  ;({ local } = await speedIn({ server }))
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  await local.benchmark()
+  await speedEnded(local)
+  await Promise.all(writes)
+  assert.equal(writes.length, 2)
+  const s = await local.readSettings()
+  assert.deepEqual([s.idleMinutes, s.keepWarm, Object.keys(s.measured), Object.keys(s.speed)], [7, true, ['big@12288'], ['big@12288']])
+  // And settings changes sent together are all kept, not only the last one to save.
+  await Promise.all([local.setSettings({ maxCores: 3 }), local.setSettings({ maxRamGB: 20 }), local.setSettings({ gpuLayers: 'auto' })])
+  const after = await local.readSettings()
+  assert.deepEqual([after.maxCores, after.maxRamGB, after.gpuLayers, Object.keys(after.speed)], [3, 20, 'auto', ['big@12288']])
+  // setSettings never takes a speed patch: only a speed run writes readings.
+  await local.setSettings({ speed: {} })
+  assert.deepEqual(Object.keys((await local.readSettings()).speed), ['big@12288'])
+  await local.dispose()
+})
+
+test('a held Laya beside the model is kept with its reading, and whether it is there decides whether the reading stands', async () => {
+  const res = residencyStub()
+  const { local } = await speedIn({ residency: res })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  const laya = layaIn(res, { held: true })
+  await local.benchmark()
+  await speedEnded(local)
+  const r = (await local.readSettings()).speed['big@12288']
+  assert.equal(r?.laya, 'cuda', 'measured with Laya held on the GPU beside it')
+  assert.equal((await modelIn(local, 'big')).speed.stands, true)
+  // Laya let go and gone: the next load has the GPU to itself, and the reading does not stand for it.
+  laya.held = false
+  res.clear('laya', laya.entry)
+  assert.equal((await modelIn(local, 'big')).speed.why, 'it was measured with Laya on the GPU beside it and the next load will not have Laya beside it')
+  await local.dispose()
+})
+
+test('the install picker and /install-llm rate an installed model from a reading that stands, as measured, and every other one as estimated', async () => {
+  const { local } = await speedIn()
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  const [, , big, small] = MANIFEST_MODULES
+  // Before anything is measured, every model rating is an estimate and says so.
+  let c = await buildCatalog(local, PC)
+  assert.deepEqual(c.modules.filter((x) => x.kind === 'model').map((x) => [x.id, x.rating.source]), [['big', 'estimated'], ['small', 'estimated'], ['exp', 'estimated']])
+  assert.match(c.modules.find((x) => x.id === 'big').rating.label, /est\.\)$/)
+  const suggestedBefore = c.suggestions
+  await local.benchmark()
+  await speedEnded(local)
+  const measured = `20 tokens/s measured on this PC on ${today()}, 8,192 tokens into a conversation (about 15 words/s)`
+  c = await buildCatalog(local, PC)
+  assert.deepEqual(c.modules.find((x) => x.id === 'big').rating, { fit: 'split', label: `Splits GPU + CPU (29 of 37 layers on the GPU): ${measured}`, wordsPerSec: 15, source: 'measured' })
+  assert.deepEqual(c.modules.find((x) => x.id === 'small').rating, rateModule(small, PC, 'cuda12'), 'not installed: nobody can have measured it')
+  assert.equal(c.modules.find((x) => x.id === 'small').rating.source, 'estimated')
+  assert.deepEqual(c.suggestions, suggestedBefore, 'suggest() only suggests models that are not installed, so a reading changes none of it')
+  // status() carries the same rating, for the card.
+  assert.deepEqual((await modelIn(local, 'big')).rating, c.modules.find((x) => x.id === 'big').rating)
+  // /install-llm prints it.
+  const text = (await installLlmCommand('', { local, catalog: () => buildCatalog(local, PC) })).text
+  assert.ok(text.includes(`\`big\` Big · 5.0 GB · Splits GPU + CPU (29 of 37 layers on the GPU): ${measured}`), text)
+  // A reading that does not stand is not used: the rating is the estimate again.
+  await local.setSettings({ maxCores: 3 })
+  assert.equal((await buildCatalog(local, PC)).modules.find((x) => x.id === 'big').rating.source, 'estimated')
+
+  // Where it ran comes from the engine's own count of layers: all, some or none on the GPU. With
+  // no count the estimate's fit stays, and the label says that part is estimated.
+  const reading = { at: new Date().toISOString(), tokensPerSec: 21.2, depth: 8192, layersOnGpu: { gpu: 37, total: 37 } }
+  assert.deepEqual(rateModule(big, PC, 'cuda12', { installed: true, speed: reading }), { fit: 'gpu', label: `Runs fully on GPU: 21 tokens/s measured on this PC on ${today()}, 8,192 tokens into a conversation (about 16 words/s)`, wordsPerSec: 16, source: 'measured' })
+  assert.deepEqual(rateModule(big, PC, 'cuda12', { installed: true, speed: { ...reading, tokensPerSec: 2.9, layersOnGpu: { gpu: 0, total: 37 } } }), { fit: 'cpu', label: `CPU only: 2.9 tokens/s measured on this PC on ${today()}, 8,192 tokens into a conversation (about 2 words/s)`, wordsPerSec: 2, source: 'measured' })
+  assert.deepEqual(rateModule(big, PC, 'cuda12', { installed: true, speed: { ...reading, layersOnGpu: null } }), { fit: 'split', label: `21 tokens/s measured on this PC on ${today()}, 8,192 tokens into a conversation (about 16 words/s); the engine did not report its GPU split, so where it runs is estimated`, wordsPerSec: 16, source: 'measured' })
+  // A reading from another year says the year.
+  assert.match(rateModule(big, PC, 'cuda12', { installed: true, speed: { ...reading, at: '2024-03-02T12:00:00.000Z' } }).label, / on 2 Mar 2024, /)
+  await local.dispose()
+})
+
+test('a model the RAM watchdog unloads while it is measured, or one that does not load, records nothing and says why, and the run goes on', async () => {
+  let clock = 0
+  const rss = { 2147483647: 6 * 1024 ** 3 }
+  const { local, server } = await speedIn({ ids: ['big', 'small'], now: () => clock, readWorkingSet: async (pid) => rss[pid] ?? null, watchEveryMs: 3_600_000 })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  await local.setSettings({ maxRamGB: 5 })
+  // Big's working set stays over the 5 GB budget for 30 seconds while its first generation is timed.
+  const held = server.hold((e) => e.model === 'big' && e.body?.n_predict === 128)
+  await local.benchmark()
+  await held.arrived
+  await local.checkMemory()
+  clock += 30_000
+  await local.checkMemory()
+  assert.equal((await local.status()).engine.running, false, 'the watchdog unloaded it')
+  rss[2147483647] = 1 * 1024 ** 3
+  held.release()
+  const run = await speedEnded(local)
+  assert.deepEqual(run.done.map((d) => d.text).slice(0, 1), ['Big not measured: the RAM watchdog unloaded it: its working set stayed over the 5 GB RAM budget for 30 s (last reading 6 GB)'])
+  assert.equal(run.done[1].ok, true, 'Small is measured all the same')
+  assert.deepEqual(Object.keys((await local.readSettings()).speed), ['small@12288'])
+  await local.dispose()
+
+  // An engine that exits while it loads.
+  const broken = fakeLlamaServer({ healthy: () => false })
+  const { local: failing } = await speedIn({ server: broken })
+  await failing.benchmark()
+  await waitFor('the engine is loading', () => broken.started.length, (n) => n === 1, { timeoutMs: 5000 })
+  broken.started[0].child.stderr.emit('data', 'CUDA error: out of memory\n')
+  broken.started[0].child.kill()
+  const failed = await speedEnded(failing)
+  assert.deepEqual(failed.done.map((d) => d.text), ['Big not measured: it did not load (llama-server exited: CUDA error: out of memory)'])
+  await failing.dispose()
+})
+
+test('a speed reading records the Laya that was resident when the model loaded, held or not: one answering a call as the load starts, and one let go while it is measured', async () => {
+  // A Laya nothing holds, answering a call (a shadow of a Jev Auto run, say) when the load starts: it
+  // does not give way, so the layers are placed around it on the GPU, whatever it does after.
+  const res = residencyStub()
+  const answering = layaIn(res, { held: false })
+  const { local, server } = await speedIn({ residency: res, layaBusy: () => answering.busy })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  const warm = server.hold((e) => e.body?.n_predict === 16)
+  await local.benchmark()
+  answering.busy = true
+  await warm.arrived
+  assert.deepEqual(answering.unloads, [], 'it did not give way to the load')
+  // Its call ends before the timed requests, and it stays resident, idle, through them.
+  answering.busy = false
+  warm.release()
+  assert.equal((await speedEnded(local)).done[0].ok, true)
+  assert.equal((await local.readSettings()).speed['big@12288'].laya, 'cuda', 'measured beside a Laya on the GPU')
+  // Nothing holds it, so the next load has the GPU to itself: the reading does not stand for that load.
+  assert.deepEqual([(await modelIn(local, 'big')).speed.stands, (await modelIn(local, 'big')).speed.why], [false, 'it was measured with Laya on the GPU beside it and the next load will not have Laya beside it'])
+  await local.dispose()
+
+  // A Laya held when the model loads (a Laya Auto run, say) and let go while the prompt is read: it
+  // stays resident, and the reading is still one taken beside it.
+  const res2 = residencyStub()
+  const held = layaIn(res2, { held: true })
+  const { local: local2, server: server2 } = await speedIn({ residency: res2 })
+  const fill = server2.hold((e) => e.body?.n_predict === 1)
+  await local2.benchmark()
+  await fill.arrived
+  held.held = false
+  fill.release()
+  assert.equal((await speedEnded(local2)).done[0].ok, true)
+  assert.equal((await local2.readSettings()).speed['big@12288'].laya, 'cuda')
+  assert.equal((await modelIn(local2, 'big')).speed.why, 'it was measured with Laya on the GPU beside it and the next load will not have Laya beside it')
+  await local2.dispose()
+})
+
+test('a Laya loaded or unloaded beside the model while it is measured leaves nothing recorded, and says why: the split the model loaded with is not the one that ran', async () => {
+  const notMeasured = ['Big not measured: Laya was loaded or unloaded beside it while it was measured']
+  // Unloaded while the prompt is read: the layers were placed around it.
+  const res = residencyStub()
+  const laya = layaIn(res, { held: true })
+  const { local, server } = await speedIn({ residency: res })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  const fill = server.hold((e) => e.body?.n_predict === 1)
+  await local.benchmark()
+  await fill.arrived
+  res.clear('laya', laya.entry)
+  fill.release()
+  assert.deepEqual((await speedEnded(local)).done.map((d) => d.text), notMeasured)
+  assert.deepEqual((await local.readSettings()).speed, {})
+  await local.dispose()
+
+  // Loaded during a timed request, after the layers had the GPU to themselves.
+  const res2 = residencyStub()
+  const { local: local2, server: server2 } = await speedIn({ residency: res2 })
+  const second = server2.hold((e) => e.body?.n_predict === 128)
+  await local2.benchmark()
+  await second.arrived
+  layaIn(res2, { held: true })
+  second.release()
+  assert.deepEqual((await speedEnded(local2)).done.map((d) => d.text), notMeasured)
+  assert.equal(measuredRequests(server2).length, 1, 'no request is run again: that would not undo the split')
+  await local2.dispose()
+
+  // Stopped and started again between two requests, on the same device: another process all the same.
+  const res3 = residencyStub()
+  layaIn(res3, { held: true })
+  const { local: local3, server: server3 } = await speedIn({ residency: res3 })
+  const first = server3.hold((e) => e.body?.n_predict === 128)
+  await local3.benchmark()
+  await first.arrived
+  res3.clear('laya', res3.get('laya'))
+  layaIn(res3, { held: true })
+  first.release()
+  assert.deepEqual((await speedEnded(local3)).done.map((d) => d.text), notMeasured)
+  await local3.dispose()
+})
+
+test('Cancel while the speed run loads again the model it found loaded is refused with why, rather than ignored, and the run says whether it has been cancelled', async (t) => {
+  const { local, server } = await speedIn({ ids: ['big', 'small'] })
+  assert.equal(typeof local.cancelBenchmark, 'function', 'the local models cancel a speed run')
+  // Big is loaded, and only Small is measured, so the run ends by loading Big again; a chat title
+  // for Small holds the engine meanwhile, so that load waits.
+  await local.start('big')
+  const timed = server.hold((e) => e.model === 'small' && e.body?.n_predict === 128)
+  await local.benchmark({ ids: ['small'] })
+  await timed.arrived
+  const title = await local.acquire('small')
+  t.after(async () => { title.release(); timed.release(); await speedEnded(local); await local.dispose() })
+  assert.equal((await local.status()).speedRun.cancelled, false, 'not cancelled while it measures')
+  timed.release()
+  let run = null
+  for (let i = 0; i < 500 && run?.current?.phase !== 'restoring'; i++) {
+    run = (await local.status()).speedRun
+    if (run.current?.phase !== 'restoring') await new Promise((r) => setTimeout(r, 10))
+  }
+  assert.equal(run.current?.phase, 'restoring')
+  assert.throws(() => local.cancelBenchmark(), (err) => err.status === 409 && err.message === 'The speed benchmark has measured every model it will and is putting the engine back as it was before it; that cannot be cancelled.')
+  assert.deepEqual([(await local.status()).speedRun.state, (await local.status()).speedRun.cancelled], ['running', false], 'nothing changed')
+  title.release()
+  assert.equal((await speedEnded(local)).restore, 'Big is loaded again, as it was before.')
+})
+
+test('KzH closing while a speed run waits to load the model it found loaded loads nothing: no engine outlives it, and the last line says why', async () => {
+  const { local, server } = await speedIn({ ids: ['big', 'small'] })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  // Big is loaded, and only Small is measured, so the run ends by loading Big again.
+  await local.start('big')
+  const timed = server.hold((e) => e.model === 'small' && e.body?.n_predict === 128)
+  await local.benchmark({ ids: ['small'] })
+  await timed.arrived
+  // A chat title for Small reaches the engine meanwhile, so the restore's load of Big waits for it.
+  const title = await local.acquire('small')
+  timed.release()
+  let phase = null
+  for (let i = 0; i < 500 && phase !== 'restoring'; i++) {
+    phase = (await local.status()).speedRun.current?.phase ?? null
+    if (phase !== 'restoring') await new Promise((r) => setTimeout(r, 10))
+  }
+  assert.equal(phase, 'restoring', 'the restore waits for the title')
+  const spawned = server.started.length
+  await local.dispose()
+  title.release()
+  // The restore's load looks again every 500 ms while another model holds the engine.
+  await new Promise((r) => setTimeout(r, 1200))
+  assert.equal(server.started.length, spawned, 'nothing was loaded after KzH closed')
+  assert.ok(server.started.every((s) => s.child.exitCode !== null), 'and every engine it started has stopped')
+  assert.equal((await local.status()).engine.running, false)
+  const run = await speedEnded(local)
+  assert.equal(run.restore, 'Stopped. Readings already taken are kept; KzH closed during the speed benchmark, so nothing was loaded again.')
+  // Nor does anything else load a model once KzH has closed.
+  await assert.rejects(local.acquire('big'), { message: 'KzH is closing, so Big was not loaded' })
+  assert.equal(server.started.length, spawned)
+})
+
+test('a model whose context cannot hold the 8,192-token prompt and the 128 tokens generated after it is not measured, and says so before anything is loaded', async () => {
+  // The plugin config may start every model at 8k, below the 12k floor.
+  const { local, server } = await speedIn({ contextSize: 8192 })
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  assert.equal((await modelIn(local, 'big')).ctx, 8192)
+  await local.benchmark()
+  assert.deepEqual((await speedEnded(local)).done.map((d) => d.text), ['Big not measured: its context of 8k cannot hold the 8,192-token prompt and the 128 tokens generated after it'])
+  assert.equal(server.started.length, 0, 'nothing was loaded for it')
+  assert.deepEqual((await local.readSettings()).speed, {})
+  await local.dispose()
+  // A context that is no whole number of k is given in tokens.
+  const { local: odd, server: oddServer } = await speedIn({ contextSize: 8300 })
+  await odd.benchmark()
+  assert.deepEqual((await speedEnded(odd)).done.map((d) => d.text), ['Big not measured: its context of 8300 tokens cannot hold the 8,192-token prompt and the 128 tokens generated after it'])
+  assert.equal(oddServer.started.length, 0)
+  await odd.dispose()
+  // One that holds them is measured, below the floor as it is.
+  const { local: enough } = await speedIn({ contextSize: 9216 })
+  await enough.benchmark()
+  assert.equal((await speedEnded(enough)).done[0].ok, true)
+  assert.deepEqual(Object.keys((await enough.readSettings()).speed), ['big@9216'])
+  await enough.dispose()
+})
+
+test('a timed request that has to read the whole prompt again, because a request for the same model took the one slot\'s cache, has the fill\'s time for it and is run again', async () => {
+  // Time scaled so that a minute is 60 ms. This engine reads 10 tokens a second, as a CPU may: the
+  // 8,192-token prompt takes 13.7 minutes to read, over 10 minutes and under the fill's 30.
+  const scale = 60 / 60_000
+  const realTimeout = AbortSignal.timeout
+  AbortSignal.timeout = (ms) => realTimeout.call(AbortSignal, Math.max(1, Math.round(ms * scale)))
+  try {
+    const base = fakeLlamaServer({ report: () => SPLIT_REPORT, speed: () => ({ generate: 20, read: 10 }) })
+    // Each /completion answers when llama-server would, scaled: once it has read the prompt and generated.
+    const fetch = async (url, init = {}) => {
+      const r = await base.fetch(url, init)
+      const t = String(url).endsWith('/completion') && r.ok ? (await r.clone().json()).timings : null
+      if (t) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, (t.prompt_ms + t.predicted_ms) * scale)
+          init.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(init.signal.reason) }, { once: true })
+        })
+      }
+      return r
+    }
+    const { local } = await speedIn({ server: { ...base, fetch } })
+    assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+    const first = base.hold((e) => e.body?.n_predict === 128)
+    await local.benchmark()
+    await first.arrived
+    // A chat title for Big reaches the engine before the first timed request: its own prompt takes
+    // the one slot's cache, so that request reads all 8,192 tokens again.
+    const conn = await local.acquire('big')
+    await base.fetch(`${conn.url}/completion`, { method: 'POST', headers: { authorization: `Bearer ${conn.key}` }, body: JSON.stringify({ prompt: [1, 2, 3], n_predict: 4, cache_prompt: true }) })
+    conn.release()
+    first.release()
+    const run = await speedEnded(local, { timeoutMs: 20_000 })
+    assert.equal(run.done[0].ok, true, run.done[0].text)
+    const timed = measuredRequests(base)
+    assert.equal(timed.length, 4, 'the request that had company, and three more')
+    assert.equal((await local.readSettings()).speed['big@12288'].tokensPerSec, 20)
+    await local.dispose()
+  } finally {
+    AbortSignal.timeout = realTimeout
+  }
+})
+
+test('a speed reading stands only for the weights it was measured on: once a manifest update ships other weights under the same model id, the card and the install picker give the estimate, and the card says why', async () => {
+  const { local, engineDir, modelsDir } = await speedIn()
+  assert.equal(typeof local.benchmark, 'function', 'the local models run a speed benchmark')
+  await local.benchmark()
+  await speedEnded(local)
+  assert.equal((await modelIn(local, 'big')).speed.stands, true)
+  await local.dispose()
+  // The manifest now ships another quantisation of Big, another file and SHA-256, installed in its place.
+  const modules = MANIFEST_MODULES.map((m) => (m.id === 'big' ? { ...m, file: 'big-q5.gguf', sha256: sha('big-q5') } : m))
+  writeFileSync(join(modelsDir, 'big-q5.gguf'), 'big-q5')
+  const server = fakeLlamaServer({ report: () => SPLIT_REPORT })
+  const again = createLocalModels({ modules, engineDir, modelsDir, settingsFile: join(engineDir, '..', 'local.json'), specs: async () => PC, port: 0, spawn: server.spawn, fetch: server.fetch })
+  await again.installed()
+  await again.settled()
+  const big = await modelIn(again, 'big')
+  assert.equal(big.state, 'installed')
+  assert.deepEqual([big.speed.stands, big.speed.why], [false, 'it was measured on other weights of this model'])
+  assert.equal(big.rating.source, 'estimated')
+  const picked = (await buildCatalog(again, PC)).modules.find((x) => x.id === 'big')
+  assert.equal(picked.rating.source, 'estimated')
+  assert.match(picked.rating.label, /est\.\)$/)
+  // Measured again, on the new weights, it stands, and says which weights it was measured on.
+  await again.benchmark()
+  await speedEnded(again)
+  assert.equal((await modelIn(again, 'big')).speed.stands, true)
+  assert.deepEqual((await again.readSettings()).speed['big@12288'].weights, { file: 'big-q5.gguf', sha256: sha('big-q5') })
+  await again.dispose()
 })

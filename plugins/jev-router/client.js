@@ -104,6 +104,11 @@ window.__ModuleLoader__.load({
 .jevi table.cmp thead th{color:var(--dsw-alias-label-tertiary)}
 .jevi table.cmp td{font-variant-numeric:tabular-nums}
 .jevi .why.shadow{margin-top:2px}
+/* Sortable tables: the header is a button that sorts, and a filter field sits under each one. */
+.jevi table.sortable{max-height:60vh;overflow:auto}
+.jevi table.sortable td .clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-width:200px}
+.jevi table.sortable th button.sorter{background:none;border:0;padding:0;font:inherit;color:inherit;cursor:pointer;text-align:left}
+.jevi table.sortable th input.filter{width:100%;min-width:56px;box-sizing:border-box;font:inherit;padding:2px 4px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}
 .jevi ol.steps{margin:0;padding-left:18px}
 .jevi ol.steps li{margin:0 0 8px}
 .jevi details.q{border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base);border-radius:10px;padding:8px 10px;margin:0 0 6px}
@@ -164,6 +169,9 @@ window.__ModuleLoader__.load({
 .jevi-modal{position:fixed;inset:0;background:var(--dsw-alias-bg-mask-1);display:flex;align-items:center;justify-content:center;z-index:10000;height:auto;padding:0}
 .jevi-modal .box{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;padding:18px;max-width:380px;width:calc(100% - 32px);box-shadow:0 10px 40px var(--dsw-alias-bg-mask-3)}
 .jevi-modal .box.wide{max-width:640px;max-height:calc(100vh - 48px);overflow:auto}
+.jevi-modal .box.confirm{display:flex;flex-direction:column;max-height:calc(100vh - 48px);box-sizing:border-box}
+.jevi-modal .box.confirm .body{overflow:auto;min-height:0}
+.jevi-modal .box.confirm h3,.jevi-modal .box.confirm .actions{flex:none}
 .jevi-modal .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
 .jevi kbd{font:var(--dsw-font-xxxs-11);font-family:var(--ds-font-family-code);padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);white-space:nowrap}
 .jevi kbd.none{font-family:inherit;color:var(--dsw-alias-label-caption);border-style:dashed}
@@ -386,7 +394,11 @@ window.__ModuleLoader__.load({
       }, [])
     }
 
-    /** Confirmation overlay: names what goes, clear cancel. */
+    /**
+     * Confirmation overlay: names what goes, clear cancel. However long its body, the title and the
+     * buttons stay in view and the body scrolls between them, so a box taller than the window never
+     * loses its top above the edge, where a centred overlay cannot scroll to.
+     */
     function Confirm({ title, body, confirmLabel, onCancel, onConfirm }) {
       useEffect(() => {
         const k = (e) => { if (e.key === 'Escape') onCancel() }
@@ -394,9 +406,10 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener('keydown', k)
       }, [onCancel])
       return h('div', { className: 'jevi jevi-modal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'jevi-confirm-t', onClick: onCancel },
-        h('div', { className: 'box', onClick: (e) => e.stopPropagation() },
+        h('div', { className: 'box confirm', onClick: (e) => e.stopPropagation() },
           h('h3', { id: 'jevi-confirm-t' }, title),
-          h('p', null, body),
+          // A body of several paragraphs, as the capability benchmark's confirmation is, is one per line.
+          h('div', { className: 'body' }, ...(Array.isArray(body) ? body.map((t, i) => h('p', { key: i }, t)) : [h('p', null, body)])),
           h('div', { className: 'actions' },
             h('button', { className: 'btn', onClick: onCancel, autoFocus: true }, 'Cancel'),
             h('button', { className: 'btn danger', onClick: onConfirm }, confirmLabel))))
@@ -1729,13 +1742,202 @@ window.__ModuleLoader__.load({
         h('div', { className: 'why' }, latencyLine(data.latency)))
     }
 
+    // ---------- tables with a sort and a filter on every column (docs/handoff.md, the table rule) ----------
+    // A table is `columns` of { key, label } and `rows` of cells, one { text, value } per column: the
+    // text is what the cell shows and what a filter reads, the value what a sort reads. A value of
+    // null is a blank.
+
+    /** What a sort reads of a cell: its value when it has one, else its text. */
+    const sortKeyOf = (cell) => (cell && Object.hasOwn(cell, 'value') ? cell.value : cell?.text)
+    const isBlank = (v) => v == null || v === '' || (typeof v === 'number' && Number.isNaN(v))
+
+    /**
+     * `rows` sorted by column `col`, 'asc' or 'desc'; with no column or direction, as they came.
+     * Numbers sort as numbers and text as text, a blank goes last either way, and rows that compare
+     * equal keep their order.
+     */
+    function sortRows(rows, col, dir) {
+      if (col == null || !dir) return rows.slice()
+      const compare = (a, b) => (typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' }))
+      return rows.map((row, i) => [row, i]).sort(([ra, ia], [rb, ib]) => {
+        const a = sortKeyOf(ra[col])
+        const b = sortKeyOf(rb[col])
+        if (isBlank(a) || isBlank(b)) return isBlank(a) === isBlank(b) ? ia - ib : isBlank(a) ? 1 : -1
+        const c = compare(a, b)
+        return (dir === 'desc' ? -c : c) || ia - ib
+      }).map(([row]) => row)
+    }
+
+    /** The rows whose cell shows the filter's text in every column that has one, whatever its case. */
+    function filterRows(rows, filters) {
+      const active = Object.entries(filters ?? {}).map(([col, f]) => [Number(col), String(f ?? '').trim().toLowerCase()]).filter(([, f]) => f)
+      return rows.filter((row) => active.every(([col, f]) => String(row[col]?.text ?? '').toLowerCase().includes(f)))
+    }
+
+    /**
+     * Any table under the table rule: a sort toggle on every column header (none, ascending,
+     * descending, said by aria-sort) and a filter field under every header, all filters together.
+     * The table scrolls within a height of its own, so its scroll bars stay in view, and a column
+     * marked `clamp` shows at most three lines of a cell, with the whole of it as the cell's title.
+     */
+    function SortTable({ label, columns, rows, empty = 'Nothing yet.' }) {
+      const [sort, setSort] = useState({ col: null, dir: null })
+      const [filters, setFilters] = useState({})
+      const shown = sortRows(filterRows(rows ?? [], filters ?? {}), sort?.col ?? null, sort?.dir ?? null)
+      const next = (i) => setSort((s) => (s.col !== i ? { col: i, dir: 'asc' } : s.dir === 'asc' ? { col: i, dir: 'desc' } : { col: null, dir: null }))
+      const ariaSort = (i) => (sort?.col === i ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none')
+      return h('table', { className: 'cmp sortable', 'aria-label': label },
+        h('thead', null,
+          h('tr', null, ...columns.map((c, i) => h('th', { key: c.key, scope: 'col', 'aria-sort': ariaSort(i) },
+            h('button', { type: 'button', className: 'sorter', title: `Sort by ${c.label}`, onClick: () => next(i) }, c.label, ariaSort(i) === 'ascending' ? ' ▲' : ariaSort(i) === 'descending' ? ' ▼' : '')))),
+          h('tr', null, ...columns.map((c, i) => h('th', { key: `${c.key}-filter` },
+            h('input', { type: 'search', className: 'filter', placeholder: 'Filter', 'aria-label': `Filter ${c.label}`, value: filters?.[i] ?? '', onChange: (e) => setFilters((f) => ({ ...f, [i]: e.target.value })) }))))),
+        h('tbody', null, ...(shown.length
+          ? shown.map((row, k) => h('tr', { key: k }, ...columns.map((c, i) => (c.clamp
+            ? h('td', { key: c.key, title: row[i]?.text ?? '' }, h('div', { className: 'clamp' }, row[i]?.text ?? ''))
+            : h('td', { key: c.key }, row[i]?.text ?? '')))))
+          : [h('tr', { key: 'none' }, h('td', { colSpan: columns.length, className: 'muted' }, (rows ?? []).length ? 'No row matches the filters.' : empty))])))
+    }
+
+    // ---------- the capability benchmark (docs/benchmark.md 3.11) ----------
+
+    const BENCH_DIMENSION_COLUMNS = [
+      { key: 'agent', label: 'Agent' }, { key: 'model', label: 'Model' }, { key: 'dimension', label: 'Dimension' },
+      { key: 'benchmark', label: 'Benchmark' }, { key: 'weight', label: 'Weight' }, { key: 'prior', label: 'Prior' },
+      { key: 'now', label: 'Profile now' }, { key: 'skills', label: 'Skills' }, { key: 'run', label: 'Run' },
+    ]
+    // What came of a task beside the task, so the narrow inspector shows it first; a long why is clamped.
+    const BENCH_TASK_COLUMNS = [
+      { key: 'agent', label: 'Agent' }, { key: 'task', label: 'Task' }, { key: 'outcome', label: 'Outcome' }, { key: 'why', label: 'Why', clamp: true },
+      { key: 'skill', label: 'Skill' }, { key: 'level', label: 'Level' }, { key: 'time', label: 'Time' }, { key: 'tokens', label: 'Tokens' },
+      { key: 'effort', label: 'Effort' }, { key: 'run', label: 'Run' },
+    ]
+    /** How long something has been running, in words. */
+    const elapsedText = (ms) => (ms < 60_000 ? `${Math.max(0, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`)
+
+    /**
+     * One agent's line while the benchmark runs (3.11): how far it is, what came of its tasks, the
+     * task under way with its time or the lanes' waiting line, and when its queue has ended, how.
+     */
+    function benchmarkProgress(a, now = Date.now()) {
+      const sentence = (t) => (/[.!?]$/.test(t) ? t : `${t}.`)
+      if (a.status === 'waiting') return `${a.id}: waits for its turn.`
+      // Nothing was run on it: its line says why, and there is nothing to count.
+      if (a.status === 'not_run' || a.status === 'too_small') return sentence(a.line ?? `${a.id} was not run`)
+      const counts = [`${a.passed} passed`, `${a.failed} failed`, ...(a.timedOut ? [`${a.timedOut} timed out`] : [])].join(', ')
+      const more = [a.reruns ? `${a.reruns} run again after an error` : '', a.didNotFit ? `${a.didNotFit} did not fit` : ''].filter(Boolean).join('; ')
+      // The first, one-file task is not scored: how it went is said apart from the scored tasks counted.
+      const first = a.first ? `first task ${{ passed: 'passed', failed: 'failed', timed_out: 'timed out', errored: 'errored', not_scored: 'not scored' }[a.first] ?? a.first}; ` : ''
+      const head = `${a.id}: ${first}${a.done} of ${a.total}: ${counts}${more ? `; ${more}` : ''}.`
+      // Between tasks the runner may be reading the agent's usage, which may take seconds: its phase says so.
+      const between = a.phase === 'spend-before' ? 'Reading its usage before it starts.' : a.phase === 'spend-after' ? 'Reading what it spent.' : 'Starting.'
+      if (a.status === 'running') return `${head} ${a.task ? sentence(a.task.waiting ?? `Running ${a.task.id}, ${elapsedText(now - a.task.startedAt)}`) : between}`
+      return a.line ? `${head} ${sentence(a.line)}` : head
+    }
+
+    /** The benchmark's state, read every 5 seconds, and every 2 while a run goes. */
+    function useBenchmark(sessionId, visible) {
+      const [state, setState] = useState({ data: null, error: '' })
+      const [asked, setAsked] = useState(0)
+      useEffect(() => {
+        if (!visible) return undefined
+        let stop = false
+        let timer
+        const read = async () => {
+          let running = false
+          try {
+            const d = await api(`/jev-router/benchmark${sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''}`)
+            running = !!d.run
+            if (!stop) setState({ data: d, error: '' })
+          } catch (e) { if (!stop) setState((s) => ({ data: s.data, error: e.message })) }
+          if (!stop) timer = setTimeout(read, running ? 2000 : 5000)
+        }
+        read()
+        return () => { stop = true; clearTimeout(timer) }
+      }, [sessionId, visible, asked])
+      return { ...state, reload: () => setAsked((n) => n + 1) }
+    }
+
+    /**
+     * The Capability benchmark card of the Router tab (3.11): what it is, where it runs, the agents to
+     * pick with what a run on each would spend, a confirmation the server writes, the run's progress
+     * with Stop, and the results. Nothing is ever picked for the person.
+     */
+    function BenchmarkCard({ sessionId, visible = true, now = Date.now() }) {
+      const { data, error, reload } = useBenchmark(sessionId, visible)
+      const [picked, setPicked] = useState([])
+      const [confirm, setConfirm] = useState(null)
+      const [msg, setMsg] = useState('')
+      const [busy, setBusy] = useState(false)
+      const title = h('div', { className: 'label', id: 'jevi-bench-h' }, 'Capability benchmark')
+      if (!data) return h('section', { className: 'card', 'aria-labelledby': 'jevi-bench-h' }, title, h('div', { className: error ? 'err' : 'muted', role: error ? 'alert' : undefined }, error || 'Reading the benchmark…'))
+      const chosen = (picked ?? []).filter((id) => data.agents.some((a) => a.id === id && a.can))
+      const run = data.run
+      const act = async (fn) => {
+        setMsg(''); setBusy(true)
+        try { await fn() } catch (e) { setMsg(e.message) } finally { setBusy(false); reload() }
+      }
+      const toggle = (id, on) => setPicked((p) => (on ? [...new Set([...(p ?? []), id])] : (p ?? []).filter((x) => x !== id)))
+      const askToRun = () => act(async () => {
+        const plan = await post('/jev-router/benchmark/plan', { session: sessionId, agents: chosen })
+        setConfirm({
+          ...plan.confirm,
+          run: () => act(async () => { await post('/jev-router/benchmark/start', { session: sessionId, agents: chosen, planId: plan.planId }); setPicked([]) }),
+        })
+      })
+      const askToStop = () => setConfirm({
+        title: 'Stop the benchmark?',
+        body: 'The task under way is stopped. Every agent that has not finished all its tasks records nothing; agents that finished keep what they recorded.',
+        confirmLabel: 'Stop',
+        run: () => act(() => post('/jev-router/benchmark/stop', {})),
+      })
+      // Only from the scratch workspace, with a pick, while nothing runs and the task set on disk is the version it says.
+      const canRun = data.where?.state === 'scratch' && data.taskSet?.digestOk !== false && chosen.length > 0 && !run && !busy
+      const pick = (a) => h('li', { key: a.id, style: { display: 'block' } },
+        h('label', { className: 'toggle', title: a.can ? undefined : a.why },
+          h('input', { type: 'checkbox', checked: chosen.includes(a.id), disabled: !a.can || !!run, 'aria-label': `Pick ${a.id}`, onChange: (e) => toggle(a.id, e.target.checked) }),
+          h('b', null, a.id), h('span', { className: 'pill' }, a.kindText), h('code', { style: { marginLeft: 6 } }, a.subject)),
+        a.can ? null : h('div', { className: 'err' }, a.why),
+        ...(a.estimate ?? []).map((t, i) => h('div', { className: 'why', key: `e${i}` }, t)),
+        ...(a.warnings ?? []).map((t, i) => h('div', { className: 'warnline', key: `w${i}` }, t)),
+        a.lastRun ? h('div', { className: 'why' }, `Last run ${a.lastRun.day}, version ${a.lastRun.version ?? '?'}${a.lastRun.older ? ', older than the task set' : ''}: ${a.lastRun.statusText}.`) : null)
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-bench-h' },
+        title,
+        h('p', { className: 'why', style: { margin: '0 0 8px' } }, data.what),
+        h('div', { className: data.where?.state === 'scratch' ? 'why' : data.where?.state === 'in_git' ? 'err' : 'warnline' }, data.where?.text),
+        data.where?.accountText ? h('div', { className: 'warnline' }, data.where.accountText) : null,
+        data.taskSet && !data.taskSet.digestOk ? h('div', { className: 'err' }, `The task set on disk no longer matches version ${data.taskSet.version}; nothing can be run until it does.`) : null,
+        h('div', { className: 'label', style: { margin: '10px 0 4px' } }, 'Agents'),
+        data.agents.length ? h('ul', { className: 'plain' }, ...data.agents.map(pick)) : h('div', { className: 'muted' }, 'No agent is switched on.'),
+        h('div', { className: 'head', style: { marginTop: 8 } },
+          h('button', { className: 'btn primary', disabled: !canRun, onClick: askToRun }, `Run on ${chosen.length} agent${chosen.length === 1 ? '' : 's'}`),
+          run ? h('button', { className: 'btn danger', disabled: busy || run.stopping, onClick: askToStop }, run.stopping ? 'Stopping…' : 'Stop') : null),
+        msg ? h('div', { className: 'err', role: 'alert' }, msg) : null,
+        error ? h('div', { className: 'err', role: 'alert' }, `The benchmark could not be read: ${error}`) : null,
+        run ? h('div', { role: 'status', 'aria-label': 'Benchmark progress', style: { marginTop: 8 } }, ...run.agents.map((a) => h('div', { key: a.id, className: 'why' }, benchmarkProgress(a, now)))) : null,
+        !run && data.last ? h('div', { role: 'status', 'aria-label': 'Last benchmark', style: { marginTop: 8 } },
+          // A run that ended any other way (its log could not be written, the task set changed under
+          // it) ended early, and its lines say why.
+          h('div', { className: 'why' }, `The last run ${{ interrupted: 'was interrupted: KzH stopped before it ended, and every agent that had not finished records nothing.', stopped: 'was stopped.', finished: 'finished.' }[data.last.status] ?? 'ended early, and every agent that had not finished records nothing.'}`),
+          ...(data.last.lines ?? []).map((t, i) => h('div', { key: i, className: 'why' }, t))) : null,
+        h('div', { className: 'label', style: { margin: '10px 0 4px' } }, 'Results by dimension'),
+        h(SortTable, { label: 'Benchmark results by dimension', columns: BENCH_DIMENSION_COLUMNS, rows: data.results?.dimensions ?? [], empty: 'No agent has finished a run yet.' }),
+        h('div', { className: 'label', style: { margin: '10px 0 4px' } }, 'Tasks'),
+        h(SortTable, { label: 'Benchmark tasks', columns: BENCH_TASK_COLUMNS, rows: data.results?.tasks ?? [], empty: 'No task has run yet.' }),
+        h('div', { className: 'why', style: { marginTop: 6 } }, data.note),
+        confirm ? h(Confirm, { title: confirm.title, body: confirm.body, confirmLabel: confirm.confirmLabel, onCancel: () => setConfirm(null), onConfirm: () => { const c = confirm; setConfirm(null); c.run() } }) : null)
+    }
+
     /**
      * The Router view: how far each routing domain has matured, what is blocking the next step,
      * and what the capability registry currently believes about each resource and on what
      * evidence. This is the tab that answers "why did it pick that, and who decided". `laya` is
      * the comparison of Jev and Laya (useLayaCompare), shown under the domains when there is one.
+     * The Capability benchmark card of the chat `sessionId` follows what each resource is believed
+     * to be good at (docs/benchmark.md 3.11); `visible` is whether the tab is shown, and the card
+     * reads the benchmark only then, as the tab's other reads do.
      */
-    function RouterView({ data, error, busy, onRefresh, laya = null }) {
+    function RouterView({ data, error, busy, onRefresh, laya = null, sessionId = null, visible = true }) {
       if (error) return h('div', { className: 'err', role: 'alert' }, error)
       if (!data) return h('div', { className: 'empty' }, busy ? 'Reading the router…' : 'No routing state yet.')
       if (!data.enabled) return h('div', { className: 'empty' }, 'Adaptive routing is switched off in the config; Jev routes every task.')
@@ -1785,7 +1987,7 @@ window.__ModuleLoader__.load({
               `${evidenceNote(v.confidence)}`,
               v.prior ? ` · started from a ${v.prior.source.replace(/_/g, ' ')} of ${pct(v.prior.score)}` : '',
               v.execution ? ` · ${v.execution.n} runs here, trend ${v.execution.trend}` : '',
-              v.benchmark ? ` · benchmark ${pct(v.benchmark.score)}` : '')))))
+              v.benchmark ? ` · benchmark ${Math.round(v.benchmark.score * 100)}% (${v.benchmark.passed} of ${v.benchmark.tasks} task${v.benchmark.tasks === 1 ? '' : 's'})` : '')))))
       })
       return h('div', null,
         h('div', { className: 'head' },
@@ -1797,8 +1999,9 @@ window.__ModuleLoader__.load({
           : h(LayaCompare, { data: laya?.data ?? null }),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'Resources, as the provider adapters report them'), h('ul', { className: 'plain' }, ...resources)),
         h('div', { className: 'card' }, h('div', { className: 'label' }, 'What each resource is believed to be good at'),
-          h('div', { className: 'why', style: { margin: '4px 0 8px' } }, 'Priors are the owner\'s starting observations. Recorded runs, reviews and feedback move them; an unknown dimension stays unknown.'),
-          ...profiles))
+          h('div', { className: 'why', style: { margin: '4px 0 8px' } }, 'Priors are the owner\'s starting observations. Recorded runs, reviews, feedback and the capability benchmark below move them; an unknown dimension stays unknown.'),
+          ...profiles),
+        h(BenchmarkCard, { sessionId, visible }))
     }
 
     /** One answer of a call. `shadow` is Laya's answer to the same question in Jev Auto (shadowCell), or null. */
@@ -2857,6 +3060,8 @@ window.__ModuleLoader__.load({
           h('div', { style: { minWidth: 0 } },
             h('b', null, agentLabel(r.agent)), r.role || r.phase ? h('span', { className: 'pill' }, r.role ?? r.phase) : null,
             r.limitHit ? h('span', { className: 'pill bad' }, 'limit hit') : null,
+            // A task of the capability benchmark is real usage, kept apart from the person's own runs.
+            r.purpose === 'benchmark' ? h('span', { className: 'pill', title: 'A task of the capability benchmark: real usage, left out of Saved by Jev and of the estimates of your own runs' }, 'benchmark') : null,
             r.account ? h('div', { className: 'why' }, r.account) : null),
           h('span', { className: 'why', style: { textAlign: 'right' } }, [
             when(r.ts), r.durationMs != null ? ms(r.durationMs) : null,
@@ -3033,7 +3238,7 @@ window.__ModuleLoader__.load({
         chipErr ? h('div', { className: 'err', role: 'alert' }, chipErr) : null,
         h('div', { className: 'tabs', role: 'tablist' }, tab('decisions', 'Decisions', runs.length), tab('router', 'Router'), tab('subagents', 'Subagents', liveKids), tab('jobs', 'Background', live), tab('usage', 'Usage', limited)),
         view === 'decisions' ? h(Decisions, { runs })
-          : view === 'router' ? h(RouterView, { ...routing, onRefresh: routing.load, laya: layaCompare })
+          : view === 'router' ? h(RouterView, { ...routing, onRefresh: routing.load, laya: layaCompare, sessionId, visible })
             : view === 'subagents' ? h(Subagents, { sessionId, entries })
               : view === 'usage' ? h(UsageView, { usage, error: usageErr, busy: usageBusy, onRefresh: () => loadUsage(true), onSaved: () => loadUsage(false) }) : h(Tasks, { sessionId, runs, jobs, entries, tasks }))
     }
@@ -4102,7 +4307,8 @@ window.__ModuleLoader__.load({
         const n = ++seq.current
         try { const d = await api('/jev-router/local'); if (n === seq.current) { setData(d); setError('') } } catch (e) { if (n === seq.current) setError(e.message) }
       }, [])
-      const busy = !!data?.modules?.some((m) => ACTIVE_JOB.includes(m.job?.state) || m.state === 'verifying')
+      // Polled faster while something moves: an install, a hash, or a speed benchmark.
+      const busy = !!data?.modules?.some((m) => ACTIVE_JOB.includes(m.job?.state) || m.state === 'verifying') || data?.speedRun?.state === 'running'
       useEffect(() => {
         if (!active) return
         load()
@@ -4256,6 +4462,104 @@ window.__ModuleLoader__.load({
      */
     const reducedText = (from, to) => ([from, to].every((n) => n % 1024 === 0) ? `${ctxText(from)} to ${ctxText(to)}` : `${from} tokens to ${to} tokens`)
     const threadsText = (n) => `${n} thread${n === 1 ? '' : 's'}`
+    const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    /** The day a figure was measured, "25 Sep", with its year when that is not this one. */
+    const dayText = (iso, now = new Date()) => {
+      const d = new Date(iso)
+      if (Number.isNaN(d.getTime())) return 'an unknown day'
+      return `${d.getDate()} ${MONTHS[d.getMonth()]}${d.getFullYear() === now.getFullYear() ? '' : ` ${d.getFullYear()}`}`
+    }
+
+    // local.js SPEED_DEPTH and SPEED_PREDICT, which the Benchmark button's words state; the test holds
+    // the copies to the same numbers, as it does MIN_CTX.
+    const SPEED_DEPTH = 8192
+    const SPEED_PREDICT = 128
+    const layaText = (device) => (device === 'cuda' ? 'the GPU' : 'the CPU')
+
+    /**
+     * An installed model's speed line (docs/benchmark.md 2.9), from the `speed` status() gives it
+     * (`{ reading, stands, why }`, the reading for its next load) and its `rating`: the reading when
+     * it stands, with where and how it was taken; the reading, why it does not stand for the next
+     * load, and the estimate for that load; or, with none, the estimate, which says it is one.
+     */
+    const speedLine = (m) => {
+      const r = m?.speed?.reading
+      const rating = m?.rating
+      // The estimate for the next load, from the rating status() gives when no reading stands for it.
+      const estimate = () => {
+        const guess = rating.wordsPerSecRange ? `about ${rating.wordsPerSecRange[0]} to ${rating.wordsPerSecRange[1]} words/s` : `about ${rating.wordsPerSec} words/s`
+        const unknown = rating.wordsPerSecRange ? ", a range because this GPU's memory is unknown" : ''
+        return `${guess} estimated from its size and this PC's memory bandwidth${unknown}`
+      }
+      if (!r) {
+        if (!rating) return 'Speed: not measured on this PC.'
+        if (rating.fit === 'no') return `Speed: not measured on this PC, which cannot run it: ${rating.reason}.`
+        return `Speed: not measured on this PC; ${estimate()}.`
+      }
+      const tps = Number(r.tokensPerSec).toFixed(1)
+      if (!m.speed.stands) {
+        const stale = `Speed: measured ${tps} tokens/s on ${dayText(r.at)}, but ${m.speed.why}, so that reading does not stand for the next load. Benchmark it again.`
+        if (!rating) return stale
+        if (rating.fit === 'no') return `${stale} This PC cannot run it now: ${rating.reason}.`
+        return `${stale} Until then, ${estimate()}.`
+      }
+      const layers = r.layersOnGpu ? `${r.layersOnGpu.gpu} of ${r.layersOnGpu.total} layers on the GPU` : 'the engine did not report its GPU split'
+      const beside = r.laya ? `, Laya on ${layaText(r.laya)} beside it` : ''
+      const how = `(measured ${dayText(r.at)}; ${layers}, ${threadsText(r.threads)}${beside})`
+      const depth = `${Number(r.depth).toLocaleString('en-US')} tokens into a conversation`
+      return r.promptTokensPerSec == null
+        ? `Speed: ${tps} tokens/s generating, ${depth} ${how}. Its reading speed was not measured, because llama-server reused its prompt cache.`
+        : `Speed: ${tps} tokens/s generating and ${Math.round(r.promptTokensPerSec)} tokens/s reading, both ${depth} ${how}.`
+    }
+
+    /**
+     * The Benchmark button's title: what it does, and how long it takes by the model's last reading
+     * (its load, the fill at its reading speed and three generations at its speed), or that nobody
+     * knows yet.
+     */
+    const speedButtonTitle = (m) => {
+      const r = m?.speed?.reading
+      let wait = 'How long is not known until it has run once; on the CPU it can take 10 minutes or more'
+      if (r && r.tokensPerSec > 0) {
+        const read = r.promptTokensPerSec > 0 ? r.depth / r.promptTokensPerSec : 0
+        const minutes = Math.max(1, Math.round(((r.loadMs ?? 0) / 1000 + read + (3 * r.nPredict) / r.tokensPerSec) / 60))
+        wait = `About ${minutes} minute${minutes === 1 ? '' : 's'} by its last measurement${read ? '' : ', and longer by the time it takes to read the prompt, which was not measured'}`
+      }
+      return `Load it at the context its runs get, read an ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt and time ${SPEED_PREDICT} generated tokens after it three times. ${wait}; a model you had loaded is loaded again after.`
+    }
+
+    /**
+     * What the card says of the speed run (status().speedRun, 2.5 and 2.9): while it goes, where it
+     * is, what follows and that local agents wait; the models measured so far, with their readings
+     * or why none was recorded; and, once it has ended, what became of the model that was loaded.
+     */
+    const speedRunText = (run, modules) => {
+      if (!run) return { running: false, status: [], done: [], restore: null, cancel: null }
+      const name = (id) => (modules ?? []).find((m) => m.id === id)?.name ?? id
+      const status = []
+      const c = run.current
+      if (run.state === 'running' && c) {
+        if (c.phase === 'restoring') status.push(c.id ? `Speed benchmark: loading ${name(c.id)} again, as it was before.` : 'Speed benchmark: stopping the engine again, as it was before.')
+        else {
+          const phase = {
+            loading: 'loading it at the context its runs get',
+            warming: 'a first short request, not timed',
+            reading: `reading an ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt`,
+            measuring: `timing ${SPEED_PREDICT} generated tokens, ${c.run} of 3`,
+          }[c.phase] ?? c.phase
+          const k = run.done.length + 1
+          const then = run.queue.length ? ` Then ${run.queue.map(name).join(', ')}.` : ''
+          status.push(`Speed benchmark: ${name(c.id)}, ${k} of ${k + run.queue.length}: ${phase}.${then}`)
+        }
+        status.push('Local agents wait until the speed benchmark ends; a chat title or a compaction waits for the model being measured.')
+      }
+      // Cancel stops a run while it measures; once pressed it is under way, and while the run puts the
+      // engine back there is nothing left to stop (local.js cancelBenchmark refuses it and says why).
+      const restoring = run.state === 'running' && c?.phase === 'restoring'
+      const cancelled = run.state === 'running' && !!run.cancelled
+      const cancel = { disabled: restoring || cancelled, label: cancelled ? 'Cancelling…' : 'Cancel', title: restoring ? 'The speed benchmark has measured every model it will and is putting the engine back as it was before it; that cannot be cancelled.' : undefined }
+      return { running: run.state === 'running', status, done: (run.done ?? []).map((d) => ({ text: d.text, ok: !!d.ok })), restore: run.restore ?? null, cancel }
+    }
 
     /**
      * The four limits, in the order the table lists them. `title` is the field's tooltip: what the
@@ -4451,8 +4755,10 @@ window.__ModuleLoader__.load({
         : b?.vramNotApplied ? 'VRAM budget not applied'
           : m.memory.vramGB > s.maxVramGB ? `over your VRAM budget of ${gbText(s.maxVramGB)}` : null
       const fits = !budget || m.overBudget ? '' : ` · ${vram ?? `fits your budget of ${budget}`}`
+      // A measured figure says the day it was taken, which recordMemory keeps as `at`.
+      const source = m.memory.source === 'measured' && m.memory.at ? `measured on ${dayText(m.memory.at)}` : m.memory.source
       return {
-        line: `${ctxText(m.ctx)} context: ${gbText(m.memory.vramGB)} VRAM + ${gbText(m.memory.ramGB)} RAM (${m.memory.source})${fits}`,
+        line: `${ctxText(m.ctx)} context: ${gbText(m.memory.vramGB)} VRAM + ${gbText(m.memory.ramGB)} RAM (${source})${fits}`,
         over: m.overBudget ?? null,
         floor: Number.isFinite(m.ctx) && m.ctx < MIN_CTX ? `${ctxText(m.ctx)} context is below the ${ctxText(MIN_CTX)} floor, so expect a context-exceeded error mid-chat: it comes from the context size, not from the model.` : null,
         reduced: m.ctxReducedFrom && !m.overBudget ? `The budget reduced its context from ${reducedText(m.ctxReducedFrom, m.ctx)}, the largest that fits it.` : null,
@@ -4556,13 +4862,24 @@ window.__ModuleLoader__.load({
       const pick = startModel || data.settings.chatModel || models[0]?.id || ''
       const rows = removableRows(data)
       const busyJobs = data.modules.filter((m) => ACTIVE_JOB.includes(m.job?.state) || m.state === 'verifying')
+      // The speed benchmark (docs/benchmark.md 2.9). It is free and changes nothing but which model is
+      // loaded, so it asks for no confirmation; a refusal shows under the head with the card's others.
+      const speed = speedRunText(data.speedRun, data.modules)
+      const canBenchmark = e.installed && models.length > 0 && !speed.running
+      const benchmark = (ids) => run(() => post('/jev-router/local/benchmark', ids ? { ids } : {}))
       return h('section', { className: 'card', 'aria-labelledby': 'jevi-local-h' },
         h('div', { className: 'head' },
           h('div', { className: 'label', id: 'jevi-local-h', style: { margin: 0 } }, 'Local models'),
           h('div', { style: { display: 'flex', gap: 8 } },
+            h('button', { className: 'btn', disabled: !canBenchmark, title: `Measure every installed model's speed on this PC, one after another: each is loaded at the context its runs get, reads an ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt and generates ${SPEED_PREDICT} tokens after it three times. A model you had loaded is loaded again after.`, onClick: () => benchmark(null) }, 'Benchmark all'),
             h('button', { className: 'btn primary', onClick: () => openLlm('install') }, 'Install…'),
             h('button', { className: 'btn danger', disabled: !rows.length, onClick: () => openLlm('remove') }, 'Remove…'))),
         h('p', { className: 'why', style: { margin: '4px 0 8px' } }, 'Free, private models on this PC (llama.cpp, 127.0.0.1 only). Used when you are offline, as a fallback chat model, and as cheap agents Jev may pick. Type /install-llm in any chat to add one.'),
+        speed.status.length || speed.done.length || speed.restore ? h('div', { role: 'status', 'aria-label': 'Speed benchmark', style: { margin: '0 0 8px' } },
+          ...speed.status.map((t, i) => h('div', { key: `s${i}`, className: i === 0 ? null : 'why' }, t)),
+          ...speed.done.map((d, i) => h('div', { key: `d${i}`, className: cx('why', !d.ok && 'err') }, d.text)),
+          speed.restore ? h('div', { className: 'why' }, speed.restore) : null,
+          speed.running ? h('button', { className: 'btn', style: { marginTop: 4 }, disabled: speed.cancel.disabled, title: speed.cancel.title, onClick: () => run(() => post('/jev-router/local/benchmark/cancel', {})) }, speed.cancel.label) : null) : null,
         h('div', null, h('span', { className: cx('dot', e.running ? 'on' : 'off') }),
           !e.installed ? 'Engine not installed.' : e.running ? `Running ${e.model}${e.ready ? '' : ' (loading…)'} · 127.0.0.1:${e.port} · context ${e.ctx}${e.gpuLayers ? ` · ${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : ''}${e.vision ? ' · vision' : ''}` : `Stopped (engine: ${e.variant}). Starts by itself when a local model is needed.`),
         h('div', { className: 'why' }, 'On a 4 GB GPU a model bigger than ~3 GB splits between GPU and CPU and gets several times slower; the rest waits in RAM.'),
@@ -4585,7 +4902,8 @@ window.__ModuleLoader__.load({
           const m = data.modules.find((x) => x.id === r.ids[0])
           // What it takes at the context it runs with, under the budget as it stands, so a budget
           // change shows its effect on each model at the next reload.
-          const fit = m?.kind === 'model' && m.state === 'installed' ? modelFit(m, data.settings, data.budget) : null
+          const chat = m?.kind === 'model' && m.state === 'installed'
+          const fit = chat ? modelFit(m, data.settings, data.budget) : null
           return h('li', { key: r.id },
             h('div', { style: { minWidth: 0 } },
               h('div', null, h('b', null, r.name), m?.state === 'corrupt' ? h('span', { className: 'pill bad' }, 'SHA256 mismatch') : h('span', { className: 'pill ok' }, 'installed'), m?.agent ? h('span', { className: 'pill' }, m.agent) : null, fit?.over ? h('span', { className: 'pill bad' }, 'over budget') : null),
@@ -4594,8 +4912,11 @@ window.__ModuleLoader__.load({
               fit?.reduced ? h('div', { className: 'why' }, fit.reduced) : null,
               fit?.over ? h('div', { className: cx('why', 'err') }, fit.over) : null,
               fit?.floor ? h('div', { className: 'warnline' }, fit.floor) : null,
+              chat ? h('div', { className: 'why' }, speedLine(m)) : null,
               m?.badges ? h(Badges, { list: m.badges }) : null),
-            h('button', { className: 'btn danger', 'aria-label': `Remove ${r.name}`, onClick: () => ask(removeConfirm([r], () => post('/jev-router/local/remove', { ids: r.ids }))) }, 'Remove'))
+            h('div', { style: { display: 'flex', gap: 8, flexShrink: 0 } },
+              chat ? h('button', { className: 'btn', disabled: !canBenchmark, 'aria-label': `Benchmark ${r.name}`, title: speedButtonTitle(m), onClick: () => benchmark([m.id]) }, 'Benchmark') : null,
+              h('button', { className: 'btn danger', 'aria-label': `Remove ${r.name}`, onClick: () => ask(removeConfirm([r], () => post('/jev-router/local/remove', { ids: r.ids }))) }, 'Remove')))
         })) : h('div', { className: 'muted', style: { marginTop: 8 } }, 'Nothing installed yet. Install… suggests models that fit this PC.'),
         h(ResourceBudget, { data, edits: budget, errors: budgetMsg, onEdit: (k, v) => setBudget((b) => ({ ...b, [k]: v })), onSave: saveBudget }))
     }
@@ -5445,7 +5766,7 @@ window.__ModuleLoader__.load({
       // DOM globals so a test can prove a pass lands on a timer while no frame is ever delivered.
       // ResourceBudget and LocalModelsCard are rendered with stand-in Reacts in test/budgetpanel.test.js,
       // SetupSection in test/laya-card.test.js and InspectorBody in test/routerview.test.js.
-      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, taskItems },
+      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, sortRows, filterRows, SortTable, BenchmarkCard, benchmarkProgress, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, taskItems },
       apply(ctx) {
         sessionsApi = ctx.sessions
         sidebarRight = ctx.sidebarRight

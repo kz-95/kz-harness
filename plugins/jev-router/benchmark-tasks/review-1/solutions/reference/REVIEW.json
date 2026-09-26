@@ -1,0 +1,5 @@
+[
+  { "file": "src/paginate.js", "line": 23, "problem": "totalPages floors the division, so a last page that is not full is not counted; it should round up." },
+  { "file": "src/paginate.js", "line": 19, "problem": "The check lets page 0 through, while a page under 1 must throw a RangeError." },
+  { "file": "src/paginate.js", "line": 24, "problem": "Math.max(1, ...) makes totalPages 1 for an empty list, where it must be 0." }
+]

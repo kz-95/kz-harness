@@ -402,13 +402,16 @@ test('index.js takes the cap on tasks at once from the local settings, at start 
   // kept from before the change would send a model more than it holds, or refuse what it could.
   assert.match(index, /onSettings: \(s\) => \{ readyGen\+\+; readyCache = null; lanes\.setMax\(s\.maxConcurrentTasks\); resolveAux\(\); refreshLocal\(\) \}/, 'a budget change clears the readiness cache, reaches the lanes, picks the chat model again and reads the local agents\' windows again')
   assert.match(index, /local\.readSettings\(\)\.then\(\(s\) => lanes\.setMax\(s\.maxConcurrentTasks\)/, 'and the saved cap is read once at start')
-  // Every way into a lane says so when it has to wait: the background runner, and route() for /auto,
-  // /<agent> and jev_route, which used to wait on the cap in silence.
+  // Every way into a lane says so when it has to wait: the background runner, route() for /auto,
+  // /<agent> and jev_route, which used to wait on the cap in silence, and a task of the capability
+  // benchmark, which tells its card (docs/benchmark.md 3.8).
   const ways = index.match(/lanes\.acquire\([^\n]*/g)
-  assert.equal(ways.length, 2, 'the background runner and route()')
+  assert.equal(ways.length, 3, 'the background runner, route() and the capability benchmark')
   assert.match(ways[0], /^lanes\.acquire\(key, `route-\$\{randomUUID\(\)\}`, signal, \{ onWait: \(why\) => \{ emit\?\.\(\{ type: 'queued', text: WAITING\[why\] \}\); process\.stdout\.write\(`\[jev\] \$\{WAITING\[why\]\}\\n`\) \} \}\)$/, 'a foreground run tells its live lines and the log')
   assert.ok(index.indexOf(ways[0]) > index.indexOf('async function route('), 'that one is route()')
-  assert.match(ways[1], /^lanes\.acquire\(laneKey\(t\.workspace\), t\.jobId, signal, \{ onWait: \(why\) => emit\(\{ type: 'queued', text: WAITING\[why\] \}\) \}\)/, 'a background task tells its row')
+  assert.match(ways[1], /^lanes\.acquire\(laneKey\(folder\), `benchmark-\$\{runId\}`, signal, \{ onWait: \(why\) => onWait\?\.\(WAITING\[why\]\) \}\)$/, 'a benchmark task tells its card')
+  assert.ok(index.indexOf(ways[1]) > index.indexOf('async function runBenchmarkTask('), 'that one is the benchmark\'s')
+  assert.match(ways[2], /^lanes\.acquire\(laneKey\(t\.workspace\), t\.jobId, signal, \{ onWait: \(why\) => emit\(\{ type: 'queued', text: WAITING\[why\] \}\) \}\)/, 'a background task tells its row')
   assert.match(index, /position: ahead \? ahead \+ 1 : lanes\.waits\(key\) \? 1 : 0/, 'and the chat line does not promise "starting now" when the cap is full')
 })
 

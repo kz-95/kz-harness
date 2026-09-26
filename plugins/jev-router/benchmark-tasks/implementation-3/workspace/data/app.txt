@@ -1,0 +1,24 @@
+2026-09-19T08:00:00Z INFO service started
+2026-09-19T08:00:02Z DEBUG loaded 14 routes
+2026-09-19T09:30:00Z INFO user ana signed in
+2026-09-19T11:45:10Z WARN slow query on orders (1.8 s)
+2026-09-19T14:05:00Z INFO nightly report queued
+2026-09-19T18:20:33Z ERROR payment provider timed out
+2026-09-19T18:21:00Z INFO payment retried and accepted
+2026-09-19T23:59:59Z DEBUG cache stats: 912 hits, 88 misses
+2026-09-20T00:00:00Z INFO rotated log files
+2026-09-20T02:10:00Z WARN disk 81% full on /var
+2026-09-20T06:00:00Z INFO backup finished in 42 min
+2026-09-20T08:15:00Z INFO user bo signed in
+2026-09-20T09:00:00Z INFO deploy 7.4.1 started
+2026-09-20T09:02:30Z DEBUG migrations: none to run
+2026-09-20T09:05:00Z INFO deploy 7.4.1 finished
+2026-09-20T10:15:00Z INFO user ana signed out
+2026-09-20T10:30:00Z WARN rate limit reached for key k-12
+2026-09-20T10:45:00Z ERROR search index out of date
+2026-09-20T11:00:00Z INFO search index rebuilt
+2026-09-20T11:20:00Z DEBUG gc pause 12 ms
+2026-09-20T11:30:00Z INFO user cy signed in
+2026-09-20T11:45:00Z WARN certificate expires in 14 days
+2026-09-20T11:59:00Z INFO health check passed
+2026-09-20T12:00:00Z INFO health check passed

@@ -1,0 +1,16 @@
+{
+  "id": "debugging-3",
+  "skill": "debugging",
+  "level": 3,
+  "dimensions": ["debugging", "coding", "general_reasoning"],
+  "folder": "price-cache",
+  "prompt": "Read ISSUE.md: users report two problems with prices.\nFind the causes in src/ and fix them.\nDo not change ISSUE.md, the existing tests or package.json.",
+  "protect": ["package.json", "test/", "ISSUE.md"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/prices.test.js": 8
+    }
+  }
+}

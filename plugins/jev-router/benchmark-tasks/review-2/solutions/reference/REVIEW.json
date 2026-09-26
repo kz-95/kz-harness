@@ -1,0 +1,6 @@
+[
+  { "file": "src/retry.js", "line": 25, "problem": "The loop calls fn only retries times, where the doc comment promises retries + 1 calls." },
+  { "file": "src/retry.js", "line": 31, "problem": "The wait is not awaited, so the retries run at once with no delay between them." },
+  { "file": "src/retry.js", "line": 35, "problem": "When every call fails the last error is swallowed and undefined is returned instead of the error being thrown." },
+  { "file": "src/http.js", "line": 26, "problem": "Every 4xx answer is retried, while only 429 should be and the others are final." }
+]

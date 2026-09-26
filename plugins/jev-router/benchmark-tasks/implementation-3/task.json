@@ -1,0 +1,16 @@
+{
+  "id": "implementation-3",
+  "skill": "implementation",
+  "level": 3,
+  "dimensions": ["coding", "instruction_following"],
+  "folder": "log-filter",
+  "prompt": "Add a --since option to the log tool, which runs as node src/cli.js <file> [options].\n--since takes either an ISO 8601 date-time such as 2026-09-20T12:00:00Z or an age: a whole number followed by m, h or d, such as 30m, 12h or 3d, counted back from the time in the environment variable LOG_NOW (an ISO date-time), or from the current time when LOG_NOW is not set.\nOnly lines whose timestamp is at or after that moment are printed, and --since works together with --level.\nFor a value that is neither form, the tool prints exactly error: --since expects an ISO date-time or an age like 12h on stderr, prints nothing on stdout and exits with code 2.\nKeep the existing options and output format as they are, and list --since in the usage text that --help prints.\nDo not change the existing tests, package.json or data/.",
+  "protect": ["package.json", "test/", "data/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/since.test.js": 16
+    }
+  }
+}

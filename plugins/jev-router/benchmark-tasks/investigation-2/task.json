@@ -1,0 +1,17 @@
+{
+  "id": "investigation-2",
+  "skill": "investigation",
+  "level": 2,
+  "dimensions": ["general_reasoning"],
+  "folder": "list-helpers",
+  "prompt": "One exported function in src/ changes the array it is given.\nWrite its file and name to ANSWER.json as {\"file\": \"src/<file>.js\", \"function\": \"<name>\"}.\nDo not change any other file.",
+  "protect": [],
+  "onlyChanged": ["ANSWER.json"],
+  "grade": {
+    "kind": "answer",
+    "expect": {
+      "file": "src/rank.js",
+      "function": "topScores"
+    }
+  }
+}

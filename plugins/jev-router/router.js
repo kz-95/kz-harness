@@ -41,6 +41,49 @@ function describeError(err) {
   return redactSecrets(`${err?.constructor?.name ?? 'Error'}: ${err?.message ?? String(err)}`).slice(0, 300)
 }
 
+/**
+ * One agent's time limit in an attempt (config.agentTimeoutMs). `signal` fires when the run is
+ * stopped or the agent has had `ms` of its own time, with the reason AbortSignal.timeout gives.
+ * `untimed(promise)` is a wait that is not the agent's work: the clock stands still until the
+ * promise settles, and `waitedMs` adds up how long it stood. It is how a local agent held back
+ * before it starts, while a speed benchmark goes (docs/benchmark.md 2.6), is neither run out of time
+ * by that wait nor charged for it; a stop of the run still ends the wait at once. `end()` clears the
+ * timer once the attempt is over.
+ */
+export function attemptClock(signal, ms) {
+  const limit = new AbortController()
+  let left = ms
+  let since = Date.now()
+  let timer = null
+  let waits = 0
+  let waitedMs = 0
+  const arm = () => {
+    timer = setTimeout(() => limit.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), left)
+    // As AbortSignal.timeout's own timer: a limit never keeps the process alive.
+    timer.unref?.()
+  }
+  arm()
+  return {
+    signal: AbortSignal.any([signal, limit.signal]),
+    get waitedMs() { return waitedMs },
+    async untimed(promise) {
+      if (waits++ === 0) {
+        clearTimeout(timer)
+        left = Math.max(0, left - (Date.now() - since))
+        since = Date.now()
+      }
+      try { return await promise } finally {
+        if (--waits === 0) {
+          waitedMs += Date.now() - since
+          since = Date.now()
+          if (!limit.signal.aborted) arm()
+        }
+      }
+    },
+    end() { clearTimeout(timer) },
+  }
+}
+
 // The model an executor says it actually served, when it says so. `model` on an attempt is what
 // the config asked for; a provider may serve another version, and profiles key on the one that ran.
 // Nothing is invented: an executor that reports neither leaves the attempt without the field.
@@ -393,6 +436,14 @@ function skillLine(skill) {
   return `Approach this mainly as ${skill.primary} work${skill.description ? ` (${skill.description})` : ''}.${supporting.length ? ` It also draws on ${supporting.join(', ')}.` : ''}`
 }
 
+/**
+ * The handoff note of a run in `cwd`, named by its full path in every prompt: an agent's working
+ * directory need not be its workspace (a capability benchmark's agent works in the scratch root and
+ * its task folder is named only in the prompt, docs/benchmark.md 3.7), and a path from the
+ * workspace would land wherever the agent resolves it.
+ */
+const handoffIn = (cwd) => join(cwd, HANDOFF)
+
 function basePrompt(task, cwd, { near, handoff, plan, skill } = {}) {
   return [
     task,
@@ -400,11 +451,11 @@ function basePrompt(task, cwd, { near, handoff, plan, skill } = {}) {
     `Workspace: ${cwd}. Work only inside this workspace.`,
     skillLine(skill),
     'Do not commit, push, deploy, publish packages, or touch databases.',
-    `Keep ${HANDOFF} (in the workspace) updated as you work, with sections Done / Next / Open problems / How to verify, so another agent can take over.`,
+    `Keep ${handoffIn(cwd)} updated as you work, with sections Done / Next / Open problems / How to verify, so another agent can take over.`,
     near ? 'You are close to your usage limit: work in small steps and update the handoff after each step.' : '',
     'When done, summarize what you changed (or found) and how you verified it.',
     plan ? `\nA stronger model planned this work first. Follow the plan unless the code proves it wrong, and say where you departed from it:\n${plan.slice(0, 6000)}` : '',
-    handoff ? `\nEarlier unfinished work on this task (handoff note from ${HANDOFF}); continue from it:\n${handoff.slice(0, 8000)}` : '',
+    handoff ? `\nEarlier unfinished work on this task (handoff note from ${handoffIn(cwd)}); continue from it:\n${handoff.slice(0, 8000)}` : '',
   ].filter((l, i) => l !== '' || i === 1).join('\n')
 }
 
@@ -417,7 +468,7 @@ function planPrompt(task, cwd, { skill } = {}) {
     // The planner sets the approach the worker follows, so it is told the skill the work needs too.
     skillLine(skill),
     'Read whatever you need. Then write a concrete plan another engineer can follow: the files to change and why, the order of steps, the risks and how to verify each step.',
-    `Do not modify any files (do not write ${HANDOFF} either). Your answer is the plan.`,
+    `Do not modify any files (do not write ${handoffIn(cwd)} either). Your answer is the plan.`,
   ].filter((l, i) => l !== '' || i === 2).join('\n')
 }
 
@@ -441,7 +492,7 @@ function reviewPrompt(task, cwd, diff) {
     '',
     `Uncommitted changes (git diff HEAD):\n${diff.stat || '(no file changes; review the earlier answer and the code it refers to)'}`,
     '',
-    `Do not modify any files (do not write ${HANDOFF} either). Report concrete defects or regressions with file and line, or state that the work is correct and complete.`,
+    `Do not modify any files (do not write ${handoffIn(cwd)} either). Report concrete defects or regressions with file and line, or state that the work is correct and complete.`,
   ].join('\n')
 }
 
@@ -484,7 +535,7 @@ function harnessHandoff({ task, attempts, diff, checks, previous }) {
  * @param {string} p.cwd
  * @param {string} [p.forceAgent]  manual override; skips Jev routing only
  * @param {object} p.config        plugin config (agents, tools, limits, thresholds, checks)
- * @param {object} p.deps          { offline?: true when the internet is unreachable (local agents only, no Jev), localOnly?: true to use local agents only while Jev still routes, checkBalance?(agentId) -> {state, balance, until} re-read after each attempt, ready?: {[agentId]: {loggedIn, detail}}, quota?: {[agentId]: {state, until}}, isLimitError?, onLimit?, logAttempt?, jev | null, jevUnavailableReason, execute(agentDef, prompt, signal), runTool?(tool, args, task, signal), review?, emit?, history }
+ * @param {object} p.deps          { offline?: true when the internet is unreachable (local agents only, no Jev), localOnly?: true to use local agents only while Jev still routes, checkBalance?(agentId) -> {state, balance, until} re-read after each attempt, ready?: {[agentId]: {loggedIn, detail}}, quota?: {[agentId]: {state, until}}, isLimitError?, onLimit?, logAttempt?, jev | null, jevUnavailableReason, execute(agentDef, prompt, signal, { effort, speed, untimed }) where untimed(promise) is a wait before the work that the agent's time limit does not count (attemptClock), runTool?(tool, args, task, signal), review?, emit?, history }
  *   and, for whoever decides: decider?: the createJev() client that answers, or null for none (`jev`
  *   is its old name, read only when `decider` is not given),
  *   provider?: that client's record (providers.js; a Jev record from config.thresholds without one);
@@ -730,8 +781,12 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   const { limits } = config
   const productionCritical = config.productionWorkspaces.some((p) => cwd.toLowerCase().startsWith(p.toLowerCase()))
   emit('start', { task, cwd, forceAgent })
-  await ensureHandoffIgnored(cwd).catch(() => {})
-  const { context, snapshot: startSnap } = await gatherContext(cwd, { productionCritical, signal })
+  // The environment every git call in the workspace runs with, when the config gives one: the
+  // capability benchmark's names its task's repository, kept outside the folder the agent writes to,
+  // and holds no key of KzH's (docs/benchmark.md 3.7). KzH's own environment otherwise.
+  const gitOpts = config.git?.env ? { env: config.git.env } : {}
+  await ensureHandoffIgnored(cwd, gitOpts).catch(() => {})
+  const { context, snapshot: startSnap } = await gatherContext(cwd, { productionCritical, signal, ...gitOpts })
   const history = await deps.history.recent(cwd, 10)
   // Agents billed by time of day (DeepSeek): Jev sees which are on their cheap rate right now.
   const pricing = pricingNow(config.pricing?.peak)
@@ -1061,7 +1116,8 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // 2. Baseline checks, so later failures can be told apart from pre-existing ones.
   //    Taken before the first agent attempt; a tool run skips them to stay fast.
   // ponytail: after a tool that edited files escalates, the baseline includes the tool's edits.
-  const checkOpts = { scripts: config.checks.scripts, timeoutMs: config.checks.timeoutMs, outputChars: config.checks.outputChars, signal }
+  // `env`, when the config gives one, is the environment the checks run the agent's code with.
+  const checkOpts = { scripts: config.checks.scripts, timeoutMs: config.checks.timeoutMs, outputChars: config.checks.outputChars, signal, ...(config.checks.env ? { env: config.checks.env } : {}) }
   let baseline = null
   const ensureBaseline = async () => {
     if (baseline) return
@@ -1078,7 +1134,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     const s = await stat(handoffFile).catch(() => null)
     const previous = s ? await readFile(handoffFile, 'utf8').catch(() => '') : ''
     if (s && s.mtimeMs >= since - 1000) { emit('handoff', { path: HANDOFF, source: 'agent' }); return previous }
-    const text = harnessHandoff({ task, attempts, diff: await changedSince(cwd, startSnap, signal), checks: lastChecks, previous })
+    const text = harnessHandoff({ task, attempts, diff: await changedSince(cwd, startSnap, signal, gitOpts), checks: lastChecks, previous })
     await mkdir(dirname(handoffFile), { recursive: true })
     await writeFile(handoffFile, text)
     emit('handoff', { path: HANDOFF, source: 'harness' })
@@ -1145,8 +1201,8 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       if (next.role === 'review' && reviewCount >= limits.maxReviews) { status = 'limit_reached'; statusReason = `maxReviews (${limits.maxReviews}) reached`; break }
 
       if (next.role !== 'tool' && !answerOnly) await ensureBaseline()
-      const before = await snapshot(cwd, signal)
-      const diffSoFar = attempts.length ? await changedSince(cwd, startSnap, signal) : { stat: '', patch: '' }
+      const before = await snapshot(cwd, signal, gitOpts)
+      const diffSoFar = attempts.length ? await changedSince(cwd, startSnap, signal, gitOpts) : { stat: '', patch: '' }
       const opts = { near: near(next.agent), handoff: handoffNote, plan: planText, skill: plan.skill }
       const prompt = next.role === 'tool' ? '' : next.role === 'primary' ? basePrompt(task, cwd, opts)
         : next.role === 'plan' ? planPrompt(task, cwd, { skill: plan.skill })
@@ -1169,23 +1225,28 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       // answer-only requests), so two agents answering at once cannot collide in the working tree.
       const opinionAgent = next.role === 'primary' && answerOnly && !parallelDone && plan.parallelWith && byId.get(plan.parallelWith) ? byId.get(plan.parallelWith) : null
       let opinion = null
+      // Each agent's own time limit, which a wait before its work starts does not use up (attemptClock).
+      const clock = attemptClock(signal, config.agentTimeoutMs)
+      const sideClock = opinionAgent ? attemptClock(signal, config.agentTimeoutMs) : null
       try {
-        const agentSignal = AbortSignal.any([signal, AbortSignal.timeout(config.agentTimeoutMs)])
         const main = next.role === 'tool'
-          ? deps.runTool(tool, routing.toolArgs ?? {}, task, agentSignal)
-          : deps.execute(agentDef, prompt, agentSignal, { effort: eff, speed })
+          ? deps.runTool(tool, routing.toolArgs ?? {}, task, clock.signal)
+          : deps.execute(agentDef, prompt, clock.signal, { effort: eff, speed, untimed: clock.untimed })
         if (opinionAgent) {
           parallelDone = true
           emit('attempt_start', { index: attemptIndex + 1, agent: opinionAgent.id, role: 'opinion' })
-          const side = deps.execute(opinionAgent, prompt, agentSignal, { effort: toAgentEffort(level, opinionAgent, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[effortFamily(opinionAgent)], model: deps.modelOf?.(opinionAgent), bands: T.effortBands }) })
+          const side = deps.execute(opinionAgent, prompt, sideClock.signal, { effort: toAgentEffort(level, opinionAgent, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[effortFamily(opinionAgent)], model: deps.modelOf?.(opinionAgent), bands: T.effortBands }), untimed: sideClock.untimed })
             .then((r) => r, (err) => (signal.aborted ? Promise.reject(err) : { stopReason: 'error', diagnostic: describeError(err), answerText: '' }))
           ;[result, opinion] = await Promise.all([main, side])
         } else result = await main
       } catch (err) {
         if (signal.aborted) throw err
         result = { stopReason: 'error', diagnostic: describeError(err), answerText: '' }
+      } finally {
+        clock.end()
+        sideClock?.end()
       }
-      const changes = await changedSince(cwd, before, signal)
+      const changes = await changedSince(cwd, before, signal, gitOpts)
       let limit = next.role === 'tool' ? { hit: false }
         : (deps.isLimitError ? deps.isLimitError(byId.get(next.agent), result) : builtinLimit(result)) ?? { hit: false }
       const attempt = {
@@ -1195,7 +1256,10 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
         stopReason: result.stopReason,
         diagnostic: result.diagnostic,
         answerText: result.answerText,
-        durationMs: Date.now() - started,
+        // Its own time: a wait before its work started is kept apart, so an average of these says
+        // how long the agent works, not how long it was held back.
+        durationMs: Date.now() - started - clock.waitedMs,
+        ...(clock.waitedMs ? { waitedMs: clock.waitedMs } : {}),
         changedFiles: changes.files,
         ...(next.role === 'tool' ? {} : { model: deps.modelOf?.(agentDef) }),
         ...(next.role === 'tool' ? {} : servedModel(result)),
@@ -1204,7 +1268,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       }
       attempts.push(attempt)
       if (opinion) {
-        const o = { agent: opinionAgent.id, role: 'opinion', stopReason: opinion.stopReason, diagnostic: opinion.diagnostic, answerText: opinion.answerText, durationMs: Date.now() - started, changedFiles: [], model: deps.modelOf?.(opinionAgent), ...servedModel(opinion) }
+        const o = { agent: opinionAgent.id, role: 'opinion', stopReason: opinion.stopReason, diagnostic: opinion.diagnostic, answerText: opinion.answerText, durationMs: Date.now() - started - sideClock.waitedMs, ...(sideClock.waitedMs ? { waitedMs: sideClock.waitedMs } : {}), changedFiles: [], model: deps.modelOf?.(opinionAgent), ...servedModel(opinion) }
         attempts.push(o)
         emit('attempt_end', { index: attemptIndex + 1, attempt: { ...o, answerText: (o.answerText ?? '').slice(0, 4000) } })
         // PARALLEL_SECOND_OPINION promises that the two answers are COMPARED. Without this the
@@ -1313,7 +1377,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       attempt.checks = lastChecks.map(({ name, passed, exitCode, durationMs }) => ({ name, passed, exitCode, durationMs }))
       emit('attempt_end', { index: attemptIndex, attempt: { ...attempt, answerText: (attempt.answerText ?? '').slice(0, 4000) } })
       const cmp = compareChecks(baseline ?? [], lastChecks)
-      const totalDiff = await changedSince(cwd, startSnap, signal)
+      const totalDiff = await changedSince(cwd, startSnap, signal, gitOpts)
       const touchedCode = totalDiff.files === null || totalDiff.files.length > 0
       const blockAccept = result.stopReason !== 'completed' || cmp.regressed.length > 0 || (requireChecks && touchedCode && cmp.failing.length > 0)
 

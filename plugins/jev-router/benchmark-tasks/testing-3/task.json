@@ -1,0 +1,14 @@
+{
+  "id": "testing-3",
+  "skill": "testing",
+  "level": 3,
+  "dimensions": ["testing", "coding"],
+  "folder": "intervals",
+  "prompt": "Write tests for src/intervals.js in test/intervals.test.js, using node:test, that check everything its doc comments promise for both functions.\nDo not change src/ or package.json.",
+  "protect": ["package.json", "src/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "mutants",
+    "file": "src/intervals.js"
+  }
+}

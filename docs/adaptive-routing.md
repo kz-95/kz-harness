@@ -224,9 +224,14 @@ Belief can come from three places, combined as a precision-weighted mean rather 
 1. **Priors**, in `config/capability-priors.json`.
    These are the owner's observations, stated as machine-readable numbers with their own confidence.
    They are evidence, not rules: they seed a family's profile and real evidence overtakes them.
-2. **Benchmark evidence.**
-   The source, a reliability of 0.7 and a 180-day half-life exist in the schema, but nothing produces it: no importer, fetcher or job writes a `benchmark` row or a `benchmark_prior`.
-   Today the effective capability is the prior plus execution evidence.
+2. **Benchmark evidence**, weighed at a reliability of 0.7 with a 180-day half-life.
+   Its producer is the capability benchmark in the Router tab ([`benchmark.md`](benchmark.md) section 3), which writes, for every agent that finishes all its tasks, one row per task and credited dimension, score 1 or 0, confidence 0.9.
+   Each row's `n` is 3 over the number of the set's tasks that credit its dimension, so a whole run weighs on a dimension as three observations at reliability 0.7, 1.89 when fresh.
+   A task that does not fit the window KzH gives a local model is not run and gives no row, not even a `long_context` one, so such a run weighs less on the dimensions those tasks credit ([`benchmark.md`](benchmark.md) 3.9).
+   The rows are not runs: they are left out of `samples`, and so out of `evidenceSamples`, the ranking's `evidenceRuns` and the Router tab's observations, and reported as the dimension's `benchmark` summary, `{ score, tasks, passed, weight }`.
+   A benchmark row with a `runId` counts only when that `runId` is the newest recorded for its subject and benchmark id, by file order, also after a reload; older rows stay on file and count in `explain()`'s `notCounted`.
+   The 180-day half-life and the 45-day window for unpinned names apply, and a benchmark alone leaves a model cold.
+   Nothing writes a `benchmark_prior`: no importer brings in published benchmarks.
 3. **Execution evidence** from real runs here: did the work get accepted, did the checks pass, did a
    reviewer agree.
    A person's Like or Dislike counts here too, as `human_outcome` evidence recorded when the verdict is given: `POST /jev-router/feedback` stores it and hands it to `index.js` `onVerdict`, while a run's end records the run's own evidence and no verdict (`runEvidence`), because nobody can judge an answer before it exists.
@@ -563,6 +568,7 @@ With learning off there is no domain registry, and the report still names who an
 The inspector shows each `RESOURCE_x` key with the agent id next to it: the person sees the mapping, Jev does not.
 
 In the app, the inspector's **Router** tab shows each domain's maturity, which gate it is waiting on, what each provider adapter currently reports, and what the registry believes about each resource with the evidence behind every number.
+A dimension's line adds `benchmark 75% (9 of 12 tasks)` when benchmark rows count for it, and a dimension only a benchmark has measured is listed too; the Capability benchmark card follows ([`benchmark.md`](benchmark.md) 3.11).
 Under the maturity pill it says what the rung means for who decides (`client.js` `maturityWords`), and a domain decided in code says so.
 A domain whose state reports `localDecides: false` (the resource ranking) shows `a rule in code decides at every rung; the local router is recorded beside it for comparison and never decides` in place of the rung's words, while the pill still shows the rung.
 A domain Jev teaches whose local authority a policy took away (`localDecides: false` set in config) reads `Jev decides at every rung; ...` instead, because no rule in code decides it.
@@ -604,16 +610,17 @@ The decision line and the report name Laya where they name Jev: `Laya and routin
 
 ## What this does not do yet
 
-- **No benchmark source.** The evidence pipeline accepts benchmark rows and weighs them, but
-  nothing here runs, fetches or imports benchmarks; that evidence class is empty until something writes to it.
+- **No published benchmarks.** The capability benchmark in the Router tab is the source of `benchmark` rows now (see Benchmark evidence under "Capability, as evidence rather than rules").
+  What stays empty is `benchmark_prior`: nothing imports published benchmarks.
 - **Only local models have a real version.** Claude Code, Codex and API agents report no served version, so they are keyed by their configured model name and protected only by the 45-day window, unless that name is itself a dated snapshot.
 - **Most limit kinds and scopes have no producer.** Only `rolling_window` and `monetary_budget` limits, all at scope `account`, come from a shipped adapter; the governor ignores scope.
 - **A reply with no run mark.** A verdict on an answer that carries no `[jev-run]` mark (one from before the mark existed) is credited by time, so a first verdict on an older answer, given after a newer run in the same session had already ended, is credited to that newer run, and every later form of that verdict follows it there.
 - **Keys are positional; familiarity is not.** `RESOURCE_x` is assigned over the current pool, so a resource's key can shift when the pool changes.
   The ranker learns from each candidate's features, never its key, so its choices do not depend on the shift, and the familiar-candidate check counts resources by their stable id (in code; the classifier never sees an id), so a new resource that inherits an old key is still flagged unfamiliar.
   An artifact trained before that change is read by key until its next retrain.
-- **A local model's speed is declared, not measured.**
-  Tokens per second come from the manifest and the machine's hardware, not from timing real runs.
+- **Routing does not read a local model's speed.**
+  The resource snapshot routing reads carries no tokens per second (`resources.js`, `tokensPerSecond: null`), and the latency class comes from whether a resource is local, an API or a subscription.
+  The speed benchmark measures a local model's tokens per second for the Local models card and the install picker ([`benchmark.md`](benchmark.md) section 2), and routing does not read that reading either.
   Its memory is measured once it has run (`local.js` `readMemoryUsage`), and estimated until then.
   Its context is the plugin config's `local.contextSize` when set, else the manifest's (16,384 when the manifest names none), or 12,288 on a PC with under 12 GB RAM, and never above the manifest's `maxContext`.
   A RAM budget sizes it down to the largest whole k that fits, to 12,288 at least (`local.js` `planFor`).

@@ -17,6 +17,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { MIN_CTX, createLocalModels } from '../local.js'
+// A namespace as well, for what the speed benchmark adds to local.js (docs/benchmark.md 5): the file
+// then still loads where local.js lacks it, and each of those tests fails by its own assertion.
+import * as localJs from '../local.js'
+import { fakeLlamaServer } from './fixtures/fake-llama-server.mjs'
 import { localStatus } from '../index.js'
 import { createLanes, laneKey } from '../tasks.js'
 
@@ -28,7 +32,10 @@ const helpers = (() => {
   const start = client.indexOf('// ---- pure budget helpers')
   const end = client.indexOf('// ---- end pure budget helpers')
   assert.ok(start > 0 && end > start, 'the budget helper block is marked')
-  return new Function(`${client.slice(start, end)}\nreturn { MIN_CTX, BUDGET_ROWS, gbText, ctxText, budgetCells, budgetPatch, budgetError, modelFit, budgetNotes, modelName, chatModelOptions }`)()
+  // What the speed benchmark adds to the block is read only where it is there, so the whole file
+  // still loads against a page without it, and the tests of it fail by their own assertions.
+  const added = ['SPEED_DEPTH', 'SPEED_PREDICT', 'speedLine', 'speedButtonTitle', 'speedRunText'].map((k) => `${k}: typeof ${k} === 'undefined' ? undefined : ${k}`).join(', ')
+  return new Function(`${client.slice(start, end)}\nreturn { MIN_CTX, BUDGET_ROWS, gbText, ctxText, budgetCells, budgetPatch, budgetError, modelFit, budgetNotes, modelName, chatModelOptions, ${added} }`)()
 })()
 
 // ---------- a real local models instance, as the page's GET serves it ----------
@@ -93,6 +100,8 @@ async function installed(extra = {}, { engine = true, models = ['big', 'small'] 
   }
 }
 const byKey = (cells) => Object.fromEntries(cells.map((c) => [c.key, c]))
+/** Today as the page dates a measured figure, "25 Sep": a reading taken in this test was taken today. */
+const today = (d = new Date()) => `${d.getDate()} ${['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][d.getMonth()]}`
 const modelOf = (status, id) => status.modules.find((m) => m.id === id)
 
 test('the budget helpers stand on their own, and the page holds the context floor where local.js does', () => {
@@ -240,7 +249,7 @@ test('each installed model shows what it takes at the context it runs with, esti
   // Once a run like this one has reported what it took, the figure is that, and says so.
   await local.setSettings({ maxVramGB: null })
   await run('big', ['CUDA0 model buffer size = 3584.00 MiB', 'CPU model buffer size = 3072.00 MiB'])
-  assert.equal((await fit('big')).line, '12k context: 3.5 GB VRAM + 3 GB RAM (measured)')
+  assert.equal((await fit('big')).line, `12k context: 3.5 GB VRAM + 3 GB RAM (measured on ${today()})`)
   await local.dispose()
 
   // The plugin config can set every model's context below the floor. The page does not hide it.
@@ -265,19 +274,19 @@ test('a model is never said to fit a VRAM budget that does not hold it, in its o
   // is, but nothing may call that a fit, and the peak in the 2 GB row says it is over.
   await run('big', ['CUDA0 model buffer size = 3584.00 MiB', 'CPU model buffer size = 3072.00 MiB'])
   ;({ fit, cells } = await status())
-  assert.deepEqual(fit('big'), { line: '12k context: 3.5 GB VRAM + 3 GB RAM (measured) · VRAM budget not applied', over: null, floor: null, reduced: null })
+  assert.deepEqual(fit('big'), { line: `12k context: 3.5 GB VRAM + 3 GB RAM (measured on ${today()}) · VRAM budget not applied`, over: null, floor: null, reduced: null })
   assert.equal(cells.maxVramGB.peak.text, '3.5 GB')
   assert.match(cells.maxVramGB.peak.title, /^Big at 12k context, .*\. That is more than the VRAM budget, which is not applied: see below\.$/)
   // A RAM budget beside it: the RAM side fits, but the line still does not claim the whole budget.
   await local.setSettings({ maxRamGB: 8 })
   ;({ fit } = await status())
-  assert.equal(fit('big').line, '12k context: 3.5 GB VRAM + 3 GB RAM (measured) · VRAM budget not applied')
+  assert.equal(fit('big').line, `12k context: 3.5 GB VRAM + 3 GB RAM (measured on ${today()}) · VRAM budget not applied`)
   // With the budget applied, a run that still reports more than it is over it, and says so.
   await local.stop()
   await local.setSettings({ gpuLayers: null, maxRamGB: null })
   await run('small', ['CUDA0 model buffer size = 2355.20 MiB', 'CPU model buffer size = 2867.20 MiB'])
   ;({ fit, cells } = await status())
-  assert.equal(fit('small').line, '12k context: 2.3 GB VRAM + 2.8 GB RAM (measured) · over your VRAM budget of 2 GB')
+  assert.equal(fit('small').line, `12k context: 2.3 GB VRAM + 2.8 GB RAM (measured on ${today()}) · over your VRAM budget of 2 GB`)
   assert.equal(cells.maxVramGB.peak.text, '2.3 GB')
   assert.match(cells.maxVramGB.peak.title, /\. That is more than the VRAM budget\.$/)
   // And a figure the budget does hold is a fit, and its peak says nothing more.
@@ -520,6 +529,7 @@ async function card(extra, opts) {
   const lanes = createLanes()
   const { local, run } = await installed({ onSettings: (s) => lanes.setMax(s.maxConcurrentTasks), ...extra }, opts)
   const posts = []
+  const benchmarks = []
   const holds = { GET: [], POST: [] }
   const polls = []
   let busy = 0
@@ -534,6 +544,15 @@ async function card(extra, opts) {
         const patch = JSON.parse(init.body)
         posts.push(patch)
         body = await local.setSettings(patch).then(() => ({ ok: true }), (e) => { code = 400; return { error: e.message } })
+      } else if (method === 'POST' && path === '/jev-router/local/benchmark') {
+        // As index.js answers it: the queue, or the refusal with its status.
+        const b = JSON.parse(init.body)
+        benchmarks.push(b)
+        body = await local.benchmark({ ids: b.ids }).then((queued) => ({ queued }), (e) => { code = e.status ?? 400; return { error: e.message } })
+      } else if (method === 'POST' && path === '/jev-router/local/benchmark/cancel') {
+        // As index.js answers it: ok, or the refusal with its status.
+        benchmarks.push('cancel')
+        try { local.cancelBenchmark(); body = { ok: true } } catch (e) { code = e.status ?? 400; body = { error: e.message } }
       } else code = 404
       const held = holds[method].shift()
       if (held) { busy--; await held; busy++ }
@@ -558,7 +577,7 @@ async function card(extra, opts) {
   const all = () => nodes(view.tree)
   const input = (id) => all().find((n) => n.type === 'input' && n.props.id === id)
   return {
-    local, lanes, run, posts, settle, all,
+    local, lanes, run, posts, benchmarks, settle, all,
     field: (id) => input(id).props.value,
     /** Typed into a field, rendered, as a keystroke is, before anything else can happen. */
     type: async (id, value) => { input(id).props.onChange({ target: { value } }); await settle() },
@@ -905,4 +924,199 @@ test('the words under the table say what a held Laya costs the local models on t
   assert.equal(now('RAM'), '1.9 GB (Laya 1.9 GB at its first start, llama.cpp not loaded)')
   assert.ok(textOf(tree).includes(held))
   await local.dispose()
+})
+
+// ---------- the speed benchmark on the card (docs/benchmark.md 2.9) ----------
+
+/** Until the speed run has ended; its status then. */
+async function speedEnded(local, { timeoutMs = 10_000 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const run = (await local.status()).speedRun
+    if (run?.state === 'idle') return run
+    if (Date.now() > deadline) throw new Error(`the speed run did not end: ${JSON.stringify(run)}`)
+    await new Promise((r) => setTimeout(r, 10))
+  }
+}
+// The load report of a split run on the 4 GB GPU: 29 of Big's 37 layers there, the rest in RAM.
+const SPLIT = ['load_tensors: offloaded 29/37 layers to GPU', 'CUDA0 model buffer size = 3584.00 MiB', 'CPU model buffer size = 1024.00 MiB']
+
+test('each model\'s speed line says what was measured, when, how and with what beside it; why a reading does not stand; and the estimate, as one, when nothing was measured', async () => {
+  assert.equal(typeof helpers.speedLine, 'function', 'the budget helpers word a model\'s speed')
+  // The page keeps its own copies of the depth and the tokens timed, which its words state.
+  assert.deepEqual([helpers.SPEED_DEPTH, helpers.SPEED_PREDICT], [localJs.SPEED_DEPTH, localJs.SPEED_PREDICT])
+  const at = new Date(new Date().getFullYear(), 8, 25, 12).toISOString()
+  const reading = { at, tokensPerSec: 21.2, promptTokensPerSec: 412.7, depth: 8192, nPredict: 128, loadMs: 7810, roomGB: 4, gpuLayers: 'auto', threads: 6, layersOnGpu: { gpu: 29, total: 37 }, laya: null }
+  const line = (speed, rating = null) => helpers.speedLine({ speed, rating })
+  assert.equal(line({ reading, stands: true, why: null }), 'Speed: 21.2 tokens/s generating and 413 tokens/s reading, both 8,192 tokens into a conversation (measured 25 Sep; 29 of 37 layers on the GPU, 6 threads).')
+  assert.equal(line({ reading: { ...reading, laya: 'cuda' }, stands: true, why: null }), 'Speed: 21.2 tokens/s generating and 413 tokens/s reading, both 8,192 tokens into a conversation (measured 25 Sep; 29 of 37 layers on the GPU, 6 threads, Laya on the GPU beside it).')
+  assert.equal(line({ reading: { ...reading, layersOnGpu: null, threads: 1 }, stands: true, why: null }), 'Speed: 21.2 tokens/s generating and 413 tokens/s reading, both 8,192 tokens into a conversation (measured 25 Sep; the engine did not report its GPU split, 1 thread).')
+  assert.equal(line({ reading: { ...reading, promptTokensPerSec: null }, stands: true, why: null }), 'Speed: 21.2 tokens/s generating, 8,192 tokens into a conversation (measured 25 Sep; 29 of 37 layers on the GPU, 6 threads). Its reading speed was not measured, because llama-server reused its prompt cache.')
+  assert.equal(line({ reading, stands: false, why: 'it was measured at 16k context and the next load gets 14k' }), 'Speed: measured 21.2 tokens/s on 25 Sep, but it was measured at 16k context and the next load gets 14k, so that reading does not stand for the next load. Benchmark it again.')
+  // Nothing measured: the estimate, which says it is one, and its range where the GPU's size is unknown.
+  assert.equal(line({ reading: null, stands: false, why: null }, { fit: 'split', wordsPerSec: 17, source: 'estimated' }), "Speed: not measured on this PC; about 17 words/s estimated from its size and this PC's memory bandwidth.")
+  assert.equal(line({ reading: null, stands: false, why: null }, { fit: 'unknown', wordsPerSec: null, wordsPerSecRange: [6, 20], source: 'estimated' }), "Speed: not measured on this PC; about 6 to 20 words/s estimated from its size and this PC's memory bandwidth, a range because this GPU's memory is unknown.")
+  assert.equal(line({ reading: null, stands: false, why: null }), 'Speed: not measured on this PC.')
+
+  // Fed the real status() of a model, before and after a speed run.
+  const server = fakeLlamaServer({ report: () => SPLIT })
+  const { local } = await installed({ spawn: server.spawn, fetch: server.fetch })
+  const big = async () => modelOf(await local.status(), 'big')
+  assert.equal(helpers.speedLine(await big()), "Speed: not measured on this PC; about 6 words/s estimated from its size and this PC's memory bandwidth.")
+  await local.benchmark({ ids: ['big'] })
+  await speedEnded(local)
+  assert.equal(helpers.speedLine(await big()), `Speed: 20.0 tokens/s generating and 400 tokens/s reading, both 8,192 tokens into a conversation (measured ${today()}; 29 of 37 layers on the GPU, 4 threads).`)
+  await local.setSettings({ maxCores: 3 })
+  assert.equal(helpers.speedLine(await big()), `Speed: measured 20.0 tokens/s on ${today()}, but it was measured with 4 threads and the next load gets 3, so that reading does not stand for the next load. Benchmark it again. Until then, about 6 words/s estimated from its size and this PC's memory bandwidth.`)
+  await local.dispose()
+})
+
+test('a reading that does not stand is shown with why, and with the estimate for the next load beside it, as one', () => {
+  assert.equal(typeof helpers.speedLine, 'function', 'the budget helpers word a model\'s speed')
+  const at = new Date(new Date().getFullYear(), 8, 25, 12).toISOString()
+  const reading = { at, tokensPerSec: 21.2, promptTokensPerSec: 412.7, depth: 8192, nPredict: 128, loadMs: 7810, roomGB: 4, gpuLayers: 'auto', threads: 6, layersOnGpu: { gpu: 29, total: 37 }, laya: null }
+  const speed = { reading, stands: false, why: 'it was measured at 16k context and the next load gets 14k' }
+  const stale = 'Speed: measured 21.2 tokens/s on 25 Sep, but it was measured at 16k context and the next load gets 14k, so that reading does not stand for the next load. Benchmark it again.'
+  assert.equal(helpers.speedLine({ speed, rating: { fit: 'split', wordsPerSec: 6, source: 'estimated' } }), `${stale} Until then, about 6 words/s estimated from its size and this PC's memory bandwidth.`)
+  assert.equal(helpers.speedLine({ speed, rating: { fit: 'unknown', wordsPerSec: null, wordsPerSecRange: [6, 20], source: 'estimated' } }), `${stale} Until then, about 6 to 20 words/s estimated from its size and this PC's memory bandwidth, a range because this GPU's memory is unknown.`)
+  assert.equal(helpers.speedLine({ speed, rating: { fit: 'no', reason: 'needs about 9.9 GB, this PC has 8 GB RAM', source: 'estimated' } }), `${stale} This PC cannot run it now: needs about 9.9 GB, this PC has 8 GB RAM.`)
+  assert.equal(helpers.speedLine({ speed, rating: null }), stale, 'with no rating there is no estimate to give')
+})
+
+test('the Benchmark button says what it does, and how long it takes by the model\'s last reading or that nobody knows yet', () => {
+  assert.equal(typeof helpers.speedButtonTitle, 'function', 'the budget helpers word the Benchmark button')
+  const what = 'Load it at the context its runs get, read an 8,192-token prompt and time 128 generated tokens after it three times.'
+  assert.equal(helpers.speedButtonTitle({ speed: { reading: null } }), `${what} How long is not known until it has run once; on the CPU it can take 10 minutes or more; a model you had loaded is loaded again after.`)
+  // 7.8 s to load, 8,192 tokens at 80 a second and three times 128 at 4: 206 s, about 3 minutes.
+  const reading = { at: new Date().toISOString(), tokensPerSec: 4, promptTokensPerSec: 80, depth: 8192, nPredict: 128, loadMs: 7800 }
+  assert.equal(helpers.speedButtonTitle({ speed: { reading, stands: true } }), `${what} About 3 minutes by its last measurement; a model you had loaded is loaded again after.`)
+  assert.equal(helpers.speedButtonTitle({ speed: { reading: { ...reading, tokensPerSec: 40, promptTokensPerSec: 800, loadMs: 3000 }, stands: false } }), `${what} About 1 minute by its last measurement; a model you had loaded is loaded again after.`)
+  assert.equal(helpers.speedButtonTitle({ speed: { reading: { ...reading, promptTokensPerSec: null }, stands: true } }), `${what} About 2 minutes by its last measurement, and longer by the time it takes to read the prompt, which was not measured; a model you had loaded is loaded again after.`)
+})
+
+test('a model\'s memory line says the day a measured figure was taken', async () => {
+  assert.equal(typeof helpers.speedLine, 'function', 'the page words what the speed benchmark measured')
+  const { local, run } = await installed()
+  const fit = async (id) => { const s = await local.status(); return helpers.modelFit(modelOf(s, id), s.settings, s.budget) }
+  assert.equal((await fit('big')).line, '12k context: 4 GB VRAM + 2.7 GB RAM (estimated)', 'an estimate has no day')
+  await run('big', ['CUDA0 model buffer size = 3584.00 MiB', 'CPU model buffer size = 3072.00 MiB'])
+  assert.equal((await fit('big')).line, `12k context: 3.5 GB VRAM + 3 GB RAM (measured on ${today()})`)
+  await local.dispose()
+  const figure = { ctx: 16384, memory: { vramGB: 3.9, ramGB: 2.1, source: 'measured', at: '2024-03-02T12:00:00.000Z' } }
+  assert.equal(helpers.modelFit(figure, {}, {}).line, '16k context: 3.9 GB VRAM + 2.1 GB RAM (measured on 2 Mar 2024)', 'with its year when that is not this one')
+})
+
+test('while the speed run loads the model you had loaded again, Cancel is shown disabled and says why, and a press that gets through is answered with the reason', async (t) => {
+  const server = fakeLlamaServer({ report: () => SPLIT })
+  const page = await card({ spawn: server.spawn, fetch: server.fetch })
+  const button = (label) => page.all().find((n) => n.type === 'button' && (n.props['aria-label'] === label || textOf(n) === label))
+  assert.ok(button('Benchmark Small'), 'the model row has Benchmark')
+  await page.local.start('big')
+  const timed = server.hold((e) => e.model === 'small' && e.body?.n_predict === 128)
+  button('Benchmark Small').props.onClick()
+  await page.settle()
+  await timed.arrived
+  await page.poll()
+  assert.deepEqual([button('Cancel').props.disabled, button('Cancel').props.title], [false, undefined], 'while it measures, Cancel stops it')
+  // A chat title for Small holds the engine, so loading Big again waits.
+  const title = await page.local.acquire('small')
+  t.after(async () => { title.release(); timed.release(); await speedEnded(page.local); await page.local.dispose() })
+  timed.release()
+  for (let i = 0; i < 500 && (await page.local.status()).speedRun.current?.phase !== 'restoring'; i++) await new Promise((r) => setTimeout(r, 10))
+  await page.poll()
+  assert.match(textOf(page.all().find((n) => n.props?.['aria-label'] === 'Speed benchmark')), /^Speed benchmark: loading Big again, as it was before\./)
+  const why = 'The speed benchmark has measured every model it will and is putting the engine back as it was before it; that cannot be cancelled.'
+  assert.deepEqual([button('Cancel').props.disabled, button('Cancel').props.title], [true, why])
+  button('Cancel').props.onClick()
+  await page.settle()
+  assert.deepEqual(page.alerts(), [why], 'said, never ignored')
+})
+
+test('once Cancel is pressed it reads Cancelling and cannot be pressed again while the run stops', async (t) => {
+  const server = fakeLlamaServer({ report: () => SPLIT })
+  const page = await card({ spawn: server.spawn, fetch: server.fetch })
+  const button = (label) => page.all().find((n) => n.type === 'button' && (n.props['aria-label'] === label || textOf(n) === label))
+  assert.ok(button('Benchmark Small'), 'the model row has Benchmark')
+  await page.local.start('big')
+  const timed = server.hold((e) => e.model === 'small' && e.body?.n_predict === 128)
+  button('Benchmark Small').props.onClick()
+  await page.settle()
+  await timed.arrived
+  // A chat title for Small holds the engine, so the run, once cancelled, waits to load Big again.
+  const title = await page.local.acquire('small')
+  t.after(async () => { title.release(); timed.release(); await speedEnded(page.local); await page.local.dispose() })
+  await page.poll()
+  button('Cancel').props.onClick()
+  await page.settle()
+  await page.poll()
+  const cancel = page.all().filter((n) => n.type === 'button' && ['Cancel', 'Cancelling…'].includes(textOf(n))).map((n) => [textOf(n), n.props.disabled === true])
+  assert.deepEqual(cancel, [['Cancelling…', true]], 'it reads Cancelling, and cannot be pressed again')
+})
+
+test('the card benchmarks a model from its row or every one from its head, shows the run as it goes with Cancel, says what it found until the next run, and shows a refusal', async () => {
+  const server = fakeLlamaServer({ report: () => SPLIT })
+  const page = await card({ spawn: server.spawn, fetch: server.fetch })
+  const button = (label) => page.all().find((n) => n.type === 'button' && (n.props['aria-label'] === label || textOf(n) === label))
+  const speedBlock = () => page.all().find((n) => n.props?.['aria-label'] === 'Speed benchmark')
+  const speedLines = () => speedBlock().children.filter((c) => c?.type === 'div')
+  assert.ok(button('Benchmark all'), 'the card head has Benchmark all')
+  assert.equal(button('Benchmark all').props.disabled, false)
+  // Each installed model: its speed line, and a Benchmark button that says what it does.
+  const why = (name) => nodes(page.row(name)).filter((n) => n.props.className === 'why').map(textOf)
+  assert.ok(why('Big').includes("Speed: not measured on this PC; about 6 words/s estimated from its size and this PC's memory bandwidth."), why('Big').join('\n'))
+  assert.match(button('Benchmark Big').props.title, /^Load it at the context its runs get, read an 8,192-token prompt and time 128 generated tokens after it three times\. How long is not known until it has run once/)
+  assert.equal(speedBlock(), undefined, 'nothing to say before the first run')
+
+  // Benchmark on Big's row: it asks for no confirmation, since it is free and changes nothing but which model is loaded.
+  const fill = server.hold((e) => e.body?.n_predict === 1)
+  button('Benchmark Big').props.onClick()
+  await page.settle()
+  assert.deepEqual(page.benchmarks, [{ ids: ['big'] }])
+  await fill.arrived
+  await page.poll()
+  assert.deepEqual(speedLines().map(textOf), [
+    'Speed benchmark: Big, 1 of 1: reading an 8,192-token prompt.',
+    'Local agents wait until the speed benchmark ends; a chat title or a compaction waits for the model being measured.',
+  ])
+  assert.ok(button('Cancel'), 'with Cancel')
+  assert.equal(button('Benchmark all').props.disabled, true, 'one run at a time')
+  assert.equal(button('Benchmark Small').props.disabled, true)
+  fill.release()
+  await speedEnded(page.local)
+  await page.poll()
+  // What it found stays until the next run, with the engine as it was left.
+  assert.deepEqual(speedLines().map(textOf), [
+    'Big: 20.0 tokens/s generating and 400 tokens/s reading, 8,192 tokens into a conversation, at 12k context.',
+    'The engine is stopped again, as it was before.',
+  ])
+  assert.equal(button('Cancel'), undefined)
+  assert.ok(why('Big').includes(`Speed: 20.0 tokens/s generating and 400 tokens/s reading, both 8,192 tokens into a conversation (measured ${today()}; 29 of 37 layers on the GPU, 4 threads).`), why('Big').join('\n'))
+  assert.match(button('Benchmark Big').props.title, /About 1 minute by its last measurement; a model you had loaded is loaded again after\.$/)
+
+  // Benchmark all, cancelled while Small is timed.
+  const timed = server.hold((e) => e.model === 'small' && e.body?.n_predict === 128)
+  button('Benchmark all').props.onClick()
+  await page.settle()
+  await timed.arrived
+  await page.poll()
+  assert.match(textOf(speedBlock()), /^Speed benchmark: Small, 2 of 2: timing 128 generated tokens, 1 of 3\./)
+  button('Cancel').props.onClick()
+  await page.settle()
+  await speedEnded(page.local)
+  await page.poll()
+  assert.deepEqual(page.benchmarks.slice(1), [{}, 'cancel'])
+  assert.deepEqual(speedLines().map((n) => [textOf(n), n.props.className]), [
+    ['Big: 20.0 tokens/s generating and 400 tokens/s reading, 8,192 tokens into a conversation, at 12k context.', 'why'],
+    ['Small not measured: cancelled', 'why err'],
+    ['Stopped. Readings already taken are kept; the engine is stopped again, as it was before.', 'why'],
+  ])
+  timed.release()
+
+  // A refusal is shown where the card shows its others.
+  const conn = await page.local.acquire('small')
+  button('Benchmark all').props.onClick()
+  await page.settle()
+  assert.deepEqual(page.alerts(), ['A local model is answering right now; a speed benchmark would unload it mid-answer. Try again when it is idle.'])
+  conn.release()
+  await page.close()
 })

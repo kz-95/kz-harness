@@ -1,0 +1,21 @@
+{
+  "id": "review-2",
+  "skill": "review",
+  "level": 2,
+  "dimensions": ["code_review"],
+  "folder": "retry-helper",
+  "prompt": "Review src/retry.js and src/http.js against what their doc comments promise.\nWrite every defect you find to REVIEW.json in this folder: a JSON array of objects with file (the path from this folder, such as src/retry.js), line (the line of the defect) and problem (one sentence).\nDo not change any other file.",
+  "protect": [],
+  "onlyChanged": ["REVIEW.json"],
+  "grade": {
+    "kind": "findings",
+    "defects": [
+      { "file": "src/retry.js", "from": 25, "to": 25 },
+      { "file": "src/retry.js", "from": 31, "to": 31 },
+      { "file": "src/retry.js", "from": 34, "to": 35 },
+      { "file": "src/http.js", "from": 22, "to": 26 }
+    ],
+    "minFound": 3,
+    "maxExtra": 2
+  }
+}

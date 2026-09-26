@@ -16,9 +16,11 @@ branch        main                         977e39e, pushed; adaptive routing mer
               fix/routing-self-labelling   merged into main, pushed, safe to delete
               feat/routing-stability-local-context   parked by the owner, not merged
               feat/laya-auto               Laya Auto, built group by group (docs/laya-auto.md 11); G1 to G9 integrated, the cloud end-to-end test run but for its install step, the final review done and fixed, and the end-to-end test run again on the fixed code; pushed (see the Laya section)
+              feat/benchmark               from feat/laya-auto at a1e42b4; the benchmark designed (docs/benchmark.md); step B1, speed and memory of local models, built and reviewed, not observed; step B2, capability, built in d71b76c, its review fixed in 1363776 and its second review in 5f19588, tested with stub agents, a fake Codex command and a fake llama-server, not yet run with real agents; not pushed
 remote        origin github.com/kz-95/kz-harness, PUBLIC
 tests         820 tests, 819 pass, 0 fail, 1 skipped on fix/roadmap-open-items  (npm --prefix plugins/jev-router test)
-              1196 tests, 1195 pass, 0 fail, 1 skipped on feat/laya-auto
+              1200 tests, 1199 pass, 0 fail, 1 skipped on feat/laya-auto at a1e42b4 (1196 before the compaction commit)
+              1325 tests, 1324 pass, 0 fail, 1 skipped on feat/benchmark at 5f19588 (1231 at c0ef03c, 1276 at d71b76c, 1286 at 1363776)
 app           NOT rebuilt; the running app is on older plugin code than either branch
 ```
 
@@ -37,6 +39,9 @@ feature is silently gone.
 
 One line per finished workflow step, newest first, written by `scripts/doc-queue.mjs log` when the step ends.
 
+- 2026-09-26 02:56 UTC, Benchmark review and fixes: Second review of benchmark step B2 fixed on feat/benchmark: a stop is a stop however the run returns, a task folder's git repository kept outside the scratch root and every benchmark git call run with no key of KzH's, a task that does not fit a local window records nothing, plan ids start one run within 30 minutes, the card's reads, tables, confirmation, progress and last-run words say what happened, and Cancel during the speed run's restore says why; red-check against da08532 finds 32 of the 43 new tests failing at the base and 11 passing there (commit 5f19588; 1325 tests, 1324 pass, 0 fail, 1 skipped).
+- 2026-09-26 00:04 UTC, B2: Benchmark step B2 built and reviewed on feat/benchmark: the capability benchmark, 27 fixed Node.js tasks in nine skills plus a preflight, run one at a time on each picked agent, forced at high effort, in the KzH scratch workspace through the normal run path, graded by code, and recorded as capped benchmark evidence of which only the newest run counts, behind a confirmation that says what it spends; tested with stub agents, a fake Codex command and the fake llama-server only (commit 1363776; 1286 tests, 1285 pass, 0 fail, 1 skipped).
+- 2026-09-25 20:36 UTC, B1: Benchmark step B1 built and reviewed on feat/benchmark: local models' speed measured at an 8,192-token depth with llama-server's own timings, kept in local.json beside the memory readings, shown as measured in the install picker and the Local models card, local agents held back off their time limit meanwhile; tested against a fake llama-server only (commit c0ef03c; 1231 tests, 1230 pass, 0 fail, 1 skipped).
 - 2026-09-25 17:21 UTC, Compaction at 97 percent: The engine's compaction-basic set to 0.97 of the window in config/cordis.patch.yml, with a 1,024-token summary on local models and a test of the arithmetic.
 - 2026-09-25 16:53 UTC, Wording fixes and the doc queue: The CPU-fallback note and the signal restart line corrected; scripts/doc-queue.mjs added with its tests, and red-check taught repository scripts (1196 tests, 1195 pass, 0 fail, 1 skipped).
 - 2026-09-25 16:24 UTC, Real laya.serve run on the fixed code: 8 of 9 end-to-end steps passed, step 1 not run for disk; figures within about 10 percent of the first run.
@@ -272,11 +277,29 @@ These need the Windows machine, the running app or the owner, and could not be d
 9. **Owner decision: whether Jev is offered the whole capability vocabulary.**
    Jev is offered only the capabilities some agent in the pool can carry out (the "Still open" bullet under the 23 Sep fix rounds); offering the whole vocabulary so code can refuse is a design choice.
    Done when the owner has chosen and the choice is in roadmap §5.
+10. **Run the speed benchmark against the real llama-server** (`feat/benchmark`, docs/benchmark.md step B1; see "Built but NOT observed").
+    Where: Settings → Jev setup → Local models, with both local models (Qwen3 8B and Gemma 4 E4B) installed; run **Benchmark all**.
+    Check that each model gets a reading whose three runs agree, that the card's lines and the install picker's measured labels read as docs/benchmark.md 2.9 says, that a local agent task started during the run waits with its line, and that the model loaded before is loaded again after.
+    Done when every item reads as described, and any reading refused says why in words of docs/benchmark.md 2.7.
+11. **Run the capability benchmark with real agents** (`feat/benchmark`, docs/benchmark.md step B2; see "Built but NOT observed").
+    Where: restart KzH so `Start-KzH.ps1` adds **KzH scratch** to the project list, open a chat in it, then the Jev inspector's Router tab, Capability benchmark card; pick Claude Code, Codex, DeepSeek and one local agent, read the confirmation, and run.
+    Check that each agent's first task (write what `node --version` prints to `hello.txt`) passes, so Claude Code's permissions let it run `node` in its folder.
+    Check that no task fails with `wrote outside its folder` for a file the engine or the command-line tool itself writes in the scratch root: the listing of the scratch root before and after each task was only tested with stub agents.
+    Check that the Usage tab marks the rows `benchmark`, that `capability-evidence.jsonl` gets rows with `source: benchmark` for every agent that finished, and that the Router tab's profile line shows `benchmark N% (k of n tasks)`.
+    Done when a full run on each picked agent finishes, or each stop says why in words of docs/benchmark.md 3.8.
 
 ## Open, and needing the OWNER, not an agent
 
 1. **The `Use it here` holder test** is narrow but not ownership-proof: it can stop a manually started copy of the pinned engine on 3080, though it needs an explicit click and refuses anything whose command line is not our engine.
 2. **A configured tool's output is cut before it is scrubbed**, and **whether Jev is offered the whole capability vocabulary**: items 8 and 9 of "For the desktop agent".
+3. **Whether the table rule covers the Resource budget table.**
+   The Resource budget table on the Local models card (`client.js` `ResourceBudget`, client.js:4506 at `a1e42b4`, 4602 at `c0ef03c`) has no per-column sort or filter, which the table rule asks of every table (this file, "Rules that were applied and must keep being applied").
+   It is a fixed form of input rows, and whether the rule covers such a form is the owner's call.
+   The benchmark leaves the table untouched and puts the date of a measured memory figure on each model's memory line instead (docs/benchmark.md 2.9).
+4. **Whether a new test of a promise the code already kept may pass on the old code.**
+   The rule is that every new test fails on the old code (`scripts/red-check.mjs`).
+   The second review of benchmark step B2 (`5f19588`) added 11 tests of promises the code kept but no test held, such as that a run with learning off records nothing and that a task set with a defect is refused as it loads, and red-check against `da08532` exits 1 naming them as passed at the base (docs/benchmark.md 5.2).
+   Such a test cannot fail on code that already keeps its promise, so either the rule has an exception for it or those tests need another proof, such as failing on a copy of the code with the promise removed; that is the owner's call.
 
 ### Decided by the owner, 24 Sep 2026
 
@@ -328,6 +351,9 @@ independently re-derived.
      First speed and memory: load each installed local model at the configured context, time real generation, and store `tokensPerSec` beside the VRAM and RAM `local.json` already records per model and context, so the picker's `~X words/s est.` becomes measured.
      Then capability: a small fixed task set per skill, each task in a throwaway workspace with its own tests, run on every agent through the normal routing, the pass rate written as `source: 'benchmark'` rows in `capability-evidence.jsonl` (`profiles.js` already weighs them at 0.7 with a 180-day half-life and the Router tab already shows them).
      The task set is the part that decides what the scores mean; cloud agents cost real usage, so it is a button behind a confirmation, never automatic.
+     It is designed in [`benchmark.md`](benchmark.md), kind design, build against it, as two steps built in that order: B1, speed and memory of local models, then B2, capability.
+     It is built: B1 in `914d8d4` and `c0ef03c`, and B2 in `d71b76c` with its review fixed in `1363776` and its second review in `5f19588`, both on `feat/benchmark`.
+     What remains is observing both against the real engine and agents: items 10 and 11 of "For the desktop agent".
   2. **Compaction at 97 percent: done on 25 Sep, in the cloud.**
      Conversation compaction belongs to the engine's `compaction-basic` plugin (`@deepseek-ai/dsh-compaction-basic`, read at the pinned 0.1.5-rc.2), whose `thresholdRatio` defaults to 0.8; `config/cordis.patch.yml` now sets it to 0.97.
      The engine replays all but the newest 16% of the conversation to the model and asks for a summary of up to `maxTokens` (8,192 by default), which on a local model's 12,288 to 16,384-token window does not fit even at the old 80%, so each local chat model gets a 1,024-token summary; `test/compaction-config.test.js` checks that arithmetic for every chat model in `config/local-models.json` at the smallest window the RAM budget allows.
@@ -348,14 +374,17 @@ independently re-derived.
   Start KzH, open the Jev inspector, and check four things: the **Router** tab lists all seven domains with real sample counts; the two domains a rule in code decides say so at their rung; a routed run's reasoning block carries the decision line, on a cold router `Jev and routing rules decided; 2 Jev calls; 3 candidates considered`; and the Decisions tab shows the candidate table as the router saw it, each `RESOURCE_x` key with its agent id next to it (the person sees the mapping; Jev does not).
   Item 1 of "For the desktop agent" has the exact words to look for.
   Everything else about it is already exercised by `node scripts/kzh-routing-demo.mjs --learn 60`, which needs no engine and no network.
+- **Memory readings are not tied to the model's weights.**
+  Memory readings under `measured` in `local.json` are keyed by model and context, and `measuredFor()` compares only the GPU room and the GPU layers beside them.
+  After a manifest update ships other weights under the same model id, the old weights' memory reading still sizes the context in `planFor()` and shows on the card as measured, and if it puts the model over the budget the model is refused and never loads to be measured again.
+  Speed readings compare the weights since the review of benchmark step B1; memory readings want the same condition: keep the weights in `recordMemory()` and compare them in `measuredFor()`.
+  The review of B1 found it and left it, since it predates B1.
 - **Two small edges in the budget-sized context**, neither urgent.
   A measured reading over the RAM budget moves the next load down 1k without a watchdog unload, and the router keeps the old, larger window until its next refresh; the watchdog normally catches the same overload.
   `index.js` `refreshLocal` joins a refresh already in flight (`refreshing ??=`), which may have read the settings before a save that lands during it; this predates the branch, applies to `onChange` too, and the window is small.
-- **Benchmark evidence has no source yet.** `profiles.js` aggregates three kinds of evidence -
-  declared priors, published benchmarks and this harness's own verified runs - and only the first
-  and third ever arrive. Nothing writes a `benchmark` row or a `benchmark_prior`; the source is
-  weighed (reliability 0.7, 180-day half-life in `routing-policy.js`) but always empty. The
-  arithmetic is there and tested; a harness that fetches or imports results is not.
+- **Published benchmarks have no source.**
+  Benchmark evidence itself has one since step B2 (`feat/benchmark`): the capability benchmark writes `source: benchmark` rows (`profiles.js` `benchmarkEvidence()`), capped so a whole run weighs three observations per dimension, left out of `samples` and `evidenceSamples`, and counted only for the newest run per subject and benchmark id.
+  `benchmark_prior` rows still have no producer: nothing imports published benchmarks, which docs/benchmark.md section 6 keeps out of scope.
 - **A routing domain retrains in-process.** After a run settles, `index.js` evaluates every
   domain in the background, at most once a minute; a domain first trains at 50 verified samples
   and retrains after every 100 new ones. The routing call never waits for it, but it is
@@ -426,6 +455,20 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
 
 ## Built but NOT observed, do not claim these as working
 
+- **The capability benchmark** (docs/benchmark.md step B2, `feat/benchmark` at `5f19588`).
+  It has never run a real agent: `plugins/jev-router/test/benchmark-run.test.js` runs stub agents only, with a fake Codex command and the fake llama-server.
+  Unconfirmed: that the pinned engine starts Claude Code and Codex in the scratch chat's folder, so the prompt's `Workspace:` line points them at the task folder; that Codex's sandbox and Claude Code's edit permission let them write in the task folder; that neither command-line tool writes files of its own in the scratch root during a task, which the outside-the-folder check would fail the task for; the real spend of 28 tasks per agent; and a local model's tasks at its real window.
+  The router's prompt now names the handoff note by its full path in the task folder, so that an agent working from the scratch root keeps it there; that Claude Code and Codex write it at that path, and not relative to their working directory, was tested only with a stub that resolves the path from its parent's folder as a command-line tool would.
+  Since the second review of B2 a task folder's git repository is kept outside the scratch root (docs/benchmark.md 3.7), so an agent's own git commands in its folder find no repository; how Claude Code and Codex work in a folder with no repository, and that KzH's git calls with `GIT_DIR` and `GIT_WORK_TREE` behave on Windows as they do on Linux, where the suite ran, are unconfirmed.
+  The desktop check is item 11 of "For the desktop agent".
+- **`workspace.js` `run()` kills the whole process tree on Linux and macOS** since `d71b76c`, through `local.js` `killTree()`, which walks `ps`.
+  Before, a check that ran past its time left its grandchildren running, which in this repository's own suite left looping test processes behind after every run.
+  `test/workspace.test.js` proves it on Linux; nobody has run it on macOS, and Windows was not affected, since `taskkill /t` already ended the tree.
+- **The speed benchmark** (docs/benchmark.md step B1, `feat/benchmark`).
+  It is built and tested against a fake llama-server only (`plugins/jev-router/test/fixtures/fake-llama-server.mjs`).
+  Nobody has run Benchmark all against the real llama-server b10964 with Qwen3 8B and Gemma 4 E4B, so its reads of the `timings` object of `/completion`, of `/tokenize` behind the engine's API key, and of `prompt_n` on a prompt served from the cache (taken to be at least 1, as llama.cpp reads the last token again) are unconfirmed.
+  Nobody has looked at the Local models card's speed lines or the install picker's measured labels either, and the attempt clock that keeps a local agent's wait off its time limit (`router.js` `attemptClock()`) has run only in tests.
+  The desktop check is item 10 of "For the desktop agent".
 - **Laya Auto and the Laya comparison in Jev Auto** (`feat/laya-auto`).
   Whole runs are tested against a fake `laya.serve`; the real `laya.serve` has answered KzH's real bodies, and whole Jev Auto and Laya Auto runs through the plugin, only on random weights in the cloud, and only on the code from before the final review's fixes (the Laya section above).
   No real Laya weights have answered a KzH question, no GPU has run it, no Windows process handling has been seen, and nobody has looked at the Laya card or the inspector's Laya column.

@@ -1,0 +1,16 @@
+{
+  "id": "performance-3",
+  "skill": "performance",
+  "level": 3,
+  "dimensions": ["debugging", "general_reasoning"],
+  "folder": "grid-paths",
+  "prompt": "countPaths() in src/paths.js takes far too long on grids of 20 by 20 cells or more.\nMake it return the same answers quickly on grids up to 60 by 60.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/paths.test.js": 8
+    }
+  }
+}

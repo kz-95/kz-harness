@@ -11,6 +11,9 @@ import { DIMENSIONS, TASK_DIMENSIONS, resolvePolicy } from '../routing-policy.js
 import {
   EVIDENCE_SOURCES, PRIOR_SOURCES, UNPINNED_WINDOW_DAYS, agreementOf, createCapabilityRegistry, evidenceFromFeedback, evidenceFromRun, loadPriors, priorFor, subjectKey, subjectOf, validatePriors, versionPinned,
 } from '../profiles.js'
+// A namespace as well, for what the capability benchmark added (benchmarkEvidence), so this file
+// loads where the plugin lacks it and each of those tests fails by its own assertion.
+import * as profilesModule from '../profiles.js'
 
 const PRIORS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'config', 'capability-priors.json')
 const DAY = 86_400_000
@@ -238,7 +241,8 @@ test('evidence decay: an old benchmark weighs less than a new one, and slower th
   assert.ok(old.weight < fresh.weight)
   assert.ok(ex.score > 0.5, 'the new benchmark wins')
   assert.ok(close(ex.score, fresh.weight / (fresh.weight + old.weight)))
-  assert.deepEqual(ex.benchmark, { score: ex.score, n: 2 })
+  // The benchmark summary is the plain pass rate over its rows, one per task, and the weight they carry now.
+  assert.deepEqual(ex.benchmark, { score: 0.5, tasks: 2, passed: 1, weight: old.weight + fresh.weight })
   assert.equal(ex.execution, null)
   assert.equal(reg.cold(s), true, 'a benchmark alone does not warm a subject')
   // Execution evidence of the same age has decayed further: a shorter half-life.
@@ -799,9 +803,11 @@ test('an upgrade without known-resources.json seeds from history as well as samp
   assert.deepEqual(await fresh.note([{ id: 'claude' }, { id: 'zeta' }]), [])
 })
 
-test('shipped text: no benchmark claim in the priors, and the local agents say what they are, not what they are good at', () => {
+test('shipped text: the priors say where benchmark evidence comes from and how much it weighs, and the local agents say what they are, not what they are good at', () => {
   assert.doesNotMatch(priors.about, /benchmarks overtakes/)
-  assert.match(priors.about, /nothing imports or records any benchmark/)
+  assert.doesNotMatch(priors.about, /nothing imports or records any benchmark/)
+  assert.match(priors.about, /capability benchmark in the Router tab/)
+  assert.match(priors.about, /as three observations/)
   const manifest = JSON.parse(readFileSync(join(dirname(PRIORS_FILE), 'local-models.json'), 'utf8'))
   const descriptions = (Array.isArray(manifest) ? manifest : manifest.modules ?? Object.values(manifest).find(Array.isArray) ?? []).filter((m) => m.agent).map((m) => m.agent.description)
   assert.ok(descriptions.length >= 2)
@@ -1231,4 +1237,132 @@ test('createHistoryDeps: a verdict with no runId is placed on the run the route 
   assert.equal(deps.runOfVerdict(later, await deps.records())?.runId, 'run-1', 'the run its evidence is on')
   const blind = createHistoryDeps({ historyFile, feedback: h.fb })
   assert.equal(blind.runOfVerdict(later, await blind.records())?.runId, 'run-2', 'without the registry it would be read as the newer run')
+})
+
+// ---------- the capability benchmark's evidence (docs/benchmark.md 3.9) ----------
+
+// The task set's shape: nine skills of three tasks each, crediting what 3.2 says.
+const BENCH = { id: 'kzh-capability', version: '1' }
+const BENCH_CREDITED = {
+  implementation: ['coding', 'instruction_following'], debugging: ['debugging', 'coding', 'general_reasoning'], refactor: ['coding'],
+  testing: ['testing', 'coding'], review: ['code_review'], security: ['security_review', 'code_review'],
+  performance: ['debugging', 'general_reasoning'], simple_change: ['instruction_following'], investigation: ['general_reasoning'],
+}
+const BENCH_TASKS = Object.entries(BENCH_CREDITED).flatMap(([skill, dimensions]) => [1, 2, 3].map((level) => ({ id: `${skill}-${level}`, skill, level, dimensions })))
+/** One agent's task rows of a run, the preflight's first, each task's outcome as `outcome` says. */
+const benchRows = (outcome = () => 'passed', { model = 'gpt-5', modelVersion = null, ts = T0 } = {}) => [
+  { task: 'preflight', outcome: 'passed', ts, model, modelVersion },
+  ...BENCH_TASKS.map((t) => ({ task: t.id, outcome: outcome(t), ts, model, modelVersion })),
+]
+const benchEvidence = (agent, runId, outcome, over = {}, benchmark = BENCH) => profilesModule.benchmarkEvidence(benchRows(outcome, over), { tasks: BENCH_TASKS, agent, priors, benchmark, runId })
+const CODEX = { id: 'codex', provider: 'codex' }
+
+test('benchmarkEvidence: a row per task and credited dimension, of the model the attempts recorded, with n of 3 over the tasks crediting the dimension, so a whole run weighs 1.89 on coding when fresh', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  // 9 of the 12 coding tasks pass: the three level-3 ones of implementation, refactor and testing fail.
+  const failing = new Set(['implementation-3', 'refactor-3', 'testing-3'])
+  const rows = benchEvidence(CODEX, 'bench-1', (t) => (failing.has(t.id) ? 'failed' : 'passed'))
+  const s = subjectOf(CODEX, { modelOf: () => 'gpt-5', priors })
+  assert.equal(rows.length, 45, 'one row per task and dimension it credits')
+  assert.deepEqual(rows.find((r) => r.note === 'debugging-2' && r.dimension === 'debugging'), {
+    ts: T0, subject: s, dimension: 'debugging', score: 1, source: 'benchmark', confidence: 0.9, n: 0.5, taskType: 'debugging', benchmark: BENCH, runId: 'bench-1', note: 'debugging-2',
+  })
+  assert.equal(rows.find((r) => r.note === 'refactor-3').score, 0)
+  const nOf = (dim) => [...new Set(rows.filter((r) => r.dimension === dim).map((r) => r.n))]
+  assert.deepEqual(
+    Object.fromEntries(['coding', 'general_reasoning', 'debugging', 'instruction_following', 'code_review', 'testing', 'security_review'].map((d) => [d, nOf(d)])),
+    { coding: [3 / 12], general_reasoning: [3 / 9], debugging: [3 / 6], instruction_following: [3 / 6], code_review: [3 / 6], testing: [3 / 3], security_review: [3 / 3] },
+  )
+  // Recorded, a whole run weighs on coding as three observations at the benchmark's reliability do.
+  const reg = registry()
+  reg.recordMany(rows)
+  const coding = reg.explain(s, 'coding')
+  assert.equal(coding.items.length, 12)
+  assert.ok(close(coding.evidenceWeight, 3 * 0.9 * policy.evidence.reliability.benchmark), `weight ${coding.evidenceWeight}`)
+  assert.ok(close(coding.evidenceWeight, 1.89))
+  assert.ok(close(coding.score, (coding.priorStrength * coding.prior.score + coding.evidenceWeight * 0.75) / (coding.priorStrength + coding.evidenceWeight)), 'the pass rate pulls the prior by the run\'s capped weight')
+})
+
+test('benchmarkEvidence: a task that did not fit the window KzH gives a local model gives no row at all, since the window is KzH\'s setting and not the model; the others keep their weight', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const rows = benchEvidence(CODEX, 'bench-1', (t) => (t.id === 'implementation-3' ? 'did_not_fit' : 'passed'))
+  assert.deepEqual(rows.filter((r) => r.note === 'implementation-3'), [], 'nothing of the task that did not fit')
+  assert.deepEqual(rows.filter((r) => r.dimension === 'long_context'), [], 'and no long context row')
+  assert.equal(rows.length, 45 - 2, 'every other task keeps its rows: implementation-3 credits coding and instruction following')
+  assert.deepEqual([...new Set(rows.filter((r) => r.dimension === 'coding').map((r) => r.n))], [3 / 12], 'n is still over the set\'s tasks, so a run with a task that did not fit weighs less')
+})
+
+test('benchmarkEvidence: a timed-out task scores 0, and a run that describes no one model or holds an unscored task gives nothing', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const rows = benchEvidence(CODEX, 'bench-1', (t) => (t.id === 'debugging-1' ? 'timed_out' : 'passed'))
+  assert.deepEqual(rows.filter((r) => r.note === 'debugging-1').map((r) => r.score), [0, 0, 0])
+  const mixed = benchRows()
+  mixed[3] = { ...mixed[3], model: 'gpt-4.1' }
+  assert.throws(() => profilesModule.benchmarkEvidence(mixed, { tasks: BENCH_TASKS, agent: CODEX, priors, benchmark: BENCH, runId: 'bench-2' }), /codex ran on more than one model during the benchmark \(gpt-5, gpt-4\.1\)/)
+  assert.throws(() => benchEvidence(CODEX, 'bench-3', (t) => (t.id === 'review-2' ? 'errored' : 'passed')), /codex's review-2 was not scored \(errored\)/)
+})
+
+test('benchmark rows are not runs: they are left out of samples and evidenceSamples, reported as the dimension\'s benchmark summary with its tasks, passes and weight, and leave the model cold', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const reg = registry()
+  const s = subjectOf(CODEX, { modelOf: () => 'gpt-5', priors })
+  reg.recordMany(benchEvidence(CODEX, 'bench-1', (t) => (t.level === 3 ? 'failed' : 'passed')))
+  const profile = reg.profileOf(s)
+  assert.equal(profile.samples, 0, 'no verified run behind the profile: what the ranking and Jev read as evidenceSamples')
+  assert.equal(profile.dimensions.coding.samples, 0)
+  assert.equal(reg.effective(s, ['coding']).coding.samples, 0)
+  assert.deepEqual(profile.dimensions.coding.benchmark, { score: 0.667, tasks: 12, passed: 8, weight: 1.89 }, 'the pass rate, the tasks, the passes and the weight now')
+  assert.deepEqual(profile.dimensions.testing.benchmark, { score: 0.667, tasks: 3, passed: 2, weight: 1.89 })
+  assert.equal(reg.cold(s), true, 'a benchmark alone leaves a model cold')
+  // A run's own row does count as a sample beside them.
+  reg.record(row(s, 'coding', 1, { n: 1 }))
+  assert.equal(reg.profileOf(s).dimensions.coding.samples, 1)
+  assert.equal(reg.profileOf(s).dimensions.coding.benchmark.tasks, 12)
+})
+
+test('a newer benchmark run replaces an older one for the same model and benchmark, also after a reload, and explain() counts the older rows as not counted', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const file = tmp()
+  const reg = registry({ file })
+  const s = subjectOf(CODEX, { modelOf: () => 'gpt-5', priors })
+  const other = subjectOf(CODEX, { modelOf: () => 'gpt-4.1', priors })
+  reg.recordMany(benchEvidence(CODEX, 'bench-1', () => 'passed', { ts: daysAgo(3) }))
+  reg.recordMany(benchEvidence(CODEX, 'bench-2', () => 'failed', { ts: daysAgo(1) }))
+  // Another model's run, and a run of another benchmark on this model, are not replaced by it.
+  reg.recordMany(benchEvidence(CODEX, 'bench-9', () => 'passed', { model: 'gpt-4.1', ts: daysAgo(2) }))
+  reg.recordMany(benchEvidence(CODEX, 'other-1', () => 'passed', { ts: daysAgo(2) }, { id: 'another-benchmark', version: '1' }))
+  const check = (r, label) => {
+    const ex = r.explain(s, 'coding')
+    assert.deepEqual([...new Set(ex.items.map((it) => it.runId))].sort(), ['bench-2', 'other-1'], `${label}: only the newest run of each benchmark counts`)
+    assert.equal(ex.notCounted, 12, `${label}: the older run's rows stay on file, not counted`)
+    assert.deepEqual(r.explain(other, 'coding').items.map((it) => it.runId), Array(12).fill('bench-9'), `${label}: another model keeps its own`)
+  }
+  check(reg, 'as recorded')
+  const again = createCapabilityRegistry({ file, priors, policy, now: () => NOW })
+  again.load()
+  check(again, 'after a reload')
+  assert.equal(readFileSync(file, 'utf8').trim().split('\n').length, 4 * 45, 'nothing is deleted from the file')
+})
+
+test('benchmark rows of a model known only by a name stop counting 45 days after the run, and those of a local model pinned by its weights do not', () => {
+  assert.equal(typeof profilesModule.benchmarkEvidence, 'function')
+  const reg = registry()
+  const claude = { id: 'claude', provider: 'claude-code' }
+  const qwen = { id: 'qwen-local', provider: 'spawn', llm: { provider: 'local', model: 'qwen3-8b' } }
+  const SHA = 'c'.repeat(64)
+  const old = daysAgo(UNPINNED_WINDOW_DAYS + 1)
+  reg.recordMany(benchEvidence(claude, 'bench-c', () => 'passed', { model: 'opus', ts: old }))
+  reg.recordMany(benchEvidence(qwen, 'bench-q', () => 'passed', { model: 'qwen3-8b', modelVersion: SHA, ts: old }))
+  const opus = subjectOf(claude, { modelOf: () => 'opus', priors })
+  const local = subjectOf(qwen, { modelOf: () => 'qwen3-8b', versionOf: () => SHA, priors })
+  assert.deepEqual([versionPinned(opus.version), versionPinned(local.version)], [false, true])
+  const byName = reg.explain(opus, 'coding')
+  assert.deepEqual([byName.items.length, byName.notCounted, byName.benchmark], [0, 12, null], 'opus may be another model by now')
+  const pinned = reg.explain(local, 'coding')
+  assert.equal(pinned.items.length, 12, 'the same weights are the same model')
+  assert.ok(pinned.items.every((it) => it.decay < 1 && it.decay > 0.8), 'and its rows age on the benchmark\'s half-life')
+  // Inside the window a name's rows count.
+  const fresh = registry()
+  fresh.recordMany(benchEvidence(claude, 'bench-d', () => 'passed', { model: 'opus', ts: daysAgo(UNPINNED_WINDOW_DAYS - 1) }))
+  assert.equal(fresh.explain(opus, 'coding').items.length, 12)
 })

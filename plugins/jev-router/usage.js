@@ -342,6 +342,8 @@ const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const m = s.le
  *   limits avoided: agents skipped at routing for being stopped/exhausted, plus limit hits moved to a
  *     rotated key or a peer, in runs that did not end paused. Counted, not priced.
  * Agent median = median durationMs of completed primary agent attempts, all time; agentMedianFallbackMs when none.
+ *   An attempt of the capability benchmark (`purpose: 'benchmark'`) is left out: a small synthetic
+ *   task at a fixed effort says nothing about how long the person's own work takes.
  * No clamping: a negative saving is reported as negative.
  * Only what Jev decided counts: a direct answer whose row names another `decider`, and a run whose
  *   `routing.decider` is another, are Laya Auto's and saved nothing by Jev. A row or run from
@@ -352,7 +354,7 @@ const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const m = s.le
  */
 export function computeSavings(usage, runs, { baseline = DEFAULT_BASELINE, agentMedianFallbackMs = 10_000 } = {}, now = Date.now()) {
   const b = { ...DEFAULT_BASELINE, ...baseline }
-  const done = usage.filter((l) => l.agent !== 'jev' && l.agent !== 'chat' && l.role === 'primary' && l.stopReason === 'completed' && Number.isFinite(l.durationMs)).map((l) => l.durationMs)
+  const done = usage.filter((l) => l.agent !== 'jev' && l.agent !== 'chat' && l.role === 'primary' && l.stopReason === 'completed' && l.purpose !== 'benchmark' && Number.isFinite(l.durationMs)).map((l) => l.durationMs)
   const agentMs = done.length ? median(done) : agentMedianFallbackMs
   const midnight = new Date(now); midnight.setHours(0, 0, 0, 0)
   const starts = { today: midnight.getTime(), week: now - 7 * 86_400_000, all: -Infinity }

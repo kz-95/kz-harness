@@ -1,0 +1,22 @@
+{
+  "id": "review-3",
+  "skill": "review",
+  "level": 3,
+  "dimensions": ["code_review"],
+  "folder": "inventory",
+  "prompt": "CHANGE.md describes a change that was just made to src/.\nReview the code in src/ for defects, in that change or anywhere else.\nWrite every defect you find to REVIEW.json in this folder: a JSON array of objects with file (the path from this folder, such as src/stock.js), line (the line of the defect) and problem (one sentence).\nDo not change any other file.",
+  "protect": [],
+  "onlyChanged": ["REVIEW.json"],
+  "grade": {
+    "kind": "findings",
+    "defects": [
+      { "file": "src/orders.js", "from": 18, "to": 19 },
+      { "file": "src/stock.js", "from": 32, "to": 32 },
+      { "file": "src/reservations.js", "from": 17, "to": 18 },
+      { "file": "src/orders.js", "from": 24, "to": 28 },
+      { "file": "src/orders.js", "from": 21, "to": 21 }
+    ],
+    "minFound": 4,
+    "maxExtra": 3
+  }
+}

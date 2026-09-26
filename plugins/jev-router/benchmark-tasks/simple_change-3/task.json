@@ -1,0 +1,16 @@
+{
+  "id": "simple_change-3",
+  "skill": "simple_change",
+  "level": 3,
+  "dimensions": ["instruction_following"],
+  "folder": "uploads",
+  "prompt": "Raise the upload limit from 10 MB to 25 MB.\nEvery place in src/ that states or enforces the limit must agree with the new one, and nothing else may change.\nDo not change the tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": ["src/limits.js", "src/errors.js", "src/hint.js"],
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/limit.test.js": 5
+    }
+  }
+}

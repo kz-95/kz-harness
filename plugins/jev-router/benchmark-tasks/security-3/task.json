@@ -1,0 +1,16 @@
+{
+  "id": "security-3",
+  "skill": "security",
+  "level": 3,
+  "dimensions": ["security_review", "code_review"],
+  "folder": "order-pages",
+  "prompt": "This small web module has security problems in more than one file.\nFind and fix them while keeping normal behaviour: pages render the same text, redirects to this site's own paths still work, and exported CSV holds the same values.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/web.test.js": 12
+    }
+  }
+}

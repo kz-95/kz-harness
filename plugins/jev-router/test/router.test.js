@@ -1870,3 +1870,43 @@ test('decider: the person\'s verdicts move a close pick under Laya as under Jev'
     assert.ok(events.some((e) => e.type === 'feedback' && e.from === 'codex' && e.to === 'claude'), `${provider.id}: the move is said as it happens`)
   }
 })
+
+test('an agent held back before its work starts is not run out of time by the wait: its time limit stands still while it waits (untimed), the wait is kept apart from its own time, and the limit still holds for the work after it', async () => {
+  const quick = { ...config, agentTimeoutMs: 200 }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  // Held back for more than twice its whole time limit, then it does the work: the attempt completes,
+  // and one attempt is all the run needs.
+  const dir = repo()
+  const held = async (agentDef, prompt, agentSignal, options) => {
+    await options.untimed(sleep(500))
+    agentSignal.throwIfAborted()
+    writeFileSync(join(dir, 'state.txt'), 'fixed')
+    return { stopReason: 'completed', answerText: 'fixed it' }
+  }
+  const r = await runRouted({ task: 'fix', cwd: dir, forceAgent: 'claude', config: quick, signal, deps: { jev: null, execute: held, history: history() } })
+  assert.equal(r.attempts.length, 1, JSON.stringify(r.attempts.map((a) => [a.stopReason, a.diagnostic])))
+  const [a] = r.attempts
+  assert.deepEqual([a.stopReason, r.finalStatus], ['completed', 'accepted'])
+  assert.ok(a.waitedMs >= 480, `it waited ${a.waitedMs} ms`)
+  assert.ok(a.durationMs < a.waitedMs, `its own time, ${a.durationMs} ms, leaves the wait out`)
+
+  // The limit counts again once the wait is over, from where it stood: work that runs past it is stopped
+  // by the limit, as any attempt's is, after its own 200 ms and not before.
+  const dir2 = repo()
+  const slow = async (agentDef, prompt, agentSignal, options) => {
+    await options.untimed(sleep(100))
+    // Work that never ends on its own. The limit's timer, like AbortSignal.timeout's, does not keep
+    // the process alive, so this stands in for the engine that does.
+    const alive = setInterval(() => {}, 20)
+    try {
+      await new Promise((resolve, reject) => agentSignal.addEventListener('abort', () => reject(agentSignal.reason), { once: true }))
+    } finally { clearInterval(alive) }
+  }
+  const one = { ...quick, limits: { ...quick.limits, maxAttempts: 1 } }
+  const timedOut = await runRouted({ task: 'fix', cwd: dir2, forceAgent: 'claude', config: one, signal, deps: { jev: null, execute: slow, history: history() } })
+  const [t] = timedOut.attempts
+  assert.equal(t.stopReason, 'error')
+  assert.match(t.diagnostic, /aborted due to timeout/)
+  assert.ok(t.waitedMs >= 90 && t.waitedMs < 200, `it waited ${t.waitedMs} ms`)
+  assert.ok(t.durationMs >= 190, `the limit gave its work its own time, ${t.durationMs} ms`)
+})

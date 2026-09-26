@@ -1,0 +1,14 @@
+{
+  "id": "testing-1",
+  "skill": "testing",
+  "level": 1,
+  "dimensions": ["testing", "coding"],
+  "folder": "slugify",
+  "prompt": "Write tests for src/slugify.js in test/slugify.test.js, using node:test, that check everything its doc comment promises.\nDo not change src/ or package.json.",
+  "protect": ["package.json", "src/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "mutants",
+    "file": "src/slugify.js"
+  }
+}

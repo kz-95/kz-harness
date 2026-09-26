@@ -1,0 +1,16 @@
+{
+  "id": "refactor-2",
+  "skill": "refactor",
+  "level": 2,
+  "dimensions": ["coding"],
+  "folder": "order-status",
+  "prompt": "The order states are written as bare strings all over src/.\nPut them in one frozen object, OrderStatus, exported from a new file src/status.js, with the keys PENDING, PAID, SHIPPED and CANCELLED and the same string values, and use it everywhere in src/ instead of the strings.\nBehaviour must not change.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/status.test.js": 5
+    }
+  }
+}

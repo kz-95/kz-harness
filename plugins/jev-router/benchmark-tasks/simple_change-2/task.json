@@ -1,0 +1,16 @@
+{
+  "id": "simple_change-2",
+  "skill": "simple_change",
+  "level": 2,
+  "dimensions": ["instruction_following"],
+  "folder": "linecount",
+  "prompt": "Rename the command-line flag --verbose to --debug in src/cli.js, src/options.js and README.md.\nKeep --verbose working as an old name for --debug, but when it is used print exactly warning: --verbose is deprecated, use --debug on stderr, once.\nThe usage text that --help prints must list --debug and not --verbose.\nChange no other file.",
+  "protect": [],
+  "onlyChanged": ["src/cli.js", "src/options.js", "README.md"],
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/flag.test.js": 7
+    }
+  }
+}

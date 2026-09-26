@@ -1,0 +1,16 @@
+{
+  "id": "performance-1",
+  "skill": "performance",
+  "level": 1,
+  "dimensions": ["debugging", "general_reasoning"],
+  "folder": "dedupe",
+  "prompt": "dedupe() in src/dedupe.js is far too slow on large lists.\nMake it fast while returning exactly the same results as now.\nDo not change the existing tests or package.json.",
+  "protect": ["package.json", "test/"],
+  "onlyChanged": null,
+  "grade": {
+    "kind": "tests",
+    "tests": {
+      "grade/dedupe.test.js": 5
+    }
+  }
+}

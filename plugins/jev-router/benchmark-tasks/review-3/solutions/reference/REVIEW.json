@@ -1,0 +1,7 @@
+[
+  { "file": "src/orders.js", "line": 18, "problem": "reserve() is not awaited, so the out-of-stock check sees a promise and two orders can both be charged for the last item." },
+  { "file": "src/stock.js", "line": 32, "problem": "The check uses > where >= is meant, so the last units in stock can never be taken." },
+  { "file": "src/reservations.js", "line": 18, "problem": "The shared default options object is changed on every call, so its watchers grow from order to order." },
+  { "file": "src/orders.js", "line": 27, "problem": "When the payment fails the reservation is not released, so the stock stays held for an order that will not be paid." },
+  { "file": "src/orders.js", "line": 21, "problem": "shippingCents expects kilograms but is given the weight in grams." }
+]

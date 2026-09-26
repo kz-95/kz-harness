@@ -60,7 +60,7 @@ test('stopped/exhausted agents are excluded; near-limit agents are flagged to Je
   assert.deepEqual(routeArgs.availability, { claude: 'near limit', deepseek: 'ok' })
   assert.equal(prompts[0][0], 'claude')
   assert.match(prompts[0][1], /close to your usage limit/)
-  assert.match(prompts[0][1], /\.kz-harness\/handoff\.md/)
+  assert.ok(prompts[0][1].includes(`Keep ${join(dir, '.kz-harness', 'handoff.md')} updated as you work`), 'the note by its full path')
   assert.match(formatReport(r), /Out: codex until \d\d:\d\d; near limit: claude/)
   const allOut = { claude: { state: 'stopped' }, codex: { state: 'exhausted', until }, deepseek: { state: 'exhausted' } }
   await assert.rejects(runRouted({ task: 'fix', cwd: dir, config, signal, deps: { jev, quota: allOut, execute, history: history() } }), /at their usage limits \(earliest reset/)
