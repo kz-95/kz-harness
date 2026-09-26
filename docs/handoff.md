@@ -11,17 +11,15 @@ unless it says otherwise. Where something is unverified it says so.
 ## State
 
 ```
-branch        main                         977e39e, pushed; adaptive routing merged, unchanged by the branch below
-              fix/roadmap-open-items       pushed, NOT merged into main; the second pass of 24 Sep
-              fix/routing-self-labelling   merged into main, pushed, safe to delete
-              feat/routing-stability-local-context   parked by the owner, not merged
-              feat/laya-auto               Laya Auto, built group by group (docs/laya-auto.md 11); G1 to G9 integrated, the cloud end-to-end test run but for its install step, the final review done and fixed, and the end-to-end test run again on the fixed code; pushed (see the Laya section)
-              feat/benchmark               from feat/laya-auto at a1e42b4; the benchmark designed (docs/benchmark.md); step B1, speed and memory of local models, built and reviewed, run against the real llama-server b10964 on a CPU with tiny test models on 26 Sep, not observed on a GPU or with the real models; step B2, capability, built in d71b76c, its review fixed in 1363776 and its second review in 5f19588, tested with stub agents, a fake Codex command and a fake llama-server, not yet run with real agents; all of it squashed into f88947a and pushed on 26 Sep; the speed run from a shell (Speed-Run.bat), streamed speed requests, the generation speed over n - 1, the speed run logs and scripts/run-as-script.mjs in the commit after f88947a, pushed on 26 Sep
+branch        main                         977e39e, pushed; the roadmap and the doc cleanup
+              fix/roadmap-open-items       the roadmap's open items, not merged
+              feat/laya-auto               Laya Auto, stacked on the above, not merged
+              feat/benchmark               the capability and speed benchmark, stacked again, not merged
+              fix/windows-findings         5 commits on feat/benchmark: the first Windows run's findings
 remote        origin github.com/kz-95/kz-harness, PUBLIC
-tests         820 tests, 819 pass, 0 fail, 1 skipped on fix/roadmap-open-items  (npm --prefix plugins/jev-router test)
-              1200 tests, 1199 pass, 0 fail, 1 skipped on feat/laya-auto at a1e42b4 (1196 before the compaction commit)
-              1353 tests, 1352 pass, 0 fail, 1 skipped on feat/benchmark at the commit after f88947a (1325 at f88947a, whose code is 5f19588's; 1231 at c0ef03c, 1276 at d71b76c, 1286 at 1363776)
-app           NOT rebuilt; the running app is on older plugin code than either branch
+tests         1354 tests, 1354 pass, 0 fail on Windows (npm --prefix plugins/jev-router test)
+              1309/1330 before this branch: the stack had never been run on Windows at all
+app           NOT rebuilt since any of this; the running app is on older plugin code
 ```
 
 Git authorship is the GitHub noreply alias on every commit. All five were rewritten on 22 Sep
