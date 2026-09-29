@@ -458,9 +458,10 @@ test('the strategies are eligible over the pool that does the work and the wider
 test('after a conservation move the strategy is chosen over the pool that really does the work', async () => {
   // Two resources: a scarce frontier one and a strong one. Before the move there is a capability
   // gap, so a cheap-then-premium strategy is on offer. Once the frontier one is conserved one
-  // resource does the work, so no strategy that needs two workers can be - but the conserved one
-  // still reviews, so a frontier review still can. And the strategy domain must be shown the
-  // one-resource pool, not the two-resource pool the decision started from.
+  // resource does the work, so no strategy that needs two workers can be; the conserved one still
+  // may review, though not as a planned frontier review at this risk (see the assertion below).
+  // And the strategy domain must be shown the one-resource pool, not the two-resource pool the
+  // decision started from.
   const two = AGENTS.filter((a) => a.id === 'claude' || a.id === 'deepseek')
   const seen = {}
   const spy = () => {
@@ -474,7 +475,11 @@ test('after a conservation move the strategy is chosen over the pool that really
   assert.ok(unmoved.routing.decision.strategies.includes('CHEAP_THEN_PREMIUM_REVIEW'), 'two workers with a gap before the move')
   assert.ok(!moved.routing.decision.strategies.includes('CHEAP_THEN_PREMIUM_REVIEW'), 'one worker after it')
   assert.ok(!moved.routing.decision.strategies.includes('PREMIUM_PLAN_CHEAP_EXECUTE'))
-  assert.ok(moved.routing.decision.strategies.includes('CHEAP_EXECUTE_FRONTIER_REVIEW'), 'the conserved resource still reviews')
+  // Work easy enough to conserve is under riskForReview, and a planned frontier review starts at
+  // riskBands.medium: the conserved resource reviews only when the accept bar or a second opinion
+  // asks for one, not as a plan.
+  assert.ok(!moved.routing.decision.strategies.includes('CHEAP_EXECUTE_FRONTIER_REVIEW'), 'risk 0.2 plans no frontier review')
+  assert.ok(unmoved.routing.decision.strategies.includes('CHEAP_EXECUTE_FRONTIER_REVIEW'), 'risk 0.9 does')
   assert.notDeepEqual(moved.routing.decision.strategies, unmoved.routing.decision.strategies)
   const strategyFeatures = seen.execution_strategy?.at(-1)?.features?.numeric
   assert.ok(strategyFeatures, 'the strategy domain was consulted')
@@ -586,15 +591,80 @@ test('the broker takes the planner and the parallel answerer from the work pool,
   assert.equal(par.parallelWith, 'mid', 'the frontier resource kept for review does not answer the task')
   const planned = planStrategy({ strategy: 'PREMIUM_PLAN_CHEAP_EXECUTE', primaryId: 'cheap', candidates: work, reviewCandidates: review })
   assert.equal(planned.steps.find((st) => st.role === 'plan')?.agent, 'mid', 'nor does it write the plan')
-  const reviewed = planStrategy({ strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW', primaryId: 'cheap', candidates: work, reviewCandidates: review })
+  const reviewed = planStrategy({ strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW', primaryId: 'cheap', candidates: work, reviewCandidates: review, profile: { risk: 0.7 } })
   assert.equal(reviewed.reviewer, 'kept', 'but it does review, which is what it was kept for')
 })
 
 
+test('a strategy that plans a review by a second agent needs the risk to pay for it, on the decider\'s risk bands', async () => {
+  const { heldByRisk, planStrategy } = await import('../broker.js')
+  const c = (id, tier, over = {}) => ({ id, tier, fit: 0.8, source: 'api', marginalCost: 'metered', expectedCost: { total: 0.5 }, ...over })
+  // Two workers with a real gap and a third to judge: every review strategy is possible by the candidates.
+  const work = [c('cheap', 'standard', { expectedCost: { total: 0.2 } }), c('top', 'frontier')]
+  const at = (risk, riskBands) => eligibleStrategies({ candidates: work, profile: { risk }, riskBands })
+  const REVIEWS = ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE', 'CHEAP_EXECUTE_FRONTIER_REVIEW']
+  const reviews = (list) => REVIEWS.filter((s) => list.includes(s))
+  // The first real run: risk 1.3% got CHEAP_EXECUTE_FRONTIER_REVIEW and eleven minutes.
+  assert.deepEqual(reviews(at(0.013)), [], 'under riskBands.low no review is planned')
+  assert.ok(at(0.013).includes('CHEAP_DIRECT') && at(0.013).includes('PREMIUM_DIRECT'), 'the direct strategies stay')
+  assert.deepEqual(reviews(at(0.25)), ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE'], 'from the low cut, a stronger agent may review')
+  assert.deepEqual(reviews(at(0.59)), ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE'])
+  assert.deepEqual(reviews(at(0.6)), REVIEWS, 'from the medium cut, a planned frontier review too')
+  assert.deepEqual(reviews(at(undefined)), ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE'], 'a missing risk reads 0.5')
+  // The cuts are the deciding provider's: wider bands hold more back.
+  assert.deepEqual(reviews(at(0.3, { low: 0.4, medium: 0.8 })), [])
+  assert.deepEqual(reviews(at(0.7, { low: 0.4, medium: 0.8 })), ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE'])
+  assert.deepEqual(heldByRisk('CHEAP_EXECUTE_FRONTIER_REVIEW', 0.3), { band: 'medium', cut: 0.6 })
+  assert.equal(heldByRisk('CHEAP_DIRECT', 0), null, 'a strategy with no planned review is never held')
+  // A review strategy asked for anyway runs directly, and the plan says it was the risk.
+  const plan = planStrategy({ strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW', primaryId: 'cheap', candidates: work, profile: { risk: 0.013 } })
+  assert.equal(plan.strategy, 'STANDARD_DIRECT')
+  assert.equal(plan.forceReview, false)
+  assert.equal(plan.reviewer, null)
+  assert.deepEqual(plan.notes, ['CHEAP_EXECUTE_FRONTIER_REVIEW plans a review that risk 0.01 is too low for (riskBands.medium 0.6); running cheap directly'])
+})
+
+test('an answer-only run is offered no strategy that plans a review, since its loop ends at the first answer and never reviews', async () => {
+  const c = (id, tier, over = {}) => ({ id, tier, fit: 0.8, source: 'api', marginalCost: 'metered', expectedCost: { total: 0.5 }, ...over })
+  const work = [c('cheap', 'standard', { expectedCost: { total: 0.2 } }), c('top', 'frontier')]
+  const REVIEWS = ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE', 'CHEAP_EXECUTE_FRONTIER_REVIEW']
+  const risky = { risk: 0.9 }
+  assert.deepEqual(REVIEWS.filter((s) => eligibleStrategies({ candidates: work, profile: risky }).includes(s)), REVIEWS, 'work at this risk may plan any of them')
+  const answer = eligibleStrategies({ candidates: work, profile: risky, answerOnly: true })
+  assert.deepEqual(REVIEWS.filter((s) => answer.includes(s)), [])
+  assert.ok(answer.includes('PARALLEL_SECOND_OPINION'), 'a second answer beside it is still possible')
+  // Through the engine: the question Jev is asked lists none of them.
+  const jev = fakeJev({ profile: profileOf({ risk: 0.9, complexity: 0.6 }), strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW' })
+  const d = await decide(engineWith(fakeDomains()), jev, { answerOnly: true })
+  for (const s of REVIEWS) assert.ok(!jev.calls.at(-1).strategies.includes(s), s)
+  assert.equal(d.plan.forceReview, false)
+})
+
+test('under the low risk band, Jev is offered no review strategy and a second-opinion yes is held, said and not labelled', async () => {
+  // The first real run's numbers: complexity 32.5%, risk 1.3%, second opinion 67%.
+  const profile = profileOf({ complexity: 0.325, risk: 0.013 })
+  const base = fakeJev({ profile, strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW' })
+  const jev = { ...base, route: async (args) => { const out = await base.route(args); if (args.candidates && args.ask?.judgments !== false) out.secondOpinion = 0.67; return out } }
+  const d = await decide(engineWith(fakeDomains()), jev)
+  const offered = base.calls.at(-1).strategies
+  for (const s of ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE', 'CHEAP_EXECUTE_FRONTIER_REVIEW']) assert.ok(!offered.includes(s), `${s} is not offered`)
+  assert.notEqual(d.plan.strategy, 'CHEAP_EXECUTE_FRONTIER_REVIEW')
+  assert.equal(d.plan.forceReview, false)
+  assert.equal(d.routing.decision.domains.second_opinion.label, 'yes', 'the answer is kept as given')
+  assert.equal(d.routing.decision.domains.second_opinion.heldBy, 'risk', 'and marked as held')
+  assert.ok(d.plan.notes.includes('second opinion not asked for: risk 0.01 is under riskBands.low 0.25'))
+  assert.ok(!d.samples.some((x) => x.domain === 'second_opinion'), 'a held yes changes nothing, so labels nothing')
+  // At the low cut the same yes is carried out and labelled.
+  const at = { ...base, route: async (args) => { const out = await fakeJev({ profile: profileOf({ risk: 0.25 }) }).route(args); if (args.candidates && args.ask?.judgments !== false) out.secondOpinion = 0.67; return out } }
+  const e = await decide(engineWith(fakeDomains()), at)
+  assert.equal(e.routing.decision.domains.second_opinion.heldBy, undefined)
+  assert.ok(e.samples.some((x) => x.domain === 'second_opinion'))
+})
+
 test('a judgment that cannot change the run is not labelled by it', async () => {
   const labelled = (d) => d.samples.map((x) => x.domain)
   // A direct plan with no review in it: a second opinion or a frontier review would change the run.
-  const plain = await decide(engineWith(fakeDomains()), fakeJev({ strategy: 'STANDARD_DIRECT' }))
+  const plain = await decide(engineWith(fakeDomains()), fakeJev({ profile: profileOf({ risk: 0.3 }), strategy: 'STANDARD_DIRECT' }))
   assert.equal(plain.plan.forceReview, false, 'the setting: no review planned')
   assert.ok(labelled(plain).includes('second_opinion'))
   assert.ok(labelled(plain).includes('frontier_escalation'))
@@ -613,6 +683,12 @@ test('a judgment that cannot change the run is not labelled by it', async () => 
   const added = await decide(engineWith(fakeDomains()), fakeJev({ profile: risky, strategy: 'STANDARD_DIRECT' }))
   assert.ok(added.plan.notes.includes('frontier review added by the frontier-escalation domain'))
   assert.ok(labelled(added).includes('frontier_escalation'))
+  // Under the low risk band no second opinion is asked for whatever the answer, so none is labelled.
+  const low = await decide(engineWith(fakeDomains()), fakeJev({ profile: profileOf({ risk: 0.1 }), strategy: 'STANDARD_DIRECT' }))
+  assert.equal(low.plan.forceReview, false)
+  assert.ok(!labelled(low).includes('second_opinion'))
+  assert.equal(low.routing.decision.domains.second_opinion.heldBy, 'risk')
+  assert.ok(labelled(low).includes('frontier_escalation'), 'a frontier yes could still change it')
 })
 
 test('what cleared the hard facts but does not do the work is recorded with its numbers, for the review', async () => {
@@ -983,6 +1059,39 @@ test('the cut-offs are the deciding provider\'s, read from its record through th
   const raised = resolvePolicy({ minimumReview: { riskForReview: 0.4 } })
   const e = createDecisionEngine({ policy: raised, domains: undefined, profiles: createCapabilityRegistry({ priors: PRIORS, policy: raised }), priors: PRIORS, now: () => now })
   assert.equal((await decide(e, undefined)).routing.decision.judgments.secondOpinion, 1)
+})
+
+test('the review strategies a run is offered, and the one its plan runs, are held on the deciding provider\'s risk bands', async () => {
+  const { resolveProviders } = await import('../providers.js')
+  const withBands = (riskBands) => resolveProviders({ laya: { thresholds: { riskBands } } }, { policy }).laya
+  const REVIEWS = ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE', 'CHEAP_EXECUTE_FRONTIER_REVIEW']
+  // With both subscriptions pressing, the strong metered key is the cheapest and a frontier
+  // subscription the strongest, so these candidates make a review by a stronger agent possible;
+  // work this hard conserves nothing.
+  const run = async (provider, risk, secondOpinion = 0.2) => {
+    const decider = fakeLaya({ profile: profileOf({ risk, complexity: 0.9 }), strategy: 'CHEAP_THEN_PREMIUM_REVIEW', secondOpinion })
+    const d = await decide(engine(), undefined, { decider, provider, snapshots: snapshots(usageRows({ claudeWeekly: 88, codexWeekly: 86 })) })
+    return { plan: d.plan, offered: REVIEWS.filter((s) => decider.calls.at(-1).strategies.includes(s)) }
+  }
+  // Laya's default bands are Jev's, 0.25 and 0.6: at risk 0.3 a stronger agent may review.
+  const { laya } = await records()
+  const usual = await run(laya, 0.3)
+  assert.deepEqual(usual.offered, ['CHEAP_THEN_PREMIUM_REVIEW', 'PREMIUM_PLAN_CHEAP_EXECUTE'], 'the setting: these candidates make a review possible')
+  assert.equal(usual.plan.strategy, 'CHEAP_THEN_PREMIUM_REVIEW')
+  // Wider bands hold the same run back, and the second-opinion hold reads the same cut.
+  const wide = await run(withBands({ low: 0.4, medium: 0.8 }), 0.3, 0.9)
+  assert.deepEqual(wide.offered, [], 'risk 0.3 is under this record\'s riskBands.low 0.4')
+  assert.notEqual(wide.plan.strategy, 'CHEAP_THEN_PREMIUM_REVIEW')
+  assert.equal(wide.plan.forceReview, false)
+  assert.ok(wide.plan.notes.includes('second opinion not asked for: risk 0.30 is under riskBands.low 0.4'))
+  // Narrower ones let a lower risk plan any review, a frontier review included, where Jev's bands
+  // would hold all three. The plan reads the bands again, and carries the review out rather than
+  // holding it at Jev's 0.25.
+  const narrow = await run(withBands({ low: 0.1, medium: 0.2 }), 0.22)
+  assert.deepEqual(narrow.offered, REVIEWS, 'risk 0.22 is over this record\'s riskBands.medium 0.2 and under Jev\'s low 0.25')
+  assert.equal(narrow.plan.strategy, 'CHEAP_THEN_PREMIUM_REVIEW')
+  assert.equal(narrow.plan.forceReview, true)
+  assert.ok(!narrow.plan.notes.some((n) => /too low for/.test(n)), narrow.plan.notes.join('; '))
 })
 
 test('a Laya run asks Laya every question whatever rung Jev\'s ladder holds a domain at, and leaves that ladder as it was', async () => {

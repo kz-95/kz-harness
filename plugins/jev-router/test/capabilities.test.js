@@ -193,3 +193,60 @@ test('the cost class comes from the billing kind and the economics override, nev
   // rank() sorts on it, which is what a capability swap lands on.
   assert.deepEqual(rank(list.filter((e) => e.id !== 'byok')).map((e) => e.id), ['acme', 'renamed'])
 })
+
+test('read-only work is locked, never trusted: Claude only through its plan-mode row, a spawn agent by the read tools its parent sees, Codex never', async () => {
+  const caps = await import('../capabilities.js')
+  assert.equal(typeof caps.lockOf, 'function', 'capabilities.js says how an agent is locked')
+  const { lockOf, READ_ONLY_CLAUDE } = caps
+  const claude = { id: 'claude', provider: 'claude-code' }
+  const deep = { id: 'deep', provider: 'spawn', llm: { provider: 'deepseek', model: 'deepseek-chat' } }
+  const plan = { config: { permissionMode: 'plan' } }
+  const spawn = { capabilities: { toolFilter: true } }
+  const providers = (rows) => (n) => rows[n]
+  const sees = (names) => (n) => names.includes(n)
+  // Claude: the row in plan mode, missing, or in a mode that can edit.
+  assert.deepEqual(lockOf(claude, { providerNamed: providers({ [READ_ONLY_CLAUDE]: plan }) }), { lock: { how: 'Claude Code plan mode', provider: READ_ONLY_CLAUDE } })
+  assert.match(lockOf(claude, { providerNamed: providers({}) }).why, /^the claude-code-readonly row \(Claude Code in plan mode\) is not in this profile/)
+  assert.equal(lockOf(claude, { providerNamed: providers({ [READ_ONLY_CLAUDE]: { config: { permissionMode: 'acceptEdits' } } }) }).why, 'the claude-code-readonly provider runs in acceptEdits mode, not plan mode')
+  // Spawn: only the read tools the parent really sees, in native mode, with a filter the provider takes.
+  const facts = { providerNamed: providers({ spawn }), toolMode: 'native' }
+  assert.deepEqual(lockOf(deep, { ...facts, visibleTool: sees(['read', 'glob', 'bash', 'write']) }), { lock: { how: 'read tools only (read, glob)', toolFilter: { allow: ['read', 'glob'] } } })
+  assert.equal(lockOf(deep, { ...facts, visibleTool: sees(['glob', 'write']) }).why, 'no read tool is mounted for it')
+  assert.match(lockOf(deep, { ...facts, toolMode: 'ptc', visibleTool: sees(['read']) }).why, /run_code \(ptc mode\)/)
+  assert.equal(lockOf(deep, { providerNamed: providers({ spawn: { capabilities: {} } }), toolMode: 'native', visibleTool: sees(['read']) }).why, 'its provider takes no per-start tool filter')
+  assert.equal(lockOf(deep, { ...facts, visibleTool: sees(['read']), images: true }).why, 'it cannot open the attached image: read_image is not mounted')
+  assert.deepEqual(lockOf(deep, { ...facts, visibleTool: sees(['read', 'read_image']), images: true }).lock.toolFilter, { allow: ['read', 'read_image'] })
+  // Codex, anything else, and an agent whose lock did not hold.
+  assert.equal(lockOf({ id: 'codex', provider: 'codex' }, facts).why, 'Codex cannot be locked through its provider')
+  assert.equal(lockOf({ id: 'x', provider: 'acp' }, facts).why, 'acp has no read-only mode KzH can set')
+  assert.match(lockOf(claude, { providerNamed: providers({ [READ_ONLY_CLAUDE]: plan }), distrusted: { at: Date.UTC(2026, 8, 26, 14, 5), files: ['src/a.ts'] } }).why, /^files changed while it ran locked at 14:05 UTC \(src\/a\.ts\), so its lock is not trusted until the harness restarts$/)
+})
+
+test('a lock whose facts cannot be read fails closed', async () => {
+  const { lockOf } = await import('../capabilities.js')
+  assert.equal(typeof lockOf, 'function', 'capabilities.js has no lockOf')
+  const boom = () => { throw new Error('no such service') }
+  assert.equal(lockOf({ id: 'claude', provider: 'claude-code' }, { providerNamed: boom }).lock, null)
+  assert.equal(lockOf({ id: 'deep', provider: 'spawn' }, { providerNamed: boom, toolMode: 'native', visibleTool: boom }).lock, null)
+  assert.equal(lockOf({ id: 'deep', provider: 'spawn' }, { providerNamed: () => ({ capabilities: { toolFilter: true } }), toolMode: 'native', visibleTool: boom }).why, 'no read tool is mounted for it')
+  assert.equal(lockOf({ id: 'deep', provider: 'spawn' }).lock, null, 'no facts at all')
+})
+
+test('the template mounts Claude Code a second time, in plan mode, as the provider name the lock looks for, with git\'s optional locks off', async () => {
+  const { READ_ONLY_CLAUDE } = await import('../capabilities.js')
+  const { readFileSync } = await import('node:fs')
+  const lines = readFileSync(new URL('../../../config/cordis.patch.yml', import.meta.url), 'utf8').split(/\r?\n/)
+  // The insert names the same package the first Claude Code row is, under an id of its own.
+  const inserted = lines.findIndex((l, i) => l.trim() === '- id: subagent-claude-code-readonly' && lines[i - 1]?.trim() === '- insert:')
+  assert.ok(inserted > 0, 'an insert entry mounts subagent-claude-code-readonly')
+  assert.equal(lines[inserted + 1].trim(), "name: '@deepseek-ai/dsh-subagent-claude-code'")
+  // Its config row, read to the next top-level entry.
+  const at = lines.findIndex((l, i) => i > inserted && l === '- id: subagent-claude-code-readonly')
+  assert.ok(at > inserted, 'and a config row follows it')
+  const row = []
+  for (const l of lines.slice(at + 1)) { if (/^\S/.test(l)) break; row.push(l.trim()) }
+  assert.deepEqual(row.filter(Boolean), ['config:', `providerName: ${READ_ONLY_CLAUDE}`, 'permissionMode: plan', 'env:', "GIT_OPTIONAL_LOCKS: '0'", "GIT_CONFIG_COUNT: '1'", 'GIT_CONFIG_KEY_0: diff.autoRefreshIndex', "GIT_CONFIG_VALUE_0: 'false'"])
+  // The first Claude Code row keeps editing the workspace for work that writes.
+  const first = lines.findIndex((l) => l === '- id: subagent-claude-code')
+  assert.equal(lines[first + 2].trim(), 'permissionMode: acceptEdits')
+})

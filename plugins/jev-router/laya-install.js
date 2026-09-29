@@ -260,11 +260,37 @@ export function isAlive(pid) {
 }
 
 /**
- * engine/laya/install.lock: one process installs, updates, repairs or removes at a time, the card
- * or the command line. Created exclusively with this process's pid; a lock whose pid is not alive
- * is left over from a crash and taken over. Returns the release function.
+ * A process's image name (python.exe, node.exe), or null when it cannot be read. On Windows this is
+ * readable for a process run as administrator too, whose path and command line CIM leaves empty,
+ * so it still tells a Laya (always python) or an installer (always node) from a program that took
+ * a recorded pid over.
  */
-export async function takeInstallLock(paths, { pid = process.pid, alive = isAlive } = {}) {
+export async function processName(pid, { platform = process.platform, run = execText } = {}) {
+  if (platform === 'win32') {
+    const out = await run('powershell.exe', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | ForEach-Object { $_.Name }`])
+    return String(out ?? '').split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? null
+  }
+  try { return (await readFile(`/proc/${pid}/comm`, 'utf8')).trim() || null } catch { return null }
+}
+
+/**
+ * Whether install.lock's holder is an installer still at work: alive, and node (the engine that
+ * runs the card, or the command line), or of a name that cannot be read. A pid Windows gave to
+ * another program after an installer died without releasing the lock is not.
+ */
+export async function lockHeld(holder, { alive = isAlive, name = processName } = {}) {
+  if (!Number.isSafeInteger(holder) || holder <= 0 || !alive(holder)) return false
+  const n = await Promise.resolve().then(() => name(holder)).catch(() => null)
+  return n == null || /^node(\.exe)?$/i.test(n)
+}
+
+/**
+ * engine/laya/install.lock: one process installs, updates, repairs or removes at a time, the card
+ * or the command line. Created exclusively with this process's pid; a lock whose holder is not an
+ * installer still at work (lockHeld) is left over from a crash and taken over. Returns the release
+ * function.
+ */
+export async function takeInstallLock(paths, { pid = process.pid, alive = isAlive, name = processName } = {}) {
   await mkdir(dirname(paths.lock), { recursive: true })
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -275,7 +301,7 @@ export async function takeInstallLock(paths, { pid = process.pid, alive = isAliv
     } catch (err) {
       if (err.code !== 'EEXIST') throw err
       const holder = Number((await readFile(paths.lock, 'utf8').catch(() => '')).trim())
-      if (holder && alive(holder)) throw new Error(`Another Laya install is running (pid ${holder}).`)
+      if (await lockHeld(holder, { alive, name })) throw new Error(`Another Laya install is running (pid ${holder}).`)
       await unlink(paths.lock).catch(() => {})
     }
   }
@@ -634,11 +660,23 @@ export function createLayaInstaller({
    * Install (or with `update`, rebuild beside the running one) and swap in. `device` is 'gpu' or
    * 'cpu'; `skipWeights` and `torchIndex: 'pypi'` are for the cloud end-to-end test only.
    */
+  /**
+   * A Laya an earlier session left that the sweep could not check (run as administrator, most
+   * likely) holds the venv's and the model's files open: no job changes them beside it, from the
+   * card or the command line. Swept again here, so one the person has since ended is let go.
+   */
+  async function besideUnchecked() {
+    await Promise.resolve().then(() => sidecar?.sweepOrphans?.()).catch(() => {})
+    const left = sidecar?.status?.()?.orphansUnchecked ?? []
+    if (left.length) throw new StepError(`A Laya an earlier session left may still be running (pid ${left.join(', ')}), and it would hold the files this changes. End it in Task Manager (Details, right-click pid ${left[0]}, End process tree; run Task Manager as administrator if it says access is denied), or restart the PC, then try again.`)
+  }
+
   async function build({ device, update, skipWeights = false, torchIndex = null }) {
     // Step 7 of an update is refused while a Laya Auto run is open, so the update is refused before
     // it downloads anything it could not use (about 2.5 GB of PyTorch for the GPU): nothing is run.
     if (update && runOpen()) throw new StepError(RUN_OPEN)
     const release = await takeInstallLock(paths, { pid, alive })
+    try { await besideUnchecked() } catch (err) { await release(); throw err }
     const wasRunning = !!sidecar?.isReady?.()
     let stoppedForCheck = false
     try {
@@ -783,6 +821,7 @@ export function createLayaInstaller({
     const release = await takeInstallLock(paths, { pid, alive })
     try {
       if (runOpen()) throw new StepError(RUN_OPEN)
+      await besideUnchecked()
       const freed = await sizeOf(paths.engine) + await sizeOf(paths.models)
       await sidecar?.stop?.({ reason: 'remove' })
       await rmRetry(paths.engine, { sleep, remove })
@@ -798,6 +837,7 @@ export function createLayaInstaller({
   async function repairWeights() {
     const release = await takeInstallLock(paths, { pid, alive })
     try {
+      await besideUnchecked()
       step(6)
       const rec = await fetchWeights(paths.venv)
       job.done = true
@@ -837,6 +877,7 @@ export function createLayaInstaller({
       step(6, 'Switching to the newer Laya model')
       if (!existsSync(paths.hfStaging)) throw new StepError('No newer model has been downloaded; choose Check for a newer model first.')
       if (runOpen()) throw new StepError(RUN_OPEN)
+      await besideUnchecked()
       const got = await fetchWeights(paths.venv, { hf: paths.hfStaging, record: false })
       sidecar?.suspend?.()
       await sidecar?.stop?.({ reason: 'update' })

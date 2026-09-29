@@ -52,7 +52,18 @@ window.__ModuleLoader__.load({
       if (!r.ok) throw Object.assign(new Error(body.error ?? `HTTP ${r.status}`), { status: r.status })
       return body
     }
-    const ms = (n) => (n == null ? '-' : n < 1000 ? `${Math.round(n)} ms` : `${(n / 1000).toFixed(1)} s`)
+    // A duration as a person reads one: 450 ms, 41.0 s, 2 min 30 s, 1 h 5 min.
+    const ms = (n) => {
+      if (n == null) return '-'
+      if (n < 1000) return `${Math.round(n)} ms`
+      // Rounded first, so 59.96 s is not shown as '60.0 s' beside a minute shown as '1 min'.
+      const tenths = Math.round(n / 100)
+      if (tenths < 600) return `${(tenths / 10).toFixed(1)} s`
+      const sec = Math.round(n / 1000)
+      if (sec < 3600) return `${Math.floor(sec / 60)} min${sec % 60 ? ` ${sec % 60} s` : ''}`
+      const min = Math.round(sec / 60)
+      return `${Math.floor(min / 60)} h${min % 60 ? ` ${min % 60} min` : ''}`
+    }
     const pct = (x) => (typeof x === 'number' ? `${(x * 100).toFixed(1)}%` : '-')
     const cx = (...c) => c.filter(Boolean).join(' ')
 
@@ -300,7 +311,12 @@ window.__ModuleLoader__.load({
 .kzh-wb-stop:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .kzh-wb-stop:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
 .kzh-wb-list{list-style:none;margin:0;padding:0;max-height:160px;overflow-y:auto}
+.kzh-wb-item{min-width:0}
 .kzh-wb-row{display:flex;align-items:center;gap:8px;padding:3px 0;min-width:0}
+.kzh-wb-why{padding:0 0 3px 24px;font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.kzh-wb-x{flex:none;border:1px solid var(--dsw-alias-border-l2);background:none;color:var(--dsw-alias-label-secondary);border-radius:6px;padding:0 6px;font:var(--dsw-font-xxxs-11);cursor:pointer}
+.kzh-wb-x:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.kzh-wb-x:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
 .kzh-wb-mark{flex:none;width:16px;text-align:center;color:var(--dsw-alias-label-tertiary)}
 .kzh-wb-row.live .kzh-wb-mark{width:12px;height:12px;border:2px solid var(--dsw-alias-bg-layer-3);border-top-color:var(--dsw-alias-state-business-primary);border-radius:50%;animation:kzh-spin .8s linear infinite}
 .kzh-wb-title{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -405,11 +421,14 @@ window.__ModuleLoader__.load({
         window.addEventListener('keydown', k)
         return () => window.removeEventListener('keydown', k)
       }, [onCancel])
-      return h('div', { className: 'jevi jevi-modal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'jevi-confirm-t', onClick: onCancel },
+      // Focus goes back where it was when the dialog opened (the row's own button), so a keyboard
+      // user is not left at the top of the page each time a dialog closes.
+      useEffect(() => { const back = typeof document === 'undefined' ? null : document.activeElement; return () => { try { back?.focus?.() } catch {} } }, [])
+      return h('div', { className: 'jevi jevi-modal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'jevi-confirm-t', 'aria-describedby': 'jevi-confirm-b', onClick: onCancel },
         h('div', { className: 'box confirm', onClick: (e) => e.stopPropagation() },
           h('h3', { id: 'jevi-confirm-t' }, title),
           // A body of several paragraphs, as the capability benchmark's confirmation is, is one per line.
-          h('div', { className: 'body' }, ...(Array.isArray(body) ? body.map((t, i) => h('p', { key: i }, t)) : [h('p', null, body)])),
+          h('div', { className: 'body', id: 'jevi-confirm-b' }, ...(Array.isArray(body) ? body.map((t, i) => h('p', { key: i }, t)) : [h('p', null, body)])),
           h('div', { className: 'actions' },
             h('button', { className: 'btn', onClick: onCancel, autoFocus: true }, 'Cancel'),
             h('button', { className: 'btn danger', onClick: onConfirm }, confirmLabel))))
@@ -1231,7 +1250,10 @@ window.__ModuleLoader__.load({
       // The run's own last event. Laya's shadow rows land in the same log (5.3), often after the
       // run has ended, and their time is Laya's background work, not how long the run took.
       const last = ev.filter((e) => e.type !== 'shadow').at(-1)
-      const final = ev.find((e) => e.type === 'final')
+      // A read pass that handed its task to the folder's line (docs/queue-and-cost-findings.md 1)
+      // ends there with no final event of its own: it ended, as needs_write, with the reason given.
+      const handedBack = ev.find((e) => e.type === 'access' && e.mode === 'write' && e.from === 'read')
+      const final = ev.find((e) => e.type === 'final') ?? (handedBack ? { type: 'final', at: handedBack.at, status: 'needs_write', statusReason: handedBack.why } : undefined)
       const error = ev.find((e) => e.type === 'error')
       const routed = ev.find((e) => e.type === 'routed')
       const traces = ev.filter((e) => e.type === 'jev').map((e) => e.trace)
@@ -1277,6 +1299,7 @@ window.__ModuleLoader__.load({
       accepted_pending_human_review: ['warn', 'Accepted, human review recommended'],
       needs_human: ['warn', 'Needs human'],
       limit_reached: ['bad', 'Stopped: limit reached'],
+      needs_write: ['warn', 'Handed to its folder\'s line'],
     }
 
     /** `decisionCard`: the decision card is rendered beside this one and carries the gate notes itself. */
@@ -1299,7 +1322,9 @@ window.__ModuleLoader__.load({
       const rows = []
       if (picked) {
         rows.push(['Task type', `${R.taskType} (${pct(R.taskTypeConfidence)})`], ['Complexity', pct(R.complexity)], ['Risk', pct(R.risk)],
-          ['Second opinion', pct(R.needsSecondOpinion)], ['Human review', pct(R.needsHumanReview)], ['Needs tests', pct(R.needsTests)])
+          // A yes under the low risk band is kept as answered and held (decision.js): say so, or the
+          // figure reads as a review that never comes.
+          ['Second opinion', `${pct(R.needsSecondOpinion)}${R.decision?.domains?.second_opinion?.heldBy === 'risk' ? ' (held: low risk)' : ''}`], ['Human review', pct(R.needsHumanReview)], ['Needs tests', pct(R.needsTests)])
       }
       if (s.routed.tool) for (const [k, v] of Object.entries(R.toolArgs ?? {})) rows.push([`arg ${k}`, v])
       const st = s.final && (STATUS[s.final.status] ?? ['', s.final.status])
@@ -2225,16 +2250,29 @@ window.__ModuleLoader__.load({
       const phase = t.phase && taskLabels[t.phase] !== taskLabels[state] ? taskLabels[t.phase] : null
       // Elapsed while it runs; the record's own duration once it is finished, so a reopened list
       // shows how long the work took rather than how long ago it ended.
+      // None while it waits: a task back in its folder's line after a read pass has a start time,
+      // but it is waiting, and its time in line is its own (`waited`).
       const timing = done
-        ? (t.durationMs != null ? ms(t.durationMs) : elapsed(t.startedAt, t.finishedAt ?? t.startedAt))
-        : elapsed(t.startedAt, now)
+        ? (t.durationMs != null ? ms(t.durationMs) : elapsed(t.startedAt + (t.inLineMs ?? 0), t.finishedAt ?? t.startedAt))
+        // Its running clock leaves out any time back in line after a read pass.
+        : queued ? '' : elapsed(t.startedAt + (t.inLineMs ?? 0), now)
       const meta = [
-        queued ? (pos > 1 ? `${ordinal(pos)} in line` : 'next up') : null,
+        // Where it stands, as the server reads it off the line (tasks.js waiting.placeText): a
+        // task waiting for a free slot is not "next up" when another workspace's goes first. A
+        // record without it (an older engine's) keeps the words from its position.
+        queued ? (t.waiting?.placeText || (pos > 1 ? `${ordinal(pos)} in line` : 'next up')) : null,
         // A queued task waits for whoever decides it: the task record keeps its decider (3.1).
         t.agent ?? (queued ? `${deciderName(t.decider)} picks` : null),
         t.model, t.effort,
+        // A task judged read only runs on an agent locked against writing, beside the folder's writer.
+        t.access === 'read' ? 'reads only' : null,
         phase, folderOf(t.workspace), timing || null,
       ].filter(Boolean).join(' · ')
+      // What a waiting task waits for now and, where past runs allow, how long: the server reads
+      // both off the line as it stands and writes the whole line (tasks.js waiting.text), so every
+      // view says the same thing, and an estimate always carries its basis in its own words, or is
+      // not there at all.
+      const wait = queued ? String(t.waiting?.text ?? '') : ''
       return {
         jobId: t.jobId,
         title: t.taskName || t.taskText || t.task || '',
@@ -2247,10 +2285,106 @@ window.__ModuleLoader__.load({
         meta,
         // A task that did not complete says why in the row itself, not only behind the disclosure.
         reason: done && state !== 'completed' ? String(t.terminalReason ?? t.progressText ?? '').trim() : '',
-        detail: String(t.progressText ?? t.lastLine ?? '').trim() || '…',
+        detail: wait || String(t.progressText ?? t.lastLine ?? '').trim() || '…',
+        wait,
+        // How long it has been in line, from when it was queued: a waiting task has no start time.
+        waited: queued ? elapsed(t.waiting?.since ?? t.queuedAt, now) : '',
+        // Run next moves it to the front of its own line, so it is offered only with someone there
+        // in front of it (the run holding the workspace is not in the line).
+        runNext: queued && (t.waiting ? t.waiting.ahead > 0 : pos > 2),
         canStop: !done,
+        // A task that never started is taken out of the line, not stopped: nothing ran.
+        stopWord: queued ? 'Remove' : 'Stop',
+        // Back in the line after its read pass: it ran, locked against writing, and changed nothing,
+        // unless its lock check saw files change (readBreach), which the dialog then says instead.
+        again: queued && !!t.requeuedAt && !t.readBreach,
+        breach: queued && !!t.requeuedAt && t.readBreach?.changed?.length ? t.readBreach.changed : null,
         canClear: done,
       }
+    }
+
+    /**
+     * The confirmation for stopping one task, in words that fit what it is doing: a task still in
+     * line never ran, so taking it out changes nothing in the workspace, which is what a person
+     * deciding whether to look needs to know. Pure, so test/workboard.test.js pins it.
+     */
+    function stopOneWords(m) {
+      const what = clip(m.title || 'this task', 120)
+      if (m.stopWord === 'Remove' && m.breach) return { title: 'Remove this task from the line?', body: `"${what}" ran a read pass, and ${clip(m.breach.slice(0, 3).join(', '), 200)}${m.breach.length > 3 ? ` and ${m.breach.length - 3} more` : ''} changed in this repository while it read, so its lock may not have held. It leaves the line, and nothing more of it runs.`, confirmLabel: 'Remove task' }
+      if (m.stopWord === 'Remove' && m.again) return { title: 'Remove this task from the line?', body: `"${what}" ran only a read pass, locked against writing, so nothing in the workspace has changed. It leaves the line, and its message in the chat says it was removed after its read pass.`, confirmLabel: 'Remove task' }
+      return m.stopWord === 'Remove'
+        ? { title: 'Remove this task from the line?', body: `"${what}" has not started, so nothing in the workspace has changed. It leaves the line, and its message in the chat says it was removed before it started.`, confirmLabel: 'Remove task' }
+        : { title: 'Stop this task?', body: `Stop "${what}"? Work it already did stays in the workspace.`, confirmLabel: 'Stop task' }
+    }
+
+    /**
+     * The work board's Stop all, its accessible name and its confirmation, counting running and
+     * waiting tasks apart: a waiting task is not running, and stopping it loses no work. Pure.
+     */
+    function stopAllWords(live, now = Date.now()) {
+      const waiting = live.filter((t) => t.state === 'queued').length
+      const running = live.length - waiting
+      const n = live.length
+      const tasks = (k) => `${k} task${k === 1 ? '' : 's'}`
+      const what = clip(live.map((t) => taskRowModel(t, now).title).filter(Boolean).join(', '), 200)
+      const parts = [running ? `${running} running` : '', waiting ? `${waiting} waiting` : ''].filter(Boolean).join(', ')
+      // A task back in the line after its read pass did start: it read, locked against writing, and
+      // changed nothing, unless its lock check saw files change (stopOneWords says the same of one).
+      const models = live.filter((t) => t.state === 'queued').map((t) => taskRowModel(t, now))
+      const again = models.filter((m) => m.again).length
+      const breached = models.filter((m) => m.breach).length
+      const some = (k) => (k === 1 ? 'one of them' : `${k} of them`)
+      const unchanged = breached
+        ? `Files changed in the repository of ${waiting === 1 ? 'this task' : some(breached)} while its read pass read, so its lock may not have held; nothing more of ${waiting === 1 ? 'it' : 'them'} runs.`
+        : !again ? `${waiting === 1 ? 'It has not started' : 'None of them has started'}, so nothing in the workspace changes.`
+          : again === waiting ? `${waiting === 1 ? 'It' : 'Each'} ran only a read pass, locked against writing, so nothing in the workspace changes.`
+            : `${some(again)[0].toUpperCase()}${some(again).slice(1)} ran only a read pass, locked against writing, and the rest have not started, so nothing in the workspace changes.`
+      const body = !waiting ? `${running} running ${running === 1 ? 'task' : 'tasks'} in this session stop${running === 1 ? 's' : ''} now: ${what}. Work already done stays in the workspace.`
+        : !running ? `${waiting} waiting ${waiting === 1 ? 'task leaves' : 'tasks leave'} the line: ${what}. ${unchanged}`
+          : `${running} running ${running === 1 ? 'task stops' : 'tasks stop'} now and ${waiting} waiting ${waiting === 1 ? 'task leaves' : 'tasks leave'} the line: ${what}. Work already done stays in the workspace.`
+      return { label: `Stop all ${tasks(n)} in this session: ${parts}`, title: `Stop all ${tasks(n)}?`, body, confirmLabel: `Stop ${n}` }
+    }
+
+    /**
+     * Stop one task, or take it out of the line. Remove asks the server to stop it only while it still
+     * waits: one that started while the person was confirming is not stopped under words that said
+     * nothing had changed, and the person is told why not.
+     */
+    function stopTask(t, now = Date.now()) {
+      const m = taskRowModel(t, now)
+      const remove = m.stopWord === 'Remove'
+      return post('/jev-router/tasks/stop', { jobId: t.jobId, ...(remove ? { onlyIfWaiting: true } : {}) }).then((r) => {
+        if (r?.result === 'started') throw new Error(`"${clip(m.title || 'This task', 120)}" started before it could be removed, so it was not stopped. Use Stop on its row to stop it.`)
+        return r
+      })
+    }
+
+    /**
+     * The words of a confirmation about one task, from its row as it is now, or null once it has
+     * ended. A dialog never changes what its button does: one whose task started, ended or went
+     * back to waiting meanwhile closes and says so (confirmDrift).
+     */
+    const confirmFor = (tasks, jobId, now, word) => {
+      const t = (tasks ?? []).find((x) => x.jobId === jobId)
+      if (!t || TERMINAL_TASK.includes(t.state)) return null
+      const m = taskRowModel(t, now)
+      return !word || m.stopWord === word ? { ...stopOneWords(m), run: () => stopTask(t, now) } : null
+    }
+    /**
+     * Why a dialog about one task closed on its own, or '' while it still fits: the task ended, or
+     * started (Remove asked) or went back to waiting (Stop asked) while the person was confirming.
+     * The dialog is never reworded into the other action: nobody pressed that one.
+     */
+    const confirmDrift = (tasks, confirm, now) => {
+      if (!confirm?.jobId || !confirm.word) return ''
+      const t = (tasks ?? []).find((x) => x.jobId === confirm.jobId)
+      const what = clip(t ? taskRowModel(t, now).title || 'This task' : 'This task', 120)
+      if (!t || TERMINAL_TASK.includes(t.state)) return `"${what}" ended while you were confirming, so nothing was done.`
+      const word = taskRowModel(t, now).stopWord
+      if (word === confirm.word) return ''
+      return confirm.word === 'Remove'
+        ? `"${what}" started while you were confirming, so it was not removed. Use Stop on its row to stop it.`
+        : `"${what}" went back to waiting in line while you were confirming, so nothing was stopped. Use Remove on its row to take it out of the line.`
     }
 
     /** This session's queued, running and finished background tasks, polled while the tab is on screen. */
@@ -2287,9 +2421,12 @@ window.__ModuleLoader__.load({
       return h(Markdown, { className: 'answer-text', text: state.text || 'No report.' })
     }
 
+    // Every router run a task owns: a task judged read only may have run a read pass before the pass
+    // that writes, each its own run. An older server names only the current one.
+    const runIdsOf = (t) => (t?.runIds?.length ? t.runIds : [t?.runId].filter(Boolean))
     /** Live work in this session: a background task counts once, not as its job and its run too. */
     function liveCount({ runs, jobs, entries, tasks }) {
-      const shadowRuns = new Set(tasks.map((t) => t.runId).filter(Boolean))
+      const shadowRuns = new Set(tasks.flatMap(runIdsOf))
       return tasks.filter((t) => LIVE_TASK.includes(t.state)).length
         + jobs.filter((j) => j.kind !== 'jev' && (j.status === 'running' || j.status === 'stopping')).length
         + runs.filter((r) => !shadowRuns.has(r.id) && summarize(r).running).length
@@ -2300,21 +2437,20 @@ window.__ModuleLoader__.load({
     const RANK = { running: 0, routing: 0, verifying: 0, reviewing: 0, queued: 1 }
     function taskItems({ sessionId, runs, jobs, entries, tasks, open, now }) {
       // A background task owns both a job and a router run; show the task, not its two shadows.
-      const shadowed = new Set(tasks.map((t) => t.runId).filter(Boolean))
+      const shadowed = new Set(tasks.flatMap(runIdsOf))
       const fromTasks = tasks.map((t) => {
-        const queued = t.state === 'queued'
         const m = taskRowModel(t, now)
         const key = `t${t.jobId}`
         return {
           key, at: t.startedAt ?? t.queuedAt ?? 0, status: t.state, title: m.title, kind: t.jobId,
           position: t.position ?? 0, icon: m.icon, label: m.label, meta: m.meta,
-          struck: m.struck, unread: m.unread, reason: m.reason,
+          struck: m.struck, unread: m.unread, reason: m.reason, wait: m.wait,
           body: open.has(key) && t.reportAvailable
             ? h(TaskReport, { jobId: t.jobId })
             : h('div', { className: 'answer-text' }, m.detail),
           // Only worth offering when something else is genuinely ahead of it.
-          runNext: queued && (t.position ?? 0) > 2 && { workspace: t.workspace, jobId: t.jobId },
-          stop: m.canStop && { what: m.title, run: () => post('/jev-router/tasks/stop', { jobId: t.jobId }) },
+          runNext: m.runNext && { workspace: t.workspace, jobId: t.jobId },
+          stop: m.canStop && { what: m.title, jobId: t.jobId, word: m.stopWord },
           clear: m.canClear && { what: m.title, run: () => post('/jev-router/tasks/clear', { jobIds: [t.jobId] }) },
         }
       })
@@ -2499,7 +2635,8 @@ window.__ModuleLoader__.load({
       const s = String(finalStatus ?? '')
       if (s.startsWith('accepted') || s === 'answered') return 'done'
       if (s === 'stopped') return 'stopped'
-      if (s === 'paused_limit' || s === 'needs_human') return 'warn'
+      // A read pass handed to its folder's line is no failure: the task went on as work that writes.
+      if (s === 'paused_limit' || s === 'needs_human' || s === 'needs_write') return 'warn'
       return 'failed'
     }
 
@@ -2531,11 +2668,12 @@ window.__ModuleLoader__.load({
      * and start time. Pure.
      */
     function runLedgerRows(pairs, taskRows) {
-      const ownedIds = new Set((taskRows ?? []).map((r) => r.task?.runId).filter(Boolean))
+      const ownedIds = new Set((taskRows ?? []).flatMap((r) => runIdsOf(r.task)))
       const ownedByTask = (p) => p.record && (taskRows ?? []).some((r) => r.task?.task === p.record.task && Number.isFinite(r.at) && Number.isFinite(p.at) && Math.abs(r.at - p.at) <= RUN_MATCH_MS)
       const out = []
       for (const p of pairs ?? []) {
-        if (p.live ? ownedIds.has(p.live.id) : ownedByTask(p)) continue
+        // A durable record carries its run's id, which its task keeps for every pass (runIds).
+        if (p.live ? ownedIds.has(p.live.id) : ownedIds.has(p.record?.runId) || ownedByTask(p)) continue
         const at = p.at
         const s = p.live ? summarize(p.live) : null
         const status = p.live
@@ -2647,6 +2785,9 @@ window.__ModuleLoader__.load({
       const now = useNow(anyRunning)
       const items = taskItems({ sessionId, runs, jobs, entries, tasks, open, now })
       const finished = tasks.filter((t) => TERMINAL_TASK.includes(t.state))
+      const shown = confirm?.jobId ? confirmFor(tasks, confirm.jobId, now, confirm.word) : confirm
+      const drift = confirmDrift(tasks, confirm, now)
+      useEffect(() => { if (drift) { setConfirm(null); setErr(drift) } }, [drift])
       const act = (fn) => { setErr(''); Promise.resolve(fn()).catch((e) => setErr(e.message)) }
       const toggle = (key, isOpen) => setOpen((s) => { const n = new Set(s); if (isOpen) n.add(key); else n.delete(key); return n })
       if (!items.length) return h('div', { className: 'empty' }, 'Nothing queued, running or finished in this session yet.')
@@ -2682,7 +2823,10 @@ window.__ModuleLoader__.load({
                     it.meta),
                   // Why a task failed, stopped, needs a person or ran out of limit: in the row, not only
                   // behind the disclosure, because the reason is the part that needs acting on.
-                  it.reason ? h('div', { className: cx('reason', it.status) }, it.reason) : null)),
+                  it.reason ? h('div', { className: cx('reason', it.status) }, it.reason) : null,
+                  // Why it waits, in the row itself: it is what decides whether to act, so it is not
+                  // only behind the disclosure. Not a live region: its estimate moves every minute.
+                  it.wait ? h('div', { className: 'why' }, it.wait) : null)),
               h('div', { style: { marginTop: 6 } }, it.body)),
             it.runNext ? h('button', {
               className: 'btn', 'aria-label': `Run ${it.title} next`,
@@ -2698,20 +2842,17 @@ window.__ModuleLoader__.load({
               }),
             }, 'Clear') : null,
             it.stop ? h('button', {
-              className: 'btn danger', 'aria-label': `Stop ${it.title}`,
-              onClick: () => setConfirm({
-                title: 'Stop this task?',
-                body: `Stop "${clip(it.stop.what, 120)}"? Work it already did stays in the workspace.`,
-                confirmLabel: 'Stop task',
-                run: it.stop.run,
-              }),
-            }, 'Stop') : null)))),
-        confirm ? h(Confirm, {
-          title: confirm.title,
-          body: confirm.body,
-          confirmLabel: confirm.confirmLabel,
+              className: 'btn danger', 'aria-label': `${it.stop.word ?? 'Stop'} ${it.title}`,
+              // A task's dialog is worded from its row each time it renders (confirmFor); a run, a
+              // job or a subagent is asked about as it was when the button was pressed.
+              onClick: () => setConfirm(it.stop.jobId ? { jobId: it.stop.jobId, word: it.stop.word } : { ...stopOneWords({ title: it.stop.what, stopWord: 'Stop' }), run: it.stop.run }),
+            }, it.stop.word ?? 'Stop') : null)))),
+        shown ? h(Confirm, {
+          title: shown.title,
+          body: shown.body,
+          confirmLabel: shown.confirmLabel,
           onCancel: () => setConfirm(null),
-          onConfirm: () => { const c = confirm; setConfirm(null); act(c.run) },
+          onConfirm: () => { setConfirm(null); act(shown.run) },
         }) : null)
     }
 
@@ -2732,8 +2873,11 @@ window.__ModuleLoader__.load({
       const anyLive = tasks.some((t) => LIVE_TASK.includes(t.state))
       // One tick a second, and only while something is actually moving: a still board is cheap.
       const now = useNow(anyLive)
-      const [confirm, setConfirm] = useState(false)
+      // null, 'all' for Stop all, or { jobId } of the one task being stopped or removed.
+      const [confirm, setConfirm] = useState(null)
       const [err, setErr] = useState('')
+      const drift = confirmDrift(tasks, confirm, now)
+      useEffect(() => { if (drift) { setConfirm(null); setErr(drift) } }, [drift])
       if (!tasks.length) return null
       // Only `completed` counts as done: a stopped or failed task is finished, not a success, so
       // the header names every terminal state that did not complete instead of folding it in.
@@ -2747,13 +2891,17 @@ window.__ModuleLoader__.load({
       // completed summary, and either way the same button opens the Overview tab.
       const { text: headerText, label: openLabel } = workBoardHeader(countLine, live, now)
       const what = live.map((t) => taskRowModel(t, now).title).filter(Boolean).join(', ')
+      const all = stopAllWords(live, now)
       // The panel helpers throw when the right sidebar is missing; a click there must do nothing,
       // never throw, so the header can never become a dead end.
       const openOverview = () => { try { togglePanel(OVERVIEW_KIND) } catch {} }
-      const stopAll = () => {
-        setErr('')
-        Promise.all(live.map((t) => post('/jev-router/tasks/stop', { jobId: t.jobId }))).catch((e) => setErr(e.message))
-      }
+      const act = (fn) => { setErr(''); Promise.resolve().then(fn).catch((e) => setErr(e.message)) }
+      // Worded from the rows as they are now, so a dialog opened on a waiting task asks about a
+      // running one if it started meanwhile, and closes once the task has ended.
+      // Stop all covers the tasks it named when it opened, those still live: never one queued after.
+      const named = confirm?.all ? live.filter((t) => confirm.all.includes(t.jobId)) : []
+      const words = confirm?.all ? (named.length ? { ...stopAllWords(named, now), run: () => Promise.all(named.map((t) => post('/jev-router/tasks/stop', { jobId: t.jobId }))) } : null)
+        : confirm ? confirmFor(tasks, confirm.jobId, now, confirm.word) : null
       return h('div', { className: 'kzh-wb', role: 'region', 'aria-label': 'Background work in this session' },
         h('div', { className: 'kzh-wb-hd' },
           h('button', {
@@ -2765,30 +2913,41 @@ window.__ModuleLoader__.load({
           // Nothing is ever stopped from here while nothing is live, so the control stays hidden.
           live.length ? h('button', {
             type: 'button', className: 'kzh-wb-stop',
-            'aria-label': `Stop all ${live.length} running task${live.length === 1 ? '' : 's'}`,
-            title: `Stop: ${clip(what, 160)}`, onClick: () => setConfirm(true),
+            'aria-label': all.label,
+            title: `Stop: ${clip(what, 160)}`, onClick: () => setConfirm({ all: live.map((t) => t.jobId) }),
           }, 'Stop all') : null),
         h('ul', { className: 'kzh-wb-list', 'aria-label': 'Background tasks' }, ...tasks.map((t, i) => {
           const m = taskRowModel(t, now)
           const isLive = LIVE_TASK.includes(t.state)
           // The mark is a glyph, or the stylesheet's spinner while the task works; the pill beside
           // it says the same state in words, so shape and colour are never the only difference.
-          return h('li', { key: m.jobId ?? `t${i}`, className: cx('kzh-wb-row', isLive && 'live') },
-            h('span', { className: 'kzh-wb-mark', 'aria-hidden': true }, isLive ? '' : m.icon),
-            h('span', { className: cx('kzh-wb-title', m.struck && 'struck'), title: m.title || undefined }, m.title || 'Untitled task'),
-            h('span', { className: 'kzh-wb-state' }, m.label),
-            h('span', { className: 'kzh-wb-meta', title: m.meta }, m.meta),
-            isLive ? h('span', { className: 'kzh-wb-time' }, elapsed(t.startedAt, now) || 'starting') : null)
+          // A waiting row's clock is its time in line, from when it was queued; it has no start
+          // time, which is what used to leave it reading "starting" for as long as it waited.
+          const time = !isLive ? null : t.state === 'queued' ? (m.waited ? `in line ${m.waited}` : null) : elapsed(t.startedAt + (t.inLineMs ?? 0), now) || null
+          return h('li', { key: m.jobId ?? `t${i}`, className: 'kzh-wb-item' },
+            h('div', { className: cx('kzh-wb-row', isLive && 'live') },
+              h('span', { className: 'kzh-wb-mark', 'aria-hidden': true }, isLive ? '' : m.icon),
+              h('span', { className: cx('kzh-wb-title', m.struck && 'struck'), title: m.title || undefined }, m.title || 'Untitled task'),
+              h('span', { className: 'kzh-wb-state' }, m.label),
+              h('span', { className: 'kzh-wb-meta', title: m.meta }, m.meta),
+              time ? h('span', { className: 'kzh-wb-time' }, time) : null,
+              isLive && m.canStop ? h('button', {
+                type: 'button', className: 'kzh-wb-x', 'aria-label': `${m.stopWord} ${m.title || 'this task'}`,
+                title: m.stopWord === 'Remove' ? 'Take this task out of the line' : 'Stop this task', onClick: () => setConfirm({ jobId: t.jobId, word: m.stopWord }),
+              }, m.stopWord) : null),
+            // Why it waits, and how long it may, under the row: the reason is the part that decides
+            // what to do about it, so it is never cut off with the meta line.
+            m.wait ? h('div', { className: 'kzh-wb-why' }, m.wait) : null)
         })),
         // The same news the background button gives, spoken: one polite line, never taking focus.
         h('span', { className: 'kzh-sr', role: 'status', 'aria-live': 'polite', 'aria-atomic': true }, resultAnnouncement(awaitingDelivery(tasks))),
         err ? h('div', { className: 'kzh-wb-err', role: 'alert' }, err) : null,
-        confirm ? h(Confirm, {
-          title: 'Stop all running tasks?',
-          body: `${live.length} task${live.length === 1 ? '' : 's'} in this session stop now: ${clip(what, 200)}. Work already done stays in the workspace.`,
-          confirmLabel: `Stop ${live.length}`,
-          onCancel: () => setConfirm(false),
-          onConfirm: () => { setConfirm(false); stopAll() },
+        words ? h(Confirm, {
+          title: words.title,
+          body: words.body,
+          confirmLabel: words.confirmLabel,
+          onCancel: () => setConfirm(null),
+          onConfirm: () => { setConfirm(null); act(words.run) },
         }) : null)
     }
 
@@ -2998,7 +3157,8 @@ window.__ModuleLoader__.load({
       // Where to get a key and where to pay, per provider. Opened in the person's own browser.
       const link = links?.[a.keyProvider] ?? null
       const st = stateInfo(a)
-      const acct = a.account?.email ?? a.account?.label
+      // A key made active since launch is used only after a restart (usage.js pendingKey).
+      const acct = [a.account?.email ?? a.account?.label, a.account?.pendingKey ? `${a.account.pendingKey} after Restart harness` : null].filter(Boolean).join(', ')
       const L = a.limits ?? {}
       const fields = a.kind === 'local' ? [] : a.id === 'jev' ? [['monthlyBudgetUsd', 'Monthly budget ($)', false]] : a.kind === 'subscription'
         ? [['handoffAtPercent', 'Handoff at %', true], ['stopAtPercent', 'Stop at %', true]]
@@ -3113,7 +3273,7 @@ window.__ModuleLoader__.load({
             h('dt', null, 'Agent run'), h('dd', null, a.agentMedianSamples ? `${ms(a.agentMedianMs)}, median of ${a.agentMedianSamples} completed agent runs` : `${ms(a.agentMedianMs)} default (no completed agent runs yet)`),
             h('dt', null, 'Direct answer'), h('dd', null, 'saves one agent run, minus the answer time'),
             h('dt', null, 'Tool run'), h('dd', null, 'accepted without an agent: saves one agent run, minus the tool time'),
-            h('dt', null, 'Limit saves'), h('dd', null, 'agents skipped at their limit, and limit hits moved to another key or agent, in runs that did not pause; counted, not priced')),
+            h('dt', null, 'Limit saves'), h('dd', null, 'agents skipped at their limit, and limit hits handed to another agent, in runs that did not pause; counted, not priced')),
           h('p', { className: 'why', style: { margin: '6px 0 0' } }, 'Negative numbers mean Jev cost more than the assumed baseline.')))
     }
 
@@ -3135,15 +3295,20 @@ window.__ModuleLoader__.load({
         usage ? h(Recent, { rows: usage.recent ?? [] }) : null)
     }
 
+    // Settings says to restart while the server says a restart would move a provider onto another
+    // stored key (/jev-router/setup keysRestartPending, read again after every action), and not
+    // otherwise: after any key action of any provider, on reopening Settings, beside another notice.
+    function RestartLine({ pending }) {
+      if (!pending?.length) return null
+      return h('div', { className: 'note', role: 'status' }, `Restart the harness to apply the ${pending.map(providerLabel).join(' and ')} key change (Kz-harness → Restart harness)`)
+    }
+
     /** Settings: subscription logins and API keys per provider. */
-    function KeyProvider({ provider, list, busy, act, ask, setNotice }) {
+    function KeyProvider({ provider, list, busy, act, ask }) {
       const [name, setName] = useState('')
       const [key, setKey] = useState('')
       const label = providerLabel(provider)
-      const activate = (n) => act(async () => {
-        const r = await post('/jev-router/keys/activate', { provider, name: n })
-        if (r?.restartRequired) setNotice('Restart the harness to apply (Kz-harness → Restart harness)')
-      })
+      const activate = (n) => act(() => post('/jev-router/keys/activate', { provider, name: n }))
       return h('div', { className: 'keys' },
         h('div', { className: 'label' }, `${label} API keys`),
         list.length ? h('ul', { className: 'plain', role: 'radiogroup', 'aria-label': `Active ${label} key` }, ...list.map((k) => {
@@ -3166,7 +3331,7 @@ window.__ModuleLoader__.load({
           setKey('') // never keep the secret in the page
           act(async () => { await post('/jev-router/keys', body); setName('') })
         } },
-          h('input', { type: 'text', required: true, pattern: '[A-Za-z0-9_]{1,32}', title: 'Letters, digits or _', placeholder: 'Key name, e.g. acct2', 'aria-label': `${label} key name`, value: name, onChange: (e) => setName(e.target.value) }),
+          h('input', { type: 'text', required: true, pattern: '[a-z0-9][a-z0-9_\\-]{0,31}', title: 'Up to 32 lowercase letters, digits, - or _, starting with a letter or digit', placeholder: 'Key name, e.g. acct2', 'aria-label': `${label} key name`, value: name, onChange: (e) => setName(e.target.value) }),
           h('input', { type: 'password', required: true, autoComplete: 'off', placeholder: 'API key', 'aria-label': `${label} API key`, value: key, onChange: (e) => setKey(e.target.value) }),
           h('button', { className: 'btn', type: 'submit', disabled: busy }, 'Add key')))
     }
@@ -3195,7 +3360,7 @@ window.__ModuleLoader__.load({
                 run: () => post('/jev-router/logout', { provider: id }),
               }) }, 'Log out')))
         })),
-        ...[...new Set(['deepseek', 'jev', ...Object.keys(keys)])].map((p) => h(KeyProvider, { key: p, provider: p, list: keys[p] ?? [], busy, act, ask, setNotice })))
+        ...[...new Set(['deepseek', 'jev', ...Object.keys(keys)])].map((p) => h(KeyProvider, { key: p, provider: p, list: keys[p] ?? [], busy, act, ask })))
     }
 
     const EMPTY = []
@@ -3774,6 +3939,9 @@ window.__ModuleLoader__.load({
       // The sweep could not always read the orphan's working set (ramGB null): then no figure is said.
       const orphan = st.orphanStopped
       if (orphan) line(`Stopped a Laya left running by an earlier session (pid ${orphan.pid}${typeof orphan.ramGB === 'number' ? `, ${orphan.ramGB} GB RAM` : ''}).`, 'warn')
+      // One the sweep found alive and could not read (run as administrator): kept on record and named.
+      const unchecked = st.orphansUnchecked ?? []
+      if (unchecked.length) line(`A Laya an earlier session left may still be running (pid ${unchecked.join(', ')}); it could not be checked or stopped from here (it may run as administrator). End it in Task Manager (Details, right-click pid ${unchecked[0]}, End process tree; run Task Manager as administrator if it says access is denied), or restart the PC.`, 'warn')
       if (st.recovered) line(st.recovered, 'warn')
       const i = st.installed
       const r = st.running ?? {}
@@ -4221,14 +4389,31 @@ window.__ModuleLoader__.load({
       const [confirm, setConfirm] = useState(null)
       const [notice, setNotice] = useState('')
       const { usage, load: loadUsage } = useUsage(true)
+      // Provider and agent names from the server's catalog: this page may be the first to need them.
+      names.use()
+      useEffect(() => { loadNames() }, [])
       const load = useCallback(async (recheck) => {
         setBusy(true); setError('')
         try { setData(await api(`/jev-router/setup${recheck ? '?recheck=1' : ''}`)) } catch (e) { setError(e.message) } finally { setBusy(false) }
       }, [])
       useEffect(() => { load(false) }, [load])
-      const act = async (fn) => { setError(''); setBusy(true); try { await fn(); loadUsage(false); await load(false) } catch (e) { setError(e.message); setBusy(false) } }
+      // What an action changed is read back whether or not it succeeded: one can fail halfway (a key
+      // removed, the next one not made active), and the page shows the state it left.
+      const act = async (fn) => {
+        setError(''); setBusy(true)
+        let failed = null
+        try { await fn() } catch (e) { failed = e }
+        loadUsage(false)
+        await load(false)
+        if (failed) setError(failed.message)
+      }
 
       if (!data) return h('div', { className: 'jevi' }, h('h3', null, 'Jev setup'), error ? h('div', { className: 'err' }, error) : h('div', { className: 'muted' }, 'Checking logins…'))
+      // The stored Jev key in use, from the polled reading once there is one: Jev moves on to its next
+      // key by itself at a limit, and the key list beside this shows that.
+      const jevKeyNow = usage && Object.hasOwn(usage, 'jevActiveKey') ? usage.jevActiveKey : data.jev.activeKey
+      // Whether Jev's credential is set, from the same reading: what Jev falls back to without a stored key.
+      const jevCredentialNow = usage && Object.hasOwn(usage, 'jevCredentialSet') ? usage.jevCredentialSet : data.jev.credentialSet ?? data.jev.configured
       const onCount = data.agents.filter((a) => a.enabled).length
       const usable = data.agents.filter((a) => a.enabled && a.status?.loggedIn).length
       const provider = data.providers.find((p) => p.id === form.provider)
@@ -4239,11 +4424,13 @@ window.__ModuleLoader__.load({
         h(AgentChips, { agents: data.agents, usage, busy, onToggle: (id, enabled) => act(() => post('/jev-router/agents', { id, enabled })) }),
         error ? h('div', { className: 'err', role: 'alert' }, error) : null,
         notice ? h('div', { className: 'note', role: 'status' }, notice) : null,
+        // The usage reading is polled, so a key a run switched by itself shows here too.
+        h(RestartLine, { pending: usage?.keysRestartPending ?? data.keysRestartPending }),
 
         h('div', { className: 'card', style: { marginTop: 12 } },
           h('div', { className: 'label' }, 'Jev router'),
-          h('div', null, h('span', { className: cx('dot', data.jev.configured ? 'on' : 'off') }),
-            data.jev.configured ? `${data.jev.credentialRef} is set. Jev routes and reviews.` : `${data.jev.credentialRef} missing. Routing falls back to the default agent. See C:\\Harness\\README.md step 2.`),
+          h('div', null, h('span', { className: cx('dot', jevKeyNow || jevCredentialNow ? 'on' : 'off') }),
+            jevKeyNow ? `Jev key '${jevKeyNow}' is active. Jev routes and reviews.` : jevCredentialNow ? `${data.jev.credentialRef} is set. Jev routes and reviews.` : `${data.jev.credentialRef} missing. Routing falls back to the default agent. See C:\\Harness\\README.md step 2.`),
           jevHostLine(data.jev) ? h('div', { className: 'why' }, jevHostLine(data.jev)) : null),
 
         h(LayaCard, { ask: setConfirm }),
@@ -4258,7 +4445,9 @@ window.__ModuleLoader__.load({
               h('div', { style: { minWidth: 0 } },
                 h('div', null, h('span', { className: cx('dot', a.status?.loggedIn ? 'on' : 'off') }), h('b', null, a.id),
                   h('span', { className: 'pill' }, a.llm ? `${a.llm.provider} / ${a.llm.model}` : a.provider), a.custom ? h('span', { className: 'pill' }, 'API key') : null),
-                h('div', { className: 'why' }, a.status?.detail ?? 'not checked')),
+                h('div', { className: 'why' }, a.status?.detail ?? 'not checked'),
+                // Whether a task judged read only can run on it locked against writing, and how.
+                a.readOnly ? h('div', { className: 'why' }, a.readOnly.how ? `Read-only work: yes, ${a.readOnly.how}` : `Read-only work: no, ${a.readOnly.why}`) : null),
               h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 } },
                 h('label', { className: 'toggle', title: lastOn ? 'At least one LLM must stay on' : '' },
                   h('input', { type: 'checkbox', role: 'switch', checked: a.enabled, disabled: lastOn || busy, 'aria-label': `Use ${a.id}`, onChange: (e) => act(() => api('/jev-router/agents', { method: 'POST', body: JSON.stringify({ id: a.id, enabled: e.target.checked }) })) }),
@@ -4294,7 +4483,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'label' }, 'Tools (no LLM)'),
           data.tools.length
             ? h('ul', { className: 'plain' }, ...data.tools.map((t) => h('li', { key: t.id }, h('div', null, h('b', null, t.id), h('div', { className: 'why' }, t.description)), h('code', { className: 'why' }, t.command))))
-            : h('div', { className: 'muted' }, 'None yet. Add scripts under `tools` in the jev-router entry of ~/.dsh/profiles/web/cordis.patch.yml; Jev runs one when it fully covers a task.')),
+            : h('div', { className: 'muted' }, 'None yet. Add scripts under `tools` in the jev-router entry of ~/.kzh/profiles/web/cordis.patch.yml; Jev runs one when it fully covers a task.')),
 
         removing ? h(Confirm, {
           title: `Remove agent "${removing}"?`,
@@ -4596,7 +4785,7 @@ window.__ModuleLoader__.load({
       { key: 'maxVramGB', label: 'VRAM', id: 'jevi-lm-vram', unit: 'GB', title: 'GPU memory the local model may use, in GB. The layers that do not fit run from RAM. Blank: no limit.' },
       { key: 'maxRamGB', label: 'RAM', id: 'jevi-lm-ram', unit: 'GB', title: 'Memory the local model may use, in GB. A soft limit: see below. Blank: no limit.' },
       { key: 'maxCores', label: 'Cores', id: 'jevi-lm-cores', unit: '', title: 'Threads the local model may run on. Blank: a default that leaves the app at least a quarter of the machine.' },
-      { key: 'maxConcurrentTasks', label: 'Tasks at once', id: 'jevi-lm-tasks', unit: '', title: 'Agent runs at once across every workspace, foreground and background. A workspace still runs one at a time. Blank: no limit.' },
+      { key: 'maxConcurrentTasks', label: 'Tasks at once', id: 'jevi-lm-tasks', unit: '', title: 'Agent runs at once across every workspace, foreground and background, read-only runs included. A workspace runs one task that writes at a time; a task judged read only runs beside it on an agent locked against writing. Blank: no limit.' },
     ]
 
     /** The budget in words, "2 GB VRAM + 8 GB RAM", as local.js words it in a refusal; null when none is set. */
@@ -5793,7 +5982,7 @@ window.__ModuleLoader__.load({
       // DOM globals so a test can prove a pass lands on a timer while no frame is ever delivered.
       // ResourceBudget and LocalModelsCard are rendered with stand-in Reacts in test/budgetpanel.test.js,
       // SetupSection in test/laya-card.test.js and InspectorBody in test/routerview.test.js.
-      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, sortRows, filterRows, SortTable, BenchmarkCard, benchmarkProgress, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, taskItems },
+      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, stopOneWords, stopAllWords, stopTask, WorkBoard, Tasks, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, sortRows, filterRows, SortTable, BenchmarkCard, benchmarkProgress, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, UsageCard, RestartLine, taskItems },
       apply(ctx) {
         sessionsApi = ctx.sessions
         sidebarRight = ctx.sidebarRight

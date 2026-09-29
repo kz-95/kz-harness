@@ -42,6 +42,13 @@
    "alsoWork": {
     "type": "noul",
     "instructions": "Even if `message` is a question to answer directly, does it also ask for work to be carried out in the project?"
+   },
+   "readOnly": {
+    "type": "noul",
+    "instructions": {
+     "question": "Can everything `message` asks for be done by reading the project's files and replying, without creating, changing or deleting any file and without running any command or program?",
+     "focus": "Running tests, builds, scripts, formatters or installs counts as running a program. Writing findings, a plan or code in the reply itself changes no file."
+    }
    }
   }
  },

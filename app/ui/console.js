@@ -70,8 +70,9 @@ const stepsEl = document.getElementById('steps')
 function showSteps(s) {
   if (!stepsEl) return
   const steps = s.steps ?? []
-  // Nothing useful to show once it is running, or when the launcher sent no step list.
-  if (!steps.length || s.phase === 'ready') { stepsEl.replaceChildren(); stepsEl.hidden = true; return }
+  // Nothing useful to show once it is running (s.page: only its page failed), or when the
+  // launcher sent no step list.
+  if (!steps.length || s.phase === 'ready' || s.page) { stepsEl.replaceChildren(); stepsEl.hidden = true; return }
   const at = steps.findIndex((x) => x.id === s.step)
   stepsEl.hidden = false
   // Only steps the launcher actually reported are ticked. A first run fetches the engine and
@@ -105,9 +106,11 @@ function showStatus(s) {
   useHere.hidden = !(s.phase === 'error' && s.holder === 'orphan')
   useHere.disabled = false
   useHere.textContent = 'Use it here'
+  // Only the harness page failed (s.page): the harness itself is still running.
   const pill = document.getElementById('log-status')
-  pill.textContent = { starting: 'starting', ready: 'running', error: 'stopped' }[s.phase] ?? s.phase
-  pill.className = `pill ${s.phase}`
+  const shown = s.page ? 'ready' : s.phase
+  pill.textContent = { starting: 'starting', ready: 'running', error: 'stopped' }[shown] ?? shown
+  pill.className = `pill ${shown}`
 }
 
 // ---------- log window ----------

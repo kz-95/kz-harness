@@ -36,7 +36,7 @@ The branch's commits after `a1e42b4` up to `5f19588`, every one this document na
 - A speed reading lives in `local.json` under `speed`, keyed `<model>@<context>` like the memory readings under `measured`, and stands only for a load of the same weights with the same context, GPU room, GPU layers setting, thread count, engine build, depth and Laya beside it; where it does not stand, the page says why and shows the estimate.
 - B1 leaves the engine as it found it: the model that was loaded is loaded again, and an engine that was stopped is stopped.
   It refuses while a local model or Laya is answering or a local agent is working on a task, holds local agents back while it runs without counting the wait against their time limit, and skips a model over the budget with the budget's own refusal.
-- The same speed run goes from a shell with KzH closed: `Speed-Run.bat` at the harness root runs `scripts/speed-run.mjs`, which refuses while KzH, a llama-server or a Laya left behind, or another Speed-Run runs, reads the context from the profile, and ends with an exit code a scheduled task can check (2.12).
+- The same speed run goes from a shell with KzH not running: `Speed-Run.bat` at the harness root runs `scripts/speed-run.mjs`, which refuses while KzH, a llama-server or a Laya left behind, or another Speed-Run runs, reads the context from the profile, and ends with an exit code a scheduled task can check (2.12).
   Every speed run, from the card or from the shell, is logged in a `speed-runs` folder beside `local.json`: a short entry in `speed-runs.log`, and a detail log of its own (2.13).
 - B2's task set is 27 tasks, three levels in each of nine skills taken from the router's task types, plus a one-file preflight task that is never scored and that proves the agent can run a command.
   A task that does not fit the window KzH gives a local model is not run on it and records nothing.
@@ -398,7 +398,7 @@ Running Benchmark all is how every installed model's figure there becomes measur
 
 ### 2.12 From a shell: Speed-Run.bat
 
-`Speed-Run.bat` at the harness root runs `node scripts/speed-run.mjs`: the same speed run as Benchmark all, with KzH closed, double-clicked or started by a Task Scheduler entry the owner makes (6).
+`Speed-Run.bat` at the harness root runs `node scripts/speed-run.mjs`: the same speed run as Benchmark all, with KzH not running, double-clicked or started by a Task Scheduler entry the owner makes (6).
 The script runs `local.js`'s own speed run (`createLocalModels().benchmark()`), so each model is loaded, measured, refused or skipped as 2.1 to 2.8 say, and its reading goes to `local.json` exactly as the in-app run stores it (2.4), where the Local models card and the install picker find it when KzH starts.
 Nothing in KzH starts it or schedules it.
 
@@ -425,18 +425,25 @@ A lock whose pid is not alive, or now names a program that is not a speed run, i
 A lock that cannot be taken for any other reason ends the run with exit code 2.
 
 Then `machineCheck()` reads the running processes, with their pids: on Windows from CIM, with their command lines, or tasklist's names alone when PowerShell fails, and from `ps` elsewhere.
-It refuses the run, with exit code 3, while:
+What of KzH runs is found by `plugins/jev-router/kzh-running.js` (`kzhRunning()`), which the Laya command line shares.
+It refuses the run, with exit code 3, in this order, while:
 
-- KzH's engine runs (node running `@deepseek-ai/dsh` with `web`, the test `app/main.js` uses), or `Kz-harness.exe` does: `KzH is running (its engine, <name>).` or `KzH is running (Kz-harness.exe).`, then `Close KzH and run this again: the speed run and KzH would load models over each other on one GPU, and both write local.json.`;
-- a `llama-server` runs with KzH closed, one a crash left behind, say, which holds memory the readings would lose;
-- a `laya.serve` an earlier KzH left running holds memory the same way, found from the pids in Laya's `sidecar.json` that are alive and run `laya.serve`: `Start KzH and close it again, which stops it, or end pid <n> in Task Manager, and run this again.`
+- `Kz-harness.exe` runs: `KzH is running (Kz-harness.exe). Quit it (right-click its tray icon and choose Quit; closing its window leaves it running) and run this again: the speed run and KzH would load models over each other on one GPU, and both write local.json.`;
+- KzH's engine runs (node running `@deepseek-ai/dsh` with `web`, the test `app/main.js` uses) with no `Kz-harness.exe`, in a `Start-KzH` window or left behind by an app that is gone, which has no tray icon to quit from: `KzH is running (its engine, <name>, pid <n>) with no Kz-harness app above it. To stop it, close the Start-KzH window it runs in, or, if no such window is open, end it in Task Manager (Details, right-click pid <n>, End process tree), and run this again: ...` with the same reason.
+  The pid named is the engine that listens on the port, or, before it listens, the engine rather than the npx wrapper `Start-KzH.ps1`'s npx start puts above it, whose end would leave the engine running, and the wrapper only while it is all that runs (npx still resolving the package), when ending its process tree stops the start;
+- something answers on `127.0.0.1:3080` that cannot be told from KzH's engine (below): the advice sends the person to a tray icon only when the process list could not be read, since a list that was read has no `Kz-harness.exe` in it; otherwise it is the engine's (its `Start-KzH` window, or its pid's process tree in Task Manager, run as administrator if access is denied) or closing that program;
+- a `llama-server` runs with KzH not running, one a crash left behind, say, which holds memory the readings would lose;
+- a `laya.serve` an earlier KzH left running holds memory the same way, found from the pids in Laya's `sidecar.json` that are alive and run `laya.serve` (the sidecar's, an install check's, and the records a sweep kept, `earlier`): `Start KzH and quit it again (right-click its tray icon and choose Quit), which stops it, or end pid <n> in Task Manager, and run this again.`
+  While an installer still at work holds Laya's `install.lock` (the Laya command line), the Laya its step 7 loads is its own, not a leftover: `A Laya install is running (pid <n>: the Laya command line, or Install-Harness.ps1 -Laya). It loads Laya to check what it installed, which would hold memory the readings would lose. Let it finish, then run this again.`
+  One that is alive but cannot be read (run as administrator) and may be Laya, being python or of a name that cannot be read either, is named as maybe still running: `A Laya an earlier KzH left may still be running (pid <n>); it could not be checked from here (it may run as administrator), ...`, with how to end it from a Task Manager run as administrator.
 
 Whatever answers on `127.0.0.1:3080` is found by its pid, from `netstat -ano` on Windows and `ss` elsewhere, and looked up in the process list.
 On Windows a listening socket is read by its far end, `0.0.0.0:0` or `[::]:0`, so netstat's output is read in any Windows language.
-The run goes ahead only when that program's command line can be read and is not KzH's engine: it is another program (LibreChat and GNS3 use that port too), and a note names it and its pid.
-Otherwise it is refused, since nobody can tell whether KzH is running: when the owner cannot be found or looked up, and when its command line reads empty, as KzH's engine's does when it runs as administrator.
+The run goes ahead, with a note, when that program is not KzH's engine: its command line can be read and is not the engine's (LibreChat and GNS3 use that port too), or its name is not node, which the engine's always is (a Windows service, System, Docker), or its pid cannot be found while no process that could be the engine runs (a node whose command line cannot be read).
+Otherwise it is refused, since nobody can tell whether KzH is running: a node whose command line reads empty, as KzH's engine's does when it runs as administrator, or that tasklist gave by name alone (`whose command line could not be listed`), a pid not in the list, and an owner that cannot be found while such a node runs or no list could be read.
+That is settled before a llama-server or a Laya is called left behind, since KzH's engine that cannot be read runs its own.
 Every refusal is written in `speed-runs.log` with why (2.13).
-Once the checks pass, it prints `Keep KzH closed until this ends: it would load models beside the ones measured.`; a KzH started during a run is not stopped by it.
+Once the checks pass, it prints `Do not start KzH until this ends: it would load models beside the ones measured.`; a KzH started during a run is not stopped by it.
 
 **The context.**
 KzH starts a local model at the plugin config's `local.contextSize` when the profile sets one, and a reading stands only for a load at the context it was taken at (2.4).
@@ -1173,7 +1180,7 @@ So capability runs happen in a workspace of KzH's own that holds nothing of the 
    - `offline: false` with no connectivity probe, so nothing reaches a TypeSafe host; a cloud agent without the network fails with its own error, which is `errored` (3.6);
    - a `history` that reads nothing and keeps the run's record for the task's row, so a benchmark run never enters `history.jsonl`, the track record, the feedback priors or the session's verdicts, and `learnFrom()` is never called for it;
    - `logAttempt` writing to `usage.jsonl` as every run does, since real usage is real usage, with `purpose: 'benchmark'` and the benchmark run id on the row; `computeSavings()` leaves such rows out of its agent median, the estimates of 3.10 leave them out of the person's own runs, and the Usage tab marks them.
-3. Each task takes the lane of its own folder (`lanes.acquire(laneKey(folder), ...)`), so it counts against the Tasks at once cap like every run and waits with the lanes' own words (`WAITING`, tasks.js:52); one task at a time means the benchmark holds at most one slot.
+3. Each task takes the lane of its own folder (`lanes.acquire(laneKey(folder), ...)`), so it counts against the Tasks at once cap like every run and waits with the lanes' own words (`WAITING`, tasks.js:53); one task at a time means the benchmark holds at most one slot.
 4. Each task's run is logged under the scratch session like any run (`logRun`), so its events show in that chat's inspector live, and its run id goes into `stoppers`, so the inspector's Stop stops that task: it is not scored, and that agent's run is then incomplete.
 
 The order and the stops:

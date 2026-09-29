@@ -246,12 +246,12 @@ test('a Laya call names Laya, its model and what it counted on this PC at $0, wi
   const { callCard } = display()
   const t = await calls()
   assert.deepEqual(callCard(t.laya), {
-    head: 'Intent: 3 questions in 2 requests on the GPU',
+    head: 'Intent: 4 questions in 2 requests on the GPU',
     label: 'Laya · laya-english/0.3.20@1a2b3c4 · 5,610 tokens on this PC ($0)',
     requestId: 'none (local)',
     notes: [],
   })
-  assert.deepEqual(callCard(t.jev), { head: 'Intent: 3 questions in one request', label: 'jev-1.13.0 · 1200 in / 30 out tokens', requestId: 'req_7Hq2', notes: [] })
+  assert.deepEqual(callCard(t.jev), { head: 'Intent: 4 questions in one request', label: 'jev-1.13.0 · 1200 in / 30 out tokens', requestId: 'req_7Hq2', notes: [] })
   // A trace from before `provider` was recorded is Jev's.
   const { provider, ...old } = t.jev
   assert.equal(provider, 'jev')
@@ -259,7 +259,7 @@ test('a Laya call names Laya, its model and what it counted on this PC at $0, wi
   // What Laya's client adds: the wait behind an earlier answer, a request at the 512-token
   // context, and a task that is not English.
   const cut = callCard({ ...t.laya, phase: 'review', meta: { ...t.laya.meta, waitedMs: 4200, requests: 4, atContextLimit: 1, lang: 'non-latin' } })
-  assert.equal(cut.head, 'Review: 3 questions in 4 requests on the GPU')
+  assert.equal(cut.head, 'Review: 4 questions in 4 requests on the GPU', 'the intent call\'s four, relabelled as a review for the notes')
   assert.deepEqual(cut.notes, [
     'Waited 4200 ms for an earlier Laya answer.',
     '1 of 4 requests reached the 512-token limit, so part of the evidence was cut.',
@@ -272,8 +272,8 @@ test('the uncalibrated pill follows each answer\'s own corrected mark, never its
   const t = await calls()
   const by = Object.fromEntries(t.laya.questions.map((q) => [q.name, answerPills(q).map(([, text]) => text)]))
   // The marks as jev.js carries them onto the trace: re-tempered, and too flat for the rules to use.
-  assert.deepEqual(by, { kind: ['uncalibrated (2 options)'], depth: ['too flat, filled by rules'], alsoWork: [] })
-  assert.deepEqual(t.jev.questions.map(answerPills), [[], [], []], 'Jev marks none')
+  assert.deepEqual(by, { kind: ['uncalibrated (2 options)'], depth: ['too flat, filled by rules'], alsoWork: [], readOnly: [] })
+  assert.deepEqual(t.jev.questions.map(answerPills), [[], [], [], []], 'Jev marks none')
   // A capability question asked with all nine capabilities and the two others is re-tempered; one
   // asked with seven is not, whatever it is called.
   const options = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`c${i}`, 1 / n]))
@@ -442,13 +442,13 @@ test('the Decisions tab shows the Laya column under a Jev call, never under a La
   const { Questions } = plugin()
   assert.equal(typeof Questions, 'function', 'the call cards can be rendered')
   const t = await calls()
-  const row = shadowRow({ callId: t.jev.callId, phase: 'intent', jev: { kind: ['choice', 'task', 0.7], depth: ['choice', 'everyday', 0.7], alsoWork: ['noul', 0.8, 0.8] }, laya: { kind: ['choice', 'question', 0.6], depth: ['choice', 'everyday', 0.55], alsoWork: ['noul', 0.7, 0.7] } })
+  const row = shadowRow({ callId: t.jev.callId, phase: 'intent', jev: { kind: ['choice', 'task', 0.7], depth: ['choice', 'everyday', 0.7], alsoWork: ['noul', 0.8, 0.8], readOnly: ['noul', 0.3, 0.7] }, laya: { kind: ['choice', 'question', 0.6], depth: ['choice', 'everyday', 0.55], alsoWork: ['noul', 0.7, 0.7], readOnly: ['noul', 0.2, 0.8] } })
   const shadow = { rows: new Map([[row.callId, row]]), waiting: true }
   const [jevCard, layaCard] = expand(Questions({ calls: [{ trace: t.jev }, { trace: t.laya }], shadow })).children
-  assert.ok(textOf(jevCard).includes('Laya shadow: 3 of 3 questions answered, 2 agree (67%). Laya decides nothing in Jev Auto.'))
+  assert.ok(textOf(jevCard).includes('Laya shadow: 4 of 4 questions answered, 3 agree (75%). Laya decides nothing in Jev Auto.'), textOf(jevCard))
   assert.ok(textOf(jevCard).includes('Request id: req_7Hq2'))
   const laya = nodes(jevCard).filter((n) => n.props.className === 'why shadow').map(textOf)
-  assert.deepEqual(laya, ['Laya: question (60.0%)differs', 'Laya: everyday (55.0%)agrees', 'Laya: 70.0%agrees'])
+  assert.deepEqual(laya, ['Laya: question (60.0%)differs', 'Laya: everyday (55.0%)agrees', 'Laya: 70.0%agrees', 'Laya: 20.0%agrees'])
   assert.ok(!textOf(layaCard).includes('Laya shadow'), 'a Laya call is compared with nothing')
   assert.ok(textOf(layaCard).includes('Request id: none (local)'))
   assert.equal(nodes(layaCard).filter((n) => n.props.className === 'why shadow').length, 0)
@@ -544,6 +544,152 @@ async function decisionsPage(runs) {
   page.close = () => view.unmount()
   await page.settle()
   return page
+}
+
+/**
+ * The work board as the chat shows it, behind GET /jev-router/tasks answering `tasks`, with every
+ * POST recorded and the timers it sets held rather than run. With `tab`, the inspector's Background
+ * tab is mounted instead and handed `tasks` directly, as the inspector hands it the ones it polls.
+ */
+async function workBoardPage(tasks, { tab = false } = {}) {
+  const page = { posts: [] }
+  let busy = 0
+  page.stopResult = 'requested'
+  const fetch = async (path, init) => {
+    busy++
+    try {
+      if (init?.method === 'POST') page.posts.push([path, JSON.parse(init.body)])
+      const body = path === '/jev-router/tasks' ? { tasks } : { result: page.stopResult }
+      return { ok: true, status: 200, json: async () => body }
+    } finally { busy-- }
+  }
+  const hold = () => 0
+  // The timers the board sets are kept, not run: page.poll() runs them, as the list's next poll.
+  const timers = []
+  const later = (fn) => { timers.push(fn); return timers.length }
+  const document = { getElementById: () => ({}), createElement: () => ({}), head: { appendChild() {} } }
+  const { React, mount } = statefulReact()
+  let registration
+  // The confirmation listens for Escape on the window.
+  const window = { __ModuleLoader__: { load: (r) => { registration = r } }, addEventListener() {}, removeEventListener() {} }
+  new Function('window', 'fetch', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'document', client)(window, fetch, later, hold, hold, hold, document)
+  const { WorkBoard, Tasks } = registration.factory((x) => { if (x === 'react') return React; throw new Error(`unexpected require: ${x}`) }).__test
+  assert.equal(typeof WorkBoard, 'function', 'the work board can be rendered')
+  const view = tab ? mount(Tasks, { sessionId: 's1', runs: [], jobs: [], entries: [], tasks }) : mount(WorkBoard, { session: { sessionId: 's1' } })
+  page.settle = async () => { for (let quiet = 0; quiet < 2; quiet = !busy && !view.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  page.buttons = () => nodes(view.tree).filter((n) => n.type === 'button')
+  page.button = (label) => page.buttons().find((b) => b.props['aria-label'] === label || textOf(b) === label)
+  page.click = async (label) => { page.button(label).props.onClick(); await page.settle() }
+  page.text = () => textOf(view.tree)
+  page.tree = () => view.tree
+  page.render = async () => { view.render(); await page.settle() }
+  page.poll = async () => { for (const fn of timers.splice(0)) fn(); await page.settle() }
+  await page.settle()
+  return page
+}
+
+test('the work board: a waiting row shows why and how long, its time in line, and is removed from the line on its own', async () => {
+  const now = Date.now()
+  const tasks = [
+    { jobId: 'jev-1', sessionId: 's1', state: 'running', taskName: 'help me do a sample', startedAt: now - 60_000, agent: 'claude', position: 0 },
+    { jobId: 'jev-2', sessionId: 's1', state: 'queued', taskName: 'realistic 1k to 1million', startedAt: null, queuedAt: now - 30_000, position: 2,
+      waiting: { why: 'workspace', place: 2, ahead: 0, slotsAhead: 0, overCap: false, since: now - 30_000, placeText: '2nd in line', reason: 'Waiting: another task is running in this workspace',
+        estimate: { lowMs: 240_000, highMs: 480_000, n: 5, text: 'Starts in about 4 to 8 min, estimated from 5 past runs of claude at medium effort with no planned review.' },
+        text: 'Waiting: another task is running in this workspace. Starts in about 4 to 8 min, estimated from 5 past runs of claude at medium effort with no planned review.' } },
+  ]
+  const page = await workBoardPage(tasks)
+  const text = page.text()
+  assert.match(text, /Waiting: another task is running in this workspace\. Starts in about 4 to 8 min, estimated from 5 past runs of claude at medium effort/)
+  assert.match(text, /in line 3\d\.\d s/)
+  assert.doesNotMatch(text, /starting/, 'a waiting row no longer reads "starting"')
+  assert.ok(page.button('Stop help me do a sample'), 'a running row has its own Stop')
+  assert.ok(page.button('Remove realistic 1k to 1million'), 'a waiting row has its own Remove')
+  assert.equal(page.button('Stop all 2 tasks in this session: 1 running, 1 waiting').props.className, 'kzh-wb-stop')
+  // Remove asks first, in words for a task that never started, and stops that one task only.
+  await page.click('Remove realistic 1k to 1million')
+  assert.match(page.text(), /Remove this task from the line\?"realistic 1k to 1million" has not started, so nothing in the workspace has changed/)
+  assert.deepEqual(page.posts, [], 'nothing is sent before it is confirmed')
+  await page.click('Remove task')
+  assert.deepEqual(page.posts, [['/jev-router/tasks/stop', { jobId: 'jev-2', onlyIfWaiting: true }]], 'Remove stops it only while it still waits')
+  // Cancel in the confirmation sends nothing.
+  await page.click('Stop help me do a sample')
+  await page.click('Cancel')
+  assert.equal(page.posts.length, 1)
+  // It started between the last poll and the click: the server stops nothing, and the board says why.
+  page.stopResult = 'started'
+  await page.click('Remove realistic 1k to 1million')
+  await page.click('Remove task')
+  assert.match(page.text(), /"realistic 1k to 1million" started before it could be removed, so it was not stopped\. Use Stop on its row to stop it\./)
+})
+
+// The waiting line, second pass: a dialog never changes what its button does, and Stop all covers
+// what it named.
+{
+  const now = Date.now()
+  const waitingRow = (over = {}) => ({ jobId: 'jev-2', sessionId: 's1', state: 'queued', taskName: 'realistic 1k to 1million', startedAt: null, queuedAt: now - 30_000, position: 2,
+    waiting: { why: 'workspace', place: 2, ahead: 0, slotsAhead: 0, overCap: false, since: now - 30_000, placeText: '2nd in line', reason: 'Waiting: another task is running in this workspace', estimate: null, text: 'Waiting: another task is running in this workspace.' }, ...over })
+
+  test('a Remove dialog whose task starts meanwhile closes and says it was not removed, rather than turning into Stop', async () => {
+    const tasks = [
+      { jobId: 'jev-1', sessionId: 's1', state: 'running', taskName: 'help me do a sample', startedAt: now - 60_000, agent: 'claude', position: 0 },
+      waitingRow(),
+    ]
+    const page = await workBoardPage(tasks)
+    await page.click('Remove realistic 1k to 1million')
+    assert.match(page.text(), /Remove this task from the line\?/)
+    Object.assign(tasks[1], { state: 'running', startedAt: now, waiting: null })
+    await page.render()
+    assert.doesNotMatch(page.text(), /Stop this task\?/, 'nobody pressed Stop: the dialog is not reworded into it')
+    assert.equal(page.button('Stop task'), undefined)
+    assert.match(page.text(), /"realistic 1k to 1million" started while you were confirming, so it was not removed\. Use Stop on its row to stop it\./)
+    assert.deepEqual(page.posts, [])
+  })
+
+  test('Stop all stops the tasks it named when it opened, never one queued after', async () => {
+    const tasks = [
+      { jobId: 'jev-1', sessionId: 's1', state: 'running', taskName: 'first', startedAt: now - 60_000, agent: 'claude', position: 0 },
+      waitingRow({ taskName: 'second' }),
+    ]
+    const page = await workBoardPage(tasks)
+    await page.click('Stop all')
+    assert.match(page.text(), /Stop all 2 tasks\?/)
+    tasks.push(waitingRow({ jobId: 'jev-3', taskName: 'third, queued after it opened', position: 3 }))
+    await page.poll()
+    assert.match(page.text(), /third, queued after it opened/, 'the board has read the new task')
+    assert.match(page.text(), /Stop all 2 tasks\?/, 'the dialog still covers what it named')
+    await page.click('Stop 2')
+    assert.deepEqual(page.posts.map(([, b]) => b.jobId).sort(), ['jev-1', 'jev-2'])
+  })
+
+  test('the Background tab shows why a task waits in its row, not only behind the disclosure', () => {
+    const [item] = plugin().taskItems({ sessionId: 's1', runs: [], jobs: [], entries: [], tasks: [waitingRow()], open: new Set(), now })
+    assert.equal(item.wait, 'Waiting: another task is running in this workspace.')
+    const src = client.slice(client.indexOf('function Tasks('), client.indexOf('function WorkBoard('))
+    const summary = src.slice(src.indexOf("h('summary'"), src.indexOf("h('div', { style: { marginTop: 6 } }, it.body)"))
+    assert.match(summary, /it\.wait/, 'rendered inside the summary, beside the reason')
+  })
+
+  test('the Background tab removes a waiting task from the line as the work board does, only while it still waits', async () => {
+    const page = await workBoardPage([waitingRow()], { tab: true })
+    assert.ok(page.button('Remove realistic 1k to 1million'), 'a waiting row has Remove, not Stop')
+    await page.click('Remove realistic 1k to 1million')
+    assert.match(page.text(), /Remove this task from the line\?"realistic 1k to 1million" has not started/)
+    await page.click('Remove task')
+    assert.deepEqual(page.posts, [['/jev-router/tasks/stop', { jobId: 'jev-2', onlyIfWaiting: true }]])
+    // It started between the last poll and the click: the tab says why nothing was stopped.
+    page.stopResult = 'started'
+    await page.click('Remove realistic 1k to 1million')
+    await page.click('Remove task')
+    assert.match(page.text(), /"realistic 1k to 1million" started before it could be removed, so it was not stopped\./)
+  })
+
+  test('a confirmation names its body for a screen reader', async () => {
+    const page = await workBoardPage([waitingRow()])
+    await page.click('Remove realistic 1k to 1million')
+    const dialog = nodes(page.tree()).find((n) => n.props?.role === 'dialog')
+    assert.equal(dialog?.props['aria-describedby'], 'jevi-confirm-b')
+    assert.ok(nodes(dialog).some((n) => n.props?.id === 'jevi-confirm-b' && /has not started/.test(textOf(n))), 'the body it names is the words about what goes')
+  })
 }
 
 test('the Laya column is read once for a run no row can come for, polled every 5 s while one can, and no more once every call has its row or the wait is over', async () => {
@@ -659,7 +805,8 @@ test('the decider tile counts the time of the calls that failed too, and says ho
   const run = { id: 'r1', task: 't', startedAt: t0, events: [{ type: 'start', at: t0 }, { type: 'jev', at: t0 + 1000, trace: t.laya }, late, { type: 'final', at: t0 + 180_000, status: 'accepted' }] }
   const s = summarize(run)
   const tiles = nodes(expand(Stats({ s }))).filter((n) => n.props.className === 'stat').map((n) => n.children.map(textOf))
-  assert.deepEqual(tiles[0], ['Laya', `${((t.laya.ms + 120_000) / 1000).toFixed(1)} s`, '1 call failed'])
+  const sec = Math.round((t.laya.ms + 120_000) / 1000)
+  assert.deepEqual(tiles[0], ['Laya', `${Math.floor(sec / 60)} min${sec % 60 ? ` ${sec % 60} s` : ''}`, '1 call failed'])
   // With every call answered, the tile is as it was.
   const answered = nodes(expand(Stats({ s: summarize({ ...run, events: run.events.filter((e) => e !== late) }) }))).filter((n) => n.props.className === 'stat')[0]
   assert.equal(answered.children.filter(Boolean).length, 2, textOf(answered))
@@ -715,6 +862,14 @@ test('a stored run names who picked the agent and how sure it was, as the live r
   assert.doesNotMatch(stored({ ...routing, agentConfidence: undefined }), /confidence/)
 })
 
+test('a second-opinion yes held under the low risk band says so where the inspector shows the figure', () => {
+  const { WhatHappened, summarize } = plugin()
+  const routing = (heldBy) => ({ mode: 'jev', primaryAgent: 'claude', agentConfidence: 0.5, taskType: 'implementation', taskTypeConfidence: 0.76, complexity: 0.325, risk: 0.013, needsSecondOpinion: 0.67, needsHumanReview: 0.86, needsTests: 0.69, decision: { domains: { second_opinion: { label: 'yes', ...(heldBy ? { heldBy } : {}) } } } })
+  const shown = (R) => textOf(expand(WhatHappened({ s: summarize({ id: 'r1', task: 't', startedAt: 1, events: [{ type: 'routed', at: 2, routing: R }] }) })))
+  assert.match(shown(routing('risk')), /Second opinion67\.0% \(held: low risk\)/)
+  assert.doesNotMatch(shown(routing()), /held/)
+})
+
 test('a run Laya decided is named Laya wherever the inspector names who decided: 2 Laya calls, Laya picked, the Stats tile', () => {
   const { RoutingDecision, WhatHappened, HistoryRunDetail, Stats, summarize } = plugin()
   for (const [name, f] of Object.entries({ RoutingDecision, WhatHappened, HistoryRunDetail, Stats, summarize })) assert.equal(typeof f, 'function', `${name} can be rendered`)
@@ -767,4 +922,20 @@ test('the Usage tab says what Laya did, at $0 and apart from what Jev saved', as
   assert.ok(lines.some((l) => l.startsWith('Jev cost $0.0001 vs LLM')), 'and Jev\'s own line counts Jev alone')
   const none = nodes(expand(SavingsCard({ savings: computeSavings(usage.slice(2), [], {}, now) }))).map(textOf)
   assert.ok(!none.some((l) => l.startsWith('Laya:')), 'no Laya line where Laya decided nothing')
+})
+
+test('a DeepSeek key made active since launch is shown as waiting for a restart beside the key in use', () => {
+  const { UsageCard } = plugin()
+  assert.equal(typeof UsageCard, 'function')
+  const a = { id: 'deepseek', kind: 'api', keyProvider: 'deepseek', state: 'stopped', account: { label: 'a', pendingKey: 'b' }, balance: { amount: 0.1, currency: 'USD' }, limits: { minBalance: 5, handoffAtBalance: 10 }, windows: [] }
+  const text = nodes(expand(UsageCard({ a, keys: [], links: {}, onSaved: () => {} }))).filter((n) => n.props?.className === 'why').map(textOf)
+  assert.ok(text.includes(' · a, b after Restart harness'), text.join('\n'))
+})
+
+test('Settings says to restart while the server says a restart would move a provider onto another key, and not otherwise', () => {
+  const { RestartLine } = plugin()
+  assert.equal(typeof RestartLine, 'function')
+  assert.equal(textOf(expand(RestartLine({ pending: ['deepseek'] }))), 'Restart the harness to apply the deepseek key change (Kz-harness → Restart harness)')
+  assert.equal(RestartLine({ pending: [] }), null)
+  assert.equal(RestartLine({}), null)
 })

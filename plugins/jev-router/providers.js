@@ -32,7 +32,9 @@ export function deepFreeze(v, seen = new WeakSet()) {
 }
 
 // The Jev column of docs/laya-auto.md 2.6: the constants the code used before they were keys,
-// so a config that sets none of them decides exactly as it did.
+// so a config that sets none of them decides exactly as it did. The exceptions are effortBands,
+// whose old cuts (medium 0.25, high 0.6) began the ladder at medium: no answer could reach low, and
+// readOnly, a bar for a question that came later (docs/queue-and-cost-findings.md 1).
 export const JEV_THRESHOLDS = deepFreeze({
   minQuestionConfidence: 0.6, alsoWork: 0.7,
   supportingSkill: 0.15, verificationChecks: 0.5,
@@ -42,7 +44,7 @@ export const JEV_THRESHOLDS = deepFreeze({
   easyComplexity: 0.5, requirementWanted: 0.5,
   needsPerson: 0.6, reject: 0.3, accept: { low: 0.55, medium: 0.7, high: 0.85 },
   riskBands: { low: 0.25, medium: 0.6 }, humanReview: 0.7, secondOpinion: 0.6,
-  effortBands: { medium: 0.25, high: 0.6 },
+  effortBands: { low: 0.125, medium: 0.375, high: 0.6 }, readOnly: 0.8,
 })
 
 // The Laya column. None of these is a calibration: section 10 of the design names the data that
@@ -56,7 +58,7 @@ export const LAYA_THRESHOLDS = deepFreeze({
   easyComplexity: 0.4, requirementWanted: 0.6,
   needsPerson: 0.6, reject: 0.3, accept: { low: 0.65, medium: 0.8, high: 0.9 },
   riskBands: { low: 0.25, medium: 0.6 }, humanReview: 0.6, secondOpinion: 0.6,
-  effortBands: { medium: 0.25, high: 0.6 },
+  effortBands: { low: 0.125, medium: 0.375, high: 0.6 }, readOnly: 0.9,
 })
 
 /**
@@ -90,7 +92,8 @@ const DESCRIPTIONS = {
   riskBands: 'The risk cuts of the accept bands.',
   humanReview: 'humanReview probability at or over which an accepted result is flagged for a person.',
   secondOpinion: 'Second-opinion bar for a run with no routing decision (routing switched off, a forced agent): accepted changed code at or over it is reviewed first. A routed run follows its second-opinion decision instead.',
-  effortBands: 'Auto effort from the larger of complexity and risk: medium under effortBands.medium, high under effortBands.high, else xhigh.',
+  effortBands: 'Auto effort from the larger of complexity and risk: low under effortBands.low, medium under effortBands.medium, high under effortBands.high, else xhigh.',
+  readOnly: 'How sure the decider must be that a message only reads the project before its task runs on an agent locked against writing, beside any task changing its folder.',
 }
 
 /**
@@ -180,15 +183,41 @@ export function validateThresholds(t, id) {
   if (!(t.reject < accept.low)) fail('reject', `${t.reject} is not below accept.low ${accept.low}`)
   if (!(riskBands.low < riskBands.medium)) fail('riskBands', `low ${riskBands.low} is not below medium ${riskBands.medium}`)
   if (t.riskForReview > t.riskForFrontierReview) fail('riskForReview', `${t.riskForReview} is above riskForFrontierReview ${t.riskForFrontierReview}`)
+  if (effortBands.low > effortBands.medium) fail('effortBands', `low ${effortBands.low} is above medium ${effortBands.medium}`)
   if (!(effortBands.medium < effortBands.high)) fail('effortBands', `medium ${effortBands.medium} is not below high ${effortBands.high}`)
+  if (!(t.readOnly > 0.5)) fail('readOnly', `${t.readOnly} is not above 0.5: a coin toss is not sure`)
 }
 
-/** Every key of `defaults`, taken from `t` where it is set there, one level into the bands. */
+/**
+ * Every key of `defaults`, taken from `t` where it is set there, one level into the bands.
+ *
+ * One band came after a config could set the others: effortBands.low. A config written before it
+ * that set effortBands.medium under low's default meant medium from zero, and the schema has
+ * already filled low with its default by now, so a low at its default above medium is read as
+ * that older config and becomes 0, the ladder it always gave, rather than refusing a config that
+ * was valid when it was written. A low set to anything else above medium is still refused.
+ *
+ * The same upgrade raised medium's default from 0.25 to 0.375. A config written before it that set
+ * only effortBands.high, above 0.25 and at or under 0.375, relied on medium being 0.25; a low and a
+ * medium both at their new defaults, the medium not below high, are read as that config and medium
+ * becomes 0.25 again. A config that set low to anything but its default was written after the
+ * upgrade and is taken as it is; one that set it to its default cannot be told apart, since the
+ * schema has filled it by now. A high at or under 0.25 was refused then and still is.
+ */
+const MEDIUM_BEFORE_LOW = 0.25
+
 function fill(t, defaults) {
   const set = (o) => Object.fromEntries(Object.entries(o ?? {}).filter(([, v]) => v !== undefined && v !== null))
   const out = {}
   for (const [k, d] of Object.entries(defaults)) {
     out[k] = d && typeof d === 'object' ? { ...d, ...set(t?.[k]) } : t?.[k] ?? d
+  }
+  let e = out.effortBands
+  if (e && defaults.effortBands) {
+    // Only a config that could predate the upgrade: one that set low was written after it.
+    if (e.low === defaults.effortBands.low && e.medium === defaults.effortBands.medium && !(e.medium < e.high) && e.high > MEDIUM_BEFORE_LOW) e = { ...e, medium: MEDIUM_BEFORE_LOW }
+    if (e.low === defaults.effortBands.low && e.medium < e.low) e = { ...e, low: 0 }
+    out.effortBands = e
   }
   return out
 }

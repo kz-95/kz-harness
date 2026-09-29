@@ -11,6 +11,7 @@
 // outcome domain, and it is only called after the run). Second, candidates are anonymous: a
 // resource is RESOURCE_A with properties, never a provider name, so a classifier learns "strong
 // coding, scarce, metered" and not "Claude" or "GPT".
+import { isWorkAttempt } from './outcome.js'
 import { REQUIREMENT_DIMENSIONS } from './routing-policy.js'
 
 export const FEATURE_SCHEMA_VERSION = 1
@@ -238,7 +239,7 @@ export function poolFeatures(profile = {}, candidates = []) {
  * without calling Jev, which is the whole point of it maturing.
  */
 export function outcomeFeatures({ profile = {}, strategy, checks = {}, attempts = [], reviewed = false, touchedCode = false, diff = {} } = {}) {
-  const work = attempts.filter((a) => a.role === 'primary' || a.role === 'retry')
+  const work = attempts.filter(isWorkAttempt)
   const last = attempts.at(-1) ?? {}
   const p = profileFeatures(profile)
   const answer = String(last.answerText ?? last.answerExcerpt ?? '')

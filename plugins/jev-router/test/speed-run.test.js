@@ -17,7 +17,7 @@ const SCRIPT_URL = new URL('../../../scripts/speed-run.mjs', import.meta.url)
 const SCRIPT = fileURLToPath(SCRIPT_URL)
 const BAT = fileURLToPath(new URL('../../../Speed-Run.bat', import.meta.url))
 // import() takes a URL, never a path: a bare `C:\...` is read as the scheme `c:` and throws.
-const { EXIT, isKzhEngine, jevContextSize, machineCheck, main, parseArgs, portOwner, processList, profileContext, table } = await import(SCRIPT_URL.href)
+const { EXIT, isKzhEngine, jevContextSize, leftoverLaya, machineCheck, main, parseArgs, portOwner, processList, profileContext, table } = await import(SCRIPT_URL.href)
 
 const made = []
 process.on('exit', () => { for (const dir of made) rmSync(dir, { recursive: true, force: true }) })
@@ -139,10 +139,24 @@ test('machineCheck: KzH\'s engine or app, a llama-server or a Laya left behind e
   const check = (list, extra = {}) => machineCheck({ harness: '/h', data: '/d', answers: closed, processes: () => list, owner: () => null, laya: none, ...extra })
   const ENGINE = 'C:\\Program Files\\nodejs\\node.exe C:\\Users\\kz\\AppData\\Local\\npm-cache\\_npx\\1a2b\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js web'
   assert.deepEqual(await check([{ pid: 1, name: 'explorer.exe', cmd: 'C:\\Windows\\explorer.exe' }, { pid: 2, name: 'node.exe', cmd: 'node C:\\x\\server.js' }]), { why: null, notes: [] })
-  assert.match((await check([{ pid: 7, name: 'node.exe', cmd: ENGINE }])).why, /^KzH is running \(its engine, node\.exe\)\. Close KzH and run this again/)
-  assert.match((await check([{ pid: 8, name: 'Kz-harness.exe', cmd: null }])).why, /^KzH is running \(Kz-harness\.exe\)\./)
-  assert.match((await check([{ pid: 9, name: 'llama-server.exe', cmd: null }])).why, /^A llama-server is running with KzH closed \(llama-server\.exe, pid 9\)/)
-  assert.match((await check([], { laya: async () => ({ pid: 4242 }) })).why, /^A Laya an earlier KzH left running \(pid 4242\) holds memory the readings would lose\. Start KzH and close it again, which stops it, or end pid 4242 in Task Manager/)
+  // An engine in a Start-KzH window, or one a closed app left behind: it has no tray icon to quit from.
+  assert.equal((await check([{ pid: 7, name: 'node.exe', cmd: ENGINE }])).why, 'KzH is running (its engine, node.exe, pid 7) with no Kz-harness app above it. To stop it, close the Start-KzH window it runs in, or, if no such window is open, end it in Task Manager (Details, right-click pid 7, End process tree), and run this again: the speed run and KzH would load models over each other on one GPU, and both write local.json.')
+  // Start-KzH.ps1's npx start: npx's own node, then cmd, then the engine. The engine is named, not the wrapper
+  // whose end would leave it running: by the port it listens on, or, before it listens, by not being npx.
+  const NPX = [
+    { pid: 21, name: 'node.exe', cmd: '"C:\\Program Files\\nodejs\\node.exe" "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js" -y @deepseek-ai/dsh@0.1.5-rc.2 web --no-open' },
+    { pid: 22, name: 'cmd.exe', cmd: 'C:\\WINDOWS\\system32\\cmd.exe /d /s /c "dsh web --no-open"' },
+    { pid: 23, name: 'node.exe', cmd: 'node "C:\\Users\\kz\\AppData\\Local\\npm-cache\\_npx\\abc\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js" web --no-open' },
+  ]
+  assert.ok(isKzhEngine(NPX[0].cmd) && isKzhEngine(NPX[2].cmd), 'both nodes read as the engine')
+  assert.match((await check(NPX, { answers: async () => true, owner: () => 23 })).why, /^KzH is running \(its engine, node\.exe, pid 23\)/)
+  assert.match((await check(NPX)).why, /^KzH is running \(its engine, node\.exe, pid 23\)/)
+  // The app, whose window's X leaves it in the tray, is named, with or without its engine in the list.
+  const APP = 'KzH is running (Kz-harness.exe). Quit it (right-click its tray icon and choose Quit; closing its window leaves it running) and run this again: the speed run and KzH would load models over each other on one GPU, and both write local.json.'
+  assert.equal((await check([{ pid: 8, name: 'Kz-harness.exe', cmd: null }])).why, APP)
+  assert.equal((await check([{ pid: 7, name: 'node.exe', cmd: ENGINE }, { pid: 8, name: 'Kz-harness.exe', cmd: null }])).why, APP)
+  assert.match((await check([{ pid: 9, name: 'llama-server.exe', cmd: null }])).why, /^A llama-server is running with KzH not running \(llama-server\.exe, pid 9\)/)
+  assert.match((await check([], { laya: async () => ({ pid: 4242 }) })).why, /^A Laya an earlier KzH left running \(pid 4242\) holds memory the readings would lose\. Start KzH and quit it again \(right-click its tray icon and choose Quit\), which stops it, or end pid 4242 in Task Manager/)
   // Something on KzH's port, looked up by the pid that listens there.
   const listening = createServer().listen(0, '127.0.0.1')
   await new Promise((r) => listening.once('listening', r))
@@ -152,7 +166,17 @@ test('machineCheck: KzH\'s engine or app, a llama-server or a Laya left behind e
     assert.deepEqual(await on([{ pid: 55, name: 'node.exe', cmd: 'node C:\\LibreChat\\api\\server\\index.js' }], 55), { why: null, notes: [`Another program answers on 127.0.0.1:${port} (node.exe, pid 55); it is not KzH's engine, so the speed run goes ahead.`] })
     // KzH's engine run as administrator: its command line reads empty, so it cannot be told from KzH.
     assert.match((await on([{ pid: 56, name: 'node.exe', cmd: '' }], 56)).why, new RegExp(`^KzH, or another program, answers on 127\\.0\\.0\\.1:${port} \\(node\\.exe, pid 56, whose command line cannot be read \\(it may run as administrator\\)\\), so nobody can tell whether KzH is running\\.`))
-    assert.match((await on([{ pid: 57, name: 'node.exe', cmd: null }], 57)).why, /whose command line cannot be read/, 'names alone cannot tell the engine')
+    assert.match((await on([{ pid: 57, name: 'node.exe', cmd: null }], 57)).why, /\(node\.exe, pid 57, whose command line could not be listed\)/, 'names alone (tasklist) cannot tell the engine')
+    // An engine that cannot be told from KzH's is settled before anything is called left behind: its own
+    // llama-server is not a leftover of a KzH that is not running.
+    const LLAMA = { pid: 60, name: 'llama-server.exe', cmd: '' }
+    for (const cmd of ['', null]) assert.match((await on([{ pid: 56, name: 'node.exe', cmd }, { ...LLAMA, cmd }], 56)).why, /^KzH, or another program, answers on /)
+    assert.match((await check([{ pid: 56, name: 'node.exe', cmd: '' }, LLAMA], { laya: async () => ({ pid: 4242 }), port, answers: undefined, owner: () => 56 })).why, /^KzH, or another program, answers on /, 'nor its Laya')
+    // Another program there, told apart: the leftover llama-server stops the run, and the note still says who is on the port.
+    assert.deepEqual(await on([{ pid: 55, name: 'node.exe', cmd: 'node C:\\LibreChat\\api\\server\\index.js' }, LLAMA], 55), {
+      why: 'A llama-server is running with KzH not running (llama-server.exe, pid 60), holding memory the readings would lose. End it in Task Manager, or restart the PC, and run this again.',
+      notes: [`Another program answers on 127.0.0.1:${port} (node.exe, pid 55); it is not KzH's engine, so the speed run goes ahead.`],
+    })
     assert.match((await on([], 58)).why, /\(pid 58, which cannot be looked up\)/)
     assert.match((await on(null, null)).why, /\(a program that cannot be found\)/)
   } finally { listening.close() }
@@ -160,6 +184,38 @@ test('machineCheck: KzH\'s engine or app, a llama-server or a Laya left behind e
   assert.ok(isKzhEngine('node /home/kz/.npm/_npx/1/node_modules/@deepseek-ai/dsh/lib/bin.js web --no-open'))
   assert.ok(!isKzhEngine('node /home/kz/.npm/_npx/1/node_modules/@deepseek-ai/dsh/lib/bin.js --version'))
   assert.ok(!isKzhEngine(null))
+})
+
+test('a Laya an earlier KzH left: found from every record sidecar.json keeps, and one that cannot be read is named as maybe still running', async (t) => {
+  const harness = mkdtempSync(join(tmpdir(), 'speed-laya-'))
+  t.after(() => rmSync(harness, { recursive: true, force: true }))
+  const data = join(harness, 'data')
+  const { layaPaths } = await import('../laya-install.js')
+  const record = layaPaths({ harnessDir: harness, dataDir: data }).sidecarJson
+  mkdirSync(join(record, '..'), { recursive: true })
+  // A record a sweep kept (`earlier`): an elevated Laya, alive, whose path and command line read empty.
+  writeFileSync(record, JSON.stringify({ earlier: [{ pid: 601, interpreterPid: 602, kind: 'main' }] }))
+  const seams = (names) => ({ isAlive: (pid) => pid in names, processInfo: async () => ({ exe: '', cmdline: '' }), processName: async (pid) => names[pid] })
+  assert.deepEqual(await leftoverLaya({ harness, data, seams: seams({ 601: 'python.exe', 602: 'python.exe' }) }), { pid: 601, unchecked: true })
+  assert.equal(await leftoverLaya({ harness, data, seams: seams({ 601: 'svchost.exe' }) }), null, 'a pid another program took over is not Laya')
+  assert.equal(await leftoverLaya({ harness, data, seams: seams({}) }), null, 'ended')
+  // One it can read is confirmed, and wins over one it cannot.
+  writeFileSync(record, JSON.stringify({ pid: 601, check: { pid: 701 } }))
+  const both = { isAlive: () => true, processInfo: async (pid) => (pid === 701 ? { exe: 'python', cmdline: 'python -m laya.serve' } : { exe: '', cmdline: '' }), processName: async () => 'python.exe' }
+  assert.deepEqual(await leftoverLaya({ harness, data, seams: both }), { pid: 701 })
+  // An installer still at work holds install.lock (the Laya command line): its check is its own, not a leftover.
+  const lock = layaPaths({ harnessDir: harness, dataDir: data }).lock
+  mkdirSync(join(lock, '..'), { recursive: true })
+  writeFileSync(lock, '5151')
+  const holder = (name) => ({ isAlive: () => true, processInfo: async () => ({ exe: 'python', cmdline: 'python -m laya.serve' }), processName: async (pid) => (pid === 5151 ? name : 'python.exe') })
+  assert.deepEqual(await leftoverLaya({ harness, data, seams: holder('node.exe') }), { installing: 5151 })
+  assert.deepEqual(await leftoverLaya({ harness, data, seams: holder('svchost.exe') }), { pid: 601 }, 'a lock whose pid another program took holds nothing')
+  rmSync(lock)
+  // What the speed run says of each.
+  const check = (laya) => machineCheck({ harness, data, answers: async () => false, processes: () => [], owner: () => null, laya })
+  assert.equal((await check(async () => ({ installing: 5151 }))).why, 'A Laya install is running (pid 5151: the Laya command line, or Install-Harness.ps1 -Laya). It loads Laya to check what it installed, which would hold memory the readings would lose. Let it finish, then run this again.')
+  assert.equal((await check(async () => ({ pid: 601, unchecked: true }))).why, 'A Laya an earlier KzH left may still be running (pid 601); it could not be checked from here (it may run as administrator), and it would hold memory the readings would lose. End it in Task Manager (Details, right-click pid 601, End process tree; run Task Manager as administrator if it says access is denied), or restart the PC, and run this again.')
+  assert.match((await check(async () => ({ pid: 701 }))).why, /^A Laya an earlier KzH left running \(pid 701\) holds memory/)
 })
 
 test('processList reads CIM\'s pids and command lines on Windows, tasklist\'s when PowerShell fails, and ps elsewhere; portOwner reads netstat and ss', () => {

@@ -80,3 +80,16 @@ test('no rows at all', () => {
   assert.equal(r.minSamples, MIN_CALIBRATION_SAMPLES)
   assert.equal(r.buckets.every((b) => b.successRate === null && b.meanConfidence === null), true)
 })
+
+test('calibration counts a completed answer as the pick carrying the run, and leaves out a read pass handed to the line', () => {
+  const r = calibration([...many(5, 0.85, { finalStatus: 'answered' }), ...many(5, 0.85, { finalStatus: 'needs_write' })], { minSamples: 1 })
+  const b = bucket(r, '0.8-0.9')
+  assert.equal(r.scored, 5, 'the handed-back read passes are not scored')
+  assert.equal(b.successRate, 1, 'and an answer by the pick is the pick working')
+})
+
+test('calibration leaves out a run a person stopped, as it says nothing about the pick', () => {
+  const r = calibration([...many(5, 0.85, { finalStatus: 'accepted' }), ...many(5, 0.85, { finalStatus: 'stopped' })], { minSamples: 1 })
+  assert.equal(r.scored, 5)
+  assert.equal(bucket(r, '0.8-0.9').successRate, 1)
+})

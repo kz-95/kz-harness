@@ -1366,3 +1366,8 @@ test('benchmark rows of a model known only by a name stop counting 45 days after
   fresh.recordMany(benchEvidence(claude, 'bench-d', () => 'passed', { model: 'opus', ts: daysAgo(UNPINNED_WINDOW_DAYS - 1) }))
   assert.equal(fresh.explain(opus, 'coding').items.length, 12)
 })
+
+test('a read pass handed to its folder\'s line is no evidence about the agent', () => {
+  assert.deepEqual(evidenceFromRun(run({ finalStatus: 'needs_write' }), { modelOf, agents, priors }), [])
+  assert.ok(evidenceFromRun(run({ finalStatus: 'answered' }), { modelOf, agents, priors }).length > 0, 'an answer still is')
+})

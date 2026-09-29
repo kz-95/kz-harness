@@ -11,10 +11,10 @@ import 'data:text/javascript,import{mkdtempSync}from"node:fs";import{tmpdir}from
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn as nodeSpawn } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { TypeSafeClient } from '@typesafe-ai/sdk'
@@ -52,11 +52,16 @@ const TEXT = {
 // The network as this file allows it: this PC, Laya's connectivity probe, and Jev's own probe while
 // `online`. Anything else is refused, and every request is kept, so a test can say where nothing went.
 const realFetch = globalThis.fetch
-const net = { seen: [], online: true }
+const net = { seen: [], online: true, deepseekBalance: null }
 globalThis.fetch = (input, init) => {
   const url = String(input?.url ?? input)
   net.seen.push(url)
   if (url.startsWith('http://127.0.0.1:')) return realFetch(input, init)
+  // DeepSeek's balance, per key value, when a test says what it is.
+  if (url === 'https://api.deepseek.com/user/balance' && net.deepseekBalance) {
+    const amount = net.deepseekBalance(String(init?.headers?.authorization ?? '').replace(/^Bearer /, ''))
+    return Promise.resolve(new Response(JSON.stringify({ is_available: true, balance_infos: [{ currency: 'USD', total_balance: String(amount) }] })))
+  }
   if (url === CONNECTIVITY || url.startsWith('https://api.typesafe.ai')) return net.online ? Promise.resolve(new Response('')) : Promise.reject(new TypeError('fetch failed'))
   return Promise.reject(new TypeError(`fetch failed: ${url} is not reachable from this test`))
 }
@@ -187,7 +192,7 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
   const workspace = repo()
   cleanUp(t, workspace)
   const children = []
-  const world = { said: {}, fakes: [], spawned: [], children, loadMs: 0, failStart: false, work: null, reply: null, delivered: [], chat: [], emitted: [] }
+  const world = { said: {}, fakes: [], spawned: [], children, loadMs: 0, failStart: false, work: null, reply: null, outcome: null, beforeDispose: null, delivered: [], chat: [], emitted: [], disposed: [], providers: {}, readTools: ['read', 'glob', 'grep'], toolMode: 'native', childSees: null }
 
   const spawn = (cmd, args, opts) => {
     world.spawned.push({ cmd, args, env: opts.env })
@@ -210,16 +215,32 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
 
   const ran = []
   const subagents = {
+    // The providers as the engine names them: spawn takes a per-start tool filter, and any other
+    // (the plan-mode Claude Code row) is what a test puts in `world.providers`.
+    getProvider: (name) => world.providers[name] ?? (name === 'spawn' ? { capabilities: { toolFilter: true } } : undefined),
     async start(provider, opts) {
-      const n = ran.push({ provider, label: opts.label, prompt: opts.prompt?.[0]?.text ?? '' })
+      const allow = opts.toolFilter?.allow ?? null
+      const entry = { provider, label: opts.label, prompt: opts.prompt?.[0]?.text ?? '', toolFilter: opts.toolFilter ?? null }
+      const n = ran.push(entry)
+      // An engine may await before its provider reads the environment: the Claude effort a start
+      // really got is read after that.
+      await world.beforeStart?.(n)
+      entry.effortEnv = process.env.CLAUDE_CODE_EFFORT_LEVEL ?? null
       const result = (async () => {
         await world.work?.(opts, n)
         // A stopped agent's run rejects, as the engine's subagents do.
         opts.signal?.throwIfAborted()
-        writeFileSync(join(workspace, 'state.txt'), 'fixed')
+        // What an agent came to on its own, when a test says so.
+        const own = world.outcome?.(n)
+        if (own) return own
+        // Started with only the read tools, or on a row in plan mode, it has nothing to write with.
+        if (!allow && world.providers[provider]?.config?.permissionMode !== 'plan') writeFileSync(join(workspace, 'state.txt'), 'fixed')
         return { stopReason: 'completed', output: [{ type: 'text', text: world.reply?.(n) ?? `Fixed it (attempt ${n}).` }], usage: {} }
       })()
-      return { result, dispose: async () => {} }
+      // A child stopped before anyone reads its result must not fail the file as unhandled.
+      result.catch(() => {})
+      // Ending a child's process can take a while (`world.beforeDispose`).
+      return { result, localAgent: { id: `child-${n}`, allow }, dispose: async () => { await world.beforeDispose?.(n); world.disposed.push(n) } }
     },
   }
   let jobCount = 0
@@ -234,6 +255,7 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
   const effects = []
   const effect = (f) => { const d = f(); if (typeof d === 'function') effects.push(d) }
   const commands = new Map()
+  const tools = new Map()
   const routes = []
   let adapter = null
   const llm = {
@@ -263,7 +285,14 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
     effect, subagents,
     get: (name) => (name === 'jobs' && jobs ? jobService : null),
     commands: { register: (cmd) => { commands.set(cmd.name, cmd) } },
-    tools: { register: () => {} },
+    // The registry as a scope sees it: the read tools mounted (`world.readTools`), presented natively
+    // (`world.toolMode`), and a child seeing its allow list, or what `world.childSees` says it sees.
+    tools: {
+      register: (tool) => { tools.set(tool.name, tool) },
+      get: (name) => tools.get(name) ?? (world.readTools.includes(name) ? { name } : undefined),
+      modeFor: () => world.toolMode,
+      schemas: (scope) => (scope?.allow ? (world.childSees?.(scope.allow) ?? scope.allow) : [...tools.keys()]).map((name) => ({ name })),
+    },
     inject: (_deps, fn) => fn(runtime),
   }
   const { timing, ...seams } = supervisor
@@ -300,10 +329,10 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
 
   const messages = []
   /** One message typed into the row `model` (Laya Auto by default), as the engine streams it through the adapter. */
-  async function say(text, { model = 'laya-auto', purpose, signal } = {}) {
+  async function say(text, { model = 'laya-auto', purpose, signal, effort } = {}) {
     if (!purpose) messages.push({ role: 'user', content: [{ type: 'text', text }] })
     const out = { text: '', reasoning: '' }
-    const options = purpose ? { model, purpose, messages: [{ role: 'user', content: [{ type: 'text', text }] }], sessionId: SESSION } : { model, messages: [...messages], sessionId: SESSION, signal }
+    const options = purpose ? { model, purpose, messages: [{ role: 'user', content: [{ type: 'text', text }] }], sessionId: SESSION } : { model, messages: [...messages], sessionId: SESSION, signal, ...(effort ? { reasoningEffort: effort } : {}) }
     for await (const e of adapter.stream(options)) {
       if (e.type === 'text-delta') out.text += e.text
       if (e.type === 'reasoning-delta') out.reasoning += e.text
@@ -330,7 +359,7 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
 
   const read = (name) => (existsSync(join(dataDir, name)) ? readFileSync(join(dataDir, name), 'utf8') : '')
   const rows = (name) => read(name).split('\n').filter(Boolean).map((l) => JSON.parse(l))
-  return { dataDir, harnessDir, workspace, world, ran, commands, agent, say, http, slash, read, rows, close, adapter: () => adapter }
+  return { dataDir, harnessDir, workspace, world, ran, commands, tools, agent, say, http, slash, read, rows, close, adapter: () => adapter }
 }
 
 /** Every file under `dir`, with its size and time, so a test can wait until nothing more is written. */
@@ -710,6 +739,636 @@ test('a Laya that cannot start refuses the run with its reason, through /laya, a
   assert.equal(q.ran.length, 1, 'the refused task ran no agent')
 })
 
+// ---------------------------------------------------------------- the waiting line
+
+test('a task waiting behind another in its workspace says why and, from past runs, about how long, through the task list', async (t) => {
+  // Five finished runs per agent, with their wall-clock time, as router.js now writes them; and one
+  // older row with none, which says nothing about how long work takes.
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-wait-data-'))
+  made.push(dataDir)
+  const past = AGENTS.flatMap((a) => [3, 4, 5, 6, 7].map((m) => ({ ts: new Date().toISOString(), workspace: 'C:\\elsewhere', routing: { primaryAgent: a.id }, finalStatus: 'accepted', attempts: [{ agent: a.id, role: 'primary' }], wallMs: m * 60_000 })))
+  writeFileSync(join(dataDir, 'history.jsonl'), `${[...past, { routing: { primaryAgent: 'deepseek' }, finalStatus: 'accepted' }].map((r) => JSON.stringify(r)).join('\n')}\n`)
+  const q = await plugin(t, { jobs: true, dataDir })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  const one = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  assert.match(one.text, /^Queued → Jev picks as \*\*jev-1\*\*/, one.text)
+  await waitFor('the first task is running', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  const two = await q.say('Now fix the failing lint in the parser', { model: 'jev-auto' })
+  assert.match(two.text, /^Queued → Jev picks as \*\*jev-2\*\* \(2nd in line for [^:]+: another task is running there\)/, two.text)
+  const waiting = await until('the second task says how long', async () => (await q.http('GET', '/jev-router/tasks')).body.tasks.find((x) => x.jobId === 'jev-2')?.waiting, (w) => w?.estimate).catch(() => null)
+  assert.ok(waiting, 'the second task says what it waits for and how long')
+  assert.equal(waiting.why, 'workspace')
+  assert.equal(waiting.reason, 'Waiting: another task is running in this workspace')
+  assert.deepEqual([waiting.ahead, waiting.placeText, waiting.slotsAhead], [0, '2nd in line', 0])
+  // The running task's own runs have no effort on record here, so the figure is drawn from its agent's.
+  assert.match(waiting.estimate.text, /^Starts in about \d+ to \d+ min, estimated from 5 past runs of (deepseek|kimi)\.$/, waiting.estimate.text)
+  assert.equal(waiting.text, `Waiting: another task is running in this workspace. ${waiting.estimate.text}`)
+  assert.ok(waiting.estimate.lowMs > 0 && waiting.estimate.lowMs < waiting.estimate.highMs)
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  // The runs that just ended wrote their wall-clock time for the next estimate.
+  const rows = q.rows('history.jsonl').slice(past.length + 1)
+  assert.equal(rows.length, 2)
+  for (const r of rows) assert.ok(Number.isFinite(r.wallMs) && Date.parse(r.startedAt) <= Date.parse(r.ts), JSON.stringify(r).slice(0, 200))
+})
+
+test('a foreground /auto beside a background task in its workspace waits its turn, and a routed agent still cannot route its own task', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  let nested = null
+  q.world.work = async (opts, n) => {
+    if (n !== 1) return
+    // The agent the router started calls jev_route on its own task, as a child of the chat.
+    const child = { id: 'child-1', session: { id: 'child-1', header: { cwd: q.workspace, parentSession: SESSION, origin: 'subagent' } } }
+    nested = await q.tools.get('jev_route').execute({ task: 'do it for me' }, { agent: child, signal: opts.signal }).then((r) => ({ ran: r }), (e) => ({ refused: e.message }))
+    await blocked
+  }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first task is running', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  await waitFor('the nested call was answered', () => nested, Boolean, { timeoutMs: 10_000 })
+  assert.deepEqual(nested, { refused: 'a routed agent must do its task directly, not call jev_route: it would wait for its own run to end' })
+  let settled = false
+  const fg = q.slash('auto', 'Fix the failing lint in the parser').finally(() => { settled = true })
+  await tick(300)
+  assert.equal(settled, false, 'it waits for the task that holds the folder, rather than refusing')
+  assert.equal(q.ran.length, 1, 'and starts no agent beside it')
+  release()
+  const r = await fg
+  assert.equal(r.kind, 'success', JSON.stringify(r).slice(0, 300))
+  assert.match(r.text, /Final status: ACCEPTED/)
+  assert.equal(q.ran.length, 2, 'it ran once the folder was free')
+})
+
+
+test('a task queued behind a run from the chat says a run from the chat holds its folder, in the chat and in the task list', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  const fg = q.slash('auto', 'Fix the failing lint in the parser')
+  await waitFor('the run from the chat is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  const queued = await q.say('Now fix the failing test in the parser', { model: 'jev-auto' })
+  assert.match(queued.text, /\(2nd in line for [^:]+: a run started from the chat is using it\)/, queued.text)
+  const row = (await q.http('GET', '/jev-router/tasks')).body.tasks.find((x) => x.jobId === 'jev-1')
+  assert.equal(row?.waiting?.text, 'Waiting: a run started from the chat is using this workspace.')
+  release()
+  await fg
+  await waitFor('the task ran once the folder was free', () => q.ran.length, (n) => n === 2, { timeoutMs: 30_000 })
+})
+
+test('Remove through the task list stops a task only while it waits: one that started as the person confirmed runs on', async (t) => {
+  // The task list's Remove posts onlyIfWaiting, because its dialog said nothing had started yet.
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  const row = async (jobId) => (await q.http('GET', '/jev-router/tasks')).body.tasks.find((x) => x.jobId === jobId)
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await until('the first task is running', () => row('jev-1'), (r) => r?.state === 'running', { timeoutMs: 20_000 })
+  await q.say('Now fix the failing lint in the parser', { model: 'jev-auto' })
+  assert.equal((await row('jev-2')).state, 'queued')
+  const running = await q.http('POST', '/jev-router/tasks/stop', { jobId: 'jev-1', onlyIfWaiting: true })
+  assert.deepEqual([running.status, running.body], [200, { result: 'started' }])
+  const waiting = await q.http('POST', '/jev-router/tasks/stop', { jobId: 'jev-2', onlyIfWaiting: true })
+  assert.deepEqual([waiting.status, waiting.body], [200, { result: 'requested' }])
+  await until('the waiting task is stopped', () => row('jev-2'), (r) => r?.state === 'stopped')
+  release()
+  // The agent reads its signal only as it returns, so a run stopped by Remove would end stopped here.
+  const first = await until('the first task finished', () => row('jev-1'), (r) => r?.finishedAt, { timeoutMs: 30_000 })
+  assert.equal(first.state, 'completed', 'the task that had started ran on to its end')
+  assert.equal(q.ran.length, 1, 'the removed task never started an agent')
+})
+
+// ---------------------------------------------------------------- read-only work
+
+/** Jev reads the next messages as only reading at `p`, routed as `capability`, until the test ends. */
+function jevReads(t, { p = 0.93, capability = 'project_read' } = {}) {
+  jev.said.readOnly = p
+  jev.said.capability = capability
+  t.after(() => { delete jev.said.readOnly; delete jev.said.capability })
+}
+const taskRow = async (q, jobId) => (await q.http('GET', '/jev-router/tasks')).body.tasks.find((x) => x.jobId === jobId)
+const folderOf = (q) => q.workspace.split(/[\\/]/).filter(Boolean).at(-1)
+/**
+ * A Claude Code command-line tool of this test's own, first on the PATH until the test ends:
+ * `claude auth status --json` says it is signed in. Claude's settings and usage are read from a
+ * home of the test's own, so the person's own login and weekly usage never decide who runs, and
+ * the effort a Claude start sets in the environment goes with the test.
+ */
+function claudeSignedIn(t, { loggedIn = true } = {}) {
+  const home = mkdtempSync(join(tmpdir(), 'kz-laya-claude-'))
+  cleanUp(t, home)
+  writeFileSync(join(home, 'claude'), `#!/bin/sh\necho '{"loggedIn":${loggedIn},"authMethod":"claude.ai"}'\n`)
+  chmodSync(join(home, 'claude'), 0o755)
+  writeFileSync(join(home, 'claude.cmd'), `@echo {"loggedIn":${loggedIn},"authMethod":"claude.ai"}\r\n`)
+  const saved = Object.fromEntries(['PATH', 'HOME', 'USERPROFILE', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_EFFORT_LEVEL'].map((k) => [k, process.env[k]]))
+  Object.assign(process.env, { PATH: `${home}${delimiter}${process.env.PATH}`, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, '.claude') })
+  t.after(() => { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v } })
+}
+
+test('a task Jev reads as only reading runs locked beside the task writing in its workspace, and the writer keeps its own diff', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the writer is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  jevReads(t)
+  const said = await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  assert.match(said.text, new RegExp(`^Queued → Jev picks as \\*\\*jev-2\\*\\* \\(starting now in ${folderOf(q)}\\)\\..* Read only: Jev judged it only reads the project \\(93%, its bar is 80%\\), so it runs on an agent locked against writing, beside any task changing ${folderOf(q)}\\.$`), said.text)
+  await waitFor('the reader\'s result is posted while the writer still works', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal(q.ran.length, 2)
+  assert.deepEqual(q.ran[1].toolFilter, { allow: ['read', 'glob', 'grep'] }, 'the reader was started with the read tools only')
+  assert.equal(q.ran[0].toolFilter?.allow, undefined, 'the writer was not')
+  assert.match(q.ran[1].prompt, /This run is locked to reading/)
+  assert.equal((await taskRow(q, 'jev-1')).state, 'running', 'the writer is still at work')
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const rows = q.rows('history.jsonl')
+  const reader = rows.find((r) => r.access?.mode === 'read')
+  const writer = rows.find((r) => r !== reader)
+  assert.ok(reader && writer, JSON.stringify(rows.map((r) => r.access ?? null)))
+  assert.equal(reader.finalStatus, 'answered')
+  assert.deepEqual(reader.attempts.map((a) => [a.changedFiles, a.locked]), [[[], true]])
+  assert.deepEqual(reader.access.lockCheck, { measured: false, reason: 'another run was going on in this repository at the same time' })
+  assert.deepEqual(writer.attempts[0].changedFiles, ['state.txt'], 'the writer\'s diff is its own')
+  const readerRow = await taskRow(q, 'jev-2')
+  assert.deepEqual([readerRow.access, readerRow.readVerdict?.p, readerRow.readVerdict?.bar], ['read', 0.93, 0.8])
+})
+
+test('a task Jev reads as only reading that Claude takes starts on its plan-mode row, and the writer beside it on the ordinary one', async (t) => {
+  claudeSignedIn(t)
+  // Claude alone, so both tasks are its and only the row each starts on tells them apart.
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: true }
+  const q = await plugin(t, { jobs: true, config: { agents: [claude] } })
+  q.world.providers['claude-code-readonly'] = { config: { permissionMode: 'plan' } }
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the writer is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the reader\'s result is posted while the writer still works', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.deepEqual(q.ran.map((r) => [r.provider, r.toolFilter]), [['claude-code', null], ['claude-code-readonly', null]], 'the writer on Claude Code, the reader on its plan-mode row')
+  assert.equal(readFileSync(join(q.workspace, 'state.txt'), 'utf8'), 'broken', 'the reader changed nothing beside the writer')
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const reader = q.rows('history.jsonl').find((r) => r.access?.mode === 'read')
+  assert.deepEqual(reader?.access.lock, { claude: 'Claude Code plan mode' })
+})
+
+test('two Claude starts at once, a writer and a read pass beside it, each start at their own effort', async (t) => {
+  claudeSignedIn(t)
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: true }
+  const q = await plugin(t, { jobs: true, config: { agents: [claude] } })
+  q.world.providers['claude-code-readonly'] = { config: { permissionMode: 'plan' } }
+  // The writer's start is held until the reader's start begins, or 3 s at most: had the effort
+  // variable been set by the reader meanwhile, the writer would read the reader's.
+  let readerStarting
+  const reader = new Promise((r) => { readerStarting = r })
+  q.world.beforeStart = async (n) => { if (n === 2) readerStarting(); if (n === 1) await Promise.race([reader, new Promise((r) => setTimeout(r, 3000))]) }
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto', effort: 'high' })
+  await waitFor('the writer is starting', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto', effort: 'low' })
+  await waitFor('the reader\'s result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  assert.deepEqual(q.ran.map((r) => [r.provider, r.effortEnv]), [['claude-code', 'high'], ['claude-code-readonly', 'low']])
+})
+
+test('a read task whose routing says it changes files waits for the writer, then runs once as a writer at the effort it was queued with', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the writer is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  jevReads(t, { capability: 'project_change' })
+  await q.say('Look at the parser and tidy it', { model: 'jev-auto', effort: 'low' })
+  const back = await until('the read task is back in its folder\'s line', () => taskRow(q, 'jev-2'), (r) => r?.state === 'queued' && r.access === 'write' && !!r.accessWhy).catch(() => null)
+  assert.ok(back, 'the read pass handed the task back to its folder\'s line')
+  assert.match(back.accessWhy, /^Jev's routing named project_change \(\d+%\), which may change files$/)
+  assert.equal(back.waiting?.why, 'workspace')
+  assert.equal(back.effort, 'low')
+  assert.equal(q.ran.length, 1, 'no agent ran for the read pass')
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  assert.equal(q.ran.length, 2, 'it ran once, as a writer')
+  assert.equal(q.ran[1].toolFilter?.allow, undefined)
+  const row = q.rows('history.jsonl').find((r) => r.access?.from === 'read')
+  assert.ok(row, 'the writer pass says it came from a read pass')
+  assert.equal(row.access.mode, 'write')
+  assert.match(row.access.why, /which may change files$/)
+  assert.equal(q.rows('history.jsonl').length, 2, 'a read pass that ran no agent writes no row')
+  assert.equal(row.attempts[0].effort, 'low', 'at the effort it was queued with')
+})
+
+test('a locked child that can still see a tool outside its allow list is stopped before it works, and its task goes to the folder\'s line', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  q.world.childSees = (allow) => [...allow, 'write']
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal(q.ran.length, 2, 'the locked start, then the writer pass')
+  assert.deepEqual(q.ran[0].toolFilter, { allow: ['read', 'glob', 'grep'] })
+  assert.ok(q.world.disposed.includes(1), 'the locked child was stopped')
+  assert.equal(q.ran[1].toolFilter?.allow, undefined)
+  const [readPass, writer] = q.rows('history.jsonl')
+  assert.equal(readPass.finalStatus, 'needs_write')
+  assert.match(readPass.statusReason, /^deepseek could not be started locked: its child could still see write$/)
+  assert.equal(readPass.attempts[0].notStarted, true)
+  assert.equal(writer.access.from, 'read')
+  assert.equal(writer.finalStatus.startsWith('accepted'), true, writer.finalStatus)
+})
+
+test('a locked child whose view cannot be read is stopped before it works, and its task goes to the folder\'s line', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  q.world.childSees = () => { throw new Error('the registry is gone') }
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal(q.ran.length, 2, 'the locked start, then the writer pass')
+  assert.deepEqual(q.ran[0].toolFilter, { allow: ['read', 'glob', 'grep'] })
+  assert.ok(q.world.disposed.includes(1), 'the locked child was stopped')
+  const [readPass, writer] = q.rows('history.jsonl')
+  assert.equal(readPass.finalStatus, 'needs_write')
+  assert.match(readPass.statusReason, /^deepseek could not be started locked: what its child can see could not be read$/)
+  assert.equal(readPass.attempts[0].notStarted, true)
+  assert.equal(writer.access.from, 'read')
+})
+
+test('a lock that stops holding after routing is read again as the agent starts, and that start is refused', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  jevReads(t)
+  // The routing found deepseek lockable; by its last call (the strategy) the spawn provider takes no
+  // tool filter any more, so only the check at the start itself can see it.
+  jev.said.strategy = () => { q.world.providers.spawn = { capabilities: { toolFilter: false } }; return undefined }
+  t.after(() => { delete jev.said.strategy })
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal(q.ran.length, 1, 'nothing started locked, only the writer pass')
+  assert.equal(q.ran[0].toolFilter?.allow, undefined)
+  const [readPass, writer] = q.rows('history.jsonl')
+  assert.equal(readPass.finalStatus, 'needs_write')
+  assert.match(readPass.statusReason, /^deepseek could not be started locked: its provider takes no per-start tool filter$/)
+  assert.deepEqual(readPass.attempts.map((a) => [!!a.locked, !!a.notStarted]), [[false, true]], 'it was never started')
+  assert.equal(writer.access.from, 'read')
+})
+
+test('with no agent that can be locked, a task read as only reading is queued for its folder\'s line and the chat says why', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  q.world.providers.spawn = { capabilities: { toolFilter: false } }
+  jevReads(t)
+  const said = await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  assert.match(said.text, new RegExp(`Read only: Jev judged it only reads the project \\(93%, its bar is 80%\\), but no agent here can be locked against writing \\(deepseek: its provider takes no per-start tool filter; kimi: its provider takes no per-start tool filter\\), so it runs as work that writes, and a task changing ${folderOf(q)} waits for it\\.$`), said.text)
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  const row = await taskRow(q, 'jev-1')
+  assert.deepEqual([row.access, row.readVerdict?.reads], ['write', true])
+  assert.equal(q.ran[0].toolFilter?.allow, undefined, 'it ran as work that writes')
+  const [record] = q.rows('history.jsonl')
+  assert.deepEqual(record.access, { mode: 'write', verdict: { p: 0.93, bar: 0.8, by: 'jev', reads: true }, why: 'no agent here can be locked against writing (deepseek: its provider takes no per-start tool filter; kimi: its provider takes no per-start tool filter)' })
+})
+
+test('a parallel opinion whose own result is in is not taken to be stopped by a primary that breaks off while its process is ended', async (t) => {
+  // Two agents of one tier, so the two answer side by side.
+  const q = await plugin(t, { jobs: true, config: { agents: [AGENTS[0], { ...AGENTS[0], id: 'deepseek-b', name: 'DeepSeek B' }] } })
+  jevReads(t)
+  jev.said.strategy = 'PARALLEL_SECOND_OPINION'
+  t.after(() => { delete jev.said.strategy })
+  // The primary's agent fails outright while the opinion, which failed on its own, is being ended.
+  q.world.work = async (_opts, n) => { if (n === 1) { await new Promise((r) => setTimeout(r, 150)); throw new Error('its process exited with code 1') } }
+  q.world.outcome = (n) => (n === 2 ? { stopReason: 'error', diagnostic: 'HTTP 500 from the provider', output: [], usage: {} } : null)
+  q.world.beforeDispose = async (n) => { if (n === 2) await new Promise((r) => setTimeout(r, 600)) }
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  const [primary, opinion] = q.ran
+  assert.ok(primary?.toolFilter?.allow && opinion?.toolFilter?.allow, 'both started locked')
+  const read = q.rows('history.jsonl').find((r) => r.attempts?.some((a) => a.role === 'opinion'))
+  const o = read?.attempts.find((a) => a.role === 'opinion')
+  assert.deepEqual([o?.diagnostic, o?.cutOff], ['HTTP 500 from the provider', undefined], JSON.stringify(read?.attempts))
+  // Both agents that can be locked tried it, so neither is asked again: the task goes to its line.
+  assert.equal(q.ran.length, 3, JSON.stringify(q.ran.map((r) => [r.label, r.toolFilter])))
+  assert.equal(q.ran[2].toolFilter?.allow, undefined, 'it then ran as work that writes')
+})
+
+test('a primary and its parallel opinion on DeepSeek keys both at their limit: only the key they ran on is spent, the next is switched to once for after a restart, and neither goes on within the run', async (t) => {
+  // Two agents on DeepSeek's stored keys, k1 active as the harness started, k2 and k3 in reserve.
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__deepseek__k1=sk-one\nKZ_KEY__deepseek__k2=sk-two\nKZ_KEY__deepseek__k3=sk-three\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before) })
+  const on = (id) => ({ ...AGENTS[0], id, name: id })
+  const q = await plugin(t, { jobs: true, config: { agents: [on('ds-a'), on('ds-b')] }, accounts: { keys: { deepseek: [{ name: 'k1', active: true }, { name: 'k2', active: false }, { name: 'k3', active: false }] } } })
+  jevReads(t)
+  jev.said.strategy = 'PARALLEL_SECOND_OPINION'
+  t.after(() => { delete jev.said.strategy })
+  // Both calls on k1 come back out of credit.
+  q.world.outcome = (n) => (n <= 2 ? { stopReason: 'error', diagnostic: 'HTTP 402: insufficient balance', output: [], usage: {} } : null)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  const read = await waitFor('the read pass is on the record', () => q.rows('history.jsonl').find((r) => r.access?.mode === 'read'), (r) => !!r, { timeoutMs: 30_000 })
+  assert.deepEqual(read.attempts.map((a) => [a.agent, a.role, a.limitHit]), [['ds-a', 'primary', true], ['ds-b', 'opinion', true]])
+  assert.ok(!read.limits.some((l) => l.action === 'rotated'), JSON.stringify(read.limits))
+  const state = JSON.parse(readFileSync(join(q.dataDir, 'accounts.json'), 'utf8'))
+  // Only the key is marked: it holds both agents out while their calls go out on it, and after a
+  // restart onto k2 they are usable at once.
+  assert.deepEqual(Object.keys(state.exhausted), ['deepseek:k1'], JSON.stringify(state.exhausted))
+  // Switched once: to k2, not on past it to k3.
+  assert.deepEqual(state.keys.deepseek.map((k) => [k.name, k.active]), [['k1', false], ['k2', true], ['k3', false]])
+  // Each call's usage row names the key it ran on.
+  const used = q.rows('usage.jsonl').filter((u) => u.runId && (u.agent === 'ds-a' || u.agent === 'ds-b')).slice(0, 2).map((u) => u.account)
+  assert.deepEqual(used, ['k1', 'k1'])
+})
+
+test('an agent that falls below its own Stop below during an attempt marks no key and switches none: the key is judged by each agent\'s own floor', async (t) => {
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__deepseek__k1=sk-one\nKZ_KEY__deepseek__k2=sk-two\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before); net.deepseekBalance = null })
+  // k1 holds 21 until the attempt spends it to 19, under this agent's floor of 20.
+  let spentTo = 21
+  net.deepseekBalance = (key) => (key === 'sk-one' ? spentTo : 50)
+  const q = await plugin(t, { config: { agents: [{ ...AGENTS[0], id: 'ds-a', name: 'ds-a' }] }, accounts: { keys: { deepseek: [{ name: 'k1', active: true }, { name: 'k2', active: false }] }, limits: { 'ds-a': { minBalance: 20, handoffAtBalance: 22 } } } })
+  q.world.work = async (_opts, n) => { if (n === 1) spentTo = 19 }
+  await q.slash('auto', 'Fix the failing lint in the parser')
+  const [row] = await waitFor('the run is on the record', () => q.rows('history.jsonl'), (rows) => rows.length >= 1, { timeoutMs: 30_000 })
+  assert.equal(row.attempts[0].limitHit, true, JSON.stringify(row.attempts))
+  const state = JSON.parse(readFileSync(join(q.dataDir, 'accounts.json'), 'utf8'))
+  assert.deepEqual(Object.keys(state.exhausted ?? {}), [], 'nothing marked: the reading says it')
+  assert.deepEqual(state.keys.deepseek.map((k) => [k.name, k.active]), [['k1', true], ['k2', false]])
+})
+
+test('a DeepSeek key added in Settings beside an active key under every agent\'s floor takes over for after a restart; beside one still over the lowest floor it waits in reserve', async (t) => {
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__deepseek__k1=sk-one\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before); net.deepseekBalance = null })
+  let k1 = 10
+  net.deepseekBalance = (key) => (key === 'sk-one' ? k1 : 50)
+  const on = (id) => ({ ...AGENTS[0], id, name: id })
+  const q = await plugin(t, { config: { agents: [on('pro'), on('flash')] }, accounts: { keys: { deepseek: [{ name: 'k1', active: true }] }, limits: { pro: { minBalance: 20, handoffAtBalance: 22 }, flash: { minBalance: 5, handoffAtBalance: 6 } } } })
+  // At 10, k1 is under pro's floor and over flash's: its row stays usable.
+  await q.http('GET', '/jev-router/usage?force=1')
+  assert.equal((await q.http('POST', '/jev-router/keys', { provider: 'deepseek', name: 'k2', key: 'sk-two' })).body.restartRequired, false)
+  let state = JSON.parse(readFileSync(join(q.dataDir, 'accounts.json'), 'utf8'))
+  assert.deepEqual(state.keys.deepseek.map((k) => [k.name, k.active]), [['k1', true], ['k2', false]], 'flash still uses k1')
+  // Under every floor: a key added now takes over.
+  k1 = 3
+  await q.http('GET', '/jev-router/usage?force=1')
+  const added = await q.http('POST', '/jev-router/keys', { provider: 'deepseek', name: 'k3', key: 'sk-three' })
+  assert.equal(added.body.restartRequired, true)
+  state = JSON.parse(readFileSync(join(q.dataDir, 'accounts.json'), 'utf8'))
+  assert.deepEqual(state.keys.deepseek.map((k) => [k.name, k.active]), [['k1', false], ['k2', false], ['k3', true]])
+})
+
+test('after one agent\'s attempt, a key still over another switched-on agent\'s floor is not taken for out: a key added beside it waits in reserve', async (t) => {
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__deepseek__k1=sk-one\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before); net.deepseekBalance = null })
+  // pro's attempt spends k1 from 25 to 10: under pro's floor of 20, over flash's of 5. flash is on,
+  // but held out for now, so pro does the work.
+  let k1 = 25
+  net.deepseekBalance = (key) => (key === 'sk-one' ? k1 : 50)
+  const on = (id) => ({ ...AGENTS[0], id, name: id })
+  const hour = new Date(Date.now() + 3_600_000).toISOString()
+  const q = await plugin(t, { config: { agents: [on('pro'), on('flash')] }, accounts: { keys: { deepseek: [{ name: 'k1', active: true }] }, limits: { pro: { minBalance: 20, handoffAtBalance: 22 }, flash: { minBalance: 5, handoffAtBalance: 6 } }, exhausted: { flash: { until: hour, reason: 'held out by the test' } } } })
+  q.world.work = async (_opts, n) => { if (n === 1) k1 = 10 }
+  await q.slash('auto', 'Fix the failing lint in the parser')
+  const [row] = await waitFor('the run is on the record', () => q.rows('history.jsonl'), (rows) => rows.length >= 1, { timeoutMs: 30_000 })
+  assert.equal(row.attempts[0].agent, 'pro', 'the test needs pro to work first')
+  // The balance check after pro's attempt left k1's row as the next routing and Settings read it.
+  const added = await q.http('POST', '/jev-router/keys', { provider: 'deepseek', name: 'k2', key: 'sk-two' })
+  assert.equal(added.status, 200)
+  const state = JSON.parse(readFileSync(join(q.dataDir, 'accounts.json'), 'utf8'))
+  assert.deepEqual(state.keys.deepseek.map((k) => [k.name, k.active]), [['k1', true], ['k2', false]], 'flash can still use k1')
+})
+
+test('removing the active DeepSeek key moves on to the next one usable by its reading, and Settings says to restart while that change waits for one, whatever other keys are then added', async (t) => {
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__deepseek__k1=sk-one\nKZ_KEY__deepseek__k2=sk-two\nKZ_KEY__deepseek__k3=sk-three\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before); net.deepseekBalance = null })
+  // k2 is under the agent's floor of 5.
+  net.deepseekBalance = (key) => (key === 'sk-two' ? 1 : 50)
+  const q = await plugin(t, { config: { agents: [{ ...AGENTS[0], id: 'ds-a', name: 'ds-a' }] }, accounts: { keys: { deepseek: [{ name: 'k1', active: true }, { name: 'k2', active: false }, { name: 'k3', active: false }] }, limits: { 'ds-a': { minBalance: 5, handoffAtBalance: 6 } } } })
+  assert.deepEqual((await q.http('GET', '/jev-router/usage?force=1')).body.keysRestartPending, [])
+  assert.deepEqual((await q.http('GET', '/jev-router/setup')).body.keysRestartPending, [])
+  assert.equal((await q.http('DELETE', '/jev-router/keys?provider=deepseek&name=k1')).status, 200)
+  const state = JSON.parse(readFileSync(join(q.dataDir, 'accounts.json'), 'utf8'))
+  assert.deepEqual(state.keys.deepseek.map((k) => [k.name, k.active]), [['k2', false], ['k3', true]])
+  // Said on the setup page and on the reading Settings polls.
+  assert.deepEqual((await q.http('GET', '/jev-router/setup')).body.keysRestartPending, ['deepseek'])
+  assert.deepEqual((await q.http('GET', '/jev-router/usage')).body.keysRestartPending, ['deepseek'])
+  // A Jev key added and chosen meanwhile changes nothing of that, and is the Jev key in use at once.
+  assert.equal((await q.http('POST', '/jev-router/keys', { provider: 'jev', name: 'j2', key: 'ts-two' })).status, 200)
+  assert.equal((await q.http('POST', '/jev-router/keys/activate', { provider: 'jev', name: 'j2' })).status, 200)
+  assert.deepEqual((await q.http('GET', '/jev-router/setup')).body.keysRestartPending, ['deepseek'])
+  assert.equal((await q.http('GET', '/jev-router/setup')).body.jev.activeKey, 'j2')
+  assert.equal((await q.http('GET', '/jev-router/usage')).body.jevActiveKey, 'j2')
+})
+
+test('a stored Jev key whose value is gone from .env is not named as the Jev key in use, on Settings or the Usage tab', async (t) => {
+  const q = await plugin(t, { accounts: { keys: { jev: [{ name: 'ghost', active: true }] } } })
+  const setup = (await q.http('GET', '/jev-router/setup')).body
+  assert.equal(setup.jev.activeKey, null, 'Jev falls back to its credential for it, as its calls do')
+  assert.equal(setup.jev.credentialSet, true)
+  const usage = (await q.http('GET', '/jev-router/usage')).body
+  assert.deepEqual([usage.jevActiveKey, usage.jevCredentialSet], [null, true])
+  assert.equal(usage.agents.find((a) => a.id === 'jev').account.label, 'default', 'the Usage tab names the credential Jev calls on')
+})
+
+test('a limit on the launch key\'s call does not switch away from another key the person added under its name and chose meanwhile', async (t) => {
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__deepseek__k1=sk-one\nKZ_KEY__deepseek__k2=sk-two\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before) })
+  const q = await plugin(t, { config: { agents: [{ ...AGENTS[0], id: 'ds-a', name: 'ds-a' }] }, accounts: { keys: { deepseek: [{ name: 'k1', active: true }, { name: 'k2', active: false }] } } })
+  // While the call on k1 runs, the person replaces k1 with a new key of that name and makes it active.
+  q.world.work = async (_opts, n) => {
+    if (n !== 1) return
+    assert.equal((await q.http('DELETE', '/jev-router/keys?provider=deepseek&name=k1')).status, 200)
+    assert.equal((await q.http('POST', '/jev-router/keys', { provider: 'deepseek', name: 'k1', key: 'sk-new' })).status, 200)
+    assert.equal((await q.http('POST', '/jev-router/keys/activate', { provider: 'deepseek', name: 'k1' })).status, 200)
+  }
+  q.world.outcome = (n) => (n === 1 ? { stopReason: 'error', diagnostic: 'HTTP 402: insufficient balance', output: [], usage: {} } : null)
+  await q.slash('auto', 'Fix the failing lint in the parser')
+  await waitFor('the run is on the record', () => q.rows('history.jsonl'), (rows) => rows.length >= 1, { timeoutMs: 30_000 })
+  const state = JSON.parse(readFileSync(join(q.dataDir, 'accounts.json'), 'utf8'))
+  assert.deepEqual(state.keys.deepseek.map((k) => [k.name, k.active]), [['k2', false], ['k1', true]], 'the person\'s choice stands')
+  assert.equal(state.exhausted['deepseek:k1'], undefined, 'the new k1 made no call')
+})
+
+test('an agent switched off, or not the one asked for, is no lock at intake: the task waits for its folder as work that writes', async (t) => {
+  // Claude could be locked (its plan-mode row is here) but is switched off; the others cannot be.
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: false }
+  const q = await plugin(t, { jobs: true, config: { agents: [...AGENTS, claude] } })
+  q.world.providers['claude-code-readonly'] = { config: { permissionMode: 'plan' } }
+  q.world.providers.spawn = { capabilities: { toolFilter: false } }
+  jevReads(t)
+  const said = await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  assert.match(said.text, /but no agent here can be locked against writing \(deepseek: its provider takes no per-start tool filter; kimi: its provider takes no per-start tool filter\), so it runs as work that writes/, said.text)
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal((await taskRow(q, 'jev-1')).access, 'write')
+  assert.equal(q.rows('history.jsonl').length, 1, 'no read pass ran, only the work itself')
+})
+
+test('an agent signed out is no lock at intake either: the task runs as work that writes and no read pass is tried', async (t) => {
+  // Claude could be locked (its plan-mode row is here) and is switched on, but signed out.
+  claudeSignedIn(t, { loggedIn: false })
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: true }
+  const q = await plugin(t, { jobs: true, config: { agents: [...AGENTS, claude] } })
+  q.world.providers['claude-code-readonly'] = { config: { permissionMode: 'plan' } }
+  q.world.providers.spawn = { capabilities: { toolFilter: false } }
+  jevReads(t)
+  const said = await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  // The one agent that could have been locked is named, with why it cannot be.
+  assert.match(said.text, /but no agent here can be locked against writing \(deepseek: its provider takes no per-start tool filter; kimi: its provider takes no per-start tool filter; claude: not signed in\), so it runs as work that writes/, said.text)
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal((await taskRow(q, 'jev-1')).access, 'write')
+  assert.equal(q.rows('history.jsonl').length, 1, 'no read pass ran, only the work itself')
+})
+
+test('a lock breach is warned about, and that agent takes no more read-only work until restart; Jev setup says so', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // The locked run's files change although nothing writes the folder: the lock did not hold.
+  q.world.work = async (opts) => { if (opts.toolFilter?.allow) writeFileSync(join(q.workspace, 'breach.txt'), 'x') }
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  const [record] = q.rows('history.jsonl')
+  const who = record.attempts[0].agent
+  assert.equal(record.access?.mode, 'read', 'the task ran as a read pass')
+  assert.deepEqual(record.access.lockCheck, { measured: true, changed: ['breach.txt'] })
+  assert.match(JSON.stringify(q.world.delivered[0]), new RegExp(`Warning: breach\\.txt changed in this repository while this locked run was reading and no other run was going on in it\\. Either you edited it, or the lock on ${who} did not hold; ${who} takes no read-only work until the harness restarts\\.`))
+  const setup = (await q.http('GET', '/jev-router/setup')).body
+  const agent = setup.agents.find((a) => a.id === who)
+  assert.equal(agent.readOnly.how, null)
+  assert.match(agent.readOnly.why, /^files changed while it ran locked at \d\d:\d\d UTC \(breach\.txt\), so its lock is not trusted until the harness restarts$/)
+  const other = setup.agents.find((a) => a.id !== who)
+  assert.deepEqual(other.readOnly, { how: 'read tools only, checked as each run starts', why: null })
+})
+
+test('two read passes in one folder at once: a change during them is pinned on neither, and neither agent is distrusted', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (opts, n) => {
+    // The first reader's lock does not hold; the second reader is only beside it.
+    if (n === 1) writeFileSync(join(q.workspace, 'breach.txt'), 'x')
+    await blocked
+  }
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await q.say('How does the lexer find a keyword', { model: 'jev-auto' })
+  const together = await waitFor('both read passes are working', () => q.ran.length, (n) => n === 2, { timeoutMs: 20_000 }).then(() => true, () => false)
+  release()
+  assert.ok(together, 'the two read passes ran at the same time')
+  assert.ok(q.ran.every((r) => r.toolFilter?.allow), 'both ran locked')
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const rows = q.rows('history.jsonl')
+  assert.equal(rows.length, 2)
+  for (const r of rows) assert.deepEqual(r.access?.lockCheck, { measured: false, reason: 'another run was going on in this repository at the same time' })
+  const setup = (await q.http('GET', '/jev-router/setup')).body
+  assert.deepEqual(setup.agents.map((a) => a.readOnly.how), ['read tools only, checked as each run starts', 'read tools only, checked as each run starts'], 'nobody is distrusted for a change nobody can pin')
+})
+
+test('a read pass that outlasts the writer it started beside: the writer\'s change is not pinned on the reader\'s agent, and nobody is distrusted', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let releaseWriter
+  let releaseReader
+  const writing = new Promise((r) => { releaseWriter = r })
+  const reading = new Promise((r) => { releaseReader = r })
+  q.world.work = async (_opts, n) => { await (n === 1 ? writing : reading) }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the writer is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the reader is working beside it', () => q.ran.length, (n) => n === 2, { timeoutMs: 20_000 })
+  // The writer changes state.txt and is gone before the reader's check: only the run that was going
+  // at the reader's start tells its change apart from a lock that did not hold.
+  releaseWriter()
+  await waitFor('the writer\'s result is posted while the reader still works', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal((await taskRow(q, 'jev-2')).state, 'running', 'the reader is still at work')
+  releaseReader()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const rows = q.rows('history.jsonl')
+  const reader = rows.find((r) => r.access?.mode === 'read')
+  const writer = rows.find((r) => r !== reader)
+  assert.deepEqual(writer?.attempts[0].changedFiles, ['state.txt'], 'the writer changed a file while the reader worked')
+  assert.deepEqual(reader?.access.lockCheck, { measured: false, reason: 'another run was going on in this repository at the same time' })
+  const setup = (await q.http('GET', '/jev-router/setup')).body
+  assert.deepEqual(setup.agents.map((a) => a.readOnly.how), ['read tools only, checked as each run starts', 'read tools only, checked as each run starts'], 'nobody is distrusted for the writer\'s change')
+  // What the runs write after they reply (Laya's standing) lands before the plugin is closed.
+  await quiet(q.dataDir)
+})
+
+test('a writer that starts and ends while a read pass works: its change is not pinned on the reader\'s agent, and nobody is distrusted', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the reader is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  // Nothing else was going at the reader's start and nothing is at its check: only the run that
+  // started since tells the writer's change to state.txt apart from a lock that did not hold.
+  jevReads(t, { p: 0.05, capability: 'project_change' })
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the writer\'s result is posted while the reader still works', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal((await taskRow(q, 'jev-1')).state, 'running', 'the reader is still at work')
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const rows = q.rows('history.jsonl')
+  const reader = rows.find((r) => r.access?.mode === 'read')
+  const writer = rows.find((r) => r !== reader)
+  assert.deepEqual(writer?.attempts[0].changedFiles, ['state.txt'], 'the writer changed a file while the reader worked')
+  assert.deepEqual(reader?.access.lockCheck, { measured: false, reason: 'another run was going on in this repository at the same time' })
+  const setup = (await q.http('GET', '/jev-router/setup')).body
+  assert.deepEqual(setup.agents.map((a) => a.readOnly.how), ['read tools only, checked as each run starts', 'read tools only, checked as each run starts'], 'nobody is distrusted for the writer\'s change')
+  // What the runs write after they reply (Laya's standing) lands before the plugin is closed.
+  await quiet(q.dataDir)
+})
+
+test('a writer at the root and a read pass in another folder of the same repository: the writer\'s change is not pinned on the reader, and no agent is distrusted', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // This chat is opened in docs, a folder of the repository, and a second chat at its root writes.
+  const docs = join(q.workspace, 'docs')
+  mkdirSync(docs)
+  q.agent.session.header.cwd = docs
+  const atRoot = { id: 'session-2', session: { id: 'session-2', header: { cwd: q.workspace } } }
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => {
+    // The writer writes state.txt only once the reader is at work, and the reader reads on until it has.
+    if (n === 1) await blocked
+    if (n === 2) { release(); await waitFor('the writer has written state.txt', () => readFileSync(join(q.workspace, 'state.txt'), 'utf8'), (s) => s === 'fixed', { timeoutMs: 20_000 }) }
+  }
+  const fg = q.commands.get('auto').handler({ agent: atRoot, rawInput: 'Fix the failing test in the parser', signal: new AbortController().signal })
+  await waitFor('the writer is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  jevReads(t)
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  // The reader's result first: a reader that never started would leave the writer blocked for good.
+  await waitFor('the reader\'s result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match((await fg).text, /Final status: ACCEPTED/)
+  assert.deepEqual(q.ran[1].toolFilter, { allow: ['read', 'glob', 'grep'] }, 'the reader was started with the read tools only')
+  const rows = q.rows('history.jsonl')
+  const reader = rows.find((r) => r.access?.mode === 'read')
+  const writer = rows.find((r) => r !== reader)
+  assert.deepEqual([writer?.workspace, reader?.workspace], [q.workspace, docs], 'the writer ran at the root and the reader in docs')
+  assert.deepEqual(reader.attempts.map((a) => [a.locked, a.stopReason]), [[true, 'completed']], 'one locked attempt, which read on until the writer had changed state.txt')
+  assert.deepEqual(reader.access.lockCheck, { measured: false, reason: 'another run was going on in this repository at the same time' })
+  const setup = (await q.http('GET', '/jev-router/setup')).body
+  assert.deepEqual(setup.agents.map((a) => a.readOnly.how), ['read tools only, checked as each run starts', 'read tools only, checked as each run starts'], 'no agent is distrusted for the writer\'s change')
+})
+
 // ---------------------------------------------------------------- Jev Auto and the shadow
 
 test('a Jev Auto run with the shadow: Laya answers the same calls beside Jev, Jev\'s calls are byte-identical to a run without it, and nothing else of it shows', async (t) => {
@@ -749,12 +1408,14 @@ test('a Jev Auto run with the shadow: Laya answers the same calls beside Jev, Je
   assert.equal(stopped.world.spawned.length, 0)
 })
 
-test('a Jev Auto run replies without waiting for the shadow: with Laya at 3 s a question, the reply comes before Laya has answered any of its calls', async (t) => {
+test('a Jev Auto run replies without waiting for the shadow: with Laya at 20 s a question, the reply comes before Laya has answered any of its calls', async (t) => {
   const p = await plugin(t, { settings: { shadow: true } })
   await started(p)
-  // Laya, loaded and ready, now takes 3 s a question, so even the intent's three take it 9 s: a
-  // run that waited for any comparison would reply no sooner than that (5.2).
-  const MS_PER_ROW = 3000
+  // Laya, loaded and ready, now takes 20 s a question, so even the intent's three take it a
+  // minute: a run that waited for any comparison would reply no sooner than that (5.2). At 3 s a
+  // question the run itself, slowed by a full suite running beside it, could outlast Laya's first
+  // answer and fail a test that is about waiting, not speed.
+  const MS_PER_ROW = 20_000
   const fake = p.world.fakes.at(-1)
   fake.setMsPerRow(MS_PER_ROW)
   const t0 = Date.now()
@@ -1005,9 +1666,10 @@ test('the orphan sweep runs first in apply(): a Laya an earlier session left run
 })
 
 test('a plugin disposed while its startup sweep runs never starts Laya afterwards: not to start it with KzH, not for a message that waited for the sweep', async (t) => {
-  // An earlier session's laya.serve for the sweep to look at, under a pid no process has, whose
-  // look waits until the test lets it go: the plugin is disposed in between, as a reload or a quit
-  // during a slow sweep does (on Windows it asks PowerShell about each recorded pid).
+  // An earlier session's laya.serve for the sweep to look at, under a pid another program has taken
+  // since (it reads as that program, so the sweep settles the record and removes it), whose look
+  // waits until the test lets it go: the plugin is disposed in between, as a reload or a quit during
+  // a slow sweep does (on Windows it asks PowerShell about each recorded pid).
   const EARLIER = 4_999_999
   async function sweeping(settings) {
     const root = mkdtempSync(join(tmpdir(), 'kz-laya-dispose-'))
@@ -1025,7 +1687,12 @@ test('a plugin disposed while its startup sweep runs never starts Laya afterward
       onSpawn: () => { if (gate.closed) throw new Error('started after the plugin was disposed') },
       supervisor: {
         isAlive: (pid) => pid === EARLIER,
-        run: async (_cmd, args) => { if (args.join(' ').includes(String(EARLIER))) { gate.reached = true; await held } return null },
+        run: async (_cmd, args) => {
+          if (!args.join(' ').includes(String(EARLIER))) return null
+          gate.reached = true
+          await held
+          return 'node.exe|node C:\\other\\program.js\r\n'
+        },
       },
     })
     await until('the startup sweep', async () => gate.reached, Boolean).catch(() => {})

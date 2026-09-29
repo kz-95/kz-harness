@@ -26,6 +26,7 @@ import { dirname, join } from 'node:path'
 import {
   FEATURE_SCHEMA_VERSION, calibrate, calibrationMetrics, evaluate, loadArtifact, predict, rank, saveArtifact, trainMulticlass, trainRanker, verifyArtifact,
 } from './classifier.js'
+import { SILENT_STATUSES, succeeded } from './outcome.js'
 import { TEACHER, providerName } from './providers.js'
 import { MATURITY, gatesFor, resolvePolicy } from './routing-policy.js'
 
@@ -1232,10 +1233,16 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
     const of = (rows, pick) => (rows.length ? rows.filter(pick).length / rows.length : 0)
     const recent = verified.slice(-window)
     const d = (r) => r.outcome?.details ?? {}
+    const judged = (r) => !SILENT_STATUSES.includes(d(r).finalStatus)
+    const failed = (r) => typeof d(r).finalStatus === 'string' && !succeeded(d(r).finalStatus)
     return {
       retry: { baseline: of(verified, (r) => num(d(r).attempts, 1) > 1), recent: of(recent, (r) => num(d(r).attempts, 1) > 1) },
       escalation: { baseline: of(verified, (r) => d(r).escalated === true), recent: of(recent, (r) => d(r).escalated === true) },
-      failure: { baseline: of(verified, (r) => typeof d(r).finalStatus === 'string' && !d(r).finalStatus.startsWith('accepted')), recent: of(recent, (r) => typeof d(r).finalStatus === 'string' && !d(r).finalStatus.startsWith('accepted')) },
+      // An answered run did what it was asked (outcome.js); counted as a failure it would raise the
+      // recent rate with every answer, block promotion and roll the domain back. A silent status
+      // (a paused or stopped run a person tagged anyway) says nothing either way, so it is left out
+      // of the rate altogether, its count and its denominator.
+      failure: { baseline: of(verified.filter(judged), failed), recent: of(recent.filter(judged), failed) },
     }
   }
 

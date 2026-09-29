@@ -1,6 +1,6 @@
 // The speed benchmark from a shell (docs/benchmark.md 2.12), for Speed-Run.bat at the harness root:
 // every installed local chat model, or the ones named, measured exactly as Settings, Local models,
-// Benchmark all measures them, with KzH closed.
+// Benchmark all measures them, with KzH not running.
 //
 //   node scripts/speed-run.mjs [--models <id>[,<id> ...]] [--context <tokens>] [--harness <dir>] [--data <dir>] [--verbose] [--no-pause]
 //
@@ -29,20 +29,20 @@
 // line says why); 2 it could not run (no engine, no model, an unknown model, a bad argument, a
 // context it cannot tell); 3 KzH, a llama-server, a Laya or another Speed-Run is running; 130
 // cancelled with Ctrl+C; 128 and the signal's number when its console was closed or it was ended.
-import { spawnSync } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { connect } from 'node:net'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { KZH_PORT, QUIT_APP, kzhRunning, otherNote, portAnswers, portOwner, processList, stopEngine, stopUnknown } from '../plugins/jev-router/kzh-running.js'
 import { runAsScript } from './run-as-script.mjs'
+
+// What of KzH runs is looked up in the plugin's kzh-running.js, which the Laya command line shares.
+export { KZH_PORT, isKzhEngine, portAnswers, portOwner, processList } from '../plugins/jev-router/kzh-running.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(here, '..', 'plugins', 'jev-router')
 const plugin = (file) => import(pathToFileURL(join(PLUGIN, file)).href)
 
-/** Where KzH serves its app (Start-KzH.ps1, app/main.js). */
-export const KZH_PORT = 3080
 export const EXIT = { measured: 0, notMeasured: 1, couldNotRun: 2, kzhRunning: 3, cancelled: 130 }
 /** Who started a run, as the speed run history says it. */
 const BY = 'Speed-Run.bat'
@@ -83,105 +83,65 @@ export function parseArgs(argv) {
   return out
 }
 
-/** Whether something accepts a connection on 127.0.0.1:`port`, within `timeoutMs`. */
-export function portAnswers(port, { host = '127.0.0.1', timeoutMs = 1500 } = {}) {
-  return new Promise((done) => {
-    const socket = connect({ host, port })
-    const end = (open) => { socket.destroy(); done(open) }
-    socket.setTimeout(timeoutMs, () => end(false))
-    socket.once('connect', () => end(true))
-    socket.once('error', () => end(false))
-  })
-}
-
 /**
- * Every process running now as `{ pid, name, cmd }`, or null when they cannot be listed. On
- * Windows the command lines come from CIM, which tells KzH's engine from any other node, and are
- * empty for a process this one may not read (one run as administrator, say); with no PowerShell,
- * tasklist gives the names alone (`cmd` null).
+ * A laya.serve an earlier KzH left running, from the pids its sidecar.json recorded (the sidecar's,
+ * an install check's, and the records a sweep could not settle, `earlier`), or null; or, while an
+ * installer still at work holds install.lock, `{ installing: <its pid> }`, whose Laya is its own. One that is
+ * alive but cannot be read (run as administrator, most likely) and may be Laya, being python or of
+ * a name that cannot be read either, comes back `unchecked`, when no pid could be confirmed.
  */
-export function processList({ platform = process.platform, run = spawnSync } = {}) {
-  if (platform === 'win32') {
-    const r = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.Name)|$($_.CommandLine)" }'], { encoding: 'utf8', windowsHide: true, maxBuffer: 32 * 1024 * 1024 })
-    if (r?.status === 0 && typeof r.stdout === 'string' && r.stdout.includes('|')) {
-      return r.stdout.split(/\r?\n/).map((l) => /^(\d+)\|([^|]*)\|(.*)$/.exec(l)).filter(Boolean).map(([, pid, name, cmd]) => ({ pid: Number(pid), name: name.trim(), cmd: cmd.trim() }))
-    }
-    const t = run('tasklist', ['/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true })
-    if (t?.status !== 0 || typeof t.stdout !== 'string') return null
-    return t.stdout.split(/\r?\n/).map((l) => /^"([^"]*)","(\d+)"/.exec(l)).filter(Boolean).map(([, name, pid]) => ({ pid: Number(pid), name, cmd: null }))
-  }
-  const r = run('ps', ['-A', '-ww', '-o', 'pid=,args='], { encoding: 'utf8' })
-  if (r?.status !== 0 || typeof r.stdout !== 'string') return null
-  return r.stdout.split('\n').map((l) => /^\s*(\d+)\s+(.*)$/.exec(l)).filter(Boolean).map(([, pid, cmd]) => ({ pid: Number(pid), name: cmd.trim().split(/\s+/)[0].split('/').pop(), cmd: cmd.trim() }))
-}
-
-/**
- * The pid listening on 127.0.0.1:`port`, or null when it cannot be found: netstat on Windows (a
- * listening socket's far end is 0.0.0.0:0 or [::]:0 whatever language Windows speaks), ss elsewhere.
- */
-export function portOwner(port, { platform = process.platform, run = spawnSync } = {}) {
-  if (platform === 'win32') {
-    const r = run('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8', windowsHide: true })
-    if (r?.status !== 0 || typeof r.stdout !== 'string') return null
-    for (const line of r.stdout.split(/\r?\n/)) {
-      const f = line.trim().split(/\s+/)
-      if (f.length >= 5 && /^TCP$/i.test(f[0]) && f[1].endsWith(`:${port}`) && /^(0\.0\.0\.0|\[::\]):0$/.test(f[2]) && Number(f.at(-1)) > 0) return Number(f.at(-1))
-    }
-    return null
-  }
-  const r = run('ss', ['-ltnpH', `sport = :${port}`], { encoding: 'utf8' })
-  const pid = r?.status === 0 && typeof r.stdout === 'string' ? /pid=(\d+)/.exec(r.stdout)?.[1] : null
-  return pid ? Number(pid) : null
-}
-
-/**
- * Whether a command line is KzH's engine: node running the @deepseek-ai/dsh package with `web` as
- * its own argument, as Start-KzH.ps1 starts it and app/main.js's isEngineCommand reads it.
- */
-export const isKzhEngine = (cmd) => /\bnode(\.exe)?\b/i.test(cmd ?? '') && /@deepseek-ai[\\/]dsh\b/i.test(cmd ?? '') && /(?:^|\s)web(?:\s|$)/i.test(cmd ?? '')
-
-/** A laya.serve an earlier KzH left running, from the pids its sidecar.json recorded, or null. */
-export async function leftoverLaya({ harness, data }) {
-  const { isAlive, layaPaths } = await plugin('laya-install.js')
-  const { processInfo } = await plugin('laya-sidecar.js')
+export async function leftoverLaya({ harness, data, seams = {} }) {
+  const { isAlive: alive, layaPaths, lockHeld } = await plugin('laya-install.js')
+  const { processInfo, processName } = await plugin('laya-sidecar.js')
+  const isAlive = seams.isAlive ?? alive
+  const info = seams.processInfo ?? processInfo
+  const name = seams.processName ?? processName
+  const paths = layaPaths({ harnessDir: harness, dataDir: data })
+  // An install, update, repair or remove at work (the Laya command line) holds install.lock and
+  // loads Laya for its step 7 check: that Laya is the installer's, not a leftover, and no advice to
+  // end it or to start and quit KzH applies (KzH's own sweep leaves it alone too).
+  let holder = null
+  try { holder = Number(readFileSync(paths.lock, 'utf8').trim()) } catch { holder = null }
+  if (holder && holder !== process.pid && await lockHeld(holder, { alive: isAlive, name })) return { installing: holder }
   let rec
-  try { rec = JSON.parse(readFileSync(layaPaths({ harnessDir: harness, dataDir: data }).sidecarJson, 'utf8')) } catch { return null }
-  for (const pid of new Set([rec?.pid, rec?.interpreterPid, rec?.check?.pid, rec?.check?.interpreterPid].filter((x) => Number.isSafeInteger(x) && x > 0))) {
+  try { rec = JSON.parse(readFileSync(paths.sidecarJson, 'utf8')) } catch { return null }
+  const records = [rec, rec?.check, ...(Array.isArray(rec?.earlier) ? rec.earlier : [])].filter((r) => r && typeof r === 'object')
+  let unchecked = null
+  for (const pid of new Set(records.flatMap((r) => [r.pid, r.interpreterPid]).filter((x) => Number.isSafeInteger(x) && x > 0))) {
     if (!isAlive(pid)) continue
-    const info = await processInfo(pid).catch(() => null)
-    if (info && /\blaya\.serve\b/.test(info.cmdline ?? '')) return { pid }
+    const i = await info(pid).catch(() => null)
+    if (i?.exe || i?.cmdline) { if (/\blaya\.serve\b/.test(i.cmdline ?? '')) return { pid }; continue }
+    const n = await name(pid).catch(() => null)
+    if (!unchecked && (n == null || /^pythonw?(\.exe)?$/i.test(n))) unchecked = { pid, unchecked: true }
   }
-  return null
+  return unchecked
 }
 
-const CLOSE_KZH = 'Close KzH and run this again: the speed run and KzH would load models over each other on one GPU, and both write local.json.'
+const WHY_NOT_BESIDE_KZH = 'the speed run and KzH would load models over each other on one GPU, and both write local.json.'
 
 /**
  * What stands in the way of a speed run now: `why` it must not start, or null, and `notes` to
- * print. KzH's engine or app is a second owner of the GPU and of local.json; a llama-server or a
- * laya.serve with no KzH is one a crash left, holding memory the budget would plan around and the
- * readings would lose. Whatever listens on KzH's port is looked up by its pid: another program, by
- * a command line that can be read and is not KzH's engine, does not stop the run; one that cannot
- * be told from KzH does.
+ * print. KzH's app or engine is a second owner of the GPU and of local.json (kzh-running.js tells
+ * which, so the advice fits: the app is quit from its tray icon, an engine with no app above it is
+ * stopped where it runs); so is whatever listens on KzH's port when it cannot be told from KzH,
+ * which is settled before anything is called left behind: a llama-server or a laya.serve counts as
+ * a leftover, holding memory the budget would plan around and the readings would lose, only once
+ * KzH is ruled out. Another program on the port, by a command line that can be read and is not
+ * KzH's engine, does not stop the run.
  */
 export async function machineCheck({ harness, data, port = KZH_PORT, answers = portAnswers, processes = processList, owner = portOwner, laya = leftoverLaya } = {}) {
-  const list = await processes()
-  const engine = list?.find((p) => isKzhEngine(p.cmd))
-  if (engine) return { why: `KzH is running (its engine, ${engine.name}). ${CLOSE_KZH}`, notes: [] }
-  const app = list?.find((p) => /^kz-harness(\.exe)?$/i.test(p.name))
-  if (app) return { why: `KzH is running (${app.name}). ${CLOSE_KZH}`, notes: [] }
-  const llama = list?.find((p) => /^llama-server(\.exe)?$/i.test(p.name))
-  if (llama) return { why: `A llama-server is running with KzH closed (${llama.name}, pid ${llama.pid}), holding memory the readings would lose. End it in Task Manager, or restart the PC, and run this again.`, notes: [] }
+  const found = await kzhRunning({ port, answers, processes, owner })
+  if (found.app) return { why: `KzH is running (${found.app.name}). Quit it (${QUIT_APP}) and run this again: ${WHY_NOT_BESIDE_KZH}`, notes: [] }
+  if (found.engine) return { why: `KzH is running (its engine, ${found.engine.name}, pid ${found.engine.pid}) with no Kz-harness app above it. To stop it, ${stopEngine(found.engine.pid)}, and run this again: ${WHY_NOT_BESIDE_KZH}`, notes: [] }
+  if (found.unknown) return { why: `KzH, or another program, answers on 127.0.0.1:${port} (${found.unknown}), so nobody can tell whether KzH is running. ${stopUnknown(found)}. Then run this again.`, notes: [] }
+  const notes = found.other ? [otherNote(found, { port, what: 'the speed run' })] : []
+  const llama = found.list?.find((p) => /^llama-server(\.exe)?$/i.test(p.name))
+  if (llama) return { why: `A llama-server is running with KzH not running (${llama.name}, pid ${llama.pid}), holding memory the readings would lose. End it in Task Manager, or restart the PC, and run this again.`, notes }
   const layaLeft = await laya({ harness, data }).catch(() => null)
-  if (layaLeft) return { why: `A Laya an earlier KzH left running (pid ${layaLeft.pid}) holds memory the readings would lose. Start KzH and close it again, which stops it, or end pid ${layaLeft.pid} in Task Manager, and run this again.`, notes: [] }
-  if (await answers(port)) {
-    const pid = await owner(port)
-    const holder = pid ? list?.find((p) => p.pid === pid) : null
-    if (holder?.cmd) return { why: null, notes: [`Another program answers on 127.0.0.1:${port} (${holder.name}, pid ${pid}); it is not KzH's engine, so the speed run goes ahead.`] }
-    const who = holder ? `${holder.name}, pid ${pid}, whose command line cannot be read (it may run as administrator)` : pid ? `pid ${pid}, which cannot be looked up` : 'a program that cannot be found'
-    return { why: `KzH, or another program, answers on 127.0.0.1:${port} (${who}), so nobody can tell whether KzH is running. Close KzH, or the program on that port, and run this again.`, notes: [] }
-  }
-  return { why: null, notes: [] }
+  if (layaLeft?.installing) return { why: `A Laya install is running (pid ${layaLeft.installing}: the Laya command line, or Install-Harness.ps1 -Laya). It loads Laya to check what it installed, which would hold memory the readings would lose. Let it finish, then run this again.`, notes }
+  if (layaLeft?.unchecked) return { why: `A Laya an earlier KzH left may still be running (pid ${layaLeft.pid}); it could not be checked from here (it may run as administrator), and it would hold memory the readings would lose. End it in Task Manager (Details, right-click pid ${layaLeft.pid}, End process tree; run Task Manager as administrator if it says access is denied), or restart the PC, and run this again.`, notes }
+  if (layaLeft) return { why: `A Laya an earlier KzH left running (pid ${layaLeft.pid}) holds memory the readings would lose. Start KzH and quit it again (right-click its tray icon and choose Quit), which stops it, or end pid ${layaLeft.pid} in Task Manager, and run this again.`, notes }
+  return { why: null, notes }
 }
 
 /**
@@ -367,7 +327,7 @@ export async function speedRun({ harness = defaultHarness(), data = defaultDataD
       if (fromProfile?.unreadable) throw refuse(EXIT.couldNotRun, `${fromProfile.unreadable} gives jev-router's local.contextSize in a form this cannot read. Run this again with --context <the number KzH starts local models with>: a reading stands only for a load at the context it was taken at.`)
       if (fromProfile) { context = fromProfile.value; print(`Context: ${context} tokens, jev-router's local.contextSize in ${fromProfile.file}.`) }
     }
-    print('Keep KzH closed until this ends: it would load models beside the ones measured.')
+    print('Do not start KzH until this ends: it would load models beside the ones measured.')
 
     local = createLocalModels({
       modules,

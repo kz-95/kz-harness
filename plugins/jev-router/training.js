@@ -27,6 +27,7 @@ import { appendFile, mkdir, open, readFile, rename } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { FEATURE_SCHEMA_VERSION, validateFeatures } from './features.js'
 import { ROUTING_TAGS } from './feedback.js'
+import { SILENT_STATUSES, isWorkAttempt, succeeded } from './outcome.js'
 import { TEACHER } from './providers.js'
 import { DISPOSITIONS, STRATEGIES, resolvePolicy, tierAtLeast } from './routing-policy.js'
 
@@ -47,7 +48,6 @@ export const STORE_AUTHORITIES = Object.freeze({ jev: AUTHORITIES, laya: Object.
 /** The kinds of store, each its own file. */
 export const STORE_KINDS = Object.freeze(Object.keys(STORE_AUTHORITIES))
 
-const WORK_ROLES = new Set(['primary', 'retry'])
 // A label or tag value that belongs to another module's vocabulary, checked when this file loads.
 // None of these strings are ours to define: naming them through their own lists means a strategy,
 // disposition or tag renamed there fails here loudly, instead of quietly ending the labels.
@@ -497,9 +497,9 @@ const pickOf = (sample) => (sample?.authority === 'local' ? sample.local ?? null
 const confirms = (sample, outcome) => (sample?.authority === TEACHER ? outcome : null)
 
 const attemptsOf = (record) => (Array.isArray(record?.attempts) ? record.attempts : [])
-const workAttempts = (record) => attemptsOf(record).filter((a) => a && WORK_ROLES.has(a.role) && !a.limitHit)
-const accepted = (record) => String(record.finalStatus ?? '').startsWith('accepted') || record.finalStatus === 'answered'
-const noEvidence = (record) => record.finalStatus === 'paused_limit' || record.finalStatus === 'stopped' || !!record.continuedFromHandoff
+const workAttempts = (record) => attemptsOf(record).filter((a) => isWorkAttempt(a) && !a.limitHit)
+const accepted = (record) => succeeded(record.finalStatus)
+const noEvidence = (record) => SILENT_STATUSES.includes(record.finalStatus) || !!record.continuedFromHandoff
 const details = (record) => {
   const attempts = attemptsOf(record)
   return {
@@ -602,11 +602,11 @@ function unplannedRescue(sample, record) {
   const strategy = String(record.strategy ?? record.plan?.strategy ?? '')
   if (!strategy.endsWith('_DIRECT')) return null
   const attempts = attemptsOf(record).filter((a) => a && !a.limitHit)
-  const first = attempts.find((a) => WORK_ROLES.has(a.role))
+  const first = attempts.find(isWorkAttempt)
   if (!first) return null
   const cands = candidateLookup(sample)
   const stronger = (a) => strongerTier(cands.tierOf(a.agent), cands.tierOf(first.agent))
-  const lastWork = attempts.filter((a) => WORK_ROLES.has(a.role)).at(-1)
+  const lastWork = attempts.filter(isWorkAttempt).at(-1)
   if (lastWork && lastWork.agent !== first.agent && lastWork.role === 'retry' && stronger(lastWork)) return RESCUE_RETRY
   // A review the plan forced, by the reviewer the plan named, is the design working, not a rescue.
   // It is exactly how a conserved frontier resource comes back into a run (the frontier review
@@ -645,7 +645,7 @@ function labelDisposition(sample, record) {
   if (!decided) return null
   const base = { verified: true, details: details(record) }
   if (noEvidence(record)) return null
-  const later = attempts.slice(decidedAt + 1).filter((a) => a && WORK_ROLES.has(a.role) && !a.limitHit)
+  const later = attempts.slice(decidedAt + 1).filter((a) => isWorkAttempt(a) && !a.limitHit)
   let needed = null
   if (record.finalStatus === 'needs_human') needed = HUMAN
   else if (later.length) needed = later[0].agent === decided.agent ? RETRY_SAME_TIER : RETRY_OTHER

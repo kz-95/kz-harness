@@ -14,12 +14,37 @@
 #   dsh-subagent-codex/lib/index.js (turn/start reads KZ_CODEX_EFFORT /
 #   KZ_CODEX_SERVICE_TIER; original kept as index.js.orig). A reinstall drops it.
 #   Do not set `env: CLAUDE_CODE_EFFORT_LEVEL` here: it would override per-run effort.
+#   claude-code-readonly (below) is Claude Code once more, in plan mode, for
+#     read-only work.
 - id: subagent-claude-code
   config:
     permissionMode: acceptEdits
 - id: subagent-codex
   config:
     permissionMode: approve-for-me
+
+# Read-only work (README, Read-only work): a second Claude Code provider in plan
+# mode, which jev-router starts for a task judged read only so it can run beside
+# a task changing the same folder. Your own Claude settings still apply: run
+# README's check once. Set `model` here only if you set one on
+# subagent-claude-code. GIT_OPTIONAL_LOCKS=0 keeps Claude Code's own git status
+# off the index lock a writing agent needs, and diff.autoRefreshIndex=false (git
+# 2.31 or later reads it from GIT_CONFIG_*) does the same for its git diff, which
+# plan mode allows and which otherwise rewrites a stat-dirty index. With it,
+# git diff --name-only also lists files that were only touched. Without this row
+# Claude takes no read-only work, and Jev setup says why.
+- insert:
+    - id: subagent-claude-code-readonly
+      name: '@deepseek-ai/dsh-subagent-claude-code'
+- id: subagent-claude-code-readonly
+  config:
+    providerName: claude-code-readonly
+    permissionMode: plan
+    env:
+      GIT_OPTIONAL_LOCKS: '0'
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: diff.autoRefreshIndex
+      GIT_CONFIG_VALUE_0: 'false'
 
 # Conversation compaction (the engine's compaction-basic): a conversation is
 # summarised when it reaches 97% of its model's context window, not the

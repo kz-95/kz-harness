@@ -256,8 +256,11 @@ test('checks that run past their time fail with that reason, and the grade envir
     }
     // The real thing, on the platform that adds them: a child given this environment sees no
     // account name. On Linux nothing is added and this passes for the ordinary reason.
+    // What it sees is the five, less any this machine does not have: Windows has all of them, and
+    // Linux has no SystemRoot and often no TEMP or TMP, which gradeEnv then does not invent.
     const child = spawnSync(process.execPath, ['-e', 'const e = process.env; console.log(Object.entries(e).filter(([, v]) => v !== \'\').map(([k]) => k).sort().join(\' \'))'], { env: gradeEnv('/w'), encoding: 'utf8' })
-    assert.deepEqual(child.stdout.trim().split(' ').sort(), ['BENCH_WORKSPACE', 'PATH', 'SystemRoot', 'TEMP', 'TMP'], child.stdout)
+    const here = ['BENCH_WORKSPACE', 'PATH', 'SystemRoot', 'TEMP', 'TMP'].filter((k) => k === 'BENCH_WORKSPACE' || process.env[k])
+    assert.deepEqual(child.stdout.trim().split(' ').sort(), here.sort(), child.stdout)
     // The run's checks get the engine's scrubbed environment: no name holding KEY, PASSWORD, SECRET or TOKEN, and no DSH_ name.
     const scrubbed = agentEnv()
     assert.equal(scrubbed.KZH_TEST_API_KEY, undefined)

@@ -1,15 +1,57 @@
-// Non-blocking orchestration: routed tasks run as DSH background jobs, one at a
-// time per workspace (a lane), while the chat stays free. The resource budget can
-// also cap how many run at once across every workspace.
+// Non-blocking orchestration: routed tasks run as DSH background jobs, one task that
+// writes at a time per workspace (a lane), while the chat stays free. A task judged read
+// only takes a slot of its own and runs beside it, on an agent locked against writing
+// (runAdmitted). The resource budget can also cap how many run at once across every
+// workspace, read-only runs included.
 //
 // One task is one record. The task list and the chat both read that record, so the
 // row and the delivered message can never disagree, and a result stays unread until
 // the conversation has actually taken it.
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { line } from './adapter.js'
+import { NEEDS_LANE } from './capabilities.js'
+import { placeText, slotFacts, waitText } from './waits.js'
+import { commonGitDir, outerRepoRoot } from './workspace.js'
 
 export const laneKey = (cwd) => resolve(cwd).toLowerCase()
+/**
+ * The lane of one read-only task: its own, so it waits for nothing in its workspace and only for a
+ * slot under the cap. NUL never occurs in a path, so no workspace's key can be one of these.
+ */
+export const readLaneKey = (cwd, jobId) => `${laneKey(cwd)}\0read:${jobId}`
+/** The lane a task waits in or holds: its own for a read-only task, its workspace's otherwise. */
+export const laneOf = (t) => (t.access === 'read' ? readLaneKey(t.workspace, t.jobId) : laneKey(t.workspace))
+
+/**
+ * Admit one task and run it. A task judged read only takes a slot of its own and runs a read pass
+ * (`run({ mode: 'read' })`); when that pass cannot do it locked (NEEDS_LANE) the slot is given up
+ * first, then the task waits for its workspace like work that writes and runs once more, as a
+ * writer told why (`run({ mode: 'write', from })`). Giving the slot up before waiting is what lets
+ * it through with a cap of 1: holding it while waiting for a workspace would wait for itself.
+ * Any other task runs once, as a writer, in its workspace's lane.
+ *
+ * `who` describes the run on the lane (createLanes acquire), a fresh copy per pass, since route()
+ * writes what it learns of the run onto it; the run gets it as `pass.who`.
+ */
+export async function runAdmitted({ lanes, task: t, signal, who = null, onWait, run }) {
+  const whoOf = (mode) => (who ? { ...who, ...(mode === 'read' ? { reads: true } : {}) } : undefined)
+  let from = null
+  if (t.access === 'read') {
+    const readWho = whoOf('read')
+    const release = await lanes.acquire(readLaneKey(t.workspace, t.jobId), t.jobId, signal, { onWait, who: readWho })
+    try { return await run({ mode: 'read', who: readWho }) } catch (err) {
+      if (err?.code !== NEEDS_LANE || signal?.aborted) throw err
+      from = { why: err.message, readPass: err.readPass ?? null }
+    } finally { release() }
+  }
+  const writeWho = whoOf('write')
+  const release = await lanes.acquire(laneKey(t.workspace), t.jobId, signal, { onWait, who: writeWho })
+  try { return await run({ mode: 'write', who: writeWho, ...(from ? { from } : {}) }) } catch (err) {
+    if (err?.code === NEEDS_LANE) throw new Error(`a pass that writes cannot be handed back: ${err.message}`)
+    throw err
+  } finally { release() }
+}
 
 /** Every state a task can be in; the task list shows one label per state. */
 export const TASK_STATES = Object.freeze([
@@ -51,16 +93,24 @@ const terminalOf = (status) => {
  */
 export const WAITING = {
   workspace: 'Waiting: another task is running in this workspace',
+  // A run started from the chat (/auto, /<agent>, jev_route, an answer with no chat model) has no
+  // row on the work board, so "another task" would point at nothing the person can see.
+  chat: 'Waiting: a run started from the chat is using this workspace',
   cap: 'Waiting for a free slot: the resource budget caps how many tasks run at once',
+  // Only the task list says this one (lanes why()): a run joining the line is told 'workspace' or
+  // 'cap', and it becomes 'line' only as the line moves, when nothing runs in its workspace and an
+  // earlier task there waits for the slot first.
+  line: 'Waiting: an earlier task in this workspace is waiting for a free slot first',
 }
 
 /**
- * One lane per workspace: a holder and a reorderable waiting line.
+ * One lane per workspace: a holder and a reorderable waiting line. A read-only task has a lane of
+ * its own (readLaneKey), so it never waits in its workspace's line and nothing waits behind it.
  * acquire() resolves with release() when it is this id's turn; an abort while waiting rejects.
  *
  * `max` caps how many lanes may hold at once across every workspace (the resource budget's tasks
- * at once); null, the default, is no cap. A workspace still runs one task at a time whatever the
- * cap. When a slot frees, the workspace whose waiting task arrived first gets it, so a busy
+ * at once); null, the default, is no cap. A workspace still runs one task that writes at a time
+ * whatever the cap; a read-only task's own lane counts under the cap like any other. When a slot frees, the workspace whose waiting task arrived first gets it, so a busy
  * workspace cannot keep a quiet one waiting; within a workspace its own line's order decides.
  *
  * The cap counts every run that holds a lane, a foreground /auto, /<agent> or jev_route as much as
@@ -69,16 +119,60 @@ export const WAITING = {
  * see WAITING) as the run joins the line, and not at all when it starts at once.
  */
 export function createLanes({ max = null } = {}) {
-  const lanes = new Map() // key -> { holder: id | null, waiting: [{ id, n, go }] }
+  const lanes = new Map() // key -> { holder: id | null, who: object | null, waiting: [{ id, n, go, onWait, told, who }] }
   let limit = max ?? Infinity
   let holding = 0 // lanes with a holder, across every workspace
   let arrivals = 0 // numbers every waiter in arrival order, across workspaces
-  const get = (k) => { if (!lanes.has(k)) lanes.set(k, { holder: null, waiting: [] }); return lanes.get(k) }
+  const get = (k) => { if (!lanes.has(k)) lanes.set(k, { holder: null, who: null, waiting: [] }); return lanes.get(k) }
+  const heldReason = (l) => (l.who?.kind === 'chat' ? 'chat' : 'workspace')
   const firstArrival = (l) => Math.min(...l.waiting.map((w) => w.n))
   // Why a run joining lane `k` now would wait, or null when it would start at once. A lane with
   // waiters and no holder is one whose waiters are held back by the cap: next() lets anyone in the
-  // moment both its workspace and a slot are free.
-  const waitsFor = (k) => (lanes.get(k)?.holder ? 'workspace' : lanes.get(k)?.waiting.length || holding >= limit ? 'cap' : null)
+  // moment both its workspace and a slot are free, so a run joining it waits behind the first of
+  // them ('line') rather than for a slot of its own.
+  const waitsFor = (k) => (lanes.get(k)?.holder ? heldReason(lanes.get(k)) : lanes.get(k)?.waiting.length ? 'line' : holding >= limit ? 'cap' : null)
+  // What the waiter at index `i` of lane `l` waits for now.
+  const reasonOf = (l, i) => (l.holder ? heldReason(l) : i === 0 ? 'cap' : 'line')
+  // Every run holding a slot now, by kind, for the words of a wait for one.
+  const heldBy = () => {
+    const by = {}
+    for (const o of lanes.values()) if (o.holder) { const kind = o.who?.kind ?? 'task'; by[kind] = (by[kind] ?? 0) + 1 }
+    return by
+  }
+  // Tasks in lines other than `k`'s that take a free slot before lane `k` does, next() picking by
+  // first arrival. Only lines nobody holds, unless `held`: a held line's holder frees a slot and its
+  // workspace together, and its own earlier waiter then takes that slot.
+  // A key's workspace: a read-only task's own lane (readLaneKey) belongs to the workspace before the NUL.
+  const workspaceOf = (key) => key.split('\0')[0]
+  // With one slot, counted by task: a line keeps beating lane `k` to each slot while its earliest
+  // arrival from its next task on is before `n`, so each of its tasks up to the last that arrived
+  // first counts. With more, by line: once a line's first task holds a slot, its next waits for
+  // that one to end, and lane `k` may get a slot first, so only its first task surely goes before.
+  const earlierForSlot = (k, n, { held = false } = {}) => {
+    let count = 0
+    let here = 0
+    for (const [key, o] of lanes) {
+      if (key === k || (!held && o.holder)) continue
+      let first = 0
+      for (let j = 0; j < o.waiting.length && Math.min(...o.waiting.slice(j).map((w) => w.n)) < n && (limit === 1 || j === 0); j++) first++
+      count += first
+      if (workspaceOf(key) === workspaceOf(k)) here += first
+    }
+    return { count, here }
+  }
+  // A waiter whose reason changed since it was last told is told again: its live lines, its task
+  // row's last line and the benchmark card then follow the line rather than keep the reason it had
+  // when it joined. A listener that throws here is past the point where it could refuse to join.
+  const retell = () => {
+    for (const l of lanes.values()) {
+      l.waiting.forEach((w, i) => {
+        const why = reasonOf(l, i)
+        if (w.told === why || !w.onWait) return
+        w.told = why
+        try { w.onWait(why) } catch { /* it keeps its place; only the words failed */ }
+      })
+    }
+  }
   // Hand out every slot the cap allows: a lane nobody holds, with somebody waiting, lets the head
   // of its line in. With no cap that is every such lane, which is what this did before there was one.
   const next = () => {
@@ -88,13 +182,15 @@ export function createLanes({ max = null } = {}) {
       if (!pick) break
       const w = pick.waiting.shift()
       pick.holder = w.id
+      pick.who = w.who ?? null
       holding++
       w.go()
     }
     for (const [k, l] of lanes) if (!l.holder && !l.waiting.length) lanes.delete(k)
+    retell()
   }
   return {
-    acquire(k, id, signal, { onWait } = {}) {
+    acquire(k, id, signal, { onWait, who } = {}) {
       return new Promise((res, rej) => {
         if (signal?.aborted) return rej(signal.reason ?? new DOMException('Stopped', 'AbortError'))
         // Told before it joins the line: a listener that throws then fails this call and leaves
@@ -109,10 +205,13 @@ export function createLanes({ max = null } = {}) {
         const w = {
           id,
           n: arrivals++,
+          onWait,
+          told: why,
+          who,
           go: () => {
             signal?.removeEventListener('abort', onAbort)
             let released = false
-            res(() => { if (released) return; released = true; l.holder = null; holding--; next() })
+            res(() => { if (released) return; released = true; l.holder = null; l.who = null; holding--; next() })
           },
         }
         signal?.addEventListener('abort', onAbort, { once: true })
@@ -148,25 +247,146 @@ export function createLanes({ max = null } = {}) {
       const i = l.waiting.findIndex((w) => w.id === id)
       return i < 0 ? -1 : i + 1 + (l.holder ? 1 : 0)
     },
+    /**
+     * Where `id` stands in lane `k` now, read off the line as it is (and told again through its
+     * onWait as its reason changes), or null when it is not waiting there:
+     * - why: 'workspace' while another run holds its workspace; 'cap' for the first in a line whose
+     *   workspace nobody holds, which starts at a free slot; 'line' for one behind that first;
+     * - place: its place in its workspace's line, the run holding it counted (as position());
+     * - ahead: the runs waiting in front of it in its workspace;
+     * - slot: for 'cap', its place among the lines waiting for a slot, by first arrival, a line
+     *   whose workspace is held counted too (its holder's slot goes to its own earlier waiter);
+     * - slotsAhead: tasks in lines nobody holds, in other workspaces, that arrived before its own
+     *   line's first once those in front of it have started, and so take a slot before it does
+     *   (0 with no cap); slotsAheadHere of them are its own workspace's read-only tasks, each on
+     *   a lane of its own;
+     * - overCap: more runs hold slots than the cap now allows, so the next to end frees none.
+     */
+    waitOf(k, id) {
+      const l = lanes.get(k)
+      const i = l ? l.waiting.findIndex((w) => w.id === id) : -1
+      if (i < 0) return null
+      const why = reasonOf(l, i)
+      // Its line's first arrival once those in front of it have started: a reordered line can hold
+      // an earlier arrival behind it. For the head of the line that is firstArrival(l).
+      const earlier = earlierForSlot(k, Math.min(...l.waiting.slice(i).map((o) => o.n)))
+      return {
+        why, place: i + 1 + (l.holder ? 1 : 0), ahead: i,
+        ...(why === 'cap' ? { slot: earlierForSlot(k, firstArrival(l), { held: true }).count + 1 } : {}),
+        slotsAhead: limit === Infinity ? 0 : earlier.count,
+        slotsAheadHere: limit === Infinity ? 0 : earlier.here,
+        overCap: holding > limit,
+        chatAhead: l.waiting.slice(0, i).filter((o) => o.who?.kind === 'chat').length,
+        // What an estimate reads, never shown as is: who holds the workspace and who waits in front.
+        holder: l.holder ? l.who : null,
+        aheadWho: l.waiting.slice(0, i).map((o) => o.who ?? null),
+        ...(limit === Infinity ? {} : { max: limit, held: heldBy() }),
+      }
+    },
     /** Waiting ids in `order` first (in that order), the rest after, unchanged. */
     reorder(k, order) {
       const l = lanes.get(k)
       const ids = new Set(l?.waiting.map((w) => w.id) ?? [])
       const unknown = order.filter((id) => !ids.has(id))
       if (unknown.length) throw new Error(`not waiting in this workspace: ${unknown.join(', ')}`)
+      if (!l) return
       const rank = new Map(order.map((id, i) => [id, i]))
       l.waiting.sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity))
+      retell()
     },
   }
 }
 
-/** Serialize async sections (set process env + start a subagent). */
+/**
+ * The keys a run in `cwd` is known by to a run log (laneKey form): its folders, and the git folder
+ * its repository's worktrees share (null outside git). The folders are the one given and the one it
+ * really is, its outermost repository's top inside git (a submodule's runs count with its
+ * superproject's, whose `git status` shows the changed submodule) and the folder itself outside. A
+ * link or junction on the way makes the two differ, and a run in a folder that holds either writes
+ * into it.
+ */
+export async function runKeysOf(cwd) {
+  const top = await outerRepoRoot(cwd).catch(() => null)
+  const real = await realpath(top ?? cwd).catch(() => top ?? cwd)
+  const common = await commonGitDir(cwd).catch(() => null)
+  return [[...new Set([laneKey(cwd), laneKey(real)])], common ? laneKey(common) : null]
+}
+
+/**
+ * Every run going on, and every run that ended while one started before its end still goes on,
+ * each by its folder keys (laneKey form; one key, or a list of the spellings it is known by), the
+ * git folder its repository's worktrees share when there is one, and when it started and ended, in
+ * one sequence. `beside(run)` is whether any other run went on at any time while `run` did in a
+ * related folder: the same one, one that holds it, one inside it, or another worktree of the same
+ * repository. `sep` is the path separator the keys use.
+ *
+ * `track(lookup, fallback)` opens a run whose keys are still being looked up (`lookup()` resolves
+ * to [key, common], as runKeysOf does; `fallback` is the key when it fails), so the run it counts
+ * never waits for git.
+ * Until its keys are known a run is related to every run: the safe side, where a lock check says it
+ * cannot tell rather than blame an agent. `besideNow(run)` is what a lock check asks: it fixes the
+ * runs that count at the moment it is asked (one that starts later cannot have written what the
+ * check read), waits `ms` at most for the lookups among those that could have overlapped `run`,
+ * then answers.
+ */
+export function createRunLog({ sep = '/', waitMs = 5000 } = {}) {
+  const log = [] // { key, common, pending, start, end: number | null }
+  let seq = 0
+  const within = (inner, outer) => inner === outer || inner.startsWith(outer.endsWith(sep) ? outer : `${outer}${sep}`)
+  const keys = (r) => [r.key].flat()
+  const related = (a, b) => !a.key || !b.key || keys(a).some((x) => keys(b).some((y) => within(x, y) || within(y, x))) || (!!a.common && a.common === b.common)
+  // Another run that went on while `me` did and had started by `upTo`.
+  const overlaps = (o, me, upTo) => o !== me && o.start <= upTo && (o.end === null || o.end > me.start)
+  const api = {
+    open(key = null, common = null, pending = null) { const r = { key, common, pending, start: ++seq, end: null }; log.push(r); return r },
+    key(r, key, common = null) { Object.assign(r, { key, common }) },
+    track(lookup, fallback = null) {
+      const r = api.open()
+      r.pending = Promise.resolve().then(lookup).then(([key, common]) => api.key(r, key, common), () => api.key(r, fallback))
+      return r
+    },
+    close(r) {
+      if (r.end !== null) return
+      r.end = ++seq
+      // An ended run matters only to one still going that started before it ended.
+      const oldest = Math.min(...log.filter((o) => o.end === null).map((o) => o.start))
+      for (let i = log.length - 1; i >= 0; i--) if (log[i].end !== null && log[i].end < oldest) log.splice(i, 1)
+    },
+    beside: (me, upTo = Infinity) => log.some((o) => overlaps(o, me, upTo) && related(o, me)),
+    async besideNow(me, ms = waitMs) {
+      const upTo = seq
+      const waits = log.filter((o) => overlaps(o, me, upTo) && !o.key && o.pending).map((o) => o.pending)
+      if (waits.length) {
+        let timer
+        await Promise.race([Promise.allSettled(waits), new Promise((res) => { timer = setTimeout(res, ms) })])
+        clearTimeout(timer)
+      }
+      return api.beside(me, upTo)
+    },
+    get size() { return log.length },
+  }
+  return api
+}
+
+/**
+ * Serialize async sections (set process env + start a subagent). A section whose `signal` aborts
+ * while it waits its turn rejects at once and never runs; the ones after it keep their order.
+ */
 export function createMutex() {
   let tail = Promise.resolve()
-  return (fn) => {
-    const run = tail.then(fn)
-    tail = run.catch(() => {})
-    return run
+  return (fn, signal) => {
+    const turn = tail
+    let release
+    tail = new Promise((r) => { release = r })
+    return new Promise((resolve, reject) => {
+      const stopped = () => reject(signal.reason ?? new DOMException('Stopped', 'AbortError'))
+      signal?.addEventListener('abort', stopped, { once: true })
+      turn.then(async () => {
+        signal?.removeEventListener('abort', stopped)
+        if (signal?.aborted) { stopped(); release(); return }
+        try { resolve(await fn()) } catch (err) { reject(err) } finally { release() }
+      })
+    })
   }
 }
 
@@ -177,6 +397,12 @@ export function validJobIds(ids) {
   return ids
 }
 export const validJobId = (id) => validJobIds([id])[0]
+
+/** What a read pass's measured breach changed, in words: the files, a few at most. */
+const breachWords = (b) => {
+  const files = b?.changed ?? []
+  return `${files.slice(0, 3).join(', ')}${files.length > 3 ? ` and ${files.length - 3} more` : ''} changed in this repository while no other run was going on`
+}
 
 const clip = (s, n) => (String(s).length > n ? `${String(s).slice(0, n - 1)}…` : String(s))
 
@@ -189,6 +415,18 @@ const SAVED = [
   'jobId', 'sessionId', 'workspace', 'taskName', 'taskText', 'capability', 'executor', 'agent', 'model',
   'state', 'phase', 'progressText', 'queuedAt', 'startedAt', 'finishedAt', 'terminalReason',
   'deliveryState', 'deliveredAt', 'seq', 'settledSeq', 'effort', 'mode', 'decider', 'finalStatus', 'statusReason', 'modalities',
+  // Read-only work: the decider's verdict at intake, whether the task runs as a read pass ('read')
+  // or waits in its workspace's line ('write'), why a task judged read only writes, and when a
+  // read pass handed it back to its workspace's line.
+  'readVerdict', 'access', 'accessWhy', 'requeuedAt',
+  // Files the read pass's lock check saw change although no other run went on, when it handed the
+  // task back: the task did not leave the folder as it found it, and says so.
+  'readBreach',
+  // The time it spent back in line after its read pass, which is no part of its running time.
+  'inLineMs',
+  // Every pass's run id, so the history rows of a read pass and of the pass that writes after it
+  // stay the task's own after a restart, when only those rows are left to match.
+  'runIds',
 ]
 
 /** A record from disk (possibly written by an older version) with every field present. */
@@ -211,6 +449,14 @@ const hydrate = (raw) => ({
   finalStatus: raw.finalStatus ?? null,
   // Every task before there was a choice was Jev's.
   decider: raw.decider ?? 'jev',
+  // Every task before there was a read lane waited in its workspace.
+  access: raw.access === 'read' ? 'read' : 'write',
+  readVerdict: raw.readVerdict ?? null,
+  accessWhy: raw.accessWhy ?? null,
+  requeuedAt: raw.requeuedAt ?? null,
+  readBreach: raw.readBreach ?? null,
+  inLineMs: raw.inLineMs ?? 0,
+  runIds: Array.isArray(raw.runIds) ? raw.runIds : raw.runId ? [raw.runId] : null,
 })
 
 /**
@@ -219,8 +465,11 @@ const hydrate = (raw) => ({
  * @param {ReturnType<typeof createLanes>} p.lanes
  * @param {() => object|null} p.jobs   ctx.jobs, or null when this DSH has no job service
  * @param {(t, {signal, emit, onEntry}) => Promise<string>} p.run  runs one task (route()) and returns its report
+ * @param {(w: {key: string, workspace: string} & object) => ({lowMs: number|null, highMs: number|null, text: string}|null)} [p.wait]
+ *   the estimate of how long a waiting task still waits, handed where it stands (lanes waitOf()),
+ *   from waits.js through index.js; none without it
  */
-export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = Date.now, max = 100, log = () => {} }) {
+export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, now = Date.now, max = 100, log = () => {} }) {
   const tasks = [] // oldest first
   // Records that came off disk. Only these can be leftovers from a previous process;
   // a task created after this call is this process's own and must not be reconciled.
@@ -290,11 +539,22 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
         }
         continue
       }
+      // One back in line after its read pass, which ran locked, changed nothing either.
+      const again = t.state === 'queued' && !!t.startedAt
+      const started = !!t.startedAt && !again
+      const finishedAt = t.finishedAt ?? now()
       Object.assign(t, {
         state: 'stopped',
-        finishedAt: t.finishedAt ?? now(),
-        terminalReason: 'interrupted: the app restarted while this task was running',
-        progressText: t.progressText ?? 'Stopped: the app was closed while this task was running',
+        finishedAt,
+        // Its time back in line, to the restart, is no part of the time it ran.
+        ...(again && t.requeuedAt ? { inLineMs: (t.inLineMs ?? 0) + Math.max(0, finishedAt - t.requeuedAt) } : {}),
+        // One that was still in line never ran: nothing in the workspace changed, and its last line
+        // is a reason to wait that no longer holds.
+        terminalReason: started ? 'interrupted: the app restarted while this task was running'
+          : again ? (t.readBreach ? `the app restarted while this task waited in line again after its read pass, during which ${breachWords(t.readBreach)}` : 'the app restarted while this task waited in line again after its read pass, so it changed nothing')
+            : 'the app restarted while this task waited in line, so it never started',
+        progressText: started ? t.progressText ?? 'Stopped: the app was closed while this task was running' : 'Stopped: the app was closed while this task waited in line',
+        ...(started ? {} : { phase: null }),
         deliveryState: 'pending',
         deliveredAt: null,
         seq: (t.seq ?? 1) + 1,
@@ -342,6 +602,12 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
   function applyEvent(jobId, e) {
     const t = find(jobId)
     if (!t || FINISHED.includes(t.state)) return false
+    // A read pass handed the task to its workspace's line: it is waiting again, as work that writes,
+    // and the agent, model and effort the read pass took are not the ones it will run with.
+    if (e.type === 'access' && e.mode === 'write' && t.access === 'read') {
+      Object.assign(t, { access: 'write', accessWhy: e.why ?? null, readBreach: e.breach ?? null, agent: null, model: null, effort: t.askedEffort ?? null })
+      transition(t, 'queued', { phase: 'queued', requeuedAt: now() })
+    }
     if (e.type === 'final') {
       t.finalStatus = e.status ?? null
       // Why the run ended the way it did. Without this the row could say "Needs input" and
@@ -383,7 +649,7 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
    * Start `task` as a background job owned by `owner` (the session's live root agent).
    * Returns the task, or null when background jobs are unavailable (caller runs it blocking).
    */
-  function enqueue({ owner, sessionId, workspace, task, forceAgent, effort, mode, decider, capability, taskName, executor, agent, modalities }) {
+  function enqueue({ owner, sessionId, workspace, task, forceAgent, effort, mode, decider, capability, taskName, executor, agent, modalities, readVerdict, access, accessWhy }) {
     const jobs = getJobs()
     if (!jobs) return null
     const ac = new AbortController()
@@ -394,6 +660,9 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
       taskName: taskName ?? clip(String(task).replace(/\s+/g, ' '), 80), taskText: task, task,
       capability: capability ?? null, executor: executor ?? null, modalities: modalities ?? ['text'],
       state: 'queued', phase: 'queued', agent: agent ?? forceAgent ?? null, model: null, mode: mode ?? 'auto', decider: decider ?? 'jev', effort: effort && effort !== 'auto' ? effort : null,
+      // The effort it was queued with, kept for a writer pass after a read pass took another.
+      askedEffort: effort && effort !== 'auto' ? effort : null,
+      readVerdict: readVerdict ?? null, access: access === 'read' ? 'read' : 'write', accessWhy: accessWhy ?? null, requeuedAt: null, inLineMs: 0,
       queuedAt: now(), startedAt: null, finishedAt: null, terminalReason: null, finalStatus: null,
       progressText: 'Waiting', lastLine: 'Waiting', report: null, runId: null,
       deliveryState: 'pending', deliveredAt: null, seq: 1, settledSeq: 0,
@@ -437,6 +706,10 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
         // A real failure or a user stop explains itself; otherwise the router's own reason for
         // stopping early (needs a person, paused at a limit) is the explanation.
         terminalReason: detail ?? t.statusReason ?? null, settledSeq: ++settledCount, seq: t.seq + 1,
+        // One that is waiting when it ends, a task back in line after its read pass included, keeps
+        // no Waiting phase: the row would read Stopped and Waiting at once.
+        ...(t.startedAt && t.state !== 'queued' ? {} : { phase: null }),
+        ...(t.startedAt && t.state === 'queued' && t.requeuedAt ? { inLineMs: (t.inLineMs ?? 0) + now() - t.requeuedAt } : {}),
       })
       if (report) t.out += `\n${report}\n`
       say({ completed: 'Done', needs_human: 'Needs input', paused_limit: 'Paused: agents at their limits', failed: `Failed: ${detail ?? ''}`, stopped: 'Stopped' }[state] ?? state)
@@ -446,37 +719,81 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
       // job, and a failure there must never stop the task from settling.
       try { onSettled?.(resultOf(t), t.owner) } catch (err) { log(`result ${t.jobId} not handed over: ${err.message}`) }
     }
-    Promise.resolve()
-      .then(() => run(t, {
+    // Started here, not a tick later: run() joins the task's line before it does anything else, so
+    // by the time enqueue returns the task's place is read off the line (the chat's queued line
+    // says what the work board will), never predicted.
+    let running
+    try {
+      running = Promise.resolve(run(t, {
         signal: ac.signal,
         emit,
         onEntry: (entry) => {
-          // The lane let it through and the run has really begun.
-          transition(t, 'routing', { startedAt: now(), runId: entry?.id ?? null })
+          // The lane let it through and the run has really begun: the wait line is no longer true.
+          // A writer pass after a read pass keeps the first start: the task began then, and its
+          // time back in line between the two is kept apart (inLineMs), no part of its running time.
+          // Every pass's run id is kept, so no view shows a pass this task owns as a run of its own.
+          transition(t, 'routing', {
+            startedAt: t.startedAt ?? now(), runId: entry?.id ?? null, runIds: [...(t.runIds ?? []), ...(entry?.id ? [entry.id] : [])], phase: 'routing',
+            ...(t.state === 'queued' && t.requeuedAt ? { inLineMs: (t.inLineMs ?? 0) + now() - t.requeuedAt } : {}),
+          })
+          say('Starting')
         },
       }))
+    } catch (err) { running = Promise.reject(err) }
+    running
       .then(
         (report) => settle(t.finalStatus ? terminalOf(t.finalStatus) : 'completed', report),
+        // A task stopped before the lane let it in never ran, and its message says so: nothing in
+        // the workspace can have changed, which a person deciding whether to look should know.
         (err) => (ac.signal.aborted
-          ? settle('stopped', null, 'stopped by the user')
+          ? settle('stopped', null, !t.startedAt ? 'removed from the line before it started' : t.state === 'queued' ? (t.readBreach ? `removed from the line after its read pass, during which ${breachWords(t.readBreach)}` : 'removed from the line after its read pass, before it changed anything') : 'stopped by the user')
           : settle('failed', `jev-router: ${err?.message ?? err}`, err?.message ?? String(err))),
       )
     return t
   }
 
-  const position = (t) => (t.state === 'queued' ? lanes.position(laneKey(t.workspace), t.jobId) : t.state === 'running' || t.state === 'routing' || t.state === 'verifying' || t.state === 'reviewing' ? 0 : null)
+  const position = (t) => (t.state === 'queued' ? lanes.position(laneOf(t), t.jobId) : t.state === 'running' || t.state === 'routing' || t.state === 'verifying' || t.state === 'reviewing' ? 0 : null)
+  /**
+   * What a waiting task waits for and where it stands, read off the line as it is now: the task list
+   * polls it, so the words follow the line as it moves. `placeText` is the meta line's words for its
+   * place, `reason` the sentence for why, `estimate` how long it may still wait with its basis in
+   * its own text (or null), and `text` the whole line the row shows. `since` is when it joined this
+   * line: when it was queued, or when a read pass handed it back to its workspace's line.
+   * Null for a task that is not waiting in a line (yet, or any more).
+   */
+  const waitingOf = (t) => {
+    if (t.state !== 'queued') return null
+    const key = laneOf(t)
+    const w = lanes.waitOf(key, t.jobId)
+    if (!w) return null
+    let estimate = null
+    let failed = false
+    // An estimate is extra: one that cannot be made must never take the task list down with it, and
+    // is never silently missing either: the line says it failed, where a short record says nothing.
+    try { estimate = wait?.({ key, workspace: t.workspace, ...w }) ?? null } catch (err) { failed = true; log(`no wait estimate for ${t.jobId}: ${err.message}`) }
+    const reason = WAITING[w.why]
+    const facts = [slotFacts(w), failed ? 'No estimate: working it out failed, and the server log says why.' : ''].filter(Boolean).join(' ')
+    // Only plain fields reach the list: who holds the lane and who waits in front are the
+    // estimate's inputs, not the view's.
+    const { holder, aheadWho, held, ...seen } = w
+    return { ...seen, since: t.requeuedAt ?? t.queuedAt, placeText: placeText(w), reason, facts, estimate, text: waitText(reason, estimate, facts) }
+  }
   const view = (t) => ({
     jobId: t.jobId, sessionId: t.sessionId, workspace: t.workspace,
     task: t.taskText, taskName: t.taskName, taskText: t.taskText,
     capability: t.capability, executor: t.executor,
     state: t.state, status: t.state, phase: t.phase, position: position(t), queuePosition: position(t),
     mode: t.mode, decider: t.decider, agent: t.agent, model: t.model, effort: t.effort,
+    readVerdict: t.readVerdict, access: t.access, accessWhy: t.accessWhy, requeuedAt: t.requeuedAt, readBreach: t.readBreach ?? null, inLineMs: t.inLineMs ?? 0,
     queuedAt: t.queuedAt, startedAt: t.startedAt, finishedAt: t.finishedAt,
     terminalReason: t.terminalReason, finalStatus: t.finalStatus, statusReason: t.statusReason,
     progressText: t.progressText, lastLine: t.progressText,
-    reportAvailable: !!t.report, runId: t.runId,
+    reportAvailable: !!t.report, runId: t.runId, runIds: t.runIds ?? (t.runId ? [t.runId] : []),
     deliveryState: t.deliveryState, deliveredAt: t.deliveredAt, seq: t.seq,
-    durationMs: t.startedAt ? (t.finishedAt ?? now()) - t.startedAt : null,
+    // None while it waits, a task back in line after its read pass included: it is not running. Its
+    // time back in line is left out once it runs again or ends.
+    durationMs: t.startedAt && t.state !== 'queued' ? (t.finishedAt ?? now()) - t.startedAt - (t.inLineMs ?? 0) : null,
+    waiting: waitingOf(t),
   })
 
   /** What the chat needs to render one finished task as its own message. */
@@ -558,10 +875,15 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
       persist()
       return true
     },
-    stop(jobId) {
+    /**
+     * Stop a task. `onlyIfWaiting` is Remove: a task that left the line and started while the person
+     * was confirming is not stopped under words that said nothing had changed ('started').
+     */
+    stop(jobId, { onlyIfWaiting = false } = {}) {
       const t = find(jobId)
       if (!t) throw Object.assign(new Error('no task with that id'), { status: 404 })
       if (FINISHED.includes(t.state)) return 'already-finished'
+      if (onlyIfWaiting && t.state !== 'queued') return 'started'
       try { getJobs()?.kill(jobId, t.owner, 'stopped by the user') } catch {}
       // A record restored from disk has no live controller: there is nothing running to abort.
       t.ac?.abort(new Error('stopped by the user'))
@@ -575,6 +897,9 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, now = 
     reorder(workspace, order) {
       if (typeof workspace !== 'string' || !workspace) throw new Error('workspace: the task folder')
       validJobIds(order)
+      // A read-only task waits for a slot of its own, not in this line, so it has no place in it.
+      const reads = order.filter((id) => find(id)?.access === 'read')
+      if (reads.length) throw new Error(`a read-only task waits for a slot of its own, not in this workspace's line: ${reads.join(', ')}`)
       lanes.reorder(laneKey(workspace), order)
     },
     clear(jobIds) {

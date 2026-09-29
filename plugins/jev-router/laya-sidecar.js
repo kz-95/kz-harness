@@ -20,7 +20,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, readlink, rename, rm, writeFile } from 'node:fs/promises'
 import { constants as osConstants, cpus, setPriority as osSetPriority } from 'node:os'
 import { resolve, sep } from 'node:path'
-import { createRotatingLog, execText, isAlive as pidAlive, layaPaths, sizeOf, verifyWeights, withoutSecrets } from './laya-install.js'
+import { createRotatingLog, execText, isAlive as pidAlive, layaPaths, lockHeld, processName, sizeOf, verifyWeights, withoutSecrets } from './laya-install.js'
 import { ADAPTER_VERSION } from './laya-questions.js'
 import { defaultThreads, freePort, killTree as defaultKillTree, workingSetOf } from './local.js'
 
@@ -48,6 +48,9 @@ export const LAYA_TEXT = Object.freeze({
   refused: (reason) => `Laya Auto did not run this: ${clause(reason)}. Nothing was run.`,
   stopWhileHeld: 'Laya is deciding for an open Laya Auto run; stop that run first.',
   orphan: (pid, gb) => `Stopped a Laya left running by an earlier session (pid ${pid}, ${gb ?? '?'} GB RAM).`,
+  // A recorded laya.serve that is alive but cannot be read (run as administrator, most likely): it
+  // cannot be told apart or stopped from here, so its record is kept and the person is told.
+  unchecked: (pids) => `A Laya an earlier session left may still be running (pid ${pids.join(', ')}); it could not be checked or stopped from here (it may run as administrator). End it in Task Manager (Details, right-click pid ${pids[0]}, End process tree; run Task Manager as administrator if it says access is denied), or restart the PC.`,
   spilling: "Laya's GPU memory is spilling into system memory, so it and the local models are slow. Stop the local model, or pick CPU for Laya.",
   hung: (s) => `Laya spent over ${s} s on one request and was restarted.`,
   temperatures: 'Laya reports uncalibrated confidence for questions with 11 or more options (always taskType and skill; capability, strategy and the agent picks when that many are offered); KzH re-tempers them and marks each such answer uncalibrated.',
@@ -127,6 +130,9 @@ export async function processInfo(pid, { platform = process.platform, run = exec
   }
 }
 
+// Read here as the speed run reads it; it lives in laya-install.js, which install.lock's check shares.
+export { processName }
+
 /**
  * On Windows a venv's python.exe can be a redirector that starts the base interpreter as its
  * child, and the model lives in that child: its pid is the one to read RAM from and set priority
@@ -205,6 +211,7 @@ export function createLayaSidecar({
   }
   const paths = layaPaths({ harnessDir, dataDir, platform })
   const readJsonSync = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return null } }
+  const readTextSync = (p) => { try { return readFileSync(p, 'utf8') } catch { return null } }
 
   // --- what is on disk, cached: status() answers at once ---
   let installedInfo = null
@@ -239,6 +246,12 @@ export function createLayaSidecar({
   let stoppedBecause = null
   let why = null
   let orphanStopped = null
+  // Recorded laya.serve pids the last sweep found alive and could not read: kept in sidecar.json.
+  let orphansUnchecked = []
+  // The records of sidecar.json the last sweep could not settle (a Laya it could not read, or an
+  // install check another live process runs under install.lock): carried in every write, and
+  // dropped once none of their pids is alive, so no write here loses them.
+  let earlier = []
   let restartInfo = null
   let restartAt = null // when the pending restart after an unexpected exit begins
   let lastRestart = null // { kind, why, at }, and an exit's code and signal: the last restart the supervisor made on its own (7.5)
@@ -538,14 +551,22 @@ export function createLayaSidecar({
    * rejects for its caller alone.
    */
   let recording = Promise.resolve()
+  // Whether this supervisor has swept an earlier session's record (sweepOrphans): until it has,
+  // what it would write over that record could be the only trace of a laya.serve still running.
+  let swept = false
   function writeSidecarJson() {
     const write = recording.then(async () => {
       const entry = (p) => (p && !p.exited ? { pid: p.pid, interpreterPid: p.interpreterPid, interpreterPath: p.interpreterPath, port: p.port, startedAt: new Date(p.startedAt).toISOString() } : null)
       const main = entry(proc)
       const check = entry(checkProc)
-      if (!main && !check) { await rm(paths.sidecarJson, { force: true }); return }
+      const kept = earlier.filter((e) => [e.pid, e.interpreterPid].some((x) => isAlive(x)))
+      // What has ended since the sweep is let go here, so the card stops naming it at once.
+      earlier = kept
+      const still = orphansUnchecked.filter((x) => isAlive(x))
+      if (still.length !== orphansUnchecked.length) { orphansUnchecked = still; changed() }
+      if (!main && !check && !kept.length) { await rm(paths.sidecarJson, { force: true }); return }
       await mkdir(paths.logDir, { recursive: true })
-      await writeFile(paths.sidecarJson, JSON.stringify({ ...main, ...(check ? { check } : {}) }))
+      await writeFile(paths.sidecarJson, JSON.stringify({ ...main, ...(check ? { check } : {}), ...(kept.length ? { earlier: kept } : {}) }))
     })
     recording = write.catch(() => {})
     return write
@@ -894,23 +915,65 @@ export function createLayaSidecar({
    * hook), the sidecar's or an install check's, from the pids sidecar.json recorded: only a process
    * that is alive, whose executable is under engine/laya (the venv's interpreter, or the base
    * interpreter in engine/laya/python, whose command line names its own path, not the venv's) and
-   * whose command line runs laya.serve.
+   * whose command line runs laya.serve. Two kinds of record are not an earlier session's to settle
+   * and are kept (`earlier`): an install check while another live process holds install.lock, since
+   * a check runs only under that lock and is that installer's (the card, or a second command line);
+   * and a pid that is alive but cannot be read (run as administrator, or PowerShell failed) and may
+   * be Laya (python, or a name that cannot be read either), which is named (`orphansUnchecked`).
    */
   async function sweepOrphans() {
+    swept = true
     const rec = readJsonSync(paths.sidecarJson)
-    if (!rec) return []
-    const killed = []
-    const ours = new Set([proc, checkProc].filter(Boolean).flatMap((p) => [p.pid, p.interpreterPid]))
-    for (const pid of new Set([rec.pid, rec.interpreterPid, rec.check?.pid, rec.check?.interpreterPid].filter((x) => Number.isSafeInteger(x) && x > 0))) {
-      if (ours.has(pid)) continue
-      if (!isAlive(pid)) continue
-      const info = await processInfo(pid, { platform, run }).catch(() => null)
-      if (!info || !under(info.exe, paths.engine, platform) || !/\blaya\.serve\b/.test(info.cmdline ?? '')) continue
-      const bytes = await readWorkingSet(pid).catch(() => null)
-      killTree(pid)
-      killed.push({ pid, ramGB: bytes == null ? null : r1(bytes / GB) })
+    if (!rec) {
+      // No record left, so nothing kept from an earlier sweep is running any more.
+      const had = orphansUnchecked.length
+      earlier = []
+      orphansUnchecked = []
+      if (had) changed()
+      return []
     }
+    const killed = []
+    const unchecked = []
+    const kept = []
+    const ours = new Set([proc, checkProc].filter(Boolean).flatMap((p) => [p.pid, p.interpreterPid]))
+    const valid = (x) => Number.isSafeInteger(x) && x > 0
+    const holder = Number(String(readTextSync(paths.lock) ?? '').trim())
+    const installing = holder !== process.pid && await lockHeld(holder, { alive: isAlive, name: (pid) => processName(pid, { platform, run }) })
+    const pick = (e, kind) => ({ pid: e.pid, interpreterPid: e.interpreterPid, port: e.port, startedAt: e.startedAt, kind })
+    const records = [
+      ...(valid(rec.pid) ? [pick(rec, 'main')] : []),
+      ...(rec.check && typeof rec.check === 'object' ? [pick(rec.check, 'check')] : []),
+      ...(Array.isArray(rec.earlier) ? rec.earlier.filter((e) => e && typeof e === 'object').map((e) => pick(e, e.kind === 'check' ? 'check' : 'main')) : []),
+    ]
+    for (const r of records) {
+      const pids = [...new Set([r.pid, r.interpreterPid].filter(valid))].filter((pid) => !ours.has(pid) && isAlive(pid))
+      if (!pids.length) continue
+      if (r.kind === 'check' && installing) { kept.push(r); continue }
+      let unsure = false
+      for (const pid of pids) {
+        // A pid already ended by the tree kill of another in its record (taskkill /t takes the
+        // venv launcher's interpreter with it) is gone, not unsure: asked again before each read,
+        // and after a read that came back empty, since a process ending meanwhile reads empty too.
+        if (!isAlive(pid)) continue
+        const info = await processInfo(pid, { platform, run }).catch(() => null)
+        if (!info?.exe && !info?.cmdline) {
+          const name = await processName(pid, { platform, run }).catch(() => null)
+          if ((name == null || /^pythonw?(\.exe)?$/i.test(name)) && isAlive(pid)) { unsure = true; unchecked.push(pid) }
+          continue
+        }
+        if (!under(info.exe, paths.engine, platform) || !/\blaya\.serve\b/.test(info.cmdline ?? '')) continue
+        const bytes = await readWorkingSet(pid).catch(() => null)
+        killTree(pid)
+        killed.push({ pid, ramGB: bytes == null ? null : r1(bytes / GB) })
+      }
+      if (unsure) kept.push(r)
+    }
+    earlier = kept
+    orphansUnchecked = unchecked
     if (!proc) await writeSidecarJson().catch(() => {})
+    if (unchecked.length) log(`laya: ${LAYA_TEXT.unchecked(unchecked)}`)
+    if (kept.some((r) => r.kind === 'check') && installing) log(`laya: an install check another process runs under install.lock (pid ${holder}) was left alone.`)
+    if (unchecked.length) changed()
     if (killed.length) {
       orphanStopped = { pid: killed[0].pid, ramGB: killed.some((k) => k.ramGB != null) ? r1(killed.reduce((a, k) => a + (k.ramGB ?? 0), 0)) : null }
       log(`laya: ${LAYA_TEXT.orphan(orphanStopped.pid, orphanStopped.ramGB)}`)
@@ -936,6 +999,9 @@ export function createLayaSidecar({
     try {
       // A disposed supervisor has no exit hook to take a check's laya.serve with the engine.
       if (disposed) throw new StartFailed('Laya was stopped with KzH')
+      // One that never swept (the command line's, install-cli.mjs) would write over, then delete,
+      // an earlier session's record of a Laya still running: swept first, as a start does.
+      if (!swept) await sweepOrphans()
       await checkRam(device)
       if (device === 'cuda') {
         const room = await gpuRoom({ torchCuda: true })
@@ -1101,6 +1167,7 @@ export function createLayaSidecar({
       lastRestart,
       stoppedBecause: state === 'stopped' ? stoppedBecause : null,
       orphanStopped,
+      orphansUnchecked: [...orphansUnchecked],
       settings: publicSettings(),
       shadow: null,
       selfTest: lastSelfTest,

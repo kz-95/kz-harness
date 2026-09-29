@@ -28,7 +28,7 @@ flowchart TD
     J -- unsure --> S[Second opinion<br/>from a different agent] --> J
     J -- wrong --> RT[Retry with another agent] --> V
     J -- needs a person --> H([Handed to you])
-    C & X & D & B -. usage limit hit .-> L[Switch key, or hand over<br/>to the peer agent with a handoff note]
+    C & X & D & B -. usage limit hit .-> L[Hand over to the peer agent,<br/>or another, with a handoff note]
     L --> V
 ```
 
@@ -41,7 +41,7 @@ flowchart TD
    Jev is asked what the task is and how to organise the work, not who does it.
    Once a routing domain has been right often enough, on outcomes that were actually verified, its local classifier answers in place of Jev whenever it is confident and the input looks familiar.
    Jev's routing questions are batched into calls, so a call is skipped only when every domain it carries answers locally; see [It learns: adaptive routing](#it-learns-adaptive-routing).
-4. **The agent works** inside your project folder. If it hits its usage limit mid-task, an API-key agent switches to your next key; a subscription agent (Claude ↔ Codex) hands the task to its peer, along with a **handoff note** (`.kz-harness/handoff.md`).
+4. **The agent works** inside your project folder. If it hits its usage limit mid-task, it is out until the limit resets and the task goes to its peer (Claude ↔ Codex) or another agent that can do it, along with a **handoff note** (`.kz-harness/handoff.md`). A spent DeepSeek key is marked, and your next key takes over after a restart (see [Usage limits and handoff](#usage-limits-and-handoff)).
 5. **Deterministic checks run:** the git diff, plus your project's `typecheck`, `lint`, `test` and `build` scripts. A check that passed before must still pass.
 6. **Jev reviews** with small yes/no questions (did it do the task? all of it? anything unrelated? regression risk? does it need a person?). Code decides from those answers: pass, second opinion, retry, or hand it to you.
 7. **You get the answer and a report**, ending with who took part, e.g. `Answered by: Jev (jev-1.13.0) → deepseek (deepseek-flash) · claude (opus), reviewer`. The **Jev inspector** shows every decision.
@@ -73,7 +73,7 @@ Only the model and API calls you choose go online. KzH switches off DSH's data c
 
 ## What you get
 
-- **Kz-harness.exe:** its own window, name and icon, a start screen with a live log, a colored log window (Ctrl+Shift+L), a tray icon, and DevTools on F12. Closing it stops everything it started.
+- **Kz-harness.exe:** its own window, name and icon, a start screen with a live log, a colored log window (Ctrl+Shift+L), a tray icon, and DevTools on F12. Closing its window leaves the harness running in the tray; quitting it (from the tray or the app menu) stops everything it started.
 - **Header like Claude desktop:** buttons for **Terminal**, **Background tasks**, **Browser** and **Jev inspector**, plus a **⋮** menu (Files, Usage, focus mode, settings). Every action has a hotkey you can change in **Settings → Shortcuts**.
 - **Right sidebar** (opens at 24% width; change it in Settings → Shortcuts):
   - **Jev inspector:** timings, the pick and its reasons, every step with that agent's own answer, and every question Jev was asked with its probabilities.
@@ -261,28 +261,166 @@ handoff updated, so a handover loses nothing. Both are editable per agent in the
 
 A task you type in a project does **not** hold the chat. Jev queues it, answers with the line
 
-> Queued -> claude as **jev-3** (2nd in line for HarnessProjects). Keep chatting - the result posts here when done.
+> Queued → Jev picks as **jev-3** (2nd in line for HarnessProjects: another task is running there). Keep chatting: the result posts here when done.
 
 and you carry on: ask a question, start a task in another project, read the inspector.
+The task joins its folder's line as it is queued, so the brackets are read off the line itself (`tasks.get(jobId).waiting`), a foreground run in it counted as much as a task.
+They say where the task stands and why: `starting now in HarnessProjects`, `2nd in line for HarnessProjects: another task is running there`, `2nd in line for HarnessProjects: an earlier task there is waiting for a free slot`, or `next for a free slot to start in HarnessProjects: the resource budget caps how many tasks run at once` (`2nd for a free slot` when another folder's task takes the next one first).
+When a run started from the chat holds the folder (an `/auto`, `/<agent>`, `jev_route` or answer run, none of which has a row on the work board), the brackets say `2nd in line for HarnessProjects: a run started from the chat is using it`, and the task's row says `Waiting: a run started from the chat is using this workspace`.
 
 When the task finishes, its result is posted into that chat **as its own message**, headed with the task name, its id, the agent, the model and the status - never merged into, and never in front of, whatever the assistant is saying. If an answer is streaming when the task lands, delivery waits for that answer to finish, so nothing interrupts it. A result counts as **unread** until your browser reports that it actually rendered the row, so the badge means "you have not seen this yet"; if the message could not be posted it stays on offer and is retried, and an appended result is never posted twice. Each result is a collapsed `Context injection · jev-router` row, which is the engine's own notice row rather than a bespoke card. That is deliberate: the slot the card needed is keyed, not chained, so taking it replaced the row for every other producer too and flattened five structured bodies. Open the row for the raw text, or the **Overview** tab in the right sidebar to read the same report rendered as Markdown, on a surface KzH owns outright.
 
-- **One at a time per project folder.** Two agents never edit the same folder at once; a second task for the same folder waits its turn.
+- **One task that writes at a time per project folder.** Two agents never edit the same folder at once; a second task for the same folder waits its turn.
+  A task the decider judged only reads the project ([Read-only work](#read-only-work) below) takes a slot of its own and runs beside the task writing there, on an agent locked against writing; it still counts under **Tasks at once**.
   Different folders run in parallel, up to the resource budget's **Tasks at once** when one is set (see [Local models & offline](#local-models--offline)).
+  KzH's own git reads of a folder (`status`, `ls-files`, `rev-parse`, `hash-object`) run with `GIT_OPTIONAL_LOCKS=0`, so they leave `.git/index` alone, and an agent's own `git add` or `git commit` there cannot fail on `.git/index.lock` because KzH was reading at that moment.
+  `git diff` still rewrites a stat-dirty `.git/index` whatever `GIT_OPTIONAL_LOCKS` says (seen on git 2.43), so KzH's own diffs also set `diff.autoRefreshIndex=false`, and KzH runs `diff` only for work that writes, in a folder whose line that work holds; a read pass runs no `diff` at all: it compares `git status`, file hashes and `HEAD` instead.
+  A folder below its repository's top (a package in a monorepo) is read from the top, so its diff names what changed there, and every changed file is hashed by one git process however many there are.
 - **Every state is on the record**: waiting, choosing executor, running, verifying, reviewing, and then completed, failed, stopped, needs input or paused by limit. A completed row gets a check mark and a struck-through title; failed, stopped, needs-input and paused rows keep their own icon, a text label (never colour alone) and the reason.
 - **Every terminal outcome reports**, including a task you stopped yourself: its message says `Status: Stopped` and why, because the report is where the explanation lives. Nothing is quietly closed without being shown.
 - **A finished result held for display is visible without touching the answer.** If a task settles while an answer is still streaming, its message waits for that answer to end; until it goes out, the top bar's Background button marks it (`N result(s) waiting to be posted`). The active answer is never modified to say so.
-- **Interrupted work is reconciled.** If the app closes mid-task, that row comes back as stopped with the reason and the last progress line it had, instead of showing work that can never finish.
-- **The task list** is the Jev inspector's **Background** tab (Ctrl+Alt+B). It shows the row's phase, place in line, agent, model, effort, elapsed time, the last router line, and the full report once you open a finished row.
-- **Stop** cancels a running or queued task; work already written to the project stays. **Run next** moves a waiting task to the front of its folder's line. **Clear** removes finished rows from the list and the saved log; results already posted in the chat stay.
-- Questions, `/auto`, `/claude` and the other forced-agent commands still answer in line, as before - only routed project work is queued.
+- **Interrupted work is reconciled.** If the app quits mid-task, that row comes back as stopped with the reason and the last progress line it had, instead of showing work that can never finish.
+  A task that was still in line comes back as stopped with `the app restarted while this task waited in line, so it never started`.
+- **The task list** is the Jev inspector's **Background** tab (Ctrl+Alt+B). It shows the row's phase, agent, model, effort, elapsed time, the last router line, and the full report once you open a finished row.
+  A waiting row's meta says its place instead of a time (`2nd in line`, `next for a free slot`, `2nd for a free slot`), and its line says why it waits, kept current as the line moves (a foreground run's live lines are told again when the reason changes), then, where past runs allow, an estimate with its basis: `Waiting: another task is running in this workspace. Starts in about 4 to 8 min, estimated from 5 past runs of claude at medium effort with no planned review.`
+  That line is in the row itself, not only behind the disclosure.
+  Between the reason and the estimate it says, in sentences with no figure, what else decides the start, each where it applies: `Tasks at once: 2 of 2 in use (1 background task and 1 capability benchmark task).` (or `Tasks at once: 2 in use, over the 1 now set, so the next to end frees no slot (...).`), `1 task waiting in another workspace takes a free slot before this one.`, and `1 run from the chat waits ahead of it in this line.`
+  An estimate that could not be worked out says `No estimate: working it out failed, and the server log says why.`
+  When the task leaves the line, its last line becomes `Starting`.
+- **Stop** cancels a running task; work already written to the project stays.
+  A waiting task's button is **Remove** instead, which takes it out of the line only while it still waits (otherwise `"<task>" started before it could be removed, so it was not stopped. Use Stop on its row to stop it.`), and its message in the chat then says `removed from the line before it started`.
+  **Run next** moves a waiting task to the front of its folder's line, and is offered only when another task waits in front of it there. **Clear** removes finished rows from the list and the saved log; results already posted in the chat stay.
+- Questions, `/auto`, `/claude` and the other forced-agent commands still answer in the chat rather than as a background task; only routed project work is queued.
+  A foreground `/auto`, `/<agent>` or `jev_route` run in a folder where a task is running waits its turn in that folder's line (`Waiting: another task is running in this workspace`) and then runs.
+  The one call still refused is `jev_route` from an agent the router started, a child of a chat whose route is running now: `a routed agent must do its task directly, not call jev_route: it would wait for its own run to end`.
 - Task records are kept in `~/.kzh/jev-router/tasks.jsonl` (the last 100). If the engine has no job service, tasks run in the chat exactly as they did before.
+
+**The wait estimate** is drawn only from history rows that recorded their wall-clock time (`startedAt` and `wallMs`, from the moment a run took its folder's lane to its end), within the provider that decided the running task (Jev or Laya), at the first of these levels with at least 5 runs: the same agent at the same effort with a planned review or without one, as the running task has; the agent at that effort; the agent; the workspace.
+Each level keeps its 50 newest runs.
+Only runs that lasted longer than the running task has so far count, and the middle half of what they had left is the range.
+The figure names the runs it stands on: `estimated from the 5 of 50 past runs of claude at medium effort with no planned review that ran longer than the running task has so far`, or plain `estimated from 6 past runs of ...` when all of them did (`past Laya runs` for a run Laya decided).
+When fewer than 5 ran that long, the line says so with no figure: `No estimate: only 2 of the 6 past runs of claude at medium effort with no planned review ran longer than the running task has so far, and an estimate needs 5.`
+Each task ahead is counted at what a whole run in this workspace takes under its own decider (Jev or Laya), and each one's middle half is added to the running task's, so a range with tasks ahead is wider than a middle half.
+When a run ahead has no known decider or only answers a question, or its decider has fewer than 5 runs in the workspace, the line says only `The running task likely ends in ...; 2 more tasks are ahead of this one.`
+When the run holding the folder only answers a question, there is no figure.
+A run in which no agent worked (a tool took the work, or a person was asked before anything ran) counts toward its workspace only.
+There is no figure at all for a task waiting for a free slot, when another folder's earlier task will take a slot before it, when more tasks run than **Tasks at once** now allows, or with fewer than 5 runs: the row then shows the reason and, where they apply, the sentences above about **Tasks at once**, other lines and runs from the chat, with no estimate.
+Stopped runs, runs that hit a usage limit, answer-only runs (an answer asked for in the chat, whether it answered or not) and read passes are not counted.
+A place for a free slot counts the other lines' tasks that arrived earlier, a folder whose own task is running included, since the slot that task frees goes to the one waiting behind it: each such task with **Tasks at once** at 1, and each such line once with more (see below).
+With **Tasks at once** at 1 the other lines' tasks that take a slot first are counted each, a line of two earlier tasks as two; with more, each such line counts once, since once its first task holds a slot its next waits for that one to end, and this task may get a slot first. For a task behind others in its own folder's line they are counted from when its own turn comes; this folder's own read-only tasks, each waiting for a slot of its own, are said apart (`1 read-only task in this workspace takes a free slot before this one.`).
+
+## Read-only work
+
+A task that only reads the project, such as "explain how the parser handles escapes", does not have to wait behind a task changing the same folder.
+When the decider judges a message read only, its task takes a slot of its own and runs beside the folder's writer, on an agent locked so that it cannot write.
+It still counts under **Tasks at once**, and it waits for a free slot under that cap (`Waiting for a free slot`), never for its folder.
+Everything else waits its turn in the folder's line as before.
+
+**Who decides.** The intent call every message already makes asks one more yes/no question, `readOnly`: can everything the message asks for be done by reading the project's files and replying, without creating, changing or deleting any file and without running any command or program?
+Running tests, builds, scripts, formatters or installs counts as running a program; writing findings, a plan or code in the reply itself changes no file.
+The answer is read against the answering provider's own bar, `thresholds.readOnly`: 0.8 for Jev and 0.9 for Laya (see [Configuration](#configuration)).
+Laya is not calibrated yet and is expected to clear 0.9 rarely, so under Laya Auto most tasks will likely still wait in the line; nobody has watched it yet.
+A flat answer, an unsure one (Laya could not sort the message), an offline run (a word test, which has no such answer), a forced agent (an agent row in the picker) or a call that did not answer gives no verdict, and the task waits in its folder's line as it always did.
+`/auto`, `/claude`, `/codex` and the other chat commands, and `jev_route`, are never judged, so they always run in the line.
+
+**Which agents can be locked.**
+
+- **Claude Code** runs a read pass through a second provider row in plan mode, `claude-code-readonly` (below).
+- **DeepSeek, API-key and local agents** start with only the read tools the chat that starts them sees, out of `read`, `glob`, `grep` and `read_image`: `read` must be among them, and `read_image` too when the task carries an image.
+  That holds only while their tools are presented natively, not through `run_code`, and while their provider takes a per-start tool filter.
+  Once the agent has started, KzH reads again what it can call, and stops it before it works if it can see anything else.
+- **Codex** cannot be locked through its provider, so its read-only work waits its turn in the folder's line.
+
+**How a read pass runs.** A task judged read only runs as a read pass when at least one agent this run could pick can be locked now (switched on, allowed in this mode, the one asked for when one was, signed in and not at its usage limit as last read, unless the time it resets has passed); otherwise it waits in the line, and its queued line says why, naming each agent with its reason (`claude: not signed in`, `claude: at its usage limit`, or for a local model `qwen: not ready on this PC (this PC cannot run ...)`).
+The read pass is routed as an answer over the whole pool of agents, with no tools, no checks, no review and no handoff note: it neither reads nor writes `.kz-harness/handoff.md`.
+The agent is told it is locked to reading, that another agent may be changing files while it reads, and to write `NEEDS-WRITE-ACCESS` on a line of its own if the task cannot be done without changing a file or running a command.
+The task goes to its folder's line, and runs once more as work that writes, decided again when it starts, when:
+
+- the routing names a capability that may change files (`project_change`, `document_processing`), and the reason says `which may change files`;
+- the routing names `web_research`, since no locked agent is shown to reach the web yet;
+- the routing names `other`, since unsure means it may write;
+- the agent picked for it cannot be locked, or could not be started locked;
+- no agent that can be locked is left to try, at the start or after a usage limit or a failed answer;
+- the agent writes `NEEDS-WRITE-ACCESS` on a line of its own, which still counts with Markdown around it on that line (bold, code, a quote or a list mark).
+
+A primary attempt that cannot be started locked, or whose agent breaks off with an error, stops its parallel second opinion.
+An opinion whose complete answer had already come back when its primary's lock was refused is the run's answer, as beside a primary that failed; otherwise the task goes to its folder's line, and the hand-back names the opinion's agent as the one that read when it ran locked and no work attempt did.
+A Stop pressed while a stopped opinion is still ending is said as the Stop (`stopped by the user`), not as the break-off.
+A primary that ends with a failed answer, an empty one or at its usage limit lets the opinion finish: when the opinion answered, its answer is the run's and no retry is paid for on top of it (a locked opinion that writes `NEEDS-WRITE-ACCESS` hands the task back as a primary would), and when it did not, a retry follows.
+An empty answer is no answer: beside an opinion that answered it gives way to that answer, as a failed one does, and otherwise a retry follows it.
+A read pass never asks an agent again that already tried it (as its primary, a retry or its parallel opinion), a locked agent past its weekly gate included when no other is left; once none is left, the task goes to its folder's line rather than run a locked agent over again.
+A parallel opinion stopped because its primary broke off has not tried the task, so it can still be asked as the retry and uses up no attempt; its attempt says `stopped when claude broke off`.
+One whose agent's result had already come back (however long its process then took to end), or that was refused its own lock, was not stopped by the break-off: it keeps its own outcome and counts as having tried.
+A complete answer stands even when its metered key crossed its floor with that very call (`- Usage limit: deepseek → its answer had come back complete, and it stands`); the limit is still on the record, the agent's next reading shows it below its floor, and the answer is credited as work done.
+Such an opinion is then the run's work to everything that learns from runs (the track record, calibration, capability evidence and the routing labels), so the agent that answered is credited and the primary that failed is not.
+The report then compares nothing and says whose answer is shown: `the primary did not finish, so there was nothing to compare. The primary did not finish; the answer below is the second opinion from deepseek.`, or `the primary gave no answer, ...` twice over for an empty one.
+A primary out of allowance adds `- Usage limit: claude → its second opinion had answered, and that answer stands`; when its locked opinion needs the folder instead, the live line says `claude hit its usage limit: the task goes to its folder's line`, and the task runs on as work that writes.
+Either way the pass waits for the opinion to end before a retry or the hand-back to the line, so nothing of the read pass works on beside what comes next.
+This holds for every answer with a parallel second opinion, read pass or not.
+
+**The lock check.** After each read pass KzH compares the repository with how it was before the pass: every path `git status` lists as changed or untracked, by content, `HEAD`, and `.git/config` and the files in the hooks folder by content, where a write that got past a lock would run code later.
+Each is named where it really is (`.git/hooks/pre-commit`, or `.husky/_/pre-commit` for husky's folder in the working tree), and the folders are compared as the file system really has them, so a workspace reached through a link, a junction or a subst drive, or typed in another case on Windows, reads the same files.
+A hooks folder outside the repository, a `core.hooksPath` every repository shares, is left out, since a run in any repository may write there.
+Ignored files are not checked: `git status` does not list them, and a folder of build output or `node_modules` would make every check slow and blind.
+It counts every other run, other read passes included, in the same repository, in another worktree of it (they share `.git/config` and the hooks), or in a folder that holds it or sits inside it (a folder of projects that is not a repository, a repository holding a clone that is not a submodule), because `git status` sees the whole repository and a run in a folder above it writes into it just the same.
+A folder reached through a link or a junction is known both as it was given and as it really is, so a folder of projects moved to another drive and linked back, or a repository opened through a link inside a folder of projects, still counts a run above it.
+Links inside a run's folder are not followed: a run in a folder of projects that writes through a link in it into a repository opened where that repository really lives is not counted, and a change it makes there is taken as one made while no other run went on.
+If a file changed while no other run went on in the repository, the report warns (`Warning: src/a.ts changed in this repository while this locked run was reading and no other run was going on in it. Either you edited it, or the lock on claude did not hold; claude takes no read-only work until the harness restarts.`), and that agent then takes no read-only work until the harness restarts.
+With two locked agents the warning ends `claude and deepseek take no read-only work until the harness restarts`.
+After such a breach each locked attempt's line says `Changed files: none credited to it (it ran locked; see the warning above)`.
+A parallel second opinion that could not be started locked, or was stopped before it started, is not listed as having run locked, and is never blamed; its line says which (`Changed files: none (it could not be started locked)` or `Changed files: none (it was stopped before it started)`).
+A pass the person stops is checked too, over every agent it had started locked: a Stop is what a person does on seeing files change.
+A submodule counts with its superproject, whose `git status` shows the submodule as changed, and a folder below its repository's top is compared from the top, so a change to a file that was already changed is seen.
+A changed path git cannot look into (a nested repository, a changed submodule) could hide a change, so when nothing else changed the check says `Lock check: not measured: git cannot see inside vendor/, so a change there would not show`.
+A breach measured in a read pass that then hands the task back goes with the task: the report of the pass that writes after it says `- Warning: src/a.ts changed in this repository while the read pass before this run was reading and no other run was going on. Either you edited it, or the lock on claude did not hold; claude takes no read-only work until the harness restarts. This run started from those changes.`, and **Remove** on it says so rather than that nothing changed.
+A pass during which any other such run went on (one was going when it started or when it ended, or one started meanwhile) cannot tell the two apart, says `Lock check: not measured: another run was going on in this repository at the same time, so a change there cannot be told from one this run made, and what it read may include that run's unfinished edits`, and distrusts nobody.
+A folder that is not a git repository gives `Lock check: not measured: not a git repository`.
+
+**The plan-mode row.** [`config/cordis.patch.yml`](config/cordis.patch.yml) has it: it inserts `subagent-claude-code-readonly` (the same `@deepseek-ai/dsh-subagent-claude-code` package once more) with `providerName: claude-code-readonly`, `permissionMode: plan` and an `env` that keeps Claude Code's own git reads off the index lock a writing agent needs: `GIT_OPTIONAL_LOCKS: '0'` for its `git status`, and `diff.autoRefreshIndex` set to `false` through `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0` (git 2.31 or later) for the `git diff` plan mode lets it run, which would otherwise rewrite a stat-dirty index.
+With that setting `git diff --name-only` also lists files that were only touched, with no change to their content.
+The installer writes a profile's patch file only once, so an existing profile gets the row only by hand; `scripts/Update-Harness.ps1` lists the lines your copy is missing.
+Without the row, Jev setup says `Read-only work: no, the claude-code-readonly row (Claude Code in plan mode) is not in this profile; config/cordis.patch.yml has it and scripts/Update-Harness.ps1 lists the lines to copy`.
+Plan mode is Claude Code's own enforcement, and your own Claude settings (allow rules, hooks, MCP servers) still apply to it, so run the check once, in a test repository with nothing to lose and no other task running there, since another run beside it leaves the lock check unmeasured.
+Send a task that is judged read only (its queued line says `Read only: ...`) and whose words also ask Claude to create a file and run `git stash`.
+Plan mode held when the lock check measured no change: either the report says `claude ran locked (Claude Code plan mode)` and `Lock check: nothing changed in this repository while it ran (measured ...)`, or Claude wrote `NEEDS-WRITE-ACCESS` (the live line says `Needs the folder after all: ...`), and the report of the pass that writes after it says `Its read pass's lock check: nothing changed in this repository while it ran (measured ...)`.
+In the second case that pass then runs as work that writes and really creates the file and stashes, which is why the check belongs in a test repository.
+If the queued line does not say `Read only`, the task runs as work that writes from the start.
+
+**What you see.**
+
+- The chat's queued line adds `Read only: Jev judged it only reads the project (93%, its bar is 80%), so it runs on an agent locked against writing, beside any task changing HarnessProjects.`
+  With no agent here that can be locked, it says `Read only: Jev judged it only reads the project (93%, its bar is 80%), but no agent here can be locked against writing (codex: Codex cannot be locked through its provider), so it waits for HarnessProjects like work that writes.`, or, when nothing holds the folder, `..., so it runs as work that writes, and a task changing HarnessProjects waits for it.`
+- The live lines say `Read only (Jev 93%, bar 80%): runs on an agent locked against writing, beside any task changing this folder; no checks, review or handoff note`, and on a hand-back `Needs the folder after all: <why>. It waits its turn there and is decided again when it starts`.
+- The task row's meta says `reads only` while it runs as a read pass.
+  A task back in the line shows no running time, in the task list and in the Overview ledger alike, and counts its time in line from when it rejoined.
+  Once it runs again or ends, its running time and its duration leave that time in line out: a 30 s read pass, 11 min back in line and a 2 min writer pass read `2 min 30 s`.
+  The task keeps the run id of every pass, so the history rows of its read pass and of the pass that writes after it stay the task's own after a restart.
+- The report says who judged it and against which bar, what locked each agent and what the lock check measured: `- Read only: Jev judged it only reads the project (93%, bar 80%); claude ran locked (Claude Code plan mode)`, then `- Lock check: nothing changed in this repository while it ran (measured over the files git lists as changed or untracked, HEAD, .git/config and its hooks folder when that is in the repository; ignored files are not checked)`.
+  A task that ran as work that writes after a hand-back says `- Judged read only (Jev 93%, bar 80%), then needed the folder: <why>; claude read for 41 s first, locked`, naming the agent that really read and that attempt's own time, then what its read pass's lock check came to (`- Its read pass's lock check: ...`).
+  When no agent read (it could not be started locked, or the routing handed the task back first), the line ends at `<why>` and says nothing of reading.
+  One no agent could lock says `- Judged read only (Jev 93%, bar 80%), but ran as work that writes: <why>`.
+- Jev setup shows one line per agent: `Read-only work: yes, Claude Code plan mode` (`yes, read tools only, checked as each run starts` for a DeepSeek, API-key or local agent) or `Read-only work: no, <why>`.
+- The server log says once, the first time a task is judged read only, which agents can take read-only work and how, and which cannot and why.
+- **Remove** on a task back in the line asks with `"<task>" ran only a read pass, locked against writing, so nothing in the workspace has changed.`, and the task ends with `removed from the line after its read pass, before it changed anything`.
+  After a breach its read pass measured, it asks with `"<task>" ran a read pass, and src/a.ts changed in this repository while it read, so its lock may not have held.` and ends with `removed from the line after its read pass, during which src/a.ts changed in this repository while no other run was going on`.
+  **Stop all** counts such a task as one that ran only a read pass (`It ran only a read pass, locked against writing, so nothing in the workspace changes.`), not as one that never started.
+  A task that waited there again when the app quit comes back with `the app restarted while this task waited in line again after its read pass, so it changed nothing`.
 
 ## The work board, history and feedback
 
 These are plugin features (`plugins/jev-router/client.js`), loaded by the engine: a harness restart picks them up, not a rebuilt exe.
 
-- **The work board** is a sticky card at the top of the conversation, per session: this session's background tasks as a checklist. The header reads `N/M completed` and names each non-completed terminal state that occurred (`1 failed`, `2 stopped`, and so on), because only `completed` counts as done. Each row shows its state in words plus the agent, model, effort and elapsed time, and a live row ticks once a second. **Stop all** stops every live task after a confirmation naming them and what is kept; the control is hidden while nothing is live. A session with no tasks renders nothing at all. Every row reuses the Tasks panel's own row model, so the words in the board, the panel and the delivered result cannot drift apart.
+- **The work board** is a sticky card at the top of the conversation, per session: this session's background tasks as a checklist.
+  The header reads `N/M completed` and names each non-completed terminal state that occurred (`1 failed`, `2 stopped`, and so on), because only `completed` counts as done.
+  Each row shows its state in words plus the agent, model, effort and elapsed time, and a live row ticks once a second.
+  A waiting row shows its time in line instead (`in line 32.0 s`), and a second line under it with why it waits and the estimate, as in the task list.
+  Each live row has its own **Stop** (running) or **Remove** (waiting) button with a confirmation in words that fit it: `Remove this task from the line?` says the task has not started, so nothing in the workspace has changed, and `Stop this task?` that work it already did stays.
+  A confirmation never changes what its button does: if its task starts, ends or goes back to waiting while it is open, here or in the Background tab, it closes and says so (`"<task>" started while you were confirming, so it was not removed. Use Stop on its row to stop it.`).
+  **Stop all** stops every running task and takes every waiting one out of the line, after a confirmation naming them and what is kept; its accessible name and confirmation count the two apart (`Stop all 3 tasks in this session: 1 running, 2 waiting`), and the control is hidden while nothing is live.
+  It stops only the tasks it named when it opened, never one queued after.
+  The dialog names its body for a screen reader (`aria-describedby`).
+  A session with no tasks renders nothing at all.
+  Every row reuses the Tasks panel's own row model, so the words in the board, the panel and the delivered result cannot drift apart.
 - **Composer history:** ArrowUp recalls your previous input, ArrowDown walks forward, and the draft you were typing is restored once you walk past the newest entry. The entries are this session's own user messages (the newest 50), and the arrows work only while the composer is on screen and the caret is on the draft's first or last line.
 - **Left sidebar file tree:** a toggle beside the Workspaces search icon opens a VS Code style tree of the open session's project folder. One directory level loads at a time as you expand it (capped at 400 rows); a directory opens and closes, and clicking a file opens it in the right sidebar the same way the shipped Files tab does. The honest limit: it roots at the **open session's** folder, because the engine exposes no independent selected workspace, so it follows the session, not a separately highlighted workspace row.
 - **Answer feedback:** every answer carries **Like** and **Dislike**. A verdict can take an optional tag and an optional one-line **Why?**; a dislike also gets a **should have been** picker naming another enabled agent.
@@ -332,7 +470,7 @@ A message is not forced to be either a question or a task. Ask *"what does the p
 
 ```text
 <the answer>
-Queued -> codex as jev-7 (starting now in Harness). Keep chatting - the result posts here when done.
+Queued → Jev picks as jev-7 (starting now in Harness). Keep chatting: the result posts here when done.
 ```
 
 The two judgments are asked separately (is this a question to answer, and does it also ask for work), because one choice between them could not express a message that is both. Work is only queued when Jev is at least 0.7 sure the message really asks for it: a wrong guess costs a background run of something you only asked about.
@@ -356,7 +494,7 @@ This is what lets non-code work be routed at all: the old question was only "que
 | `document_processing` | Read or transform a PDF or spreadsheet | an executor that accepts the file |
 | `web_research` | Current information with sources | an executor with the network |
 | `deterministic_tool` | An exact conversion a script does | the registered script, ahead of any model |
-| `project_read` | Explain how the repo behaves | a read-only project agent |
+| `project_read` | Explain how the repo behaves | a project agent, never asked to change files; locked to reading (Claude Code in plan mode, or a DeepSeek, API-key or local agent limited to read tools) only when the decider also judged the message read only and it runs as a read pass ([Read-only work](#read-only-work)), otherwise unlocked, in its turn in the folder's line; Codex cannot be locked, so its read-only work always waits its turn there |
 | `project_change` | Implement or fix something | a mutating agent, with checks and review |
 | `human_required` | A missing permission or a choice only you can make | the request stops and asks you |
 
@@ -427,15 +565,18 @@ The design and every line it writes are in [`docs/benchmark.md`](docs/benchmark.
 |---|---|
 | The agent failed, a passing check now fails, or required checks fail | retry (never accepted) |
 | "needs a person" ≥ 0.6 | human |
-| quality ≥ the accept bar | accept (a second opinion first when routing asked for one: the second-opinion routing decision, whether or not code changed; with no routing decision, `thresholds.secondOpinion` on changed code) |
+| quality ≥ the accept bar | accept (a second opinion first when routing asked for one: the second-opinion routing decision, whether or not code changed; with no routing decision, `thresholds.secondOpinion` on changed code; never under risk 0.25, `riskBands.low`) |
 | quality ≤ 0.3 | retry with another agent |
 | in between | second opinion, then human |
 
 - **Quality:** `min(addressed, complete, 1 − unrelated changes, 1 − regression risk)`.
 - **Accept bar:** scales with the task's risk: 0.55 (risk < 0.25), 0.70 (< 0.6), 0.85 above that.
+- **Planned reviews:** scale with risk too: from 0.25 (`riskBands.low`) a strategy may plan a review by a stronger agent (`CHEAP_THEN_PREMIUM_REVIEW`, `PREMIUM_PLAN_CHEAP_EXECUTE`), from 0.6 (`riskBands.medium`) a planned frontier review (`CHEAP_EXECUTE_FRONTIER_REVIEW`), and from 0.8 (`riskForFrontierReview`) the frontier-review rule in code adds one anyway.
+  Under 0.25 no strategy plans a review and no second opinion is asked for, so it is the accept bar that sends weak work to a review there.
 - **Limits:** 3 attempts, 2 reviews, 5 rounds.
 - **Model:** Jev is pinned to `jev-1.13.0`, so the thresholds keep their meaning.
 - **Parallel second opinion:** when a strategy has a second resource answer the same request alongside the first, the report compares the two answers word by word, in any script and with short numbers counted, and says whether they agree (a word comparison, not a judgment), that a side sent nothing back, or that both answered but could not be compared. It also says whose answer is shown: the last attempt that answered, and the second opinion only when nothing else did.
+  Each of the two is timed to its own end, though the run waits for both, so neither's time in the record is the other's.
 
 ## Usage limits and handoff
 
@@ -447,13 +588,26 @@ The design and every line it writes are in [`docs/benchmark.md`](docs/benchmark.
 - **Your limits, per account** (Usage tab):
   - **handoff at** (default 85%): agents are told to work in small steps and keep the handoff note updated.
   - **stop at** (default 97%): no new tasks go to that account.
-  - For API keys, a **minimum balance** plays the same role.
-- **A real limit error always counts.** API keys rotate to your next key; subscriptions hand the task to their peer agent. With no agent left, the run pauses with the note saved.
+  - For API keys, a **minimum balance** plays the same role, on the key the agent's calls go out on and against that agent's own figure: a DeepSeek agent is judged by the key active as the harness started, so a funded key in reserve does not make it usable while that key is spent or below its floor.
+    A key made active since shows on its Usage card as `b after Restart harness`, beside the key in use, and Settings says `Restart the harness to apply the DeepSeek key change` for as long as a restart would change the key calls go out on, whatever was done since (a switch a run makes by itself shows within the 30 seconds between readings), and no longer.
+    That key removed, or replaced by another under its name, is still the one calls go out on until the restart: the card names it `a (removed)`, and it is judged by its last reading and by any limit met on it, which a plugin reload keeps.
+    Removing the only DeepSeek key deletes it from `DEEPSEEK_API_KEY` in `~/.kzh/.env` too, when that line holds it, so it is gone from this PC after the restart; removing any Jev key deletes it from `TYPESAFE_API_KEY` the same way, where Jev would otherwise fall back to it, and from the engine's credential store when that holds it.
+    A key added while the active one is spent or below its floor becomes the active one, for after the restart; so does the next usable key when the active one is removed.
+    A key is out when it is below the lowest **Stop below** of the switched-on agents drawing on it.
+- **A real limit error always counts.** The agent is out until its limit resets and the task goes to its peer agent, or another that can do it. With no agent left, the run pauses with the note saved.
+  An agent that falls below its own **Stop below** during an attempt is handed on the same way, but nothing is marked: the next reading shows it, and another agent on the same key with a lower floor goes on using it.
+  An API key's limit also marks that key spent and makes your next usable DeepSeek key the active one, for after a restart: the harness reads `DEEPSEEK_API_KEY` once at launch (see API keys below), so no agent goes on with a new key within the run, and until the restart DeepSeek's calls still go out on the key it started with.
+  A limit spends the key its call went out on, and each call's usage row names that key: the DeepSeek key active as the harness started, whatever it has been switched to since (a plugin reloaded without a restart keeps it, and a key removed and added again under its name is a new key, never marked for the old one's calls).
+  That key's mark holds out every agent whose calls go out on it, and no longer: after a restart onto another key they are usable at once.
+  Other providers' calls use no stored key, so their limit marks only the agent.
+  When a primary and its parallel opinion draw on one provider's key and both hit the limit, that key is the only one marked spent, and the next is switched to once.
+  A parallel second opinion's own limit counts too: its agent is out for the rest of the run and is not asked for a retry (`- Usage limit: deepseek → out until it resets; the run went on without it`), and its call has its own row in usage.jsonl, with its tokens, whether or not its answer is the one shown.
+  Its limit hits are kept in that agent's track record, which only the legacy named call (`routing.enabled: false`) sends Jev; under adaptive routing no track record rides any call.
 - **Local models** have no quota and no key: the Usage tab shows them as *free, local*.
 
 ## Local models & offline
 
-KzH can run open models on your own PC with [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`. The jev-router plugin starts it on demand on **127.0.0.1 only**, with a new random API key each start (so other programs on the PC can't use it), and stops it after 10 idle minutes (Settings) and when KzH closes. Nothing is installed by default.
+KzH can run open models on your own PC with [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`. The jev-router plugin starts it on demand on **127.0.0.1 only**, with a new random API key each start (so other programs on the PC can't use it), and stops it after 10 idle minutes (Settings) and when KzH quits. Nothing is installed by default.
 
 **Install:** type `/install-llm` in any chat.
 A picker checks this PC (GPU and VRAM, NVIDIA driver, RAM, CPU, free disk), rates every model (*runs fully on GPU*, *splits GPU + CPU* with a speed estimate, *CPU only*, or *won't fit*; on a GPU whose memory Windows reports only as "4 GB or more", a model too big for 4 GB is rated with a speed range instead of a made-up size) and preselects its suggestions: official and stable releases that were tested with this engine first, then what runs at a usable speed, then quality.
@@ -488,8 +642,10 @@ A decimal comma is read as a point only with one or two digits after it, so `4,0
   It cannot be held with GPU layers pinned by hand, or on a GPU whose size is unknown or read through the 32-bit field that stops at 4 GB, and then the page says `VRAM budget not applied`.
 - **Cores** sets llama-server's `-t`, capped at the logical processors this PC has.
   Left blank, it leaves the rest of the PC at least a quarter of its cores, and at least two from three cores up: `max(1, min(n - 2, floor(3n / 4)))` threads, where n is the physical core count, or half the logical processors when that is unknown.
-- **Tasks at once** counts every agent run across every workspace, a foreground `/auto`, `/<agent>` or `jev_route` run as much as a background task, and a workspace still runs one task at a time.
-  A run that has to wait says why, in its task row, in a foreground run's live lines and in the log: `Waiting: another task is running in this workspace` or `Waiting for a free slot: the resource budget caps how many tasks run at once`.
+- **Tasks at once** counts every agent run across every workspace, a foreground `/auto`, `/<agent>` or `jev_route` run as much as a background task, read-only runs included, and a workspace still runs one task that writes at a time.
+  A task judged read only ([Read-only work](#read-only-work)) holds a slot of its own while it reads, and waits for a free one under the cap (`Waiting for a free slot`), never for its workspace.
+  The field's help text says so: `Agent runs at once across every workspace, foreground and background, read-only runs included. A workspace runs one task that writes at a time; a task judged read only runs beside it on an agent locked against writing. Blank: no limit.`
+  A run that has to wait says why, in its task row, in a foreground run's live lines and in the log, and says it again when the reason changes as the line moves: `Waiting: another task is running in this workspace`, `Waiting: a run started from the chat is using this workspace`, `Waiting for a free slot: the resource budget caps how many tasks run at once`, or `Waiting: an earlier task in this workspace is waiting for a free slot first`.
 - **RAM is not a hard cap**: nothing KzH can use stops a process's memory from growing.
   The context is sized down first: a model starts with the largest context, in whole k down to 12,288, whose memory figure fits the RAM budget, and the page says `The budget reduced its context from <X> to <Y>, the largest that fits it.`
   Only a model over the budget even at that 12k floor is refused before it loads, with the figure and the budget named.
@@ -516,7 +672,7 @@ Each installed model's row on the card has a speed line: the measured speeds wit
 It does not measure generation deeper than 8,192 tokens, prompt reading with a warm cache, speed while another program uses the GPU, cloud agents, Laya, or models that are not installed.
 Every speed run, from the card or from `Speed-Run.bat` (below), is logged in `%USERPROFILE%\.kzh\jev-router\speed-runs`: `speed-runs.log` keeps one short entry per run (when, who started it, the PC and the engine, and each model's speed, context, GPU layers, VRAM and RAM, or why it was not measured), and a `speed-run-<time>.log` beside it has every step of that run with its time.
 The card says where the log is once a run has ended.
-The same run works without opening KzH: close KzH and double-click `Speed-Run.bat` in the harness folder, or run `Speed-Run.bat --models qwen3-8b` for only the models named.
+The same run works without opening KzH: quit KzH (right-click its tray icon and choose Quit; closing its window leaves it running) and double-click `Speed-Run.bat` in the harness folder, or run `Speed-Run.bat --models qwen3-8b` for only the models named.
 It prints each model's speed and memory, saves the readings in `local.json` where KzH reads them, logs the run as above, and returns an exit code a scheduled task can check: 0 all measured, 1 a model not measured, 2 could not run, 3 KzH, a leftover llama-server or Laya, or another speed run is running, 130 cancelled.
 It refuses to start while KzH is running; another program on KzH's port 3080 does not stop it, as long as it can tell that program is not KzH.
 Ctrl+C cancels at any point, and closing its window stops the engine too.
@@ -590,7 +746,7 @@ Device is Auto (the GPU when it has room), GPU or CPU.
 
 ## Updating
 
-**Kz-harness → Check for updates…** pulls new KzH code (fast-forward only) and refreshes packages. If the desktop app itself changed, close it and run the installer again to rebuild the exe.
+**Kz-harness → Check for updates…** pulls new KzH code (fast-forward only) and refreshes packages. If the desktop app itself changed, quit it (right-click its tray icon and choose Quit; closing its window leaves it running) and run the installer again to rebuild the exe.
 
 The engine (DSH) is **pinned** in `Start-KzH.ps1` and does not need updates: it runs locally, and starts never contact the npm registry. Only update it if Claude Code or Codex change in a way the pinned connectors can't follow, or for a security fix:
 
@@ -625,7 +781,8 @@ KZ_KEY__deepseek__default=sk-...   # the named key the Accounts UI switches betw
 
 Nothing writes a key anywhere else. In particular the engine's own credential store (`~/.kzh/.credentials.yaml`) is *cleared* rather than written, because a value there would take precedence over `.env` and you would be editing a file the app ignores. Keys are masked in the harness log, and the Markdown export redacts anything key-shaped before it leaves the app.
 
-To remove a key: delete its lines from `~/.kzh/.env` and restart. `~/.kzh/jev-router/accounts.json` keeps only names and dates, never values.
+To remove a key: press **Remove** beside it in **Settings -> Jev setup -> Accounts**, which deletes its line (and the `DEEPSEEK_API_KEY` line holding your only DeepSeek key, or the `TYPESAFE_API_KEY` line holding a Jev key), or delete its lines from `~/.kzh/.env` by hand; then restart.
+`~/.kzh/jev-router/accounts.json` never holds a key's value: per key it keeps the name, when it was added and an id, and beside them each agent's limits, any limit mark (until when, with the provider's error text) and each key's highest balance seen.
 
 Claude Code and Codex do not use keys at all: they sign in with your own accounts, stored in `~/.claude` and `~/.codex`.
 
@@ -754,7 +911,11 @@ KzH settings live in `~/.kzh/profiles/web/cordis.patch.yml`; the installer write
 ```
 
 - **Tools** get their parameters as `JEV_ARG_<NAME>` and the task text on stdin, never in the command line.
-- **`thresholds`** holds every bar Jev's answers are read against, each defaulting to the value the code has always used: the review's accept bars, `reject` and `needsPerson`, and the cut-offs that used to be constants (`minQuestionConfidence`, `alsoWork`, `supportingSkill`, `verificationChecks`, `continueHandoff`, `toolArgConfidence`, `humanRequired`, `judgmentYes`, `easyComplexity`, `requirementWanted`, `riskBands`, `effortBands`). `verificationChecks` and `needsTests` also take `always`. `riskForReview` and `riskForFrontierReview` stay under `routing.minimumReview`.
+- **`thresholds`** holds every bar Jev's answers are read against, each but two defaulting to the value the code has always used: the review's accept bars, `reject` and `needsPerson`, the cut-offs that used to be constants (`minQuestionConfidence`, `alsoWork`, `supportingSkill`, `verificationChecks`, `continueHandoff`, `toolArgConfidence`, `humanRequired`, `judgmentYes`, `easyComplexity`, `requirementWanted`, `riskBands`, `effortBands`), and `readOnly`.
+  The first of the two is `effortBands`: its default `{ low: 0.125, medium: 0.375, high: 0.6 }` gives Auto effort `low` when the larger of complexity and risk is under 0.125, and runs a task at complexity 0.325 and risk 0.013 at `medium`, where the old cuts, which began at `medium`, ran it at `high`; `{ low: 0, medium: 0.25, high: 0.6 }` is the old ladder.
+  The second is `readOnly`, which has no earlier constant: how sure the decider must be that a message only reads the project before its task runs on an agent locked against writing ([Read-only work](#read-only-work)), 0.8 for Jev and 0.9 for Laya (`laya.thresholds.readOnly`); a bar at or under 0.5 is refused.
+  `verificationChecks` and `needsTests` also take `always`.
+  `riskForReview` and `riskForFrontierReview` stay under `routing.minimumReview`.
 - **`laya`** is checked by the plugin itself rather than by the app, so a bad value there never stops Jev Auto: `enabled`, `port`, `connectivityUrl`, `deadlines` (`floorMs`, `ceilingMs`, `hardMs`, `startWaitMs`), `shadow` (`maxQueue`, `maxAgeMs`, `chunkRows`), `temperatureCorrections`, `minTopMargin` and `thresholds`, Laya's own bars. `connectivityUrl` must be an http or https address on no TypeSafe host, or Laya is off until it is fixed. `docs/laya-auto.md` 2.2 and 2.6 say what each does. The card's switches (device, start with KzH, keep loaded, idle time, the comparison) are per PC, in `~/.kzh/jev-router/laya.json`.
 - **`routing`** tunes the adaptive router.
   Every threshold it can take has a default in `plugins/jev-router/routing-policy.js`, which is the single place any of them is written down; anything omitted here keeps that default.
@@ -783,7 +944,7 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 | Keys | `~/.kzh/.env`, and nowhere else (see [API keys](#api-keys)). The Claude and Codex logins stay in `~/.claude` and `~/.codex`. |
 | KzH settings | `~/.kzh/profiles/web/cordis.patch.yml`, `~/.kzh/settings.yaml` |
 | Accounts, limits, switches, hotkeys | `~/.kzh/jev-router/` (`accounts.json`, `agents.json`, `hotkeys.json`) |
-| History and usage | `~/.kzh/jev-router/history.jsonl` (per routed run: the task text as typed, the workspace path, changed file paths, the routing decision and the first 1000 characters of each answer) and `usage.jsonl` (per agent attempt and Jev call: tokens, cost, quota) |
+| History and usage | `~/.kzh/jev-router/history.jsonl` (per routed run: the task text as typed, the workspace path, changed file paths, the routing decision, the first 1000 characters of each answer, and when the run took its workspace's lane and how long it held it, end to end, as `startedAt` and `wallMs` beside `ts`, when it ended) and `usage.jsonl` (per agent attempt and Jev call: tokens, cost, quota) |
 | What the router learned | `~/.kzh/jev-router/routing-samples.jsonl` (one row per decision and its verified outcome; with the shipped gates each domain keeps its newest 10000 samples and its newest 10000 verified ones, and the file grows by up to that many rows again before it is compacted), `capability-evidence.jsonl` (what each resource turned out to be good at), `classifiers/` (the trained models, each with a checksum), `domains/` (how far each routing domain has got) and `known-resources.json` (the agent ids the resource domain has seen). Deleting them is safe: the router falls back to Jev and starts learning again. |
 | Background tasks | `~/.kzh/jev-router/tasks.jsonl` (the last 100 tasks: their text and, once finished, their reports) |
 | Capability benchmark | `~/.kzh/jev-router/benchmark.jsonl` holds every capability benchmark run: a run row; a folder row before each task, which also lists the names at the top of the scratch workspace as the task begins, so a start after KzH stopped mid-task can delete what appeared since, which its confirmation names first; a task row per task and attempt (outcome, reason, duration, tokens, the subject it ran as, the checks, the grade's detail, the patch and up to 1,000 characters of the answer); an agent row per agent, whose `recorded` is the number of evidence rows it wrote; and an end row. The task folders live in `kzh-scratch` beside the harness folder and are deleted once graded; their git repositories live apart in `~/.kzh/jev-router/benchmark-git/`, outside the scratch workspace, and go with them. |
@@ -797,10 +958,11 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 
 | You see | Do this |
 |---|---|
-| Start screen: another harness is already running | A `Start-KzH.cmd` console or a second Kz-harness is open. Close it, then click **Retry**. |
-| Start screen: a Kz-harness engine is still running on port 3080, left behind by an app that is no longer open | Click **Use it here**: it stops that orphaned engine and everything it started, then starts this app's own. It re-checks the holder at the click, and it refuses to stop a process that is not this harness, or a harness still under another running Kz-harness; close that one and click **Retry**. This button is app source (`app/main.js`, `app/ui/console.js`), so it reaches **Kz-harness.exe** only after a rebuild (run the installer). |
+| Start screen: another harness is already running | A `Start-KzH.cmd` console or a second Kz-harness is open. Close the console, or quit the other Kz-harness (right-click its tray icon and choose Quit; closing its window leaves it running), then click **Retry**. |
+| Start screen: the harness page stopped (or could not load); the harness itself is still running | Only the page failed; the engine and its tasks run on. Click **Retry** to open the page again: it does not restart the engine. Show from the tray opens it again too. |
+| Start screen: a Kz-harness engine is still running on port 3080, left behind by an app that is no longer open | Click **Use it here**: it stops that orphaned engine and everything it started, then starts this app's own. It re-checks the holder at the click, and it refuses to stop a process that is not this harness, or a harness still under another running Kz-harness; quit that one (from its tray icon) and click **Retry**. This button is app source (`app/main.js`, `app/ui/console.js`), so it reaches **Kz-harness.exe** only after a rebuild (run the installer). |
 | Jev setup shows a red dot | Do what the line under it says, then **Recheck logins**. |
-| "all available agents are at their usage limits" | Wait for the reset time shown, raise that account's **stop at** in Usage, or add another API key. |
+| "all available agents are at their usage limits" | Wait for the reset time shown, raise a subscription's **stop at** or lower an API key's **Stop below** in Usage, or add another DeepSeek key (it becomes the active one when the key in use is spent) and use **Restart harness**. |
 | Report says **JEV UNAVAILABLE** | The Jev key is missing or TypeSafe is unreachable; fix it and use **Restart harness**. |
 | Codex can't read files, or "windows sandbox helper … not found" | The helper comes with the Codex app; `Start-KzH.ps1` puts it on PATH. Open the Codex app once if the launcher warns. |
 | Report says **OFFLINE: local models only** | Neither TypeSafe nor DeepSeek answered. Check the connection; with no local model installed, nothing can run offline (`/install-llm` while online). |

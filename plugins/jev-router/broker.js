@@ -7,8 +7,13 @@
 // needs two distinct resources with a real strength gap, a review strategy needs a reviewer
 // other than the worker, a parallel second opinion needs read-only work (one mutating task per
 // workspace is a hard rule of the harness), and a local-first strategy needs a local model.
+// A strategy that plans a review by a second agent also needs the risk to pay for it, read on
+// the deciding provider's risk bands (the same cuts as the review's accept bars): none under the
+// low band, where the accept bar alone still sends weak work to a review, and a planned frontier
+// review only from the medium band up.
 // Named models never appear: a "premium" resource is whichever candidate the capability
 // registry currently rates strongest for this task.
+import { JEV_THRESHOLDS } from './providers.js'
 import { STRATEGIES, resolvePolicy, tierAtLeast } from './routing-policy.js'
 
 const TIER_RANK = { weak: 0, unknown: 1, standard: 2, strong: 3, frontier: 4 }
@@ -131,15 +136,35 @@ export function rankCandidates({ candidates = [], profile = {}, policy = resolve
 /** Is `b` materially stronger than `a` for this task: a higher tier, or the same tier with a clearly better fit. */
 export const strongerThan = (b, a) => !!a && !!b && (rankOf(b) > rankOf(a) || (rankOf(b) === rankOf(a) && fitOf(b) - fitOf(a) >= 0.1))
 
+// The risk band from which each strategy that plans a review by a second agent may run: the key of
+// the deciding provider's riskBands whose cut the task's risk must reach.
+const REVIEW_BAND = Object.freeze({ CHEAP_THEN_PREMIUM_REVIEW: 'low', PREMIUM_PLAN_CHEAP_EXECUTE: 'low', CHEAP_EXECUTE_FRONTIER_REVIEW: 'medium' })
+
+/**
+ * Whether the task's risk is too low for a strategy's planned review: the cut it is under, or
+ * null when the strategy plans none or the risk reaches it. A missing risk reads 0.5, as it does
+ * everywhere else in routing.
+ * @param {string} strategy
+ * @param {number|undefined} risk
+ * @param {{low: number, medium: number}} [bands]  the deciding provider's riskBands
+ * @returns {{ band: 'low'|'medium', cut: number } | null}
+ */
+export function heldByRisk(strategy, risk, bands = JEV_THRESHOLDS.riskBands) {
+  const band = REVIEW_BAND[strategy]
+  if (!band) return null
+  return num(risk, 0.5) < bands[band] ? { band, cut: bands[band] } : null
+}
+
 /**
  * Which opening strategies the candidates make possible for this task. Pure and deterministic.
  * @param {object} p
  * @param {Array<object>} p.candidates  eligible candidates (decision.js shape: id, tier, fit, expectedCost, source)
  * @param {object} [p.profile]          task profile (minimumCapability, risk)
  * @param {boolean} [p.answerOnly]      read-only answer: no files change
+ * @param {{low: number, medium: number}} [p.riskBands]  the deciding provider's, Jev's by default
  * @returns {string[]} strategy ids, in STRATEGIES order
  */
-export function eligibleStrategies({ candidates = [], reviewCandidates, profile = {}, answerOnly = false } = {}) {
+export function eligibleStrategies({ candidates = [], reviewCandidates, profile = {}, answerOnly = false, riskBands = JEV_THRESHOLDS.riskBands } = {}) {
   if (!candidates.length) return []
   const reviewers = reviewCandidates?.length ? reviewCandidates : candidates
   const minimum = profile.minimumCapability ?? 'standard'
@@ -153,12 +178,15 @@ export function eligibleStrategies({ candidates = [], reviewCandidates, profile 
   if (cheapest) out.add('CHEAP_DIRECT')
   if (strongest) out.add('PREMIUM_DIRECT')
   if (local && candidates.some((c) => c.source !== 'local')) out.add('LOCAL_FIRST')
-  if (gap) { out.add('CHEAP_THEN_PREMIUM_REVIEW'); out.add('PREMIUM_PLAN_CHEAP_EXECUTE') }
+  // An answer-only run ends at its first completed answer and is never reviewed, so a strategy that
+  // plans a review is not on offer for one: the plan would promise a review that never runs, and
+  // an answered run would confirm a strategy it never carried out.
+  if (gap && !answerOnly) { out.add('CHEAP_THEN_PREMIUM_REVIEW'); out.add('PREMIUM_PLAN_CHEAP_EXECUTE') }
   // A forced review needs someone other than the worker, and that someone may come from the wider
   // reviewer pool: the work pool can be one resource deep while a gated or lower-tier one judges.
-  if (someoneElseCanJudge && reviewers.length >= 2) out.add('CHEAP_EXECUTE_FRONTIER_REVIEW')
+  if (someoneElseCanJudge && reviewers.length >= 2 && !answerOnly) out.add('CHEAP_EXECUTE_FRONTIER_REVIEW')
   if (answerOnly && twoDistinct) out.add('PARALLEL_SECOND_OPINION')
-  return Object.keys(STRATEGIES).filter((s) => out.has(s))
+  return Object.keys(STRATEGIES).filter((s) => out.has(s) && !heldByRisk(s, profile.risk, riskBands))
 }
 
 /**
@@ -177,15 +205,18 @@ export function eligibleStrategies({ candidates = [], reviewCandidates, profile 
  * @returns {{ strategy: string, steps: Array<{ role: 'plan'|'primary', agent: string }>, reviewer: string|null,
  *   forceReview: boolean, frontierReview: boolean, parallelWith: string|null, fallbackOrder: string[], notes: string[] }}
  */
-export function planStrategy({ strategy, primaryId, candidates = [], reviewCandidates, profile = {}, answerOnly = false } = {}) {
+export function planStrategy({ strategy, primaryId, candidates = [], reviewCandidates, profile = {}, answerOnly = false, riskBands = JEV_THRESHOLDS.riskBands } = {}) {
   const notes = []
   const primary = candidates.find((c) => c.id === primaryId) ?? null
   if (!primary) throw new Error(`broker: primary ${primaryId} is not among the candidates`)
   const reviewers = reviewCandidates?.length ? reviewCandidates : candidates
-  const eligible = eligibleStrategies({ candidates, reviewCandidates: reviewers, profile, answerOnly })
+  const eligible = eligibleStrategies({ candidates, reviewCandidates: reviewers, profile, answerOnly, riskBands })
   let s = strategy && STRATEGIES[strategy] ? strategy : 'STANDARD_DIRECT'
   if (!eligible.includes(s)) {
-    notes.push(`${s} is not possible with these candidates; running ${primary.id} directly`)
+    const held = heldByRisk(s, profile.risk, riskBands)
+    notes.push(held
+      ? `${s} plans a review that risk ${num(profile.risk, 0.5).toFixed(2)} is too low for (riskBands.${held.band} ${held.cut}); running ${primary.id} directly`
+      : `${s} is not possible with these candidates; running ${primary.id} directly`)
     s = 'STANDARD_DIRECT'
   }
   // Two different "someone else"s. A REVIEWER only judges the work, so it may come from the wider

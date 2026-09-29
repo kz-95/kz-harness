@@ -527,3 +527,13 @@ test('no text reaches laya-standing.jsonl or the comparison: a marker in a task,
   assert.equal(domainOf(cmp, 'task_classification').layaAnswered, 1)
   assert.deepEqual(domainOf(cmp, 'task_classification').layaAutoRuns, { runs: 1, failed: null })
 })
+
+test('Laya and Jev agree on readOnly when both clear their own bar or both do not (Jev 0.8, Laya 0.9)', () => {
+  const rows = [
+    row({ phase: 'intent', jev: { readOnly: noul(0.85) }, laya: { readOnly: laya(noul(0.87)) } }), // Jev reads, Laya does not
+    row({ phase: 'intent', jev: { readOnly: noul(0.85) }, laya: { readOnly: laya(noul(0.95)) } }), // both read
+    row({ phase: 'intent', jev: { readOnly: noul(0.5) }, laya: { readOnly: laya(noul(0.6)) } }), // neither
+  ]
+  const cmp = compare({ shadowRows: rows, identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW })
+  assert.deepEqual(cmp.questions.find((x) => x.name === 'readOnly').atBar, { n: 3, agree: 2 })
+})

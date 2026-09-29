@@ -50,7 +50,26 @@ test('auto follows complexity/risk and never picks ultra', () => {
   assert.equal(autoLevel({ complexity: 0.9, risk: 0.1 }), 'xhigh')
   assert.equal(autoLevel({}), 'high')
   assert.equal(toAgentEffort('auto', codex, { complexity: 0.99, risk: 0.99 }), 'xhigh')
-  assert.equal(toAgentEffort(undefined, ds, { complexity: 0.1, risk: 0.1 }), 'high')
+  assert.equal(toAgentEffort(undefined, ds, { complexity: 0.1, risk: 0.2 }), 'high', 'DeepSeek has no medium: it goes up')
+})
+
+test('auto reaches the bottom rung: low under the first cut, which the old bands could not give', () => {
+  assert.equal(autoLevel({ complexity: 0, risk: 0 }), 'low')
+  assert.equal(autoLevel({ complexity: 0.1, risk: 0.05 }), 'low')
+  assert.equal(autoLevel({ complexity: 0.125, risk: 0 }), 'medium', 'a cut belongs to the rung above it')
+  // The run the work order was written from: complexity 32.5%, risk 1.3%, served at high.
+  assert.equal(autoLevel({ complexity: 0.325, risk: 0.013 }), 'medium')
+  assert.equal(autoLevel({ complexity: 0.375, risk: 0 }), 'high')
+  // Unknown is still the middle, never the floor.
+  assert.equal(autoLevel({ risk: 0 }), 'high')
+  // Each family's own word for low; an agent with no effort vocabulary still keeps its default.
+  assert.equal(toAgentEffort('auto', claude, { complexity: 0.05, risk: 0.05 }), 'low')
+  assert.equal(toAgentEffort('auto', codex, { complexity: 0.05, risk: 0.05 }), 'low')
+  assert.equal(toAgentEffort(undefined, ds, { complexity: 0.1, risk: 0.1 }), 'low')
+  assert.equal(toAgentEffort('auto', local, { complexity: 0.05, risk: 0.05 }), null)
+  // Bands with an empty low band (low at 0, or no low at all) start at medium as before.
+  assert.equal(autoLevel({ complexity: 0, risk: 0 }, { low: 0, medium: 0.25, high: 0.6 }), 'medium')
+  assert.equal(autoLevel({ complexity: 0, risk: 0 }, { medium: 0.25, high: 0.6 }), 'medium')
 })
 
 test('auto reads the bands of the provider that decided, and Jev\'s by default', () => {
@@ -60,12 +79,13 @@ test('auto reads the bands of the provider that decided, and Jev\'s by default',
   assert.equal(autoLevel({ complexity: 0.7, risk: 0.2 }, bands), 'high')
   assert.equal(autoLevel({ complexity: 0.8, risk: 0.2 }, bands), 'xhigh')
   assert.equal(autoLevel({}, bands), 'high', 'unknown is 0.5')
-  assert.equal(autoLevel({ complexity: 0.3, risk: 0.2 }), 'high')
+  assert.equal(autoLevel({ complexity: 0.3, risk: 0.2 }), 'medium')
+  assert.equal(autoLevel({ complexity: 0.5, risk: 0.2 }), 'high')
   assert.equal(autoLevel({ complexity: 0.7, risk: 0.2 }), 'xhigh')
   // toAgentEffort hands them on for 'auto' only: a level or an override is not moved by them.
   assert.equal(toAgentEffort('auto', claude, { complexity: 0.3, risk: 0.3, bands }), 'medium')
   assert.equal(toAgentEffort(undefined, ds, { complexity: 0.7, risk: 0.1, bands }), 'high')
-  assert.equal(toAgentEffort('auto', claude, { complexity: 0.3, risk: 0.3 }), 'high')
+  assert.equal(toAgentEffort('auto', claude, { complexity: 0.5, risk: 0.3 }), 'high')
   assert.equal(toAgentEffort('xhigh', claude, { complexity: 0.1, risk: 0.1, bands }), 'xhigh')
   assert.equal(toAgentEffort('auto', claude, { complexity: 0.1, override: 'max', bands }), 'max')
 })

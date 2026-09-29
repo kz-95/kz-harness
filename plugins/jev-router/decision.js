@@ -287,13 +287,15 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // whichever Jev record the run is handed: the router's default one carries fixed values.
     const T = P.teacher ? { ...P.thresholds, riskForReview: policy.minimumReview.riskForReview, riskForFrontierReview: policy.minimumReview.riskForFrontierReview } : P.thresholds
     // The deciding provider's cut-offs, in the policy object candidateTier and broker.js already
-    // receive: nothing new crosses into broker.js, and nothing is added to the stored profile.
+    // receive, riskBands included for the strategies a risk may plan a review in (broker.js
+    // heldByRisk); nothing is added to the stored profile.
     const pol = {
       ...policy,
       minimumReview: { ...policy.minimumReview, riskForReview: T.riskForReview, riskForFrontierReview: T.riskForFrontierReview },
       requirementWanted: T.requirementWanted,
       easyComplexity: T.easyComplexity,
       judgmentYes: T.judgmentYes,
+      riskBands: T.riskBands,
     }
     // Who the domains hear the answers from, and which store this run's samples belong in: a Jev
     // run's go to each domain's own store whatever `sink` says, so no wiring can send Jev's samples
@@ -571,7 +573,7 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // Who may review is wider than who may do the work (see reviewPool below), and the plan is
     // built over both, so the strategies it may choose from are too. The same call is made again
     // if conservation moves the work, so the two paths can never disagree about what is eligible.
-    const strategiesFor = (work) => eligibleStrategies({ candidates: work, reviewCandidates: kept.length ? kept : work, profile, answerOnly })
+    const strategiesFor = (work) => eligibleStrategies({ candidates: work, reviewCandidates: kept.length ? kept : work, profile, answerOnly, riskBands: pol.riskBands })
     strategies = strategiesFor(pool)
     // The tier of every resource that cleared the hard facts, for the samples of the domains that
     // are labelled by what the run did rather than by who it picked (the strategy and the yes/no
@@ -770,7 +772,7 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     // floor and the weekly gate. A gated subscription is kept for review by design, and a strong
     // resource that missed a frontier floor still reads a diff better than nobody.
     const reviewPool = kept.length ? kept : pool
-    const plan = planStrategy({ strategy: strategyPick.label, primaryId: primary.id, candidates: pool, reviewCandidates: reviewPool, profile, answerOnly })
+    const plan = planStrategy({ strategy: strategyPick.label, primaryId: primary.id, candidates: pool, reviewCandidates: reviewPool, profile, answerOnly, riskBands: pol.riskBands })
     // The strategy domain is labelled by the run only when the run carries out ITS answer. A label
     // mapped to another because it was not eligible (after conservation, say), or one the broker
     // could not build with these candidates, would have the run confirm a strategy it never tried
@@ -795,8 +797,15 @@ export function createDecisionEngine({ policy, domains, profiles, priors, store,
     }
     // A second opinion is asked for only of accepted work that no review has seen (jev-review), so
     // a plan that already promises a review, or an answer-only run, which is never reviewed, gets
-    // the same run whatever the answer was.
-    if (secondOpinion?.sampleId && !answerOnly && !plan.forceReview) samples.push({ domain: 'second_opinion', id: secondOpinion.sampleId, store: storeKind })
+    // the same run whatever the answer was. Nor is one asked for under the low risk band, where no
+    // planned review may run either: there the accept bar alone decides whether work is reviewed,
+    // so a yes is held (and the review reads the mark) and, changing nothing, labels nothing.
+    const secondOpinionHeld = risk < pol.riskBands.low
+    if (secondOpinion && secondOpinionHeld) {
+      domainReport.second_opinion = { ...domainReport.second_opinion, heldBy: 'risk' }
+      if (yes(secondOpinion) && !answerOnly && !plan.forceReview) plan.notes.push(`second opinion not asked for: risk ${risk.toFixed(2)} is under riskBands.low ${pol.riskBands.low}`)
+    }
+    if (secondOpinion?.sampleId && !answerOnly && !plan.forceReview && !secondOpinionHeld) samples.push({ domain: 'second_opinion', id: secondOpinion.sampleId, store: storeKind })
     // One row per resource as the review call and the inspector read it: the numbers the choice
     // was made over, and never a name beyond the id the router maps back from.
     const rowOf = (c) => ({

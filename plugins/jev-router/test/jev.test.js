@@ -1150,3 +1150,20 @@ test('the old form still works, as Jev with the values it names', async (t) => {
   assert.equal(seen[1].model, new TypeSafeClient({ apiKey: 'x' }).defaultModel)
   assert.equal(seen[1].timeout, undefined)
 })
+
+test('intent() asks whether everything the message asks for can be done by reading and replying, and hands the answer on as readOnly', async (t) => {
+  const asked = []
+  const real = TypeSafeClient.prototype.systemOne
+  TypeSafeClient.prototype.systemOne = async ({ questions }) => { asked.push(questions); return { model: 'jev-test', usage: {}, answers: new Proxy({}, { get: () => ANSWER }) } }
+  const restore = () => { TypeSafeClient.prototype.systemOne = real }
+  t.after(restore)
+  await createJev({ apiKey: 'tsk_test_key', timeoutMs: 1000 }).intent({ message: 'what does the parser do with tabs?' })
+  const q = asked[0].readOnly
+  assert.ok(q, 'the intent call asks readOnly')
+  assert.equal(q.type, 'noul')
+  assert.match(q.instructions.question, /reading the project's files and replying, without creating, changing or deleting any file and without running any command or program/)
+  assert.match(q.instructions.focus, /Running tests, builds, scripts, formatters or installs counts as running a program/)
+  restore()
+  const answering = createJev({ apiKey: 'tsk_test_key', client: { systemOne: ({ questions }) => ({ withResponse: async () => ({ data: { model: 'jev-1.13.0', answers: Object.fromEntries(Object.entries(questions).map(([k, v]) => [k, v.type === 'noul' ? { type: 'noul', noul: k === 'readOnly' ? 0.91 : 0.2, confidence: 0.9 } : { type: 'choice', choice: Object.keys(v.criteria)[0], confidence: 0.9, probabilities: {} }])), usage: {} }, requestId: 'r' }) }) } })
+  assert.equal((await answering.intent({ message: 'm' })).readOnly, 0.91)
+})

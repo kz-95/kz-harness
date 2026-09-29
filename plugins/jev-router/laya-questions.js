@@ -61,6 +61,7 @@ export const NOUL_TEXT = deepFreeze({
   continueHandoff: { true: 'yes: the task continues the unfinished work in handoff', false: 'no: the task is new work, not that earlier work' },
   '<tool>.fits': { true: 'yes: the <tool> tool does exactly what the task asks', false: 'no: the task needs an AI agent, not the <tool> tool' },
   alsoWork: { true: 'yes: the message also asks for work in the project', false: 'no: the message only needs an answer' },
+  readOnly: { true: 'yes: reading the files and replying is enough', false: 'no: a file must change or a program must run' },
   addressed: { true: 'yes: the attempt does what the task asked', false: 'no: the attempt does not do what the task asked' },
   complete: { true: 'yes: every part of the task is handled', false: 'no: some part of the task is left undone' },
   unrelatedChanges: { true: 'yes: the diff changes things the task did not ask for', false: 'no: every change in the diff serves the task' },

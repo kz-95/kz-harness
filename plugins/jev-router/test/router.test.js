@@ -89,7 +89,7 @@ test('failing checks override a Jev accept; loop stops at maxAttempts', async ()
 test('second opinion goes to a different agent, then accepts', async () => {
   const dir = repo()
   const used = []
-  const jev = { route: async () => routeResult({ needsSecondOpinion: 0.9 }), assess: async () => verdict('accept', { reviewAgentProbabilities: { codex: 0.9, claude: 0.05, deepseek: 0.05 }, retryAgentProbabilities: { codex: 0.9, claude: 0.05, deepseek: 0.05 } }) }
+  const jev = { route: async () => routeResult({ needsSecondOpinion: 0.9, risk: 0.3 }), assess: async () => verdict('accept', { reviewAgentProbabilities: { codex: 0.9, claude: 0.05, deepseek: 0.05 }, retryAgentProbabilities: { codex: 0.9, claude: 0.05, deepseek: 0.05 } }) }
   const execute = async (a, prompt) => { used.push(a.id); return used.length === 1 ? fixer(dir)() : noop() }
   const r = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { jev, execute, history: history() } })
   assert.deepEqual(used, ['codex', 'claude'])
@@ -194,7 +194,7 @@ test('a crashed reviewer hands the review to another agent instead of redoing th
   const dir = repo()
   const used = []
   let n = 0
-  const jev = { route: async () => routeResult({ needsSecondOpinion: 0.9 }), assess: async () => verdict('accept') }
+  const jev = { route: async () => routeResult({ needsSecondOpinion: 0.9, risk: 0.3 }), assess: async () => verdict('accept') }
   const execute = async (a) => {
     used.push(a.id)
     if (used.length === 1) return fixer(dir)()
@@ -1204,7 +1204,8 @@ test('a parallel opinion is not "already worked", so the fallback order may stil
     task: 'answer me', cwd: dir, config: adaptiveConfig(), answerOnly: true, signal,
     deps: {
       decide, review: accept, history: quiet,
-      execute: async (a) => { seen.push(a.id); return a.id === 'deepseek' ? { stopReason: 'error', diagnostic: 'boom', answerText: '' } : { stopReason: 'completed', answerText: `${a.id} says the cache warms on boot` } },
+      // Its opinion fails too, so the run still needs a retry.
+      execute: async (a) => { seen.push(a.id); return a.id === 'deepseek' || seen.filter((id) => id === 'claude').length === 1 ? { stopReason: 'error', diagnostic: 'boom', answerText: '' } : { stopReason: 'completed', answerText: `${a.id} says the cache warms on boot` } },
     },
   })
   assert.deepEqual(seen, ['deepseek', 'claude', 'claude'], 'claude only gave an opinion, so it takes over the work')
@@ -1219,7 +1220,7 @@ test('the second-opinion line says whose answer is shown when it is not the prim
   const report = formatReport(r)
   assert.doesNotMatch(report, /The answer below is the primary's/)
   assert.match(report, /the answer below is the second opinion from claude/)
-  assert.match(report, /nothing came back to compare/)
+  assert.match(report, /the primary gave no answer, so there was nothing to compare/)
   // The primary failed and a retry answered: that retry is who the person is reading.
   const dir = repo()
   const failed = await runRouted({
@@ -1227,7 +1228,8 @@ test('the second-opinion line says whose answer is shown when it is not the prim
     deps: {
       decide: async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), strategy: 'PARALLEL_SECOND_OPINION' }, plan: parallelPlan({ fallbackOrder: ['acme'] }) }),
       review: accept, history: quiet,
-      execute: async (a) => (a.id === 'deepseek' ? { stopReason: 'error', diagnostic: 'boom', answerText: '' } : { stopReason: 'completed', answerText: `${a.id} answered` }),
+      // The opinion fails as well, so a retry is who answers.
+      execute: async (a) => (a.id === 'acme' ? { stopReason: 'completed', answerText: `${a.id} answered` } : { stopReason: 'error', diagnostic: 'boom', answerText: '' }),
     },
   })
   assert.equal(failed.lastAnswer, 'acme answered')
@@ -1659,15 +1661,15 @@ test('decider: a person is needed at the decider\'s own bar, and the reason name
 
 test('decider: the effort bands are the decider\'s', async () => {
   const { jev } = await records()
-  const { laya: quick } = (await import('../providers.js')).resolveProviders({ laya: { thresholds: { effortBands: { medium: 0.1, high: 0.2 } } } }, { policy: (await import('../routing-policy.js')).resolvePolicy() })
+  const { laya: quick } = (await import('../providers.js')).resolveProviders({ laya: { thresholds: { effortBands: { low: 0.05, medium: 0.1, high: 0.2 } } } }, { policy: (await import('../routing-policy.js')).resolvePolicy() })
   const claudeOnly = { ...config, agents: [{ id: 'claude', provider: 'claude-code', description: 'a', enabled: true }] }
   const run = async (provider) => {
     const dir = repo()
     const r = await runRouted({ task: 'fix', cwd: dir, config: claudeOnly, signal, deps: { decider: answering(provider, { primaryAgent: 'claude', agentProbabilities: { claude: 1 }, complexity: 0.3, risk: 0.2 }), provider, execute: fixer(dir), history: history() } })
     return r.attempts[0].effort
   }
-  assert.equal(await run(jev), 'high', 'complexity 0.3 is high on Jev\'s bands')
-  assert.equal(await run(quick), 'xhigh', 'and xhigh on bands of 0.1 and 0.2')
+  assert.equal(await run(jev), 'medium', 'complexity 0.3 is medium on Jev\'s bands')
+  assert.equal(await run(quick), 'xhigh', 'and xhigh on bands of 0.05, 0.1 and 0.2')
 })
 
 test('decider: a Laya call that did not answer is kept on the routing record and said in the report; Jev\'s are not recorded there', async () => {
@@ -1712,6 +1714,21 @@ test('decider: the Laya client\'s own timeout reads in the report with its quest
   const report = formatReport(r).split('\n')
   assert.ok(report.includes('- Laya did not answer: route: timed out after 42 s (20 questions on the CPU)'), report.join('\n'))
   assert.ok(report.includes('- Laya did not answer: review: Laya would need about 150 s for this call on the CPU, over its 120 s deadline'), report.join('\n'))
+})
+
+test('the history row says when the run began and how long it took end to end, which the attempts\' times leave out', async () => {
+  const dir = repo()
+  const h = history()
+  const before = Date.now()
+  // The work itself is quick; the checks and the review around it are part of what a person waits for.
+  const execute = async () => { await new Promise((r) => setTimeout(r, 30)); return fixer(dir)() }
+  await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { jev: { route: async () => routeResult(), assess: async () => { await new Promise((r) => setTimeout(r, 40)); return verdict('accept') } }, execute, history: h } })
+  const row = h.rows[0]
+  assert.equal(typeof row.wallMs, 'number')
+  assert.ok(Date.parse(row.startedAt) >= before - 5 && Date.parse(row.startedAt) <= Date.parse(row.ts), row.startedAt)
+  assert.ok(row.wallMs >= 60, `the review's time is in it (${row.wallMs} ms)`)
+  const attemptMs = row.attempts.reduce((sum, a) => sum + (a.durationMs ?? 0), 0)
+  assert.ok(row.wallMs > attemptMs, `${row.wallMs} ms end to end against ${attemptMs} ms of attempts`)
 })
 
 test('decider: the run id is the caller\'s, on the record, the history row, every attempt row and the review', async () => {
@@ -1909,4 +1926,21 @@ test('an agent held back before its work starts is not run out of time by the wa
   assert.match(t.diagnostic, /aborted due to timeout/)
   assert.ok(t.waitedMs >= 90 && t.waitedMs < 200, `it waited ${t.waitedMs} ms`)
   assert.ok(t.durationMs >= 190, `the limit gave its work its own time, ${t.durationMs} ms`)
+})
+
+test('an agent\'s track record counts a completed answer as work done, and leaves out a read pass handed to its folder\'s line', async () => {
+  const { trackRecord } = await import('../router.js')
+  const run = (finalStatus) => ({ workspace: '/ws', finalStatus, routing: { taskType: 'research' }, attempts: [{ agent: 'claude', role: 'primary', durationMs: 1000 }] })
+  const t = trackRecord([run('answered'), run('answered'), run('accepted'), run('needs_write'), run('needs_write')], '/ws', [{ id: 'claude', provider: 'claude-code' }]).claude
+  assert.equal(t.overall.attempts, 3, 'the two read passes handed back are not attempts at the work')
+  assert.equal(t.overall.accepted_rate, 1, 'and an answer is not a rejected piece of work')
+})
+
+test('an agent\'s track record leaves out a run a person stopped or that paused, and still counts its usage limit', async () => {
+  const { trackRecord } = await import('../router.js')
+  const run = (finalStatus, attempts = [{ agent: 'claude', role: 'primary', durationMs: 1000 }]) => ({ workspace: '/ws', finalStatus, routing: { taskType: 'research' }, attempts })
+  // Stopped during its review: the completed work before the stop was never judged.
+  const rows = [run('accepted'), run('accepted'), run('accepted'), run('stopped'), run('stopped'), run('paused_limit', [{ agent: 'claude', role: 'primary', durationMs: 1000 }, { agent: 'claude', role: 'retry', limitHit: true }])]
+  const t = trackRecord(rows, '/ws', [{ id: 'claude', provider: 'claude-code' }]).claude
+  assert.deepEqual([t.overall.attempts, t.overall.accepted_rate, t.overall.limit_hits], [3, 1, 1])
 })

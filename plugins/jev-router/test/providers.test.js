@@ -42,7 +42,12 @@ const TODAY = {
   riskBands: { low: 0.25, medium: 0.6 }, // jev-review's accept bands
   humanReview: 0.7, // thresholds.humanReview
   secondOpinion: 0.6, // thresholds.secondOpinion
-  effortBands: { medium: 0.25, high: 0.6 }, // effort.js autoLevel
+  // effort.js autoLevel. The one key not as it was: the old cuts (medium 0.25, high 0.6) began the
+  // ladder at medium, so low was unreachable; docs/laya-auto.md 2.6 says where these came from.
+  effortBands: { low: 0.125, medium: 0.375, high: 0.6 },
+  // A bar for a question that came later: how sure the intent call must be that a task only reads
+  // before it runs locked beside work that writes (adapter.js readOnlyVerdict).
+  readOnly: 0.8,
 }
 
 test('the Jev record from a legacy config carries today\'s values, key by key', () => {
@@ -118,7 +123,7 @@ test('the Laya record is local, free, unretried and on the English checkpoint', 
     continueHandoff: 0.6, tool: 0.8, toolArgConfidence: 0.7, needsTests: 'always', humanRequired: 0.8,
     judgmentYes: 0.5, riskForReview: 0.45, riskForFrontierReview: 0.7, easyComplexity: 0.4, requirementWanted: 0.6,
     needsPerson: 0.6, reject: 0.3, accept: { low: 0.65, medium: 0.8, high: 0.9 }, riskBands: { low: 0.25, medium: 0.6 },
-    humanReview: 0.6, secondOpinion: 0.6, effortBands: { medium: 0.25, high: 0.6 },
+    humanReview: 0.6, secondOpinion: 0.6, effortBands: { low: 0.125, medium: 0.375, high: 0.6 }, readOnly: 0.9,
   })
   // The rest of the block, every default filled, for the sidecar and the Laya client.
   assert.equal(layaSettings.enabled, true)
@@ -183,6 +188,37 @@ test("'always' is accepted for verificationChecks and needsTests, and nowhere el
   assert.match(resolve({ ...LEGACY, laya: { thresholds: { needsTests: 'never' } } }).layaError, /laya\.thresholds\.needsTests/)
 })
 
+test('a config from before effortBands.low that set only high, under the new medium default, still loads with medium where it was', () => {
+  // Loads at all: before this reading it was refused, which stopped jev-router loading.
+  const loads = (config) => { let out = null; assert.doesNotThrow(() => { out = resolve(config) }); return out }
+  for (const high of [0.26, 0.3, 0.375]) {
+    const { jev } = loads({ ...LEGACY, thresholds: { ...LEGACY.thresholds, effortBands: { high } } })
+    assert.deepEqual(jev.thresholds.effortBands, { low: 0.125, medium: 0.25, high })
+    const { laya, layaError } = loads({ ...LEGACY, laya: { thresholds: { effortBands: { high } } } })
+    assert.equal(layaError, null)
+    assert.deepEqual(laya.thresholds.effortBands, { low: 0.125, medium: 0.25, high })
+  }
+  // At or under the old medium it was refused before the upgrade, and still is.
+  assert.throws(() => resolve({ ...LEGACY, thresholds: { ...LEGACY.thresholds, effortBands: { high: 0.25 } } }), { message: /^providers: thresholds\.effortBands: medium 0\.375 is not below high 0\.25$/ })
+  // A medium the config set itself is never rewritten.
+  assert.throws(() => resolve({ ...LEGACY, thresholds: { ...LEGACY.thresholds, effortBands: { medium: 0.5, high: 0.3 } } }), { message: /^providers: thresholds\.effortBands: medium 0\.5 is not below high 0\.3$/ })
+  // A config that set low was written after the upgrade: nothing of it is read as an older one.
+  assert.throws(() => resolve({ ...LEGACY, thresholds: { ...LEGACY.thresholds, effortBands: { low: 0.2, high: 0.3 } } }), { message: /^providers: thresholds\.effortBands: medium 0\.375 is not below high 0\.3$/ })
+})
+
+test('a config from before effortBands.low that set medium under it still loads, on the ladder it always gave', () => {
+  // The schema fills low with its default, 0.125; medium 0.1 meant medium from zero.
+  const { jev } = resolve({ ...LEGACY, thresholds: { ...LEGACY.thresholds, effortBands: { medium: 0.1, high: 0.3 } } })
+  assert.deepEqual(jev.thresholds.effortBands, { low: 0, medium: 0.1, high: 0.3 })
+  const { laya, layaError } = resolve({ ...LEGACY, laya: { thresholds: { effortBands: { medium: 0.1, high: 0.3 } } } })
+  assert.equal(layaError, null)
+  assert.deepEqual(laya.thresholds.effortBands, { low: 0, medium: 0.1, high: 0.3 })
+  // A low set to anything but its default, above medium, is a mistake and is still refused.
+  assert.throws(() => resolve({ ...LEGACY, thresholds: { ...LEGACY.thresholds, effortBands: { low: 0.3, medium: 0.2, high: 0.6 } } }), { message: /^providers: thresholds\.effortBands: low 0\.3 is above medium 0\.2$/ })
+  // A config that sets none keeps the new ladder.
+  assert.deepEqual(resolve(LEGACY).jev.thresholds.effortBands, { low: 0.125, medium: 0.375, high: 0.6 })
+})
+
 test('each ordering check throws naming the key', () => {
   const t = (over) => ({ ...JEV_THRESHOLDS, ...over })
   const cases = [
@@ -191,11 +227,16 @@ test('each ordering check throws naming the key', () => {
     [{ reject: 0.55 }, /^providers: laya\.thresholds\.reject: 0\.55 is not below accept\.low 0\.55$/],
     [{ riskBands: { low: 0.6, medium: 0.6 } }, /^providers: laya\.thresholds\.riskBands: low 0\.6 is not below medium 0\.6$/],
     [{ riskForReview: 0.9, riskForFrontierReview: 0.8 }, /^providers: laya\.thresholds\.riskForReview: 0\.9 is above riskForFrontierReview 0\.8$/],
-    [{ effortBands: { medium: 0.6, high: 0.6 } }, /^providers: laya\.thresholds\.effortBands: medium 0\.6 is not below high 0\.6$/],
+    [{ effortBands: { low: 0.1, medium: 0.6, high: 0.6 } }, /^providers: laya\.thresholds\.effortBands: medium 0\.6 is not below high 0\.6$/],
+    [{ effortBands: { low: 0.3, medium: 0.2, high: 0.6 } }, /^providers: laya\.thresholds\.effortBands: low 0\.3 is above medium 0\.2$/],
   ]
   for (const [over, message] of cases) assert.throws(() => validateThresholds(t(over), 'laya'), { message })
   assert.doesNotThrow(() => validateThresholds(JEV_THRESHOLDS, 'jev'))
   assert.doesNotThrow(() => validateThresholds(LAYA_THRESHOLDS, 'laya'))
+  // An empty band is allowed: low at 0 is the ladder from medium as it was, and low at medium leaves
+  // no medium band (low under the cut, high from it).
+  assert.doesNotThrow(() => validateThresholds(t({ effortBands: { low: 0, medium: 0.25, high: 0.6 } }), 'laya'))
+  assert.doesNotThrow(() => validateThresholds(t({ effortBands: { low: 0.25, medium: 0.25, high: 0.6 } }), 'laya'))
   // For Jev, each message names where the value is configured.
   assert.throws(() => validateThresholds(t({ accept: { low: 0.9, medium: 0.8, high: 0.95 } }), 'jev'), { message: /^providers: thresholds\.accept: / })
   assert.throws(() => resolve({ ...LEGACY, routing: { minimumReview: { riskForReview: 0.9, riskForFrontierReview: 0.8 } } }), { message: /^providers: routing\.minimumReview\.riskForReview: 0\.9 is above riskForFrontierReview 0\.8$/ })
@@ -280,4 +321,12 @@ test('the old form of a Jev record keeps the SDK defaults it never named', () =>
   assert.equal(bare.timeoutMs, null)
   assert.deepEqual(bare.thresholds, JEV_THRESHOLDS)
   assert.deepEqual(jevRecord({ model: 'jev-1.13.0', timeoutMs: 1000 }).timeoutMs, { intent: 1000, route: 1000, review: 1000 })
+})
+
+test('readOnly is each provider\'s own bar, Jev 0.8 and Laya 0.9, and a bar at or under 0.5 is refused', () => {
+  const { jev, laya } = resolve(LEGACY)
+  assert.deepEqual([jev.thresholds.readOnly, laya.thresholds.readOnly], [0.8, 0.9])
+  assert.equal(resolve({ ...LEGACY, laya: { thresholds: { readOnly: 0.95 } } }).laya.thresholds.readOnly, 0.95)
+  assert.throws(() => validateThresholds({ ...JEV_THRESHOLDS, readOnly: 0.5 }, 'jev'), { message: /^providers: thresholds\.readOnly: 0\.5 is not above 0\.5: a coin toss is not sure$/ })
+  assert.match(resolve({ ...LEGACY, laya: { thresholds: { readOnly: 0.4 } } }).layaError, /laya\.thresholds\.readOnly: 0\.4 is not above 0\.5/)
 })

@@ -782,3 +782,8 @@ test('pickOf and confirms: a Laya pick is contradicted as any pick is, and an ac
   // A Jev pick is confirmed as it always was.
   assert.equal(labelFromRun('task_classification', sample(), record()).labelSource, 'teacher_confirmed')
 })
+
+test('a read pass handed to its folder\'s line labels nothing', () => {
+  const s = resourceSample('RESOURCE_C')
+  assert.equal(labelFromRun('resource_selection', s, record({ finalStatus: 'needs_write' })), null)
+})

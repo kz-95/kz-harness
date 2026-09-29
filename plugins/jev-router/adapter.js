@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import { eligible, rank } from './capabilities.js'
 import { isLocalLevel, localAgentFor } from './effort.js'
 import { TEACHER, providerName } from './providers.js'
+import { placeText } from './waits.js'
 import { fileURLToPath } from 'node:url'
 
 export const JEV_PROVIDER = 'jev'
@@ -87,6 +88,26 @@ const isQuestion = (c) => c?.kind === 'question' && (c.confidence === undefined 
 // the question floor but not as high as a destructive action's.
 const ALSO_WORK = 0.7
 const alsoWork = (c) => (c.alsoWork ?? 0) >= (c.thresholds?.alsoWork ?? ALSO_WORK)
+
+/**
+ * The decider's verdict on whether a message only reads the project (the intent call's readOnly
+ * answer), against the answering provider's own bar (`thresholds.readOnly`: Jev 0.8, Laya 0.9):
+ * `{ p, bar, by, reads }`, and `flat: true` when the provider's answer was too flat to act on.
+ * `reads` is what lets a task skip its folder's line and run locked beside the task changing it
+ * (docs/queue-and-cost-findings.md 1), so every doubt says no: no verdict at all when the agent
+ * was forced (nothing was asked), offline (a word test, no such answer), unsure (Laya could not
+ * sort it), unanswered (Jev failed), or when the answer or the bar is not a number.
+ */
+export function readOnlyVerdict(cls, decider = TEACHER) {
+  if (!cls || cls.unsure || cls.offline) return null
+  const p = cls.readOnly
+  const bar = cls.thresholds?.readOnly
+  if (typeof p !== 'number' || !Number.isFinite(p) || typeof bar !== 'number' || !Number.isFinite(bar)) return null
+  const flat = !!cls.uninformative?.includes('readOnly')
+  return { p, bar, by: decider ?? TEACHER, reads: !flat && p >= bar, ...(flat ? { flat: true } : {}) }
+}
+/** A verdict in words: who judged it and how sure, against which bar. */
+const verdictText = (v) => `${providerName(v?.by ?? TEACHER)} ${Math.round((v?.p ?? 0) * 100)}%, bar ${Math.round((v?.bar ?? 0) * 100)}%`
 
 const AGENT_PREFIX = 'agent-'
 const agentIdOf = (model) => (String(model ?? '').startsWith(AGENT_PREFIX) ? String(model).slice(AGENT_PREFIX.length) : null)
@@ -338,8 +359,12 @@ export function line(e) {
     case 'balance': return `${e.agent} credit ${e.balance ? `${e.balance.amount} ${e.balance.currency ?? ''}`.trim() : 'changed'}: ${{ near: 'low, working in small steps and keeping the handoff current', stopped: 'below the floor, handing the task over', exhausted: 'spent, handing the task over' }[e.state] ?? e.state}`
     case 'gate': return `${e.agent} is ${e.percent == null ? 'past' : `${Math.round(e.percent)}% into`} its weekly window (gate ${e.at}%): ${e.to} takes the work, ${e.agent} stays for review`
     case 'feedback': return `Feedback moved the pick${e.from ? ` off ${e.from}` : ''} to ${e.to}`
-    case 'limit': return `${e.agent} hit its usage limit${e.until ? ` (resets ${new Date(e.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` : ''}: ${{ rotated: 'switched API key, continuing', peer: 'handing the task to another agent', paused: 'no agent left, pausing' }[e.action] ?? e.action}`
+    case 'limit': return `${e.agent} hit its usage limit${e.until ? ` (resets ${new Date(e.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` : ''}: ${{ rotated: 'switched API key, continuing', peer: 'handing the task to another agent', paused: 'no agent left, pausing', opinion: 'its second opinion had answered, so that answer stands', answered: 'its answer had come back complete, so it stands', line: 'the task goes to its folder\'s line', set_aside: 'it is out until it resets, and the run goes on without it' }[e.action] ?? e.action}`
     case 'handoff': return `Handoff note saved (${e.source === 'agent' ? 'by the agent' : 'by the harness'}): ${e.path}`
+    // Read-only work: a read pass starting, or handing the task to its folder's line.
+    case 'access': return e.mode === 'read'
+      ? `Read only${e.verdict ? ` (${verdictText(e.verdict)})` : ''}: runs on an agent locked against writing, beside any task changing this folder; no checks, review or handoff note`
+      : `Needs the folder after all: ${e.why ?? 'it could not be done locked'}. It waits its turn there and is decided again when it starts`
     case 'final': return `Final: ${e.status}`
     case 'error': return `Error: ${e.message}`
     default: return e.type
@@ -682,7 +707,7 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
           // Who decides rides beside the task's own fields: the queued run is the row's.
           if (alsoWork(cls) && orchestrator) {
             try {
-              const queued = await orchestrator.enqueue({ agent, task: (await imageLine()) + task, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider })
+              const queued = await orchestrator.enqueue({ agent, task: (await imageLine()) + task, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider, readVerdict: readOnlyVerdict(cls, decider) })
               if (queued) yield* textBlock(`\n\n${queued}`, pos.last + 1)
             } catch (err) { yield* textBlock(`\n\njev-router: ${err.message}`, pos.last + 1) }
           }
@@ -705,13 +730,15 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       }
 
       // A message the decider could not sort is run as a task, and the person is told why: with
-      // the queued line (queuedLine appends it), or first among the live lines.
+      // the queued line (queuedLine appends it), or first among the live lines. The decider's
+      // verdict on whether it only reads rides along: a task that reads may run beside the task
+      // changing its folder, locked against writing (index.js orchestrator.enqueue).
       const why = cls?.why ?? null
       // Project work runs in the background (one at a time per workspace); the chat stays free.
       if (!answerOnly && orchestrator) {
         let queued
         // routeTask, not task: a queued run needs the image path with its prompt too.
-        try { queued = await orchestrator.enqueue({ agent, task: routeTask, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider, why }) } catch (err) { yield* textReply(`jev-router: ${err.message}`, first); return }
+        try { queued = await orchestrator.enqueue({ agent, task: routeTask, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider, why, readVerdict: readOnlyVerdict(cls, decider) }) } catch (err) { yield* textReply(`jev-router: ${err.message}`, first); return }
         if (queued) { yield* textReply(queued, first); return }
       }
       // Live routing progress first, then the report. `pos` keeps the block indices honest so a
@@ -832,9 +859,35 @@ async function* answerDirectly(ctx, options, auxModel, offline = false, note = '
  * The chat line for a queued task. With no agent forced, whoever decides the task picks one; `why`
  * is the reason a message the decider could not sort was queued as a task (classify), said after.
  */
-export function queuedLine({ jobId, agent, position, workspace, decider = TEACHER, why }) {
+/**
+ * The chat's line for a queued task. `wait` is where it will stand (waits.js joinWait over lanes
+ * wouldWait(), null for starting now), said with why in the words the work board uses; a caller that
+ * has only a `position` gets the place alone. `access`, for a task the decider judged read only,
+ * adds one sentence: that it runs locked beside work that writes, or why it waits like that work.
+ */
+export function queuedLine({ jobId, agent, position, wait, workspace, decider = TEACHER, why, access }) {
   const where = String(workspace).split(/[\\/]/).filter(Boolean).at(-1) ?? workspace
-  return `Queued → ${agent ?? `${providerName(decider ?? TEACHER)} picks`} as **${jobId}** (${position > 0 ? `${ordinal(position)} in line for ${where}` : `starting now in ${where}`}). Keep chatting: the result posts here when done.${why ? ` ${why}` : ''}`
+  const WHY = { workspace: 'another task is running there', chat: 'a run started from the chat is using it', line: 'an earlier task there is waiting for a free slot', cap: 'the resource budget caps how many tasks run at once' }
+  const at = wait !== undefined
+    ? (!wait ? `starting now in ${where}` : wait.why === 'cap' ? `${placeText(wait)} to start in ${where}: ${WHY.cap}` : `${placeText(wait)} for ${where}: ${WHY[wait.why]}`)
+    : position > 0 ? `${ordinal(position)} in line for ${where}` : `starting now in ${where}`
+  // Waiting for the folder, not only for a free slot under the cap.
+  const waits = wait !== undefined ? !!wait && wait.why !== 'cap' : position > 0
+  return `Queued → ${agent ?? `${providerName(decider ?? TEACHER)} picks`} as **${jobId}** (${at}). Keep chatting: the result posts here when done.${why ? ` ${why}` : ''}${accessSentence(access, where, waits)}`
+}
+
+/**
+ * The queued line's sentence on read-only work, or nothing for a task not judged read only. One that
+ * cannot be locked runs as work that writes: it waits for the folder when something holds it, and
+ * otherwise takes it, so a task that changes it waits instead.
+ */
+function accessSentence(access, where, waits) {
+  const v = access?.verdict
+  if (!v?.reads) return ''
+  const judged = ` Read only: ${providerName(v.by ?? TEACHER)} judged it only reads the project (${Math.round(v.p * 100)}%, its bar is ${Math.round(v.bar * 100)}%)`
+  return access.mode === 'read'
+    ? `${judged}, so it runs on an agent locked against writing, beside any task changing ${where}.`
+    : `${judged}, but ${access.why ?? 'no agent here can be locked against writing'}, so ${waits ? `it waits for ${where} like work that writes` : `it runs as work that writes, and a task changing ${where} waits for it`}.`
 }
 
 async function* textReply(text, index = 0) {

@@ -35,6 +35,7 @@
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { SILENT_STATUSES, isWorkAttempt, succeeded } from './outcome.js'
 import { TEACHER } from './providers.js'
 import { DIMENSIONS, RELATED_TASK_TYPES, TASK_DIMENSIONS, resolvePolicy } from './routing-policy.js'
 
@@ -639,13 +640,14 @@ export function createCapabilityRegistry({ file, priors, policy = resolvePolicy(
   return api
 }
 
-const isSuccess = (status) => String(status ?? '').startsWith('accepted') || status === 'answered'
+const isSuccess = succeeded
 // Whether the teacher decided the run. A record from before there were two deciders says nothing,
 // and it was Jev.
 const taughtRun = (record) => (record?.routing?.decider ?? TEACHER) === TEACHER
-// A run that ran out of allowance or was stopped by the person says nothing about the work.
-const NO_EVIDENCE = new Set(['paused_limit', 'stopped'])
-const isWork = (a) => (a.role === 'primary' || a.role === 'retry') && !a.limitHit
+// A run that ran out of allowance, was stopped by the person, or was a read pass handed to its
+// folder's line says nothing about the work (outcome.js).
+const NO_EVIDENCE = new Set(SILENT_STATUSES)
+const isWork = (a) => isWorkAttempt(a) && !a.limitHit
 const checksFailed = (a) => Array.isArray(a.checks) && a.checks.some((c) => c && c.passed === false)
 // What a review assessment said about the work: accepted 1, sent back or handed to a person 0,
 // anything else (a second review, a skipped reviewer) is not a verdict.

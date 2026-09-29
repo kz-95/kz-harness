@@ -99,7 +99,7 @@ test('an acting request goes before the shadow chunks queued behind the one on t
   const shadow = shadowOf(client, ROUTE)
   await waitFor('the first chunk on the wire', () => fake.requests.length, (n) => n === 1)
   const answer = await client.client('act').systemOne(INTENT, { phase: 'intent' })
-  assert.deepEqual(Object.keys(answer.answers), ['kind', 'depth', 'alsoWork'])
+  assert.deepEqual(Object.keys(answer.answers), ['kind', 'depth', 'alsoWork', 'readOnly'])
   assert.equal((await shadow.done).status, 'answered')
   const order = fake.requests.map((r) => (isIntent(r) ? 'act' : 'shadow'))
   assert.deepEqual(order.slice(0, 3), ['shadow', 'act', 'shadow'], 'the acting request waited for one chunk only')
@@ -365,7 +365,7 @@ test('ensureReady runs before every request, so a restart within a call or betwe
   sidecar.state = 'restarting'
   sidecar.starting = new Promise((resolve) => setTimeout(() => { sidecar.state = 'ready'; sidecar.starting = null; resolve() }, 500))
   const later = await act.systemOne(intentOf('Review the rename'), { phase: 'review' })
-  assert.deepEqual(Object.keys(later.answers), ['kind', 'depth', 'alsoWork'])
+  assert.deepEqual(Object.keys(later.answers), ['kind', 'depth', 'alsoWork', 'readOnly'])
   assert.equal(second.requests.length, requests)
 })
 
@@ -403,7 +403,7 @@ test('a 401 rebuilds the client from the current connection and is sent once mor
   // ensureReady hands out the key of before a restart; connection() already has the new one.
   sidecar.latest = { url: fake.url, key: fresh, device: 'cpu', pid: 9 }
   const answer = await client.client('act').systemOne(INTENT, { phase: 'intent' })
-  assert.deepEqual(Object.keys(answer.answers), ['kind', 'depth', 'alsoWork'])
+  assert.deepEqual(Object.keys(answer.answers), ['kind', 'depth', 'alsoWork', 'readOnly'])
   assert.deepEqual(fake.requests.map((r) => r.status), [401, 200])
   assert.equal(fake.requests[1].authorization, `Bearer ${fresh}`)
   assert.deepEqual(sidecar.calls.noteResult.map((r) => r.status), [401, 200])
@@ -484,7 +484,7 @@ test('a 401 that begins a restart is not sent again to the server going away', a
   await assert.rejects(client.client('act').systemOne(INTENT, { phase: 'intent' }), (err) => err.code === 'LAYA_HTTP_401')
   assert.equal(fake.requests.length, 1, 'sent once')
   await waitFor('Laya running again', () => sidecar.state, (s) => s === 'ready')
-  assert.deepEqual(Object.keys((await client.client('act').systemOne(INTENT, { phase: 'intent' })).answers), ['kind', 'depth', 'alsoWork'])
+  assert.deepEqual(Object.keys((await client.client('act').systemOne(INTENT, { phase: 'intent' })).answers), ['kind', 'depth', 'alsoWork', 'readOnly'])
 })
 
 test('Laya stopped on purpose under a request: a shadow job is skipped as the stop says, and an acting call says Laya was stopped', async (t) => {
@@ -548,7 +548,7 @@ test('the answer is relabelled with what answered, its meta is complete, and its
   assert.equal(trace.meta.device, 'cpu')
   assert.equal(trace.meta.identity, IDENTITY)
   assert.equal(trace.meta.requests, 1)
-  assert.equal(trace.meta.rows, 3)
+  assert.equal(trace.meta.rows, 4, 'kind, depth, alsoWork and readOnly')
   assert.equal(trace.meta.lang, 'latin')
   assert.ok(trace.questions.every((q) => typeof q.informative === 'boolean' && typeof q.corrected === 'boolean'))
   assert.ok(fake.requests.every((r) => r.model === 'english'))

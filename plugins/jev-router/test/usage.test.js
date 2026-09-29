@@ -51,7 +51,7 @@ test('codexRpc: initialize -> initialized -> requests over newline JSON-RPC', as
   assert.equal(r['account/read'].method, 'account/read')
 })
 
-test('snapshot: per-key DeepSeek balances, agent ok while any key is usable, OMC cache for Claude, Jev spend', async () => {
+test('snapshot: per-key DeepSeek balances, the agent judged by the key its calls go out on, OMC cache for Claude, Jev spend', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'kz-use-'))
   const home = join(dir, 'home')
   mkdirSync(join(home, '.claude', 'plugins', 'oh-my-claudecode'), { recursive: true })
@@ -76,13 +76,24 @@ test('snapshot: per-key DeepSeek balances, agent ok while any key is usable, OMC
   assert.equal(s.claude.state, 'near')
   assert.equal(s.claude.account.email, 'me@x')
   assert.ok(!calls.some((u) => u.includes('anthropic')), 'fresh OMC cache: no call to the private endpoint')
-  assert.equal(s.deepseek.state, 'ok')
+  // Its calls go out on 'a', below the floor: 'b' in reserve does not make it usable, since no key
+  // is switched to within the run.
+  assert.deepEqual([s.deepseek.state, s.deepseek.account.label, s.deepseek.balance.amount], ['stopped', 'a', 0.1])
   assert.deepEqual(usage.last().keys.deepseek.map((k) => k.state), ['stopped', 'ok'])
   assert.ok(Math.abs(s.jev.spentUsd - 0.042) < 1e-9)
   await usage.snapshot(agents)
   assert.equal(calls.length, 2, 'balances cached')
-  await accounts.markExhausted('deepseek:b', { until: soon(), reason: '402' })
-  assert.equal((await usage.snapshot(agents)).deepseek.state, 'stopped')
+  // 'b' made active waits for a restart: the agent is still judged by 'a', and says what is pending.
+  await accounts.activate('deepseek', 'b')
+  const pending = (await usage.snapshot(agents)).deepseek
+  assert.deepEqual([pending.state, pending.account.label, pending.account.pendingKey], ['stopped', 'a', 'b'])
+  // After a restart its calls go out on 'b', which is under the hand-over figure.
+  const restarted = createAccounts({ dataDir: dir, envFile, run: async () => ({ ok: true, out: '{}' }), launched: {} })
+  const after = createUsage({ dataDir: dir, accounts: restarted, fetch, home })
+  const b = (await after.snapshot(agents)).deepseek
+  assert.deepEqual([b.state, b.account.label, b.account.pendingKey], ['near', 'b', undefined])
+  await restarted.markExhausted('deepseek:b', { until: soon(), reason: '402' })
+  assert.equal((await after.snapshot(agents)).deepseek.state, 'exhausted')
   const line = (await usage.recent(1))[0]
   assert.equal(line.agent, 'jev')
   assert.ok(!JSON.stringify(await usage.recent()).includes('sk-'))
@@ -175,4 +186,102 @@ test('computeSavings leaves the capability benchmark\'s attempts out of its agen
   assert.equal(s.periods.today.savedMs, 6000 - 1000, 'what a direct answer saved is measured against it')
   // With only the benchmark's attempts, there is no median of the person's own work.
   assert.equal(computeSavings([...bench, answer], [], { agentMedianFallbackMs: 10_000 }, now).assumptions.agentMedianMs, 10_000)
+})
+
+test('a reading of one agent leaves the others\' last readings in place', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kz-last-'))
+  const envFile = join(dir, '.env')
+  writeFileSync(envFile, 'KZ_KEY__deepseek__a=sk-a\nKZ_KEY__moonshot__b=sk-b\n')
+  writeFileSync(join(dir, 'accounts.json'), JSON.stringify({ keys: { deepseek: [{ name: 'a', active: true }], moonshot: [{ name: 'b', active: true }] } }))
+  const accounts = createAccounts({ dataDir: dir, envFile, run: async () => ({ ok: true, out: '{}' }) })
+  const fetch = async () => ({ ok: true, json: async () => ({ is_available: true, balance_infos: [{ currency: 'USD', total_balance: '7.00' }] }) })
+  const usage = createUsage({ dataDir: dir, accounts, fetch, home: dir })
+  const deepseek = { id: 'deepseek', provider: 'spawn', llm: { provider: 'deepseek' } }
+  const kimi = { id: 'kimi', provider: 'spawn', llm: { provider: 'moonshot' } }
+  await usage.snapshot([deepseek, kimi])
+  // A balance check after one agent's attempt reads that agent alone.
+  await usage.snapshot([deepseek], { force: true })
+  assert.deepEqual(Object.keys(usage.last().out).sort(), ['deepseek', 'jev', 'kimi'])
+})
+
+test('a limit whose second opinion had answered put no agent out, and takes nothing off the limit saves', async () => {
+  const { computeSavings } = await import('../usage.js')
+  const run = (limits) => ({ ts: new Date().toISOString(), finalStatus: 'answered', routing: { primaryAgent: 'claude' }, attempts: [], availability: { out: [{ id: 'codex' }] }, limits })
+  const saved = (limits) => computeSavings([], [run(limits)]).periods.all.limitsAvoided
+  assert.deepEqual([saved([]), saved([{ agent: 'claude', action: 'opinion' }]), saved([{ agent: 'claude', action: 'answered' }])], [1, 1, 1])
+})
+
+test('a parallel opinion\'s agent set aside at its limit is out because of the run, not skipped at routing', async () => {
+  const { computeSavings } = await import('../usage.js')
+  const run = { ts: new Date().toISOString(), finalStatus: 'answered', routing: { primaryAgent: 'claude' }, attempts: [], availability: { out: [{ id: 'deepseek' }] }, limits: [{ agent: 'deepseek', action: 'set_aside' }] }
+  assert.equal(computeSavings([], [run]).periods.all.limitsAvoided, 0)
+})
+
+test('a key moved on is no limit save, a parallel opinion\'s included: no call ever went out on it', async () => {
+  const { computeSavings } = await import('../usage.js')
+  const run = (attempts) => ({ ts: new Date().toISOString(), finalStatus: 'answered', routing: { primaryAgent: 'claude' }, attempts, availability: { out: [] }, limits: [{ agent: 'deepseek', action: 'rotated', role: 'opinion' }] })
+  const saved = (attempts) => computeSavings([], [run(attempts)]).periods.all.limitsAvoided
+  const primary = { agent: 'claude', role: 'primary', stopReason: 'completed' }
+  const opinion = { agent: 'deepseek', role: 'opinion', stopReason: 'error', limitHit: true }
+  assert.deepEqual([saved([primary, opinion]), saved([{ ...primary, stopReason: 'error' }, opinion, { agent: 'deepseek', role: 'retry', stopReason: 'completed' }])], [0, 0])
+})
+
+test('snapshot: the launch key removed is still the one calls go out on, judged by its last reading and a limit met since; each agent on a key is held to its own floor', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kz-gone-'))
+  const envFile = join(dir, '.env')
+  writeFileSync(envFile, 'KZ_KEY__deepseek__a=sk-a\nKZ_KEY__deepseek__b=sk-b\n')
+  writeFileSync(join(dir, 'accounts.json'), JSON.stringify({ keys: { deepseek: [{ name: 'a', active: true }, { name: 'b', active: false }] }, limits: { cheap: { minBalance: 1, handoffAtBalance: 2 } } }))
+  const accounts = createAccounts({ dataDir: dir, envFile, run: async () => ({ ok: true, out: '{}' }), launched: {} })
+  const fetch = async (url, { headers }) => ({ ok: true, json: async () => ({ is_available: true, balance_infos: [{ currency: 'USD', total_balance: headers.authorization === 'Bearer sk-a' ? '3.00' : '50.00' }] }) })
+  const usage = createUsage({ dataDir: dir, accounts, fetch, home: dir })
+  const agents = [{ id: 'deepseek', provider: 'spawn', llm: { provider: 'deepseek' } }, { id: 'cheap', provider: 'spawn', llm: { provider: 'deepseek' } }]
+  const s = await usage.snapshot(agents)
+  // Key 'a' holds 3: under deepseek's floor of 5, over cheap's of 1 (and its hand-over at 2).
+  assert.deepEqual([s.deepseek.state, s.cheap.state], ['stopped', 'ok'])
+  await accounts.removeKey('deepseek', 'a')
+  const gone = (await usage.snapshot(agents)).deepseek
+  // Judged by its last reading, which is not given out as a balance read now.
+  assert.deepEqual([gone.state, gone.account.label, gone.account.pendingKey, gone.balance, gone.lastBalance?.amount], ['stopped', 'a (removed)', 'b', null, 3])
+  // A plugin reload (a new reading, the same process): still judged by that reading.
+  const reloaded = createUsage({ dataDir: dir, accounts, fetch, home: dir })
+  assert.equal((await reloaded.snapshot(agents)).deepseek.state, 'stopped')
+  // A limit met on it since: out until that limit's end, whatever the reading.
+  assert.equal(await accounts.markKeyExhausted('deepseek', 'a', { until: new Date(Date.now() + 3_600_000).toISOString(), reason: 'HTTP 402' }), false)
+  const spent = await usage.snapshot(agents)
+  assert.deepEqual([spent.deepseek.state, spent.cheap.state], ['exhausted', 'exhausted'])
+})
+
+test('snapshot: a reading for one agent scores its key rows against every switched-on agent\'s floor, never a switched-off one\'s', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kz-floors-'))
+  const envFile = join(dir, '.env')
+  writeFileSync(envFile, 'KZ_KEY__deepseek__a=sk-a\n')
+  writeFileSync(join(dir, 'accounts.json'), JSON.stringify({ keys: { deepseek: [{ name: 'a', active: true }] }, limits: { pro: { minBalance: 20 }, flash: { minBalance: 5 }, off: { minBalance: 1 } } }))
+  const accounts = createAccounts({ dataDir: dir, envFile, run: async () => ({ ok: true, out: '{}' }), launched: {} })
+  const fetch = async () => ({ ok: true, json: async () => ({ is_available: true, balance_infos: [{ currency: 'USD', total_balance: '3.00' }] }) })
+  const on = (id, enabled = true) => ({ id, provider: 'spawn', llm: { provider: 'deepseek' }, enabled })
+  const all = [on('pro'), on('flash'), on('off', false)]
+  const usage = createUsage({ dataDir: dir, accounts, fetch, home: dir, floorAgents: async () => all })
+  // Key 'a' holds 3: under flash's floor of 5, the lowest switched-on one, over the switched-off agent's 1.
+  const s = await usage.snapshot([all[0]], { force: true })
+  assert.equal(s.pro.state, 'stopped')
+  assert.deepEqual(usage.last().keys.deepseek.map((k) => k.state), ['stopped'])
+  // At 10 the key is over flash's floor: the row stays usable after pro's own reading.
+  const high = createUsage({ dataDir: dir, accounts, fetch: async () => ({ ok: true, json: async () => ({ is_available: true, balance_infos: [{ currency: 'USD', total_balance: '10.00' }] }) }), home: dir, floorAgents: async () => all })
+  await high.snapshot([all[0]], { force: true })
+  assert.deepEqual(high.last().keys.deepseek.map((k) => k.state), ['ok'])
+})
+
+test('snapshot: Jev\'s row counts every Jev call this month, whatever key made it, and each Jev key\'s row its own', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kz-jevspend-'))
+  const envFile = join(dir, '.env')
+  writeFileSync(envFile, 'KZ_KEY__jev__j1=ts-1\n')
+  writeFileSync(join(dir, 'accounts.json'), JSON.stringify({ keys: { jev: [{ name: 'j1', active: true }] } }))
+  const accounts = createAccounts({ dataDir: dir, envFile, run: async () => ({ ok: true, out: '{}' }), launched: {} })
+  const usage = createUsage({ dataDir: dir, accounts, home: dir, jevKeyInUse: async () => 'j1' })
+  // On the stored key, on the credential ('default', no stored key of that name) and on a key since removed.
+  for (const account of ['j1', 'default', 'old']) await usage.logJev({ runId: 'r', account, phase: 'route', tokens: { input: 1_000_000, output: 0 } })
+  const s = await usage.snapshot([])
+  assert.ok(Math.abs(s.jev.spentUsd - 3 * 0.042) < 1e-9, `every Jev call (${s.jev.spentUsd})`)
+  assert.ok(Math.abs(usage.last().keys.jev[0].spentUsd - 0.042) < 1e-9, 'the stored key\'s row, its own calls')
+  assert.equal(s.jev.account.label, 'j1')
 })

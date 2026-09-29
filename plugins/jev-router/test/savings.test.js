@@ -31,7 +31,8 @@ const runs = [
   { ts: at(1), attempts: [{ agent: 'tool:fmt', role: 'tool', durationMs: 1000 }], finalStatus: 'accepted', limits: [], availability: { out: [] } },
   // today: tool rejected, escalated to an agent: no tool saving
   { ts: at(1), attempts: [{ role: 'tool', durationMs: 1000 }, { role: 'primary', durationMs: 5000 }], finalStatus: 'accepted', limits: [], availability: { out: [] } },
-  // 3 days ago: codex skipped at routing, claude hit a limit -> peer, deepseek rotated a key: 3 saves
+  // 3 days ago: codex skipped at routing, claude hit a limit -> peer: 2 saves; deepseek's key moved
+  // on (an older run's 'rotated') saved nothing, since no call ever went out on it
   { ts: at(72), attempts: [], finalStatus: 'accepted', limits: [{ agent: 'claude', action: 'peer' }, { agent: 'deepseek', action: 'rotated' }], availability: { out: [{ id: 'codex' }, { id: 'claude' }] } },
   // paused run: nothing avoided
   { ts: at(72), attempts: [], finalStatus: 'paused_limit', limits: [{ agent: 'claude', action: 'paused' }], availability: { out: [{ id: 'claude' }] } },
@@ -58,7 +59,7 @@ test('periods and limits avoided', () => {
   assert.equal(assumptions.agentMedianMs, 40_000)
   assert.equal(assumptions.agentMedianSamples, 3)
   assert.equal(periods.week.decisions, 2)
-  assert.equal(periods.week.limitsAvoided, 3)
+  assert.equal(periods.week.limitsAvoided, 2)
   assert.equal(periods.all.decisions, 3)
   // the old decision: 4000 - 5000 ms and $0 Jev -> negative time, shown as is
   assert.equal(periods.all.savedMs, periods.week.savedMs - 1000)

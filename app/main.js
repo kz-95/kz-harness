@@ -5,6 +5,7 @@
 // stops DSH and everything it started.
 const { app, BrowserWindow, Menu, Tray, WebContentsView, dialog, ipcMain, session, shell, nativeImage } = require('electron')
 const { spawn, execFile, execFileSync } = require('node:child_process')
+const fs = require('node:fs')
 const net = require('node:net')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
@@ -27,7 +28,7 @@ if (debugSwitch && !DEBUG) {
 // so walk up from it until Start-KzH.ps1 is found.
 const HARNESS = (() => {
   for (let d = app.isPackaged ? path.dirname(process.execPath) : path.resolve(__dirname, '..'); ; d = path.dirname(d)) {
-    if (require('node:fs').existsSync(path.join(d, 'Start-KzH.ps1'))) return d
+    if (fs.existsSync(path.join(d, 'Start-KzH.ps1'))) return d
     if (path.dirname(d) === d) return path.resolve(__dirname, '..')
   }
 })()
@@ -44,7 +45,12 @@ let main = null
 let logWin = null
 let tray = null
 let dsh = null
+// The running engine's harness page, so a window rebuilt from the tray, or one whose page
+// crashed, opens the harness again instead of the start screen. Cleared when the engine goes.
+let harnessUrl = null
 let quitting = false
+// Closing the window leaves the app in the tray, so "close Kz-harness" would stop nothing.
+const QUIT_HOW = 'Quit Kz-harness (right-click its tray icon and choose Quit, or press Ctrl+Q in its window; closing the window leaves it running)'
 const logs = [] // { t, level, text }
 // Startup is about 40 seconds and most of it is the engine loading its plugin bundle,
 // which we cannot shorten. So say what is happening instead of one unchanging line.
@@ -60,13 +66,19 @@ const STEPS = [
 /** Which step a line of launcher output means, or null when it says nothing about progress. */
 function stepFor(line) {
   if (/dsh web:/.test(line)) return 'ready'
+  if (/^Starting the engine\b/.test(line)) return 'engine'
   if (/Fetching the engine/i.test(line)) return 'fetch'
   if (/^patch-|^ensure-no-project|: applied$/.test(line)) return 'prepare'
   return null
 }
+/** Where a step sits in STEPS: the splash only ever moves forward through them. */
+const stepAt = (id) => STEPS.findIndex((x) => x.id === id)
+/** What the splash says while a step runs. */
+const stepMessage = (id) => id === 'engine' ? 'Starting the engine, this takes about half a minute…' : `${STEPS.find((x) => x.id === id)?.label ?? id}…`
 // Which steps this run actually reached. A repeat run never fetches the engine, and the
 // splash must not tick a step that never ran. Kept here, not in the window, because the
-// window can open after the first steps are already done.
+// window can open after the first steps are already done. Cleared when a run starts
+// (startDsh): a restart is a run of its own.
 const seenSteps = new Set(['update'])
 let status = { phase: 'starting', message: 'Starting the harness…', step: 'update', steps: STEPS }
 
@@ -224,7 +236,7 @@ async function safeUpdate() {
   const needsRebuild = files.some((f) => f.startsWith('app/'))
   if (needsInstall || needsRebuild) {
     const what = [needsInstall && 'new packages', needsRebuild && 'a rebuilt Kz-harness.exe'].filter(Boolean).join(' and ')
-    addLog(`Updates: ${count} new commit(s) need ${what}, which this launcher will not do behind your back. Close Kz-harness and run scripts\\Install-Harness.ps1.`, 'warn')
+    addLog(`Updates: ${count} new commit(s) need ${what}, which this launcher will not do behind your back. ${QUIT_HOW}, then run scripts\\Install-Harness.ps1.`, 'warn')
     return
   }
   const pulled = await git(['pull', '--ff-only', '--quiet'], 20000)
@@ -234,6 +246,7 @@ async function safeUpdate() {
 
 async function startDsh() {
   if (dsh) return
+  seenSteps.clear()
   await safeUpdate()
   setStatus({ phase: 'starting', message: 'Checking the port is free…', step: 'port' })
   if (await portBusy()) {
@@ -245,7 +258,7 @@ async function startDsh() {
       setStatus({ phase: 'error', holder: 'orphan', message: `A Kz-harness engine is still running on port ${PORT}, left behind by an app that is no longer open. Click "Use it here" to stop it and start here.` })
     } else if (holder?.kind === 'running') {
       addLog(`Port ${PORT} is held by a Kz-harness engine (PID ${holder.pid}) that still belongs to a running Kz-harness.`, 'warn')
-      setStatus({ phase: 'error', holder: 'running', message: `Another harness is already running on port ${PORT}. Close its black window (or the other Kz-harness), then click Retry.` })
+      setStatus({ phase: 'error', holder: 'running', message: `Another harness is already running on port ${PORT}. Close its black window (or quit the other Kz-harness from its tray icon), then click Retry.` })
     } else {
       const who = holder ? `${holder.name || 'a process'} (PID ${holder.pid})` : 'an unrelated program'
       addLog(`Port ${PORT} is held by ${who}, which is not this harness. Nothing was stopped.`, 'warn')
@@ -267,26 +280,23 @@ async function startDsh() {
       const m = line.match(/dsh web:\s*(http\S+)/)
       addLog(m ? 'KzH ready on this PC only (127.0.0.1)' : line, m ? 'ok' : undefined)
       if (m) { openHarness(m[1]); continue }
-      // The launcher's own output is the only honest progress signal we have.
+      // The launcher's own output is the only honest progress signal we have. It only moves
+      // forward: the patches run after a fetch and print 'patch-…' lines, which must not put
+      // the splash back on "Preparing" with the fetch shown as still to do. The engine itself
+      // prints nothing between starting and serving, so the launcher says when it boots it.
       const step = stepFor(line)
-      if (step && step !== status.step) {
-        setStatus({ phase: 'starting', message: `${STEPS.find((x) => x.id === step)?.label ?? step}…`, step })
+      if (step && dsh === child && status.phase === 'starting' && stepAt(step) > stepAt(status.step)) {
+        setStatus({ phase: 'starting', message: stepMessage(step), step })
       }
     }
   }
   dsh = child
-  // The engine prints nothing between starting and serving, which is most of the wait.
-  // Move to that step shortly after spawn so the splash is never silently stuck on "Preparing".
-  setTimeout(() => {
-    if (dsh === child && status.phase === 'starting' && status.step !== 'fetch' && status.step !== 'ready') {
-      setStatus({ phase: 'starting', message: 'Starting the engine, this takes about half a minute…', step: 'engine' })
-    }
-  }, 2500)
   child.stdout.on('data', onData)
   child.stderr.on('data', onData)
   child.on('exit', (code) => {
     if (dsh !== child || quitting) return // stopped on purpose (restart or quit)
     dsh = null
+    harnessUrl = null
     addLog(`Harness stopped (exit ${code}).`, code ? 'error' : 'info')
     setStatus({ phase: 'error', message: code ? `The harness stopped with an error (exit ${code}). See the log, then click Retry.` : 'The harness stopped.' })
     showStartScreen()
@@ -298,6 +308,7 @@ function stopDsh() {
   // powershell -> npx -> node: only a tree kill stops the server.
   try { execFileSync('taskkill', ['/pid', String(dsh.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }) } catch {}
   dsh = null
+  harnessUrl = null
 }
 
 /** Kz-harness -> Check for updates: runs scripts/Update-Harness.ps1 into the log, then restarts the harness. */
@@ -347,7 +358,7 @@ async function useHere() {
     if (holder?.kind !== 'orphan') {
       addLog(`Use it here: port ${PORT} is not held by an orphaned engine any more; nothing was stopped.`, 'warn')
       setStatus({ phase: 'error', holder: holder?.kind ?? 'foreign', message: holder?.kind === 'running'
-        ? `Another harness is already running on port ${PORT}. Close its black window (or the other Kz-harness), then click Retry.`
+        ? `Another harness is already running on port ${PORT}. Close its black window (or quit the other Kz-harness from its tray icon), then click Retry.`
         : `Port ${PORT} is no longer held by an orphaned engine. Open the log, then click Retry.` })
       return { ok: false, reason: holder?.kind ?? 'gone' }
     }
@@ -372,12 +383,17 @@ async function useHere() {
 // ---------- windows ----------
 const secure = { contextIsolation: true, nodeIntegration: false, sandbox: true }
 
-/** Bring the window back, rebuilding it if it was closed: the tray must never be a dead end. */
+/**
+ * Bring the window back, rebuilding it if it was closed: the tray must never be a dead end. A
+ * window left on the start screen by a harness page that failed (status.page) opens the page again,
+ * as a rebuilt one does.
+ */
 function showWindow() {
   if (!main || main.isDestroyed()) { createMain(); return }
   if (main.isMinimized()) main.restore()
   main.show()
   main.focus()
+  if (status.page && dsh && harnessUrl) openHarness(harnessUrl)
 }
 
 function showStartScreen() {
@@ -385,6 +401,7 @@ function showStartScreen() {
 }
 
 function openHarness(url) {
+  harnessUrl = url
   setStatus({ phase: 'ready', message: 'Harness running', step: 'ready', origin: new URL(url).origin })
   main?.loadURL(url)
 }
@@ -406,13 +423,32 @@ function createMain() {
   reveal()
   // Whatever the page does, the window is on screen within a second.
   setTimeout(reveal, 1000)
+  // The harness page failing is not the engine failing: while the engine runs, the start screen
+  // says so and its Retry opens the page again (harness:retry), rather than restarting the engine
+  // and ending every task in it.
+  const pageDown = (what) => {
+    setStatus({ phase: 'error', page: true, origin: new URL(harnessUrl).origin, message: `The harness page ${what}; the harness itself is still running. Click Retry to open the page again.` })
+    showStartScreen()
+    reveal()
+  }
   main.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
-    if (!isMainFrame) return
+    // -3 is ERR_ABORTED: a load cancelled because another replaced it (a second reload, the app
+    // loading the start screen or the harness), which is no failure. Chromium reports it for a
+    // page still loading when the next one commits.
+    if (!isMainFrame || code === -3) return
+    if (dsh && isHarnessPage(url)) {
+      addLog(`The harness page failed to load (${code} ${desc}); the engine is still running.`, 'error')
+      return pageDown(`could not load (${desc || code})`)
+    }
     addLog(`The start screen failed to load (${code} ${desc}) ${url}`, 'error')
     setStatus({ phase: 'error', message: `The launcher page could not load (${desc || code}). Open the log, then click Retry.` })
     reveal()
   })
   main.webContents.on('render-process-gone', (_e, d) => {
+    if (dsh && isHarnessPage(main.webContents.getURL())) {
+      addLog(`The harness page stopped (${d?.reason ?? 'unknown'}); the engine is still running.`, 'error')
+      return pageDown('stopped')
+    }
     addLog(`The window's renderer stopped (${d?.reason ?? 'unknown'}).`, 'error')
     setStatus({ phase: 'error', message: 'The launcher page stopped. Click Retry.' })
     reveal()
@@ -426,9 +462,27 @@ function createMain() {
   main.on('restore', () => browserView?.setVisible(browserWanted))
   main.webContents.on('did-navigate', () => hideBrowser())
   // Closing the window leaves the harness running in the tray; quit from the tray menu
-  // or the app menu. Quitting here made the tray icon a dead end.
-  main.on('closed', () => { main = null })
-  showStartScreen()
+  // or the app menu. Quitting here made the tray icon a dead end. The browser view lives
+  // in this window, so it goes with it; the next window builds its own.
+  main.on('closed', () => { main = null; closeBrowser(); if (!quitting) tellStillRunning() })
+  if (dsh && harnessUrl && (status.phase === 'ready' || status.page)) openHarness(harnessUrl)
+  else showStartScreen()
+}
+
+/** Whether a URL is the running engine's harness page. */
+function isHarnessPage(url) {
+  try { return !!harnessUrl && new URL(url).origin === new URL(harnessUrl).origin } catch { return false }
+}
+
+/**
+ * The first time the window closes, say once (ever, per Windows user) that the harness is still
+ * running: a new tray icon starts in Windows 11's hidden overflow, so nothing on screen would say it.
+ */
+function tellStillRunning() {
+  const told = path.join(app.getPath('userData'), 'told-still-running')
+  if (!tray || fs.existsSync(told)) return
+  tray.displayBalloon({ iconType: 'info', title: 'Kz-harness is still running', content: 'Closing the window leaves it running here. To stop it, right-click this icon and choose Quit.' })
+  try { fs.writeFileSync(told, '') } catch {}
 }
 
 function openLogs() {
@@ -473,6 +527,13 @@ let browserWanted = false
 let favicon
 const isHttp = (u) => { try { return ['http:', 'https:'].includes(new URL(u).protocol) } catch { return false } }
 function hideBrowser() { browserWanted = false; browserView?.setVisible(false) }
+function closeBrowser() {
+  const wc = browserView?.webContents
+  if (wc && !wc.isDestroyed()) wc.close()
+  browserView = null
+  browserWanted = false
+  favicon = undefined
+}
 function browserState() {
   const wc = browserView.webContents
   return { url: wc.getURL(), title: wc.getTitle(), canGoBack: wc.navigationHistory.canGoBack(), canGoForward: wc.navigationHistory.canGoForward(), loading: wc.isLoading(), favicon }
@@ -559,7 +620,12 @@ ipcMain.handle('harness:menu', (e, at) => {
 ipcMain.handle('harness:titlebar', () => ({ height: TITLEBAR_H, maximized: !!main?.isMaximized() }))
 // Only the app's own start and log pages may read the log or restart the harness, not the harness page.
 ipcMain.handle('harness:state', (e) => (fromAppPage(e) ? { status, logs } : null))
-ipcMain.handle('harness:retry', (e) => { if (fromAppPage(e)) restartDsh() })
+// Retry after the harness page failed opens the page again; the engine under it is fine.
+ipcMain.handle('harness:retry', (e) => {
+  if (!fromAppPage(e)) return
+  if (status.page && dsh && harnessUrl) openHarness(harnessUrl)
+  else restartDsh()
+})
 ipcMain.handle('harness:useHere', (e) => (fromAppPage(e) ? useHere() : null))
 ipcMain.handle('harness:openLogs', (e) => { if (fromAppPage(e)) openLogs() })
 
@@ -575,5 +641,7 @@ app.whenReady().then(() => {
   createMain()
   startDsh()
 })
-app.on('before-quit', () => { quitting = true; stopDsh(); browserView?.webContents.close(); browserView = null })
-// Not quitting on window-all-closed: the tray keeps the harness alive until you quit it.
+app.on('before-quit', () => { quitting = true; stopDsh(); closeBrowser() })
+// Not quitting on window-all-closed: the tray keeps the harness alive until you quit it. A listener
+// of its own is what turns Electron's default (quit when the last window closes) off.
+app.on('window-all-closed', () => {})

@@ -157,7 +157,7 @@ test('lanes: a task that has to wait is told so as it joins the line, once, with
   a()
   ;(await a2)()
   ;(await b)()
-  assert.equal(told.length, 2, 'said once, not again as the line moves')
+  assert.equal(told.length, 2, 'its reason did not change, so it was not told again')
   // A listener that throws is thrown to the caller before the task joins the line, so it leaves
   // nothing behind in it that would hold the workspace for good.
   const held = await take('C:/c', 'c')
@@ -326,6 +326,120 @@ test('tasks at once across workspaces: the one over the cap waits as queued, fir
   assert.deepEqual(tasks.results('s1').map((r) => r.state), ['completed', 'completed', 'completed'])
 })
 
+test('a waiting task says what it waits for as the line moves, and is told again when that changes', async () => {
+  // Cap 1: a1 runs in /a, b1 waits for the slot in /b, a2 and a3 wait behind a1 in /a. When a1
+  // ends the slot goes to b1, which arrived first, and nothing runs in /a any more.
+  const lanes = createLanes({ max: 1 })
+  assert.equal(typeof lanes.waitOf, 'function', 'the lanes say where a waiting run stands')
+  const jobs = fakeJobs()
+  const holds = new Map()
+  const asked = []
+  const tasks = createTasks({
+    file: join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl'),
+    lanes,
+    jobs: () => jobs,
+    run: async (t, { signal, emit, onEntry }) => {
+      const release = await lanes.acquire(laneKey(t.workspace), t.jobId, signal, { who: { kind: 'task', decider: t.decider }, onWait: (why) => emit({ type: 'queued', text: WAITING[why] }) })
+      try {
+        onEntry({ id: t.task })
+        return await new Promise((res) => holds.set(t.task, () => res(`${t.task} report`)))
+      } finally { release() }
+    },
+    wait: (w) => { asked.push(w); return w.why === 'workspace' && !w.slotsAhead ? { lowMs: 60_000, highMs: 120_000, n: 5, text: `Estimate for ${w.ahead} ahead.` } : null },
+  })
+  await tasks.ready
+  const own = { owner: {}, sessionId: 's1' }
+  const a1 = tasks.enqueue({ ...own, workspace: 'C:/a', task: 'a1' })
+  for (let i = 0; i < 20 && !holds.has('a1'); i++) await tick()
+  const b1 = tasks.enqueue({ ...own, workspace: 'C:/b', task: 'b1' })
+  const a2 = tasks.enqueue({ ...own, workspace: 'C:/a', task: 'a2' })
+  const a3 = tasks.enqueue({ ...own, workspace: 'C:/a', task: 'a3' })
+  for (let i = 0; i < 5; i++) await tick()
+  const waiting = (t) => tasks.get(t.jobId).waiting
+  assert.equal(waiting(a1), null, 'a running task waits for nothing')
+  assert.deepEqual([waiting(b1).why, waiting(a2).why, waiting(a3).why], ['cap', 'workspace', 'workspace'])
+  assert.deepEqual([waiting(b1).placeText, waiting(a2).placeText, waiting(a3).placeText], ['next for a free slot', '2nd in line', '3rd in line'])
+  assert.deepEqual([waiting(a2).ahead, waiting(a3).ahead], [0, 1])
+  assert.equal(waiting(a3).since, tasks.get(a3.jobId).queuedAt)
+  // b1 arrived before a2: the slot a1 frees goes to b1 first, so a2 is promised nothing.
+  assert.deepEqual([waiting(a2).slotsAhead, waiting(a2).estimate], [1, null])
+  assert.equal(waiting(a2).text, 'Waiting: another task is running in this workspace. 1 task waiting in another workspace takes a free slot before this one.')
+  assert.equal(waiting(b1).text, 'Waiting for a free slot: the resource budget caps how many tasks run at once. Tasks at once: 1 of 1 in use (1 background task).')
+  assert.equal(asked.find((w) => w.why === 'workspace').key, laneKey('C:/a'))
+  holds.get('a1')()
+  for (let i = 0; i < 20 && !holds.has('b1'); i++) await tick()
+  assert.equal(tasks.get(b1.jobId).state, 'routing', 'the slot went to b1, which arrived first')
+  assert.deepEqual([waiting(a2).why, waiting(a3).why], ['cap', 'line'], 'nothing runs in /a now: a2 waits for the slot, a3 for a2')
+  assert.equal(waiting(a3).text, 'Waiting: an earlier task in this workspace is waiting for a free slot first. Tasks at once: 1 of 1 in use (1 background task).')
+  // Told again as its reason changed, so its last line follows the line too.
+  assert.equal(tasks.get(a2.jobId).progressText, WAITING.cap)
+  assert.equal(tasks.get(a3.jobId).progressText, WAITING.line)
+  holds.get('b1')()
+  for (let i = 0; i < 20 && !holds.has('a2'); i++) await tick()
+  assert.equal(waiting(a3).why, 'workspace', 'and back to its workspace once a2 runs')
+  assert.deepEqual([waiting(a3).slotsAhead, waiting(a3).estimate?.text], [0, 'Estimate for 0 ahead.'], 'with no one else waiting for a slot, a2\'s end is a3\'s start')
+  assert.equal(waiting(a3).text, 'Waiting: another task is running in this workspace. Estimate for 0 ahead.')
+  assert.equal(tasks.get(a3.jobId).progressText, WAITING.workspace)
+  holds.get('a2')()
+  for (let i = 0; i < 20 && !holds.has('a3'); i++) await tick()
+  holds.get('a3')()
+  for (let i = 0; i < 20 && tasks.results('s1').length < 4; i++) await tick()
+  assert.equal(tasks.results('s1').length, 4)
+})
+
+test('lanes: slots are ranked by arrival, a lowered cap frees none, and a waiter is told what holds the slots', async () => {
+  const lanes = createLanes({ max: 1 })
+  const a1 = await lanes.acquire(laneKey('C:/a'), 'a1', undefined, { who: { kind: 'task', decider: 'jev' } })
+  const ac = new AbortController()
+  const pending = [lanes.acquire(laneKey('C:/b'), 'b1', ac.signal), lanes.acquire(laneKey('C:/c'), 'c1', ac.signal), lanes.acquire(laneKey('C:/b'), 'b2', ac.signal)]
+  pending.forEach((p) => p.catch(() => {}))
+  await tick()
+  assert.deepEqual([lanes.waitOf(laneKey('C:/b'), 'b1').slot, lanes.waitOf(laneKey('C:/c'), 'c1').slot], [1, 2], 'b1 arrived first')
+  // Once b1 has started, c1 arrived before b2 and takes the slot b1 frees.
+  assert.deepEqual(lanes.waitOf(laneKey('C:/b'), 'b2'), { why: 'line', place: 2, ahead: 1, slotsAhead: 1, slotsAheadHere: 0, overCap: false, chatAhead: 0, holder: null, aheadWho: [null], max: 1, held: { task: 1 } })
+  assert.equal(lanes.waitOf(laneKey('C:/a'), 'a1'), null, 'a holder is not waiting')
+  // Lowered under what runs: the next to end frees no slot, and every waiter says so.
+  lanes.setMax(0)
+  assert.equal(lanes.waitOf(laneKey('C:/c'), 'c1').overCap, true)
+  lanes.setMax(1)
+  ac.abort()
+  a1()
+})
+
+test('Remove stops a task only while it still waits: one that started meanwhile is left running', async () => {
+  const { tasks } = harness({ run: (t, { signal, onEntry }) => { onEntry({ id: 'run-1' }); return new Promise((_res, rej) => signal.addEventListener('abort', () => rej(signal.reason), { once: true })) } })
+  const t = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'already going' })
+  for (let i = 0; i < 5; i++) await tick()
+  assert.equal(tasks.get(t.jobId).state, 'routing', 'it started, and its row says routing')
+  assert.equal(tasks.get(t.jobId).phase, 'routing', 'not the phase it had while it waited')
+  assert.equal(tasks.stop(t.jobId, { onlyIfWaiting: true }), 'started')
+  for (let i = 0; i < 5; i++) await tick()
+  assert.equal(tasks.get(t.jobId).state, 'routing', 'and it runs on')
+  assert.equal(tasks.stop(t.jobId), 'requested', 'Stop still stops it')
+})
+
+test('an estimate that cannot be made never takes the task list down', async () => {
+  const lanes = createLanes()
+  const logged = []
+  const { tasks } = { tasks: createTasks({
+    file: join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl'),
+    lanes,
+    jobs: () => fakeJobs(),
+    run: async (t, { signal }) => { const release = await lanes.acquire(laneKey(t.workspace), t.jobId, signal); release(); return 'ok' },
+    wait: () => { throw new Error('history unreadable') },
+    log: (m) => logged.push(m),
+  }) }
+  const hold = await lanes.acquire(laneKey('C:/w'), 'someone')
+  const t = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/w', task: 'x' })
+  for (let i = 0; i < 5; i++) await tick()
+  const w = tasks.list().find((v) => v.jobId === t.jobId).waiting
+  assert.ok(w, 'the task list says what the task waits for')
+  assert.equal(w.why, 'workspace')
+  assert.equal(w.estimate, null)
+  assert.match(logged.join('\n'), /no wait estimate for .*history unreadable/)
+  hold()
+})
+
 test('tasks at once, now: every run holding a slot counts, a foreground run as much as a background task, and a finished one stops counting', async () => {
   const lanes = createLanes({ max: 2 })
   const jobs = fakeJobs()
@@ -403,19 +517,20 @@ test('index.js takes the cap on tasks at once from the local settings, at start 
   // kept from before the change would send a model more than it holds, or refuse what it could.
   assert.match(index, /onSettings: \(s\) => \{ readyGen\+\+; readyCache = null; lanes\.setMax\(s\.maxConcurrentTasks\); resolveAux\(\); refreshLocal\(\) \}/, 'a budget change clears the readiness cache, reaches the lanes, picks the chat model again and reads the local agents\' windows again')
   assert.match(index, /local\.readSettings\(\)\.then\(\(s\) => lanes\.setMax\(s\.maxConcurrentTasks\)/, 'and the saved cap is read once at start')
-  // Every way into a lane says so when it has to wait: the background runner, route() for /auto,
-  // /<agent> and jev_route, which used to wait on the cap in silence, and a task of the capability
+  // Every way into a lane says so when it has to wait: the background runner (through runAdmitted,
+  // which takes a read-only task's own slot or its workspace's lane), route() for /auto, /<agent>
+  // and jev_route, which used to wait on the cap in silence, and a task of the capability
   // benchmark, which tells its card (docs/benchmark.md 3.8).
   // Captured without the line ending rather than trimmed in each pattern below: on a CRLF
   // checkout every line ends in \r, and an anchored pattern would never match one.
   const ways = index.match(/lanes\.acquire\([^\r\n]*/g)
-  assert.equal(ways.length, 3, 'the background runner, route() and the capability benchmark')
-  assert.match(ways[0], /^lanes\.acquire\(key, `route-\$\{randomUUID\(\)\}`, signal, \{ onWait: \(why\) => \{ emit\?\.\(\{ type: 'queued', text: WAITING\[why\] \}\); process\.stdout\.write\(`\[jev\] \$\{WAITING\[why\]\}\\n`\) \} \}\)$/, 'a foreground run tells its live lines and the log')
+  assert.equal(ways.length, 2, 'route() and the capability benchmark; the background runner goes through runAdmitted')
+  assert.match(ways[0], /^lanes\.acquire\(key, `route-\$\{randomUUID\(\)\}`, signal, \{ who, onWait: \(why\) => \{ emit\?\.\(\{ type: 'queued', text: WAITING\[why\] \}\); process\.stdout\.write\(`\[jev\] \$\{WAITING\[why\]\}\\n`\) \} \}\)$/, 'a foreground run tells its live lines and the log')
   assert.ok(index.indexOf(ways[0]) > index.indexOf('async function route('), 'that one is route()')
-  assert.match(ways[1], /^lanes\.acquire\(laneKey\(folder\), `benchmark-\$\{runId\}`, signal, \{ onWait: \(why\) => onWait\?\.\(WAITING\[why\]\) \}\)$/, 'a benchmark task tells its card')
+  assert.match(ways[1], /^lanes\.acquire\(laneKey\(folder\), `benchmark-\$\{runId\}`, signal, \{ who: \{ kind: 'benchmark' \}, onWait: \(why\) => onWait\?\.\(WAITING\[why\]\) \}\)$/, 'a benchmark task tells its card')
   assert.ok(index.indexOf(ways[1]) > index.indexOf('async function runBenchmarkTask('), 'that one is the benchmark\'s')
-  assert.match(ways[2], /^lanes\.acquire\(laneKey\(t\.workspace\), t\.jobId, signal, \{ onWait: \(why\) => emit\(\{ type: 'queued', text: WAITING\[why\] \}\) \}\)/, 'a background task tells its row')
-  assert.match(index, /position: ahead \? ahead \+ 1 : lanes\.waits\(key\) \? 1 : 0/, 'and the chat line does not promise "starting now" when the cap is full')
+  assert.match(index, /runAdmitted\(\{ lanes, task: t, signal, who: \{ kind: 'task', decider: t\.decider \?\? 'jev' \}, onWait: \(why\) => emit\(\{ type: 'queued', text: WAITING\[why\] \}\),/, 'a background task tells its row')
+  assert.match(index, /wait: tasks\.get\(t\.jobId\)\?\.waiting \?\? null/, 'and the chat line says where it stands and why, read off the line it joined as it was queued, so it does not promise "starting now" when the cap is full')
 })
 
 test('a finished task is delivered to its own session exactly once', async () => {
@@ -623,7 +738,8 @@ test('a stopped task still reports, because its result must explain the stop', a
     file: join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl'),
     lanes,
     jobs: () => jobs,
-    run: (t, { signal }) => new Promise((_res, rej) => signal.addEventListener('abort', () => rej(signal.reason), { once: true })),
+    // It is running: the lane let it in (onEntry), as the real runner says before routing.
+    run: (t, { signal, onEntry }) => { onEntry({ id: 'run-1' }); return new Promise((_res, rej) => signal.addEventListener('abort', () => rej(signal.reason), { once: true })) },
     onSettled: (result) => { seen = result },
   })
   const t = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'long one' })
@@ -663,6 +779,7 @@ test('a task stopped before its turn settles as stopped, with an end time', asyn
   assert.equal(tasks.get(t.jobId).state, 'stopped')
   assert.ok(tasks.get(t.jobId).finishedAt)
   assert.equal(tasks.get(t.jobId).deliveryState, 'pending', 'and the person is still told that it stopped')
+  assert.equal(tasks.get(t.jobId).terminalReason, 'removed from the line before it started', 'and that it never ran')
 })
 
 test('two tasks in one workspace run one at a time, another workspace does not wait', async () => {
@@ -693,7 +810,7 @@ test('two tasks in one workspace run one at a time, another workspace does not w
 })
 
 test('stop settles as stopped, not failed, and a finished task cannot be stopped again', async () => {
-  const { tasks } = harness({ run: (t, { signal }) => new Promise((_res, rej) => signal.addEventListener('abort', () => rej(signal.reason), { once: true })) })
+  const { tasks } = harness({ run: (t, { signal, onEntry }) => { onEntry({ id: 'run-1' }); return new Promise((_res, rej) => signal.addEventListener('abort', () => rej(signal.reason), { once: true })) } })
   const t = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'long one' })
   await tick()
   assert.equal(tasks.stop(t.jobId), 'requested')
@@ -932,7 +1049,7 @@ test('background enqueue: every field the adapter passes reaches tasks.enqueue',
   const passed = new Set(callSites.flatMap((c) => keysOf(c.slice(c.indexOf('{') + 1))))
   assert.ok(passed.has('modalities'), 'the adapter still declares what the task carries')
   const index = src('index.js')
-  const taken = keysOf(index.match(/\n\s*enqueue\(\{([^}]*)\}\)/)[1])
+  const taken = keysOf(index.match(/\n\s*(?:async\s+)?enqueue\(\{([^}]*)\}\)/)[1])
   // Names, not keys: the adapter's `agent` is forwarded as `owner: agent`, so what matters is
   // that the field is used on the way through, whatever it is called on the other side.
   const forwarded = index.match(/tasks\.enqueue\(\{([^}]*)\}\)/)[1].match(/[A-Za-z_$][\w$]*/g)
@@ -964,4 +1081,161 @@ test('a task keeps who decides it: on the record, in the list, on disk, through 
   await again.tasks.ready
   assert.equal(again.tasks.get(laya.jobId).decider, 'laya')
   assert.equal(again.tasks.get('jev-99').decider, 'jev')
+})
+
+// ---------------------------------------------------------------- the waiting line, second pass
+
+/** createTasks over real lanes, whose run() joins the task's lane as index.js's does and holds it until let go. */
+function queue({ max = null, file = join(mkdtempSync(join(tmpdir(), 'kz-f4-')), 'tasks.jsonl'), keyOf = (t) => laneKey(t.workspace), wait } = {}) {
+  const lanes = createLanes({ max })
+  const jobs = fakeJobs()
+  const holds = new Map()
+  const tasks = createTasks({
+    file, lanes, jobs: () => jobs, wait,
+    run: (t, { signal, emit, onEntry }) => lanes.acquire(keyOf(t), t.jobId, signal, { who: { kind: 'task', decider: t.decider }, onWait: (why) => emit({ type: 'queued', text: WAITING[why] }) })
+      .then((release) => { onEntry({ id: `run-${t.jobId}` }); return new Promise((res) => holds.set(t.task, () => { release(); res(`${t.task} report`) })) }),
+  })
+  return { lanes, tasks, holds, file }
+}
+const own = { owner: {}, sessionId: 's1' }
+
+test('a task is in its line before enqueue returns, so the chat says what the work board will', async () => {
+  const { tasks, holds } = queue()
+  tasks.enqueue({ ...own, workspace: 'C:/w', task: 'a' })
+  const b = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'b' })
+  const now = tasks.get(b.jobId)
+  assert.ok(now.waiting, 'no tick later: it already stands in its line')
+  assert.deepEqual([now.position, now.waiting.placeText], [2, '2nd in line'])
+  for (let i = 0; i < 5; i++) await tick()
+  holds.get('a')()
+  for (let i = 0; i < 5; i++) await tick()
+  holds.get('b')()
+})
+
+test('a task that leaves the line stops saying why it waited', async () => {
+  const { tasks, holds } = queue()
+  tasks.enqueue({ ...own, workspace: 'C:/w', task: 'a' })
+  const b = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'b' })
+  for (let i = 0; i < 5; i++) await tick()
+  assert.equal(tasks.get(b.jobId).progressText, WAITING.workspace)
+  holds.get('a')()
+  for (let i = 0; i < 5; i++) await tick()
+  const v = tasks.get(b.jobId)
+  assert.equal(v.state, 'routing')
+  assert.notEqual(v.progressText, WAITING.workspace, 'its last line is no longer a reason to wait that has ended')
+  assert.equal(v.progressText, 'Starting')
+  holds.get('b')()
+})
+
+test('a task taken out of the line keeps no Waiting phase on its stopped row', async () => {
+  const { tasks, holds } = queue()
+  tasks.enqueue({ ...own, workspace: 'C:/w', task: 'a' })
+  const b = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'b' })
+  for (let i = 0; i < 5; i++) await tick()
+  assert.equal(tasks.stop(b.jobId, { onlyIfWaiting: true }), 'requested')
+  for (let i = 0; i < 5; i++) await tick()
+  const v = tasks.get(b.jobId)
+  assert.deepEqual([v.state, v.terminalReason, v.phase], ['stopped', 'removed from the line before it started', null])
+  holds.get('a')()
+})
+
+test('a task still in line when the app closed comes back as one that never started', async () => {
+  const { tasks, holds, file } = queue()
+  tasks.enqueue({ ...own, workspace: 'C:/w', task: 'running' })
+  const q = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'waiting' })
+  for (let i = 0; i < 5; i++) await tick()
+  await tasks.flushed()
+  const again = queue({ file }).tasks
+  await again.ready
+  const r = again.get(q.jobId)
+  assert.equal(r.state, 'stopped')
+  assert.equal(r.terminalReason, 'the app restarted while this task waited in line, so it never started', 'not "interrupted while this task was running"')
+  assert.equal(r.progressText, 'Stopped: the app was closed while this task waited in line', 'and not its last reason to wait')
+  assert.equal(r.phase, null)
+  assert.match(again.get(tasks.list()[0].jobId).terminalReason, /interrupted: the app restarted while this task was running/, 'one that had started is still said to have been running')
+  holds.get('running')()
+})
+
+test('a run from the chat holding the workspace is named as that, and the estimate is handed who holds it', async () => {
+  const asked = []
+  const { lanes, tasks, holds } = queue({ wait: (w) => { asked.push(w); return null } })
+  const chat = { kind: 'chat', decider: 'jev', answerOnly: false }
+  const release = await lanes.acquire(laneKey('C:/w'), 'route-1', undefined, { who: chat })
+  const b = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'b' })
+  for (let i = 0; i < 3; i++) await tick()
+  const w = tasks.get(b.jobId).waiting
+  assert.equal(w.why, 'chat')
+  assert.equal(w.text, 'Waiting: a run started from the chat is using this workspace.', 'the work board shows no task there to be "another task"')
+  assert.equal(tasks.get(b.jobId).progressText, WAITING.chat)
+  assert.equal(asked.at(-1).holder, chat, 'the estimate reads who holds the lane off the lane itself')
+  assert.equal('holder' in w || 'aheadWho' in w, false, 'which never reaches the list')
+  release()
+  for (let i = 0; i < 5; i++) await tick()
+  holds.get('b')()
+})
+
+test('a task behind a run from the chat that waits in its line is told so', async () => {
+  const { lanes, tasks, holds } = queue()
+  tasks.enqueue({ ...own, workspace: 'C:/w', task: 'a' })
+  for (let i = 0; i < 3; i++) await tick()
+  const ac = new AbortController()
+  lanes.acquire(laneKey('C:/w'), 'route-2', ac.signal, { who: { kind: 'chat', decider: 'jev' } }).catch(() => {})
+  const c = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'c' })
+  for (let i = 0; i < 3; i++) await tick()
+  const w = tasks.get(c.jobId).waiting
+  assert.ok(w)
+  assert.equal(w.placeText, '3rd in line')
+  assert.match(w.text, /1 run from the chat waits ahead of it in this line\./, 'its place counts a run the board has no row for')
+  ac.abort()
+  holds.get('a')()
+  for (let i = 0; i < 5; i++) await tick()
+  holds.get('c')()
+})
+
+test('a waiting task whose next slot another workspace takes first says so, with no figure', async () => {
+  const { lanes, tasks, holds } = queue({ max: 1, wait: () => ({ lowMs: 1, highMs: 2, n: 5, text: 'never shown' }) })
+  const a = tasks.enqueue({ ...own, workspace: 'C:/a', task: 'a1' })
+  for (let i = 0; i < 3; i++) await tick()
+  const ac = new AbortController()
+  lanes.acquire(laneKey('C:/b'), 'b1', ac.signal, { who: { kind: 'task', decider: 'jev' } }).catch(() => {})
+  const a2 = tasks.enqueue({ ...own, workspace: 'C:/a', task: 'a2' })
+  for (let i = 0; i < 3; i++) await tick()
+  const w = tasks.get(a2.jobId).waiting
+  assert.equal(w.slotsAhead, 1)
+  assert.match(w.text, /^Waiting: another task is running in this workspace\. 1 task waiting in another workspace takes a free slot before this one\./)
+  ac.abort()
+  holds.get('a1')()
+  for (let i = 0; i < 5; i++) await tick()
+  holds.get('a2')()
+  assert.ok(a)
+})
+
+test('a wait for a free slot says what holds the slots, none of which may be on this board', async () => {
+  const { lanes, tasks, holds } = queue({ max: 2 })
+  const bench = await lanes.acquire(laneKey('C:/scratch/t1'), 'benchmark-1', undefined, { who: { kind: 'benchmark' } })
+  const chat = await lanes.acquire(laneKey('C:/x'), 'route-3', undefined, { who: { kind: 'chat', decider: 'jev' } })
+  const t = tasks.enqueue({ ...own, workspace: 'C:/w', task: 't' })
+  for (let i = 0; i < 3; i++) await tick()
+  assert.equal(tasks.get(t.jobId).waiting.text, 'Waiting for a free slot: the resource budget caps how many tasks run at once. Tasks at once: 2 of 2 in use (1 run from the chat and 1 capability benchmark task).')
+  lanes.setMax(1)
+  bench()
+  assert.equal(tasks.get(t.jobId).waiting.text, 'Waiting for a free slot: the resource budget caps how many tasks run at once. Tasks at once: 1 of 1 in use (1 run from the chat).')
+  chat()
+  for (let i = 0; i < 5; i++) await tick()
+  holds.get('t')()
+})
+
+test('an estimate that failed says so on the line, rather than looking like a short record', async () => {
+  const logged = []
+  const lanes = createLanes()
+  const jobs = fakeJobs()
+  const tasks = createTasks({ file: join(mkdtempSync(join(tmpdir(), 'kz-f4-')), 'tasks.jsonl'), lanes, jobs: () => jobs, log: (m) => logged.push(m), wait: () => { throw new Error('history unreadable') },
+    run: (t, { signal, emit }) => lanes.acquire(laneKey(t.workspace), t.jobId, signal, { onWait: (why) => emit({ type: 'queued', text: WAITING[why] }) }).then(() => new Promise(() => {})) })
+  tasks.enqueue({ ...own, workspace: 'C:/w', task: 'a' })
+  const b = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'b' })
+  for (let i = 0; i < 5; i++) await tick()
+  const w = tasks.get(b.jobId).waiting
+  assert.equal(w.estimate, null)
+  assert.equal(w.text, 'Waiting: another task is running in this workspace. No estimate: working it out failed, and the server log says why.')
+  assert.match(logged.join('\n'), /history unreadable/)
 })

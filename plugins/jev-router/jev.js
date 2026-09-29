@@ -834,6 +834,11 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
      * Both ride the one call (~0.1 s), so the second question costs no extra round trip. It
      * decides which model answers: everyday talk goes to the local model first (free, private,
      * instant), and Jev is the one that decides when it is worth waking a bigger model.
+     *
+     * `readOnly` rides it too: whether the work only reads the project, which lets a task skip its
+     * folder's line on an agent locked against writing (docs/queue-and-cost-findings.md 1). It is
+     * asked here because this is the only decider call made before a task joins any line, and yes
+     * is the side that skips it, so Laya's known confident "no" on clear yeses falls on the safe side.
      */
     async intent({ message }, signal) {
       const { answers, meta } = await ask('intent', { message: scrub(message) }, {
@@ -855,6 +860,10 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
         // that is mostly a question can still queue the change it mentions - the old single
         // question-versus-task choice could not express that at all.
         alsoWork: noul('Even if `message` is a question to answer directly, does it also ask for work to be carried out in the project?'),
+        readOnly: noul({
+          question: 'Can everything `message` asks for be done by reading the project\'s files and replying, without creating, changing or deleting any file and without running any command or program?',
+          focus: 'Running tests, builds, scripts, formatters or installs counts as running a program. Writing findings, a plan or code in the reply itself changes no file.',
+        }),
       }, signal)
       return {
         kind: answers.kind.choice,
@@ -863,6 +872,7 @@ export function createJev({ provider, apiKey, client, model, timeoutMs, onTrace,
         depth: answers.depth?.choice,
         depthConfidence: answers.depth?.confidence,
         alsoWork: answers.alsoWork?.noul,
+        readOnly: answers.readOnly?.noul,
         // `depth` flat here means the caller keeps the cheap default, as when it is missing.
         uninformative: flatNames(answers),
         ...metaOf(meta),

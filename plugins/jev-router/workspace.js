@@ -1,8 +1,9 @@
 // Deterministic workspace facts: lightweight routing context, git change
 // detection, and project checks. Nothing here asks a model anything.
 import { execFile, spawn } from 'node:child_process'
-import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
-import { dirname, extname, join, resolve } from 'node:path'
+import { createHash } from 'node:crypto'
+import { appendFile, lstat, mkdir, readFile, readdir, readlink, realpath, stat } from 'node:fs/promises'
+import { dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { redactSecrets } from './export.js'
 import { killTree as killPidTree } from './local.js'
 
@@ -57,10 +58,27 @@ export function run(cmd, args, { cwd, shell = false, timeoutMs = 60_000, signal,
  * KzH's own when it is not given; the capability benchmark gives one that names its task's
  * repository, kept outside the folder an agent writes to, and holds no key of KzH's
  * (docs/benchmark.md 3.7).
+ *
+ * Always with GIT_OPTIONAL_LOCKS=0: `git status` otherwise refreshes the index and takes
+ * .git/index.lock to write it back, and an agent's own `git add` or `git commit` in the same folder
+ * at that moment fails on the lock. KzH only reads here, so it never needs to write the index.
+ * `git diff` still rewrites it whatever the variable says (git 2.43), so every diff here also sets
+ * diff.autoRefreshIndex=false (DIFF_NO_REFRESH), and a read pass, which runs beside a task
+ * changing the folder, runs no diff at all (router.js). `input` is written to its standard input.
  */
-const git = (cwd, args, signal, env) => new Promise((resolve) => {
-  execFile('git', args, { cwd, maxBuffer: 16 * 1024 * 1024, windowsHide: true, signal, ...(env ? { env } : {}) }, (err, stdout) => resolve(err ? null : stdout))
+const git = (cwd, args, signal, env, input) => new Promise((resolve) => {
+  // A start that fails at once (a command line past the system's limit throws here on some
+  // systems) is a failed call like any other, never an exception out of a snapshot.
+  try {
+    const child = execFile('git', args, { cwd, maxBuffer: 16 * 1024 * 1024, windowsHide: true, signal, env: { ...(env ?? process.env), GIT_OPTIONAL_LOCKS: '0' } }, (err, stdout) => resolve(err ? null : stdout))
+    child.stdin?.on('error', () => {})
+    child.stdin?.end(input ?? '')
+  } catch { resolve(null) }
 })
+
+// `git diff` refreshes a stat-dirty index and writes it back under .git/index.lock whatever
+// GIT_OPTIONAL_LOCKS says; with this it leaves the index alone (git 2.31 or later reads it).
+const DIFF_NO_REFRESH = ['-c', 'diff.autoRefreshIndex=false']
 
 const tail = (text, max) => (text.length <= max ? text : `...[${text.length - max} chars omitted]\n${text.slice(-max)}`)
 
@@ -73,17 +91,34 @@ async function readPackageJson(cwd) {
   try { return JSON.parse(await readFile(join(cwd, 'package.json'), 'utf8')) } catch { return undefined }
 }
 
-/** Porcelain status as Map<path, statusCode>, or null outside a git repo. */
+/** Porcelain v2 entries: how many space-separated fields come before the path, by entry kind. */
+const FIELDS_BEFORE_PATH = { 1: 8, 2: 9, u: 10 }
+
+/**
+ * `git status` as Map<path, code>, or null outside a git repo. Paths are from the repository's top
+ * folder, whatever folder it runs in. The code is the entry's XY letters ('??' for an untracked
+ * path), and for a submodule its S field as well (S<commit><modified><untracked>), so a submodule
+ * whose inside changes shows as a changed status. Porcelain v2 keeps a rename's source in a field
+ * of its own and marks a submodule, which v1 left to guessing from the letters.
+ */
 async function statusMap(cwd, signal, env) {
-  const out = await git(cwd, ['status', '--porcelain=v1', '-uall', '-z'], signal, env)
+  const out = await git(cwd, ['status', '--porcelain=v2', '-uall', '-z'], signal, env)
   if (out === null) return null
   const map = new Map()
-  const parts = out.split('\0').filter(Boolean)
+  const parts = out.split('\0')
   for (let i = 0; i < parts.length; i++) {
-    const code = parts[i].slice(0, 2)
-    // The harness's own notes (.kz-harness/) are never an agent's change.
-    if (!parts[i].slice(3).startsWith('.kz-harness/')) map.set(parts[i].slice(3), code)
-    if (code[0] === 'R' || code[0] === 'C') i++ // skip rename source
+    const entry = parts[i]
+    let path
+    let code
+    if (entry.startsWith('? ')) { path = entry.slice(2); code = '??' } else if (FIELDS_BEFORE_PATH[entry[0]] && entry[1] === ' ') {
+      const fields = entry.split(' ')
+      path = fields.slice(FIELDS_BEFORE_PATH[entry[0]]).join(' ')
+      code = fields[1] + (fields[2]?.startsWith('S') ? ` ${fields[2]}` : '')
+      if (entry[0] === '2') i++ // a rename or copy: its source follows
+    } else continue
+    // The harness's own notes (.kz-harness/, in the workspace, which may be a folder below the
+    // repository's top) are never an agent's change.
+    if (path && !`/${path}`.includes('/.kz-harness/')) map.set(path, code)
   }
   return map
 }
@@ -99,40 +134,223 @@ export async function ensureHandoffIgnored(cwd, { env } = {}) {
   await appendFile(file, `${text && !text.endsWith('\n') ? '\n' : ''}.kz-harness/\n`)
 }
 
+/** The content of a path that is not there: deleted, in the index or the working tree. */
+export const ABSENT = 'absent'
+/** How many single-file git calls run at once when the one-process read of every file fails. */
+const HASH_POOL = 4
+
+/**
+ * What each path `git status` named holds now: a file's git hash, ABSENT when nothing is there,
+ * `link:<target>` for a symbolic link, or null for a folder git lists as one entry (a nested
+ * repository, a submodule), whose inside no hash shows. What a path is comes from the file system,
+ * not from the status letters, which say nothing certain about the working tree in a conflict or
+ * after a rename. The paths are from the repository's top whatever folder the workspace is, and
+ * the file system reads them from that top as git names it (`--show-toplevel`, the real folder,
+ * even when the workspace is reached through a link, a junction or a subst drive, where a path
+ * built up from the workspace's own spelling misses). `hash-object --stdin-paths` reads its input
+ * from the top too, so the paths go there as they are, and a file hashed alone is hashed there. Every file is hashed by that one process, so no command line grows
+ * with the number of changed files. When it fails because a file went away meanwhile, it runs once
+ * more without the files now gone; only then are files hashed one each, a few at a time. A stop
+ * ends the reading at once, the files not yet hashed null.
+ */
 async function hashes(cwd, paths, signal, env) {
-  if (paths.length === 0) return new Map()
-  const out = await git(cwd, ['hash-object', '--', ...paths], signal, env)
-  const lines = out ? out.trim().split(/\r?\n/) : []
-  return new Map(paths.map((p, i) => [p, lines[i] ?? null]))
+  const out = new Map()
+  if (paths.length === 0) return out
+  const top = (await git(cwd, ['rev-parse', '--show-toplevel'], signal, env))?.trim()
+  if (!top) { for (const p of paths) out.set(p, null); return out }
+  const at = (p) => join(top, p)
+  const kinds = await Promise.all(paths.map((p) => lstat(at(p)).then((s) => s, () => null)))
+  const files = []
+  for (const [i, p] of paths.entries()) {
+    const k = kinds[i]
+    if (!k) out.set(p, ABSENT)
+    else if (k.isSymbolicLink()) out.set(p, `link:${await readlink(at(p)).catch(() => '')}`)
+    else if (k.isFile()) files.push(p)
+    else out.set(p, null)
+  }
+  const inOne = async (list) => {
+    if (!list.length) return true
+    const all = await git(cwd, ['hash-object', '--stdin-paths'], signal, env, `${list.join('\n')}\n`)
+    const lines = all?.trim().split(/\r?\n/) ?? []
+    if (all === null || lines.length !== list.length) return false
+    list.forEach((p, i) => out.set(p, lines[i]))
+    return true
+  }
+  if (await inOne(files)) return out
+  if (signal?.aborted) { for (const p of files) out.set(p, null); return out }
+  const stillThere = await Promise.all(files.map((p) => lstat(at(p)).then((k) => k.isFile(), () => false)))
+  files.forEach((p, i) => { if (!stillThere[i]) out.set(p, ABSENT) })
+  const rest = files.filter((_p, i) => stillThere[i])
+  if (await inOne(rest)) return out
+  for (let i = 0; i < rest.length; i += HASH_POOL) {
+    if (signal?.aborted) { for (const p of rest.slice(i)) out.set(p, null); break }
+    const batch = rest.slice(i, i + HASH_POOL)
+    const each = await Promise.all(batch.map((p) => git(top, ['hash-object', '--', p], signal, env)))
+    const gone = await Promise.all(batch.map((p, j) => (each[j]?.trim() ? false : lstat(at(p)).then(() => false, () => true))))
+    batch.forEach((p, j) => out.set(p, each[j]?.trim() || (gone[j] ? ABSENT : null)))
+  }
+  return out
 }
 
-/** Snapshot to diff against after an agent runs. `env` as for every git call here. */
-export async function snapshot(cwd, signal, { env } = {}) {
+/** A path as the file system really has it (links, junctions and subst drives resolved), or as given. */
+const real = (p) => realpath(p).catch(() => p)
+/** Whether `p` is `dir` or inside it; without regard to case on Windows, whose file system has none. */
+const inside = (p, dir) => {
+  const [x, d] = process.platform === 'win32' ? [p.toLowerCase(), dir.toLowerCase()] : [p, dir]
+  return x === d || x.startsWith(d.endsWith(sep) ? d : `${d}${sep}`)
+}
+/** `p` below `dir`, with forward slashes, as git names paths. */
+const below = (dir, p) => relative(dir, p).split(sep).join('/')
+
+/**
+ * .git/config and every file in the hooks folder, by content: git's own files that `git status`
+ * never lists, and where a write that got past a lock would run code later (a hook runs at the next
+ * commit). By content, since git rewrites the config file to set a value it already holds. Each is
+ * named where it really is: `.git/hooks/pre-commit` in the git folder, `.husky/_/pre-commit` for a
+ * hooks folder in the working tree. A hooks folder outside the repository (a core.hooksPath shared
+ * by every repository on the PC) is left out: a run in any other repository may write there. The
+ * folders are compared as the file system really has them, so a workspace reached through a link
+ * or spelled in another case on Windows reads the same files. Only a read pass's lock check
+ * compares them (snapshotDiff). Linked worktrees share these files, so runs in them count as
+ * related (commonGitDir).
+ */
+async function gitMeta(cwd, signal, env) {
+  const paths = (await git(cwd, ['rev-parse', '--git-path', 'config', '--git-path', 'hooks', '--git-common-dir', '--show-toplevel'], signal, env))?.trim().split(/\r?\n/)
+  if (!paths || paths.length !== 4) return null
+  // git's relative paths count from the real folder it runs in, not from a link's spelling of it.
+  const base = await real(cwd)
+  const [config, hooks, common, top] = await Promise.all(paths.map((p) => real(resolve(base, p))))
+  const mark = async (file) => { const b = await readFile(file).catch(() => null); return b ? createHash('sha1').update(b).digest('hex') : ABSENT }
+  const meta = new Map([[`.git/${below(common, config)}`, await mark(config)]])
+  const where = inside(hooks, common) ? `.git/${below(common, hooks)}` : inside(hooks, top) ? below(top, hooks) : null
+  if (where !== null) {
+    for (const name of (await readdir(hooks).catch(() => [])).sort()) meta.set(`${where}/${name}`, await mark(join(hooks, name)))
+  }
+  return meta
+}
+
+/**
+ * The git folder a repository's linked worktrees share (`--git-common-dir`), as the file system
+ * really has it, or null outside git. Two worktrees of one repository are separate folders with one
+ * .git/config and one set of hooks; the main one names the folder from its own spelling, a linked
+ * one from the real path, so both are resolved before they are compared.
+ */
+export async function commonGitDir(cwd, signal, { env } = {}) {
+  const dir = (await git(cwd, ['rev-parse', '--git-common-dir'], signal, env))?.trim()
+  return dir ? real(resolve(await real(cwd), dir)) : null
+}
+
+/**
+ * Snapshot to diff against after an agent runs. `env` as for every git call here. `meta` adds
+ * gitMeta, for a read pass's lock check.
+ */
+export async function snapshot(cwd, signal, { env, meta = false } = {}) {
   const status = await statusMap(cwd, signal, env)
   if (status === null) return { git: false }
-  return { git: true, status, hashes: await hashes(cwd, [...status.keys()].filter((p) => status.get(p) !== ' D'), signal, env) }
+  return { git: true, status, hashes: await hashes(cwd, [...status.keys()], signal, env), ...(meta ? { meta: await gitMeta(cwd, signal, env) } : {}) }
+}
+
+/**
+ * The changed paths whose content a snapshot comparison cannot see: in both snapshots with the same
+ * status, but a folder git lists as one entry (a nested repository, a submodule) in either, whose
+ * content is null. A change inside one of them shows in neither snapshot.
+ */
+export function unseenPaths(before, after) {
+  if (!before?.git || !after?.git) return []
+  return [...after.status.keys()].filter((p) => before.status.get(p) === after.status.get(p)
+    && (after.hashes.get(p) === null || before.hashes.get(p) === null))
+}
+
+/**
+ * The files whose status or content differs between two snapshots, or null when either is not a
+ * git snapshot. Pure: it runs no git, and in particular no `git diff`, which rewrites the index
+ * whatever GIT_OPTIONAL_LOCKS says; a read-only run's lock check compares two snapshots with it.
+ */
+export function snapshotDiff(before, after) {
+  if (!before?.git || !after?.git) return null
+  const files = [...new Set([...after.status.keys(), ...before.status.keys()])].filter((p) =>
+    after.status.get(p) !== before.status.get(p) || after.hashes.get(p) !== before.hashes.get(p))
+  // git's own files, when both snapshots read them (a read pass's lock check).
+  if (before.meta && after.meta) {
+    // A hooks folder in the working tree that git also tracks is named the same both ways: once.
+    for (const k of new Set([...before.meta.keys(), ...after.meta.keys()])) if ((before.meta.get(k) ?? ABSENT) !== (after.meta.get(k) ?? ABSENT) && !files.includes(k)) files.push(k)
+  }
+  return files
+}
+
+/** The top folder of the git repository `cwd` is in, or null outside one. `env` as for every git call here. */
+export async function repoRoot(cwd, signal, { env } = {}) {
+  return (await git(cwd, ['rev-parse', '--show-toplevel'], signal, env))?.trim() || null
+}
+
+/**
+ * The top folder of the outermost repository `cwd` is in: a submodule's superproject, and its own
+ * superproject in turn, since the superproject's `git status` shows a submodule that changed.
+ * Null outside git. `env` as for every git call here.
+ */
+export async function outerRepoRoot(cwd, signal, { env } = {}) {
+  let root = await repoRoot(cwd, signal, { env })
+  // Bounded, so a repository that names itself as its superproject cannot loop.
+  for (let depth = 0; root && depth < 16; depth++) {
+    const up = (await git(root, ['rev-parse', '--show-superproject-working-tree'], signal, env))?.trim()
+    if (!up || up === root) break
+    root = up
+  }
+  return root
+}
+
+/** The commit HEAD names, or null outside git or on an unborn branch. `env` as for every git call here. */
+export async function headOf(cwd, signal, { env } = {}) {
+  return (await git(cwd, ['rev-parse', '--verify', '--quiet', 'HEAD'], signal, env))?.trim() || null
+}
+
+/** How many characters of pathspecs one git command line takes, well under Windows' 32,767. */
+const SPEC_BUDGET = 8000
+
+/**
+ * `git diff HEAD` over these paths, from the repository's top (`:(top,literal)`, since the paths
+ * are from there and a workspace can be a folder below it), in as many calls as keep each command
+ * line short, their outputs joined. Null when a call fails.
+ */
+async function diffOf(cwd, paths, extra, signal, env) {
+  const outs = []
+  for (let i = 0; i < paths.length;) {
+    const specs = []
+    let size = 0
+    for (; i < paths.length && (!specs.length || size + paths[i].length < SPEC_BUDGET); i++) { specs.push(`:(top,literal)${paths[i]}`); size += paths[i].length + 16 }
+    const out = await git(cwd, [...DIFF_NO_REFRESH, 'diff', 'HEAD', ...extra, '--', ...specs], signal, env)
+    if (out === null) return null
+    outs.push(out.trim())
+  }
+  return outs.filter(Boolean).join('\n')
 }
 
 /** Files whose status or content changed since `before`. `env` as for every git call here. */
 export async function changedSince(cwd, before, signal, { env } = {}) {
   if (!before.git) return { files: null, stat: 'not a git repository', patch: '' }
-  const after = await statusMap(cwd, signal, env)
+  const status = await statusMap(cwd, signal, env)
   // git can fail mid-run (index.lock held by an agent, abort); report it instead of crashing the route.
-  if (after === null) return { files: null, stat: 'git status failed; changes unknown', patch: '' }
-  const candidates = [...after.keys()].filter((p) => after.get(p) !== ' D')
-  const now = await hashes(cwd, candidates, signal, env)
-  const files = [...new Set([...after.keys(), ...before.status.keys()])].filter((p) =>
-    after.get(p) !== before.status.get(p) || now.get(p) !== before.hashes.get(p))
-  const stat = (await git(cwd, ['diff', 'HEAD', '--stat', '--', ...files], signal, env)) ?? ''
-  const patch = files.length ? (await git(cwd, ['diff', 'HEAD', '--', ...files], signal, env)) ?? '' : ''
-  const untracked = files.filter((p) => after.get(p) === '??')
-  return { files, stat: stat.trim() + (untracked.length ? `\nnew untracked: ${untracked.join(', ')}` : ''), patch }
+  if (status === null) return { files: null, stat: 'git status failed; changes unknown', patch: '' }
+  const after = { git: true, status, hashes: await hashes(cwd, [...status.keys()], signal, env) }
+  const files = snapshotDiff(before, after)
+  if (!files.length) return { files, stat: '', patch: '' }
+  // Untracked files have no diff against HEAD; they are named below.
+  const tracked = files.filter((p) => status.get(p) !== '??')
+  const stat = tracked.length ? await diffOf(cwd, tracked, ['--stat'], signal, env) : ''
+  const patch = tracked.length ? await diffOf(cwd, tracked, [], signal, env) : ''
+  const untracked = files.filter((p) => status.get(p) === '??')
+  return {
+    files,
+    // A diff git could not give is said so, never left empty: an empty stat reads as no change.
+    stat: (stat ?? `git diff failed; ${tracked.length} changed file${tracked.length === 1 ? '' : 's'} whose diff is unknown`) + (untracked.length ? `\nnew untracked: ${untracked.join(', ')}` : ''),
+    patch: patch ?? '',
+  }
 }
 
 /** Lightweight routing context. Never reads source contents. `env` as for every git call here. */
-export async function gatherContext(cwd, { productionCritical, signal, env }) {
+export async function gatherContext(cwd, { productionCritical, signal, env, meta = false }) {
   const pkg = await readPackageJson(cwd)
-  const snap = await snapshot(cwd, signal, { env })
+  const snap = await snapshot(cwd, signal, { env, meta })
   const ctx = { gitRepo: snap.git, productionCritical }
   if (snap.git) {
     ctx.branch = (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'], signal, env))?.trim()

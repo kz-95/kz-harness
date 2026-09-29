@@ -37,6 +37,8 @@ feature is silently gone.
 
 One line per finished workflow step, newest first, written by `scripts/doc-queue.mjs log` when the step ends.
 
+- 2026-09-29 17:16 UTC, Queue and cost findings, item 1 and review rounds 2-28: Read passes before writers with lock checks and a per-repository run log, the parallel second opinion, DeepSeek keys by the launch key with Restart harness, usage floors per switched-on agent, the stored Jev key in the launcher and installer, the app kept in the tray with the harness page recovered by Retry, a forward-only splash, quit wording everywhere, kzh-running.js shared by the speed run and the Laya command line, and a Laya orphan sweep that keeps what it cannot settle; 28 adversarial review rounds, each finding fixed with a test that fails on the code before it. Built, not yet watched in the app (1585 tests, 1584 pass, 0 fail, 1 skipped).
+- 2026-09-26 13:50 UTC, Queue and cost: effort floor, strategy risk bands, queue view: Auto effort reaches low (bands 0.125/0.375/0.6); review strategies and second opinion gated by riskBands; waiting line says why, place, estimate from past runs; per-row Stop and Remove; foreground runs wait beside background tasks; git reads take no index lock. Built, not yet watched in the app (commit ea2b4e6; 1381 tests, 1380 pass, 0 fail, 1 skipped).
 - 2026-09-26 05:47 UTC, Speed-Run.bat and the speed run logs: Speed-Run.bat runs the local speed benchmark with KzH closed and every speed run, from the card or the .bat, is logged in speed-runs.log with a detail log per run; the first run against the real llama-server b10964 (CPU, tiny test models) found and fixed the non-streamed HTTP 500 and a 0.8 percent high generation speed; a code reviewer and a four-lens review workflow with verifiers confirmed issues in every part, each fixed; red-check finds all 28 new tests failing at f88947a (1353 tests, 1352 pass, 0 fail, 1 skipped).
 - 2026-09-26 02:56 UTC, Benchmark review and fixes: Second review of benchmark step B2 fixed on feat/benchmark: a stop is a stop however the run returns, a task folder's git repository kept outside the scratch root and every benchmark git call run with no key of KzH's, a task that does not fit a local window records nothing, plan ids start one run within 30 minutes, the card's reads, tables, confirmation, progress and last-run words say what happened, and Cancel during the speed run's restore says why; red-check against da08532 finds 32 of the 43 new tests failing at the base and 11 passing there (commit 5f19588; 1325 tests, 1324 pass, 0 fail, 1 skipped).
 - 2026-09-26 00:04 UTC, B2: Benchmark step B2 built and reviewed on feat/benchmark: the capability benchmark, 27 fixed Node.js tasks in nine skills plus a preflight, run one at a time on each picked agent, forced at high effort, in the KzH scratch workspace through the normal run path, graded by code, and recorded as capped benchmark evidence of which only the newest run counts, behind a confirmation that says what it spends; tested with stub agents, a fake Codex command and the fake llama-server only (commit 1363776; 1286 tests, 1285 pass, 0 fail, 1 skipped).
@@ -115,7 +117,7 @@ Roadmap §1 has the design and says where the build differs from it, and the REA
 The API behind the page:
 
 - `GET /jev-router/local` returns `{ ...status(), online, slots }` (`index.js` `localStatus`).
-  `slots` is `{ held, waiting, max }` from `tasks.js` `createLanes().slots()`: `held` is the agent runs holding a slot under `maxConcurrentTasks` across every workspace, a foreground `/auto`, `/<agent>` or `jev_route` run counting the same as a background task; `waiting` is the runs kept out by the cap alone, the first in line in a workspace where nothing runs, and nothing with no cap; `max` is null with no cap.
+  `slots` is `{ held, waiting, max }` from `tasks.js` `createLanes().slots()`: `held` is the agent runs holding a slot under `maxConcurrentTasks` across every workspace, a foreground `/auto`, `/<agent>` or `jev_route` run counting the same as a background task, and read-only runs too: each holds a lane of its own under the cap (`tasks.js` `readLaneKey`); `waiting` is the runs kept out by the cap alone, the first in line in a workspace where nothing runs (a read-only task waiting for its slot among them), and nothing with no cap; `max` is null with no cap.
   `status().settings` holds `maxVramGB` (GB of 1024^3 bytes, above 0 and at most 1024, or null for no limit), `maxRamGB` (above 0 and at most 4096, or null), `maxCores` (whole number 1-256, or null), `maxConcurrentTasks` (whole number 1-64, or null), and `measured`, keyed `'<modelId>@<ctx>'`, each reading `{ vramGB, ramGB, totalGB, gpuFraction, roomGB, gpuLayers, at }`.
   `settings.chatModel` is the chat model in effect: the stored choice if the budget lets it load, else the quickest installed model that fits, else null.
   `status().budget` is `{ threads, defaultThreads, fitTargetMiB, vramNotApplied }`: the `-t` the next load gets, what an unset core limit means, the MiB kept free per GPU, and why the VRAM budget cannot be held (`GPU layers are pinned to N, which --fit does not move`, `this GPU reports its memory through a 32-bit field that stops at 4 GB`, or `this PC's GPU memory is unknown`), else null.
@@ -140,7 +142,7 @@ The watchdog records an unload as `{ why, ctx }`, the next load is sized below t
 Honest limits, so nobody promises more than this can do.
 VRAM is a real cap where `--fit` can hold it: `--fit-target` keeps free everything the GPU has beyond the budget, but not with GPU layers pinned by hand, or on a GPU whose size is unknown or capped at 4 GB by `AdapterRAM`, and then the page says `VRAM budget not applied`.
 Cores is real, via `-t`.
-Concurrency is real, via the cap on the lanes in `tasks.js`, and it counts foreground runs as well as background tasks.
+Concurrency is real, via the cap on the lanes in `tasks.js`, and it counts foreground runs and read-only runs as well as background tasks.
 **RAM is not a hard cap**: Windows needs a native Job Object for that and none is being added, so the RAM budget sizes the context down until the figure fits, refuses a model whose figure is over it even at the 12k floor, and has a watchdog unload a model whose real working set stays over it for 30 s.
 The Electron shell and the browser view are never capped and are not in the figures, because they have to run.
 
@@ -257,7 +259,7 @@ These need the Windows machine, the running app or the owner, and could not be d
    Done when each of the seven rows shows its own icon in the running app.
 4. **Installer fixes**, each needing the Windows machine to test.
    `scripts/Install-Harness.ps1:60` treats any `cordis.patch.yml` containing "jev-router" as configured, so a privacy setting added later never lands on a re-run.
-   `scripts/Set-TypeSafeKey.ps1:7` writes a second, persistent HKCU copy of `TYPESAFE_API_KEY`, which `Start-KzH.ps1:21` reads back.
+   `scripts/Set-TypeSafeKey.ps1:7` writes a second, persistent HKCU copy of `TYPESAFE_API_KEY`, which `Start-KzH.ps1` (its `GetEnvironmentVariable('TYPESAFE_API_KEY', 'User')` read) reads back.
    `C:\HarnessProjects` is hardcoded at `app/main.js:536`, `Start-KzH.ps1:6` and `scripts/Install-Harness.ps1:74`.
    Done when a re-run adds a missing setting, the key lives only in `~/.kzh/.env`, and the projects folder follows `-Workspace`.
 5. **Jev and Laya together, on the desktop** (roadmap §2; built on `feat/laya-auto`, see "Laya: built on `feat/laya-auto`, not yet observed" above).
@@ -280,7 +282,7 @@ These need the Windows machine, the running app or the owner, and could not be d
     It has run against the real llama-server only on a Linux CPU with tiny test models, so what is left is the GPU, the Windows CUDA build and the real models.
     Where: Settings → Jev setup → Local models, with both local models (Qwen3 8B and Gemma 4 E4B) installed; run **Benchmark all**.
     Check that each model gets a reading whose three runs agree, that the card's lines and the install picker's measured labels read as docs/benchmark.md 2.9 says, that a local agent task started during the run waits with its line, and that the model loaded before is loaded again after.
-    The measuring can also be done with KzH closed: double-click `Speed-Run.bat` in the harness folder (docs/benchmark.md 2.12), which has never run on Windows, and check that it measures both models, prints its table and ends with exit code 0.
+    The measuring can also be done with KzH not running (quit it from its tray icon): double-click `Speed-Run.bat` in the harness folder (docs/benchmark.md 2.12), which has never run on Windows, and check that it measures both models, prints its table and ends with exit code 0.
     Bring back what the runs wrote in `%USERPROFILE%\.kzh\jev-router\speed-runs` (docs/benchmark.md 2.13), from the card and from `Speed-Run.bat` alike: `speed-runs.log` and the newest `speed-run-<time>.log`.
     Done when every item reads as described, and any reading refused says why in words of docs/benchmark.md 2.7.
 11. **Run the capability benchmark with real agents** (`feat/benchmark`, docs/benchmark.md step B2; see "Built but NOT observed").
@@ -302,6 +304,12 @@ These need the Windows machine, the running app or the owner, and could not be d
    The rule is that every new test fails on the old code (`scripts/red-check.mjs`).
    The second review of benchmark step B2 (`5f19588`) added 11 tests of promises the code kept but no test held, such as that a run with learning off records nothing and that a task set with a defect is refused as it loads, and red-check against `da08532` exits 1 naming them as passed at the base (docs/benchmark.md 5.2).
    Such a test cannot fail on code that already keeps its promise, so either the rule has an exception for it or those tests need another proof, such as failing on a copy of the code with the promise removed; that is the owner's call.
+   The review of `fix/queue-and-cost` added sixteen more such guards (a plan-mode start, each condition of the lock check's run count, per-repository counting, the start-time lock re-check, Remove's server guard, the Background tab's Remove, per-provider risk bands, a read pass outside git never waiting on the run log, a DeepSeek key added in Settings beside one out by its reading taking over, a key row after one agent's attempt scored against every switched-on agent's floor, a Jev key held only in the credential store unset when removed, Jev setup read back after an action that failed, Jev's Usage row counting every Jev call this month, the in-app browser view closed with its window, the window closed to the tray and reopened on the harness page, `Start-KzH.ps1`'s engine line printed after the patches and before the engine starts); each was proven to fail on a copy of the code with its promise removed.
+5. **Whether "one writer per workspace" means per folder or per repository.**
+   Lanes are keyed by folder (`tasks.js` `laneKey`), so two tasks that write in two folders of one git repository (`repo/pkg-a` and `repo/pkg-b`, or `repo` and `repo/pkg-a`) run at once.
+   `changedSince` reads the whole repository's `git status`, so each is credited with the other's changes: its `Changed files`, the checks it triggers, the stall guard (`N work attempts in a row changed no files`) and the learning features all count them.
+   Scoping a run's changes to its own folder would miss a writer's real edits outside it (a monorepo's root `package.json`); keying lanes by repository would stop two packages of one monorepo from being worked on at once.
+   The review of `fix/queue-and-cost` left it as it was; which rule holds is the owner's call.
 
 ### Decided by the owner, 24 Sep 2026
 
@@ -325,7 +333,7 @@ while it carries the person's own typed feedback reasons.
 These were raised and NOT fixed. None blocks publishing; all are real.
 
 - **`scripts/Set-TypeSafeKey.ps1:7`** writes `TYPESAFE_API_KEY` into the persistent HKCU user
-  environment, which `Start-KzH.ps1:21` reads back and which outranks `~/.kzh/.env`. The README
+  environment, which `Start-KzH.ps1` (its `GetEnvironmentVariable('TYPESAFE_API_KEY', 'User')` read) reads back and which outranks `~/.kzh/.env`. The README
   says keys live in exactly one place, and its removal instructions only cover `.env`. A second
   copy nobody is told to rotate.
 - **Real wallet thresholds are published**: `255 soft / 240 hard` appear in this file. The
@@ -457,6 +465,23 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
 
 ## Built but NOT observed, do not claim these as working
 
+- **Read-only work** (`fix/queue-and-cost`; the README's Read-only work section).
+  Nothing of it has run with real agents: `test/read-intake.test.js`, `test/read-lane.test.js` and `test/read-pass.test.js` drive it with fakes only (a fake Jev, fake agents and a fake lock, and the read pass against throwaway git repositories).
+  A known limit: links inside a run's folder are not followed, so a writer in a folder of projects that writes through a junction in it into a repository opened where it really lives is not counted beside that repository's read pass, and its change reads as a breach (the README says so).
+  To verify on the owner's PC, from `docs/queue-and-cost-findings.md` item 1:
+  - plan mode against the owner's own `~/.claude` settings, in a test repository with a long writing task holding the folder: a task judged read only that asks Claude to create a file and run `git stash` changes nothing while it reads, and either its report's lock check says `measured` or it is handed back (`Needs the folder after all`), in which case Remove it before its turn, since as work that writes it really does both (the README's plan-mode row section has the steps);
+  - that the patch loader mounts the second `subagent-claude-code` row, so `ctx.subagents.list()` shows `claude-code-readonly`, and that Claude's login, model and `CLAUDE_CODE_EFFORT_LEVEL` reach it;
+  - that a plan-mode Claude gives its answer rather than writing a plan, and whether it writes `NEEDS-WRITE-ACCESS`, plain or in Markdown, when asked to change files.
+    It cannot leave plan mode by itself: `@deepseek-ai/dsh-subagent-claude-code` 0.1.5-rc.2 starts a plan-mode provider with `disallowedTools: spec.permissionMode === "plan" ? ["AskUserQuestion", "ExitPlanMode"] : ["AskUserQuestion"]` (`lib/index.js:307`, in `claudeQueryOptions`, the options `startClaudeCodeRun` passes to the Claude query);
+  - whether plan mode reaches the web;
+  - for spawn agents (DeepSeek, API-key and local), that `ctx.tools.get('read', root)` resolves, `ctx.tools.modeFor(root)` is `native`, and the check after the start sees exactly the allow list;
+  - Windows git with `GIT_OPTIONAL_LOCKS`, with a writer looping `git add` beside a reader;
+  - on Windows, the lock check's handling of a workspace below its repository's top (paths joined onto `git rev-parse --show-toplevel`'s forward-slash real path; the one `git hash-object --stdin-paths` started in the workspace folder, which relies on git reading its input paths from the repository's top; the per-file fallback run from that top), of a submodule opened as its own workspace (`--show-superproject-working-tree`), and of a nested repository it cannot see into, each tested with git on Linux only;
+  - on Windows git, KzH's reading of a folder as the review of `fix/queue-and-cost` rewrote it, tested with git 2.43 on Linux only: `git status --porcelain=v2 -z`, one `git hash-object --stdin-paths` for every changed file, `:(top,literal)` pathspecs for `git diff` in batches under 8,000 characters, `diff.autoRefreshIndex=false` on KzH's own diffs, and `.git/config` and the hooks folder compared by content, with linked worktrees related through `--git-common-dir`, and runs related through both spellings of a folder reached through a junction; and that a workspace reached through a junction, a subst drive or typed in another case reads the same files, since `fs.realpath` (native, GetFinalPathNameByHandleW) and a case-blind compare were tested only with symlinks on Linux;
+  - that the engine keeps apart two `jev:claude` children of the same parent running at once, a reader and a writer started from one chat, which never happened before;
+  - for spawn agents, that no tool call of the child's own layer lands before a failed view check stops it, since the check runs after `start()` has handed the child its prompt;
+  - Remove and Stop on a reader waiting for its slot, and on a task waiting again after a hand-back;
+  - under Laya Auto, that `readOnly` mostly lands under Laya's 0.9, so tasks wait in the line.
 - **The capability benchmark** (docs/benchmark.md step B2, `feat/benchmark` at `5f19588`).
   It has never run a real agent: `plugins/jev-router/test/benchmark-run.test.js` runs stub agents only, with a fake Codex command and the fake llama-server.
   Unconfirmed: that the pinned engine starts Claude Code and Codex in the scratch chat's folder, so the prompt's `Workspace:` line points them at the task folder; that Codex's sandbox and Claude Code's edit permission let them write in the task folder; that neither command-line tool writes files of its own in the scratch root during a task, which the outside-the-folder check would fail the task for; the real spend of 28 tasks per agent; and a local model's tasks at its real window.
@@ -512,6 +537,33 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
   Its timeout is not: no test sets `timeoutMs`, checks the `AbortSignal` passed to the stream, or runs a stream that outlasts the deadline.
 - The orphan-kill path of `Use it here`; only its holder classification was exercised.
 - The work-board indicator's LIVE state was rendered from server-shaped data, not a running task.
+- The work board's queue view (`fix/queue-and-cost`, `client.js` `WorkBoard`): each live row's own Stop or Remove with its confirmation (`stopOneWords`, `confirmFor`), a waiting row's time in line (`in line 32.0 s`, where it read `starting`) and the line under it with why it waits and the estimate, and Stop all's name and confirmation counting running and waiting tasks apart (`stopAllWords`).
+  The Background tab's Remove and its narrower Run next are the same change.
+  So are the dialogs that close with a notice when their task starts, ends or goes back to waiting while they are open (`confirmDrift`), Stop all covering only the tasks it named when it opened, the reason `Waiting: a run started from the chat is using this workspace` (`tasks.js` `WAITING.chat`) and the sentences on the slots of Tasks at once under a waiting row (`waits.js` `slotFacts`).
+  `test/workboard.test.js` covers the words and `test/observability.test.js` renders the board with a stand-in React; a `client.js` change needs an app START, so none of it has been watched render.
+  That focus returns to the row's button when a dialog closes (`client.js` `Confirm`) is to be verified in the app: the stand-in React calls child components in place and never unmounts one, so the effect that gives focus back never runs its cleanup in a test.
+- An agent's usage limit on a stored API key (`fix/queue-and-cost`, `index.js` `onLimit`, `accounts.js` `keyInUse`).
+  The key marked spent, named on the call's usage row and judged for the agent's availability and balance floors (`usage.js` snapshot) is the DeepSeek key active as the plugin first read `accounts.json` in this process (kept on `globalThis` across plugin reloads), on the reading that DSH reads `DEEPSEEK_API_KEY` from `.env` once at launch (the comment in `accounts.js` `applyActive`); the next usable key is made active for after a restart, the Usage card shows it as `<name> after Restart harness`, and no agent goes on with a new key within the run.
+  To verify on the owner's PC: with two DeepSeek keys, a 402 on the first marks only it spent and switches the active key once; the DeepSeek agent stays out until Restart harness; after it, calls go out on the second; and a live config reload (`cordis.patch.yml`) does not take the pending switch for the key in use.
+  Other providers' agents use no stored key (nothing passes a `KZ_KEY__<provider>__<name>` value to them), so their limit marks only the agent; whether that is the intended scope of stored keys is the owner's call.
+  `Start-KzH.ps1` and `scripts/Install-Harness.ps1` (each with its own `Get-StoredJevKey`) now count the Jev key `accounts.json` marks active, while its `KZ_KEY__jev__<name>` line holds a value, in place of `TYPESAFE_API_KEY`; written without a PowerShell to run them here, so on the owner's PC:
+  - first make sure no copy of `TYPESAFE_API_KEY` can reach either script: a copy in `~/.kzh/.env` or the user environment skips both checks (`[Environment]::GetEnvironmentVariable('TYPESAFE_API_KEY','User')` must return nothing; `scripts/Set-TypeSafeKey.ps1` writes that one), and one in the machine environment or in the process that starts KzH skips the launcher's (`...,'Machine')` must return nothing; quit Kz-harness from the tray or the app menu, since closing its window leaves it running with its old environment and Restart harness reuses that; close any terminal opened while it was set);
+  - then remove the seeded Jev `default` beside another Jev key, start KzH afresh and re-run the installer: the Kz-harness log should say `Jev key '<name>' (stored in Settings) is in use.` and the installer `Jev key '<name>' present (stored in Settings)`, lines only the new code prints.
+  - Also on the owner's PC: closing the Kz-harness window now leaves it running in the tray (`app/main.js` registers its own `window-all-closed` listener), as `main.js` meant since `bb66efb`; before, with no listener, Electron quit the app when its window closed, and the tray's Show could never be reached.
+    Show from the tray rebuilds the window on the running harness page (not the start screen) and the Browser tab builds a fresh in-app browser view, since the old one closed with its window; to watch: close the window, Show from the tray, open the Browser tab.
+    The first close shows a tray notice, once per Windows user (a `told-still-running` file in the app's user data folder), that Kz-harness is still running and how to quit it.
+    Every message that said to close Kz-harness before a rebuild, a speed run, a Laya install or a key change now says to quit it (the app's update line, `Install-Harness.ps1`, `Update-Harness.ps1`, `Set-TypeSafeKey.ps1`, `speed-run.mjs`, `laya/install-cli.mjs`, README, `docs/benchmark.md`, `docs/laya-auto.md`).
+    `speed-run.mjs` and `laya/install-cli.mjs` also cover an engine with no app above it, in a `Start-KzH` window or left behind, which has no tray icon: both find what runs with `kzh-running.js` and name the engine's pid (the one listening on 3080, else the engine rather than the npx wrapper above it, and the wrapper only while it is all that runs), saying to close that window or end the pid's process tree in Task Manager; what answers on 3080 and cannot be told from the engine gets the tray advice only when the process list could not be read.
+    The speed run settles whatever answers on 3080 and cannot be told from KzH (run as administrator, or tasklist's names alone) before it calls a llama-server or a Laya left behind, since that engine runs its own; the Laya command line lets another program on 3080 be, as the speed run does.
+    A load the harness page cancels (ERR_ABORTED, -3: a second reload, or the app loading another page) is no page failure.
+    The Laya command line sweeps a Laya an earlier session left before its job, and an install check from a supervisor that never swept sweeps first.
+    A sweep leaves alone an install check another live process runs under `install.lock`, and keeps on record (and names, on the card, in the log and to the speed run) a recorded Laya that is alive but cannot be read, most likely run as administrator; the command line runs nothing beside such a Laya.
+    Run by hand, the command line reads `~/.kzh/jev-router` when `DSH_HOME` is not set, as KzH does (it read `~/.dsh`).
+    Whatever answers on 3080 is another program when its name is not node or its pid cannot be found while no node that could be the engine runs; the advice for what cannot be told from KzH is in short sentences.
+    The installer refuses Install, Update, Repair, Remove and Use the newer model beside a Laya the sweep could not check, from the card as from the command line; a lock whose pid another program has taken holds nothing; the speed run says an install at work is running rather than calling its check a leftover; a pid the sweep's own tree kill ended is not named.
+    A harness page that crashes or fails to load while the engine runs now leaves the start screen saying the harness is still running, with Retry and no startup checklist (the log window's pill says `running`), and its Retry, or Show from the tray with the window open or closed, opens the page again instead of restarting the engine and ending its tasks.
+    The splash only moves forward (the patch lines after a fetch used to put it back on Preparing), `Start-KzH.ps1` prints `Starting the engine.` right before it boots the engine, which moves the splash on in place of the old 2.5 s timer, and a restart's splash starts its steps afresh.
+    `test/app-main.test.js` drives `app/main.js` with a fake Electron (Electron's own quit when the last window closes modelled in the test), runs `app/ui/console.js` against a small fake DOM fed the statuses `main.js` sends, and checks that `Start-KzH.ps1` prints its engine line after the patches and before either engine start; the real Electron 44 window, tray notice, start screen and a PowerShell run of the launcher have not been watched.
 - The context-row revert and the Overview Markdown (22 Sep). Unit-tested, but a `client.js` change
   needs an app START, so neither half has been watched render.
 - **Jev Auto - Online** (22 Sep), the mirror of local-only: Jev still routes, over cloud and
@@ -530,9 +582,10 @@ files only. Write the check so it cannot quote the thing it is looking for, and 
 - Right panel default width 24 percent of the window (`DEFAULT_RATIO` in `client.js`).
 - Work board at the top of the conversation: the session's background tasks as a checklist,
   header `N/M completed` plus the non-completed terminals named, per-row state, agent, model,
-  effort, a ticking timer for live rows, `Stop all` behind the Confirm overlay. Renders nothing
+  effort, a ticking timer for running rows, `Stop all` behind the Confirm overlay. Renders nothing
   when the session has no tasks. The header is itself the live indicator and a real button that
   opens the Overview tab.
+  What changed since on `fix/queue-and-cost` is built, not verified: see the work board's queue view under Built but NOT observed.
 - Overview tab (`kind kz-overview`, order 49) plus `GET /jev-router/history`, returning durable
   run records from `history.jsonl` (capped 200, oldest first, tolerant of a truncated final line).
   Before this, run history lived only in a 20-run in-memory map.

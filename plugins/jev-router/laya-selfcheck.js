@@ -114,7 +114,7 @@ const intent = (message) => built('intent', (jev) => jev.intent({ message }))
  * opinion, with the task's profile as the numbers decision.js hands over.
  */
 const resource = ({ task, taskProfile }) => built('route', (jev) => jev.route({
-  task, taskProfile, candidates: DECISION.candidates, strategies: eligibleStrategies({ candidates: DECISION.candidates }),
+  task, taskProfile, candidates: DECISION.candidates, strategies: eligibleStrategies({ candidates: DECISION.candidates, profile: { risk: taskProfile?.risk } }),
   ask: { task: false, resource: true, judgments: true },
 }))
 

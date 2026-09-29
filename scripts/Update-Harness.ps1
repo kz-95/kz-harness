@@ -22,7 +22,7 @@ else {
     git -C $root pull --ff-only --quiet
     if ($LASTEXITCODE) { throw 'git pull failed (branches diverged?). Resolve it in a terminal.' }
     Write-Host "   pulled $behind commit(s)."
-    if (git -C $root diff --name-only 'HEAD@{1}' HEAD -- app) { Write-Host '   WARN the desktop app changed: close Kz-harness, then run scripts\Install-Harness.ps1 to rebuild Kz-harness.exe.' }
+    if (git -C $root diff --name-only 'HEAD@{1}' HEAD -- app) { Write-Host '   WARN the desktop app changed: quit Kz-harness (right-click its tray icon and choose Quit; closing its window leaves it running), then run scripts\Install-Harness.ps1 to rebuild Kz-harness.exe.' }
   }
 }
 $ErrorActionPreference = 'Stop'

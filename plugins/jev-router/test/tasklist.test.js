@@ -216,3 +216,47 @@ test('the waiting-result notice reads the same wherever it is shown', () => {
   assert.equal(resultAnnouncement(1), '1 result waiting to be posted')
   assert.equal(resultAnnouncement(3), '3 results waiting to be posted')
 })
+// ---------------------------------------------------------------- read-only work
+
+test('a read task says reads only in its meta, waiting and running; a task that writes does not', () => {
+  const verdict = { p: 0.93, bar: 0.8, by: 'jev', reads: true }
+  const waiting = taskRowModel(task({
+    state: 'queued', phase: 'queued', agent: null, startedAt: null, position: 1, access: 'read', readVerdict: verdict, workspace: 'C:\\work\\jev-router-test',
+    waiting: { why: 'cap', place: 1, ahead: 0, slot: 1, placeText: 'next for a free slot', text: 'Waiting for a free slot: the resource budget caps how many tasks run at once.', since: 0 },
+  }), 5000)
+  assert.equal(waiting.meta, 'next for a free slot · Jev picks · reads only · jev-router-test')
+  const running = taskRowModel(task({ state: 'running', agent: 'claude', model: 'opus', effort: 'medium', access: 'read', readVerdict: verdict, workspace: 'C:\\work\\jev-router-test', startedAt: 1000 }), 42_000)
+  assert.equal(running.meta, 'claude · opus · medium · reads only · jev-router-test · 41.0 s')
+  const writer = taskRowModel(task({ state: 'running', agent: 'claude', access: 'write', readVerdict: { ...verdict, p: 0.2, reads: false }, workspace: 'C:\\work\\jev-router-test', startedAt: 1000 }), 42_000)
+  assert.doesNotMatch(writer.meta, /reads only/)
+})
+
+test('a task waiting again after a read pass shows no running time in its meta', () => {
+  const m = taskRowModel(task({
+    state: 'queued', phase: 'queued', agent: null, model: null, access: 'write', accessWhy: 'claude said it needs to change files', position: 2,
+    startedAt: 1000, requeuedAt: 40_000, workspace: 'C:\\work\\jev-router-test',
+    waiting: { why: 'workspace', place: 2, ahead: 0, placeText: '2nd in line', text: 'Waiting: another task is running in this workspace.', since: 40_000 },
+  }), 100_000)
+  assert.equal(m.meta, '2nd in line · Jev picks · jev-router-test', 'no time that reads as running')
+  assert.equal(m.waited, '1 min', 'its time in line counts from when it rejoined')
+})
+
+test('Remove on a task back in line after its read pass says it ran only a read pass, as its message will', () => {
+  const { stopOneWords } = loadPlugin().__test
+  const m = taskRowModel(task({ state: 'queued', phase: 'queued', agent: null, startedAt: 1000, requeuedAt: 40_000, taskName: 'How does the parser work', waiting: { why: 'workspace', place: 2, ahead: 0, placeText: '2nd in line', text: 'Waiting.', since: 40_000 } }), 50_000)
+  assert.equal(m.stopWord, 'Remove')
+  assert.equal(stopOneWords(m).body, '"How does the parser work" ran only a read pass, locked against writing, so nothing in the workspace has changed. It leaves the line, and its message in the chat says it was removed after its read pass.')
+  const fresh = taskRowModel(task({ state: 'queued', phase: 'queued', agent: null, startedAt: null, taskName: 'Fix it', waiting: { why: 'workspace', place: 2, ahead: 0, placeText: '2nd in line', text: 'Waiting.', since: 0 } }), 50_000)
+  assert.match(stopOneWords(fresh).body, /has not started, so nothing in the workspace has changed/)
+})
+
+test('a duration reads as a person reads one, and a minute is never shown as 60 seconds', () => {
+  const m = (ms) => taskRowModel(task({ state: 'completed', startedAt: 1000, finishedAt: 1000 + ms, durationMs: ms }), 1000 + ms).meta.split(' · ').at(-1)
+  assert.deepEqual([450, 41_000, 59_949, 59_960, 60_000, 150_000, 3_599_600, 3_900_000].map(m), ['450 ms', '41.0 s', '59.9 s', '1 min', '1 min', '2 min 30 s', '1 h', '1 h 5 min'])
+})
+
+test('Remove on a task whose read pass saw files change says so rather than that nothing changed', () => {
+  const { stopOneWords } = loadPlugin().__test
+  const m = taskRowModel(task({ state: 'queued', phase: 'queued', agent: null, startedAt: 1000, requeuedAt: 40_000, readBreach: { changed: ['src/a.ts'], agents: ['claude'] }, taskName: 'How does the parser work', waiting: { why: 'workspace', place: 2, ahead: 0, placeText: '2nd in line', text: 'Waiting.', since: 40_000 } }), 50_000)
+  assert.equal(stopOneWords(m).body, '"How does the parser work" ran a read pass, and src/a.ts changed in this repository while it read, so its lock may not have held. It leaves the line, and nothing more of it runs.')
+})

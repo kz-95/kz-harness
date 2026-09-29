@@ -447,7 +447,28 @@ test('a stale venv.new with no journal is deleted at the next start, and so is a
   assert.ok(logs.includes('laya install: deleted a venv.new left by an install that stopped'))
 })
 
-test('install.lock: one installer at a time, a second caller refused with the pid, a dead holder\'s lock taken over; the CLI refuses while Kz-harness runs', async (t) => {
+test('no job changes Laya\'s files beside a Laya an earlier session left that could not be checked, from the card or the command line; one ended since is let go', async () => {
+  const h = harness()
+  withUv(h)
+  installedBefore(h, '0.3.20')
+  let left = [601, 602]
+  const sweeps = []
+  const sidecar = { ...sidecarStub(), sweepOrphans: async () => { sweeps.push('sweep'); return [] }, status: () => ({ state: 'stopped', orphansUnchecked: left }) }
+  const m = machine(h)
+  const { installer } = installerFor(h, m, { sidecar })
+  const why = 'A Laya an earlier session left may still be running (pid 601, 602), and it would hold the files this changes. End it in Task Manager (Details, right-click pid 601, End process tree; run Task Manager as administrator if it says access is denied), or restart the PC, then try again.'
+  for (const job of [() => installer.update(), () => installer.repair(), () => installer.remove()]) await assert.rejects(job(), { message: why })
+  assert.equal(sweeps.length, 3, 'swept again each time, so one the person has ended is let go')
+  assert.equal(m.calls.length, 0, 'nothing downloaded, installed or moved')
+  assert.ok(existsSync(h.paths.venv), 'the venv is untouched')
+  assert.ok(!existsSync(h.paths.lock), 'the lock is given back')
+  // Ended now: the next job goes ahead.
+  left = []
+  await installer.remove()
+  assert.ok(!existsSync(h.paths.engine))
+})
+
+test('install.lock: one installer at a time, a second caller refused with the pid, a dead holder\'s lock taken over; the CLI refuses while Kz-harness runs, saying how to stop what runs', async (t) => {
   const h = harness()
   const release = await takeInstallLock(h.paths, { pid: 4321, alive: () => true })
   await assert.rejects(takeInstallLock(h.paths, { pid: 999, alive: () => true }), { message: 'Another Laya install is running (pid 4321).' })
@@ -457,27 +478,89 @@ test('install.lock: one installer at a time, a second caller refused with the pi
   const takeover = await takeInstallLock(h.paths, { pid: 777, alive: (pid) => pid !== 4321 })
   assert.equal(readFileSync(h.paths.lock, 'utf8'), '777', 'a lock whose holder has gone is taken over')
   await takeover()
+  // A holder's pid another program has taken since (an installer is always node) is no holder either.
+  writeFileSync(h.paths.lock, '4321')
+  const reused = await takeInstallLock(h.paths, { pid: 778, alive: () => true, name: async () => 'svchost.exe' })
+  assert.equal(readFileSync(h.paths.lock, 'utf8'), '778')
+  await reused()
+  writeFileSync(h.paths.lock, '4321')
+  await assert.rejects(takeInstallLock(h.paths, { pid: 779, alive: () => true, name: async () => 'node.exe' }), { message: 'Another Laya install is running (pid 4321).' })
+  await assert.rejects(takeInstallLock(h.paths, { pid: 779, alive: () => true, name: async () => null }), { message: 'Another Laya install is running (pid 4321).' }, 'a name that cannot be read is taken for an installer')
+  rmSync(h.paths.lock)
   await release()
   assert.equal(isAlive(process.pid), true)
   assert.equal(isAlive(2147483647), false)
 
-  // The command line: refused while the engine answers on its port, a usage error otherwise.
-  const { main, HARNESS_RUNNING } = await import('../laya/install-cli.mjs')
+  // The command line: refused while Kz-harness runs, with the way to stop what runs; a usage error otherwise.
+  const { main, harnessRunning } = await import('../laya/install-cli.mjs')
   const engine = await new Promise((r) => { const s = createServer().listen(0, '127.0.0.1', () => r(s)) })
   t.after(() => engine.close())
-  const err = []
+  const port = engine.address().port
   const asked = []
   const stub = { recover: async () => null, install: async (o) => { asked.push(o); return { laya: '0.3.20', cuda: false, torchIndex: 'pypi' } }, status: () => ({ job: { notes: [] } }) }
-  assert.equal(await main(['install'], { enginePort: engine.address().port, installer: stub, err: (l) => err.push(l), out: () => {} }), 1)
-  assert.deepEqual(err, ['Close Kz-harness first, or install Laya from Settings → Jev setup → Laya decision model.'])
-  assert.equal(HARNESS_RUNNING, err[0])
-  assert.deepEqual(asked, [], 'nothing was run')
+  const ENGINE = 'C:\\Program Files\\nodejs\\node.exe C:\\Users\\kz\\AppData\\Local\\npm-cache\\_npx\\1a2b\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js web'
+  const refused = async (list, owner, why) => {
+    const err = []
+    assert.equal(await main(['install'], { enginePort: port, installer: stub, processes: () => list, owner: () => owner, err: (l) => err.push(l), out: () => {} }), 1)
+    assert.deepEqual(err, [why])
+    assert.deepEqual(asked, [], 'nothing was run')
+  }
+  // The app, whose window's X leaves it in the tray.
+  await refused([{ pid: 8, name: 'Kz-harness.exe', cmd: null }], null, 'Quit Kz-harness first (right-click its tray icon and choose Quit; closing its window leaves it running), or install Laya from Settings → Jev setup → Laya decision model.')
+  // Its engine with no app above it: in a Start-KzH window, or left behind by an app that is gone, with no tray icon.
+  await refused([{ pid: 7, name: 'node.exe', cmd: ENGINE }], 7, "Kz-harness's engine is running (node.exe, pid 7) with no Kz-harness app above it. To stop it, close the Start-KzH window it runs in, or, if no such window is open, end it in Task Manager (Details, right-click pid 7, End process tree), and run this again; or start Kz-harness and install Laya from Settings → Jev setup → Laya decision model.")
+  // Something on the port that cannot be told from the engine (run as administrator, its command line reads empty).
+  // The list has no Kz-harness.exe in it, so no tray icon to send the person to.
+  await refused([{ pid: 9, name: 'node.exe', cmd: '' }], 9, `Something answers on 127.0.0.1:${port} (node.exe, pid 9, whose command line cannot be read (it may run as administrator)), and this cannot tell whether it is Kz-harness. No Kz-harness app is running. If pid 9 is another program, close it. If it is Kz-harness's engine, close the Start-KzH window it runs in, or, with no such window open, end it in Task Manager (Details, right-click pid 9, End process tree; run Task Manager as administrator if it says access is denied). Then run this again, or install Laya from Settings → Jev setup → Laya decision model.`)
+  // No list at all: it may be the app.
+  await refused(null, 9, `Something answers on 127.0.0.1:${port} (pid 9, which cannot be looked up), and this cannot tell whether it is Kz-harness. If it is Kz-harness, quit it (right-click its tray icon and choose Quit; closing its window leaves it running) or close its Start-KzH window. If it is another program, close it. Then run this again, or install Laya from Settings → Jev setup → Laya decision model.`)
+  assert.equal(harnessRunning({ list: [] }), null)
+  // Another program on the port, whose command line says it is not the engine: the install goes ahead, and says so.
+  let out = []
+  assert.equal(await main(['install', '--cpu'], { enginePort: port, installer: stub, processes: () => [{ pid: 10, name: 'node.exe', cmd: 'node C:\\LibreChat\\api\\server\\index.js' }], owner: () => 10, out: (l) => out.push(l), err: () => {} }), 0)
+  assert.deepEqual(out, [`   note: Another program answers on 127.0.0.1:${port} (node.exe, pid 10); it is not Kz-harness's engine, so the install goes ahead.`, 'ok: Laya 0.3.20 installed (for the CPU).'])
+  asked.length = 0
   const free = await new Promise((r) => { const s = createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => r(port)) }) })
-  const out = []
-  assert.equal(await main(['install', '--cpu'], { enginePort: free, installer: stub, out: (l) => out.push(l), err: () => {} }), 0)
+  out = []
+  assert.equal(await main(['install', '--cpu'], { enginePort: free, installer: stub, processes: () => [], out: (l) => out.push(l), err: () => {} }), 0)
   assert.deepEqual(asked, [{ device: 'cpu' }])
   assert.deepEqual(out, ['ok: Laya 0.3.20 installed (for the CPU).'])
+  // With no KzH running, a Laya an earlier session left is swept first, before anything touches the venv.
+  const calls = []
+  const sidecar = { sweepOrphans: async () => { calls.push('sweep'); return [] } }
+  const ordered = { ...stub, recover: async () => { calls.push('recover'); return null }, install: async (o) => { calls.push('install'); return stub.install(o) } }
+  assert.equal(await main(['install', '--cpu'], { enginePort: free, installer: ordered, sidecar, processes: () => [], out: () => {}, err: () => {} }), 0)
+  assert.deepEqual(calls, ['sweep', 'recover', 'install'])
+  // A Laya the sweep found alive and could not check (run as administrator) would hold the venv's files: nothing runs.
+  const beside = []
+  const unsure = { sweepOrphans: async () => [], status: () => ({ orphansUnchecked: [601, 602] }) }
+  assert.equal(await main(['update'], { enginePort: free, installer: ordered, sidecar: unsure, processes: () => [], out: () => {}, err: (l) => beside.push(l) }), 1)
+  assert.deepEqual(beside, ['Laya update did not run: a Laya an earlier session left may still be running (pid 601, 602) and would hold the files this changes. Stop it as said above, then run this again.'])
+  assert.deepEqual(calls, ['sweep', 'recover', 'install'], 'nothing more ran')
   assert.equal(await main(['frobnicate'], { enginePort: free, installer: stub, err: () => {} }), 2)
+})
+
+test('the command line, run by hand with nothing passed in, reads KzH\'s own data folder (~/.kzh unless DSH_HOME says otherwise) and sweeps with the sidecar it builds', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'laya-cli-home-'))
+  const harnessDir = mkdtempSync(join(tmpdir(), 'laya-cli-harness-'))
+  t.after(() => { rmSync(home, { recursive: true, force: true }); rmSync(harnessDir, { recursive: true, force: true }) })
+  mkdirSync(join(harnessDir, 'config'), { recursive: true })
+  writeFileSync(join(harnessDir, 'config', 'laya.json'), readFileSync(join(REPO, 'config', 'laya.json')))
+  // A record of a Laya whose pids have ended: the sweep settles it, and the record goes.
+  const record = join(home, '.kzh', 'jev-router', 'laya', 'sidecar.json')
+  mkdirSync(dirname(record), { recursive: true })
+  writeFileSync(record, JSON.stringify({ pid: 2147483646, interpreterPid: 2147483645, port: 8091, startedAt: 'then' }))
+  const env = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, DSH_HOME: process.env.DSH_HOME }
+  t.after(() => { for (const [k, v] of Object.entries(env)) { if (v === undefined) delete process.env[k]; else process.env[k] = v } })
+  process.env.HOME = home
+  process.env.USERPROFILE = home
+  delete process.env.DSH_HOME
+  const { main } = await import('../laya/install-cli.mjs')
+  const free = await new Promise((r) => { const s = createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => r(port)) }) })
+  const out = []
+  assert.equal(await main(['recover'], { harnessDir, enginePort: free, processes: () => [], out: (l) => out.push(l), err: (l) => out.push(l) }), 0, out.join('\n'))
+  assert.ok(!existsSync(record), 'the sidecar main() built swept KzH\'s record')
+  assert.deepEqual(out, ['ok: nothing to recover'])
 })
 
 test('an update builds beside the running Laya, stops it for step 7, and starts the old one again when the check fails; refused while a Laya Auto run holds it', async () => {

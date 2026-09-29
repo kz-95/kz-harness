@@ -18,7 +18,7 @@ function loadPlugin() {
   return registration.factory((id) => { if (id === 'react') return React; throw new Error(`unexpected require: ${id}`) })
 }
 
-const { liveTasks, liveSummary, workBoardHeader } = loadPlugin().__test
+const { liveTasks, liveSummary, workBoardHeader, taskRowModel, stopOneWords, stopAllWords } = loadPlugin().__test
 
 /** One canonical task record as tasks.js view(t) hands it to the list. */
 const task = (over = {}) => ({
@@ -81,4 +81,61 @@ test('work board header: neither the text nor the accessible name uses a dash', 
   for (const s of [live.text, live.label, workBoardHeader('1/1 completed', [], 0).text]) {
     assert.doesNotMatch(s, /[\u2013\u2014]/, s)
   }
+})
+
+test('a waiting row says what it waits for and how long it may, from the server\'s words, and its time in line', () => {
+  const line = 'Waiting: another task is running in this workspace. Starts in about 4 to 8 min, estimated from 5 past runs of claude at medium effort with no planned review.'
+  const waiting = task({
+    jobId: 'q', state: 'queued', startedAt: null, queuedAt: 1000, position: 2,
+    waiting: { why: 'workspace', place: 2, ahead: 0, slotsAhead: 0, overCap: false, since: 1000, placeText: '2nd in line', reason: 'Waiting: another task is running in this workspace', estimate: { lowMs: 240_000, highMs: 480_000, n: 5, text: 'Starts in about 4 to 8 min, estimated from 5 past runs of claude at medium effort with no planned review.' }, text: line },
+  })
+  const m = taskRowModel(waiting, 66_000)
+  assert.equal(m.wait, line, 'the server\'s line, word for word')
+  assert.equal(m.detail, m.wait, 'the Background tab and the Overview say the same')
+  assert.equal(m.waited, '1 min 5 s', 'in line since it was queued, not "starting"')
+  assert.equal(m.stopWord, 'Remove')
+  assert.match(m.meta, /^2nd in line · /)
+  assert.equal(m.runNext, false, 'nothing is in front of it in its own line: the running task is not')
+  assert.doesNotMatch(m.meta, /\d (?:ms|s)\b/, 'the meta line still carries no running time for it')
+  // First for a slot is not "next up" when another workspace's task goes first.
+  const slot = taskRowModel({ ...waiting, waiting: { ...waiting.waiting, why: 'cap', place: 1, slot: 2, placeText: '2nd for a free slot', estimate: null, text: 'Waiting for a free slot: the resource budget caps how many tasks run at once.' } }, 66_000)
+  assert.match(slot.meta, /^2nd for a free slot · /)
+  assert.equal(slot.wait, 'Waiting for a free slot: the resource budget caps how many tasks run at once.')
+  // Behind another waiting task in its line: Run next moves it in front.
+  assert.equal(taskRowModel({ ...waiting, waiting: { ...waiting.waiting, why: 'line', place: 2, ahead: 1 } }, 0).runNext, true)
+  // A record from before the server said it keeps its own last line and its old place words.
+  const old = taskRowModel({ ...waiting, waiting: undefined, progressText: 'Waiting' }, 0)
+  assert.equal(old.detail, 'Waiting')
+  assert.match(old.meta, /^2nd in line/)
+  // A running row is stopped, and has no wait line.
+  const running = taskRowModel(task({ state: 'running' }), 5000)
+  assert.deepEqual([running.stopWord, running.wait, running.waited, running.runNext], ['Stop', '', '', false])
+})
+
+test('one task is stopped or removed in words that fit it, and Stop all counts running and waiting apart', () => {
+  assert.equal(typeof stopOneWords, 'function', 'the one-task confirmation has its words')
+  assert.equal(typeof stopAllWords, 'function', 'and Stop all its own')
+  assert.deepEqual(stopOneWords({ title: 'write the docs', stopWord: 'Remove' }), {
+    title: 'Remove this task from the line?',
+    body: '"write the docs" has not started, so nothing in the workspace has changed. It leaves the line, and its message in the chat says it was removed before it started.',
+    confirmLabel: 'Remove task',
+  })
+  assert.deepEqual(stopOneWords({ title: 'fix it', stopWord: 'Stop' }), { title: 'Stop this task?', body: 'Stop "fix it"? Work it already did stays in the workspace.', confirmLabel: 'Stop task' })
+  const run = task({ jobId: 'a', state: 'running', taskName: 'sample' })
+  const q1 = task({ jobId: 'b', state: 'queued', taskName: 'research', startedAt: null })
+  const q2 = task({ jobId: 'c', state: 'queued', taskName: 'ok go', startedAt: null })
+  assert.deepEqual(stopAllWords([run, q1, q2], 0), {
+    label: 'Stop all 3 tasks in this session: 1 running, 2 waiting',
+    title: 'Stop all 3 tasks?',
+    body: '1 running task stops now and 2 waiting tasks leave the line: sample, research, ok go. Work already done stays in the workspace.',
+    confirmLabel: 'Stop 3',
+  })
+  assert.equal(stopAllWords([run], 0).body, '1 running task in this session stops now: sample. Work already done stays in the workspace.')
+  assert.equal(stopAllWords([q1], 0).body, '1 waiting task leaves the line: research. It has not started, so nothing in the workspace changes.')
+  // A task back in the line after its read pass did start: it read, locked, and changed nothing.
+  const back = { ...q2, startedAt: 1000, requeuedAt: 5000 }
+  assert.equal(stopAllWords([back], 0).body, `1 waiting task leaves the line: ${taskRowModel(back, 0).title}. It ran only a read pass, locked against writing, so nothing in the workspace changes.`)
+  assert.match(stopAllWords([q1, back], 0).body, /\. One of them ran only a read pass, locked against writing, and the rest have not started, so nothing in the workspace changes\.$/)
+  assert.match(stopAllWords([{ ...back, readBreach: { changed: ['src/a.ts'], agents: ['claude'] } }, q1], 0).body, /\. Files changed in the repository of one of them while its read pass read, so its lock may not have held; nothing more of them runs\.$/)
+  for (const w of [stopAllWords([run, q1, q2], 0), stopOneWords({ title: 't', stopWord: 'Remove' })]) assert.doesNotMatch(Object.values(w).join(' '), /[\u2013\u2014]|undefined/)
 })

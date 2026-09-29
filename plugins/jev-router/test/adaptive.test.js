@@ -175,7 +175,8 @@ test('scenario I: plan on the strongest, implement on the cheaper, check, then r
 test('a strategy that promises a review gets one even when the review would have accepted', async () => {
   const dir = repo()
   const s = stack()
-  const jev = fakeJev({ strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW', pick: (cs) => cs[0], assess: () => verdict('accept') })
+  // Risk in the high band: a planned frontier review is offered only from riskBands.medium.
+  const jev = fakeJev({ profile: profileOf({ risk: 0.7 }), strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW', pick: (cs) => cs[0], assess: () => verdict('accept') })
   const used = []
   const execute = async (a, prompt) => { used.push(a.id); return /Independently review/.test(prompt) ? { stopReason: 'completed', answerText: 'fine' } : fixer(dir) }
   const r = await runRouted({ task: 'make the test pass', cwd: dir, config, signal, deps: deps(s, jev, execute) })
@@ -610,7 +611,7 @@ test('the second-opinion judgment is carried out exactly as the run labels it', 
   const nouls = { mode: 'jev', verdict: 'accept', addressed: 0.95, complete: 0.95, unrelatedChanges: 0, regressionRisk: 0, needsPerson: 0 }
   const review = createReview({ assess: async () => nouls }, config.thresholds)
   const input = (routing, over = {}) => ({
-    task: 't', routing: { risk: 0.1, ...routing }, attempts: [{ agent: 'codex', stopReason: 'completed' }], checks: [], cmp: { regressed: [], failing: [] }, diff: {},
+    task: 't', routing: { risk: 0.3, ...routing }, attempts: [{ agent: 'codex', stopReason: 'completed' }], checks: [], cmp: { regressed: [], failing: [] }, diff: {},
     agents: [], blockAccept: false, reviewed: false, touchedCode: true, pickOther: () => 'claude', ...over,
   })
   const judged = (label, p) => ({ needsSecondOpinion: p, decision: { domains: { second_opinion: { label } } } })
@@ -622,6 +623,32 @@ test('the second-opinion judgment is carried out exactly as the run labels it', 
   assert.equal((await review(input({ needsSecondOpinion: 0.55 }), signal)).action, 'accept')
   assert.equal((await review(input({ needsSecondOpinion: 0.9 }), signal)).action, 'second_review')
   assert.equal((await review(input({ needsSecondOpinion: 0.9 }, { touchedCode: false }), signal)).action, 'accept')
+  // Under the low risk band no second opinion is asked for: a yes the routing held is not acted
+  // on, and without a domain answer the risk floor holds the profile's estimate the same way.
+  const held = { needsSecondOpinion: 0.9, risk: 0.1, decision: { domains: { second_opinion: { label: 'yes', heldBy: 'risk' } } } }
+  assert.equal((await review(input(held), signal)).action, 'accept', 'a held yes')
+  assert.equal((await review(input({ needsSecondOpinion: 0.9, risk: 0.1 }), signal)).action, 'accept', 'no domain answer, risk 0.1')
+  assert.equal((await review(input({ needsSecondOpinion: 0.9, risk: 0.25 }), signal)).action, 'second_review', 'the band\'s cut is inside it')
+})
+
+test('through the real engine, the first real run\'s low-risk task is done once, with no planned or second-opinion review', async () => {
+  // Complexity 32.5%, risk 1.3%, CHEAP_EXECUTE_FRONTIER_REVIEW and a 67% second opinion: eleven
+  // minutes and a codex review of claude's work. The work is done once, and the plan says why.
+  const dir = repo()
+  const s = stack()
+  const base = fakeJev({ profile: profileOf({ complexity: 0.325, risk: 0.013 }), strategy: 'CHEAP_EXECUTE_FRONTIER_REVIEW', pick: (cs) => cs[0], assess: () => verdict('accept') })
+  const jev = { ...base, route: async (args) => { const out = await base.route(args); if (args.candidates && args.ask?.judgments) out.secondOpinion = 0.67; return out } }
+  const execute = async (a, prompt) => (/Independently review/.test(prompt) ? { stopReason: 'completed', answerText: 'looks right' } : fixer(dir))
+  const r = await runRouted({ task: 'make the test pass', cwd: dir, config, signal, deps: deps(s, jev, execute) })
+  assert.deepEqual(r.attempts.map((x) => x.role), ['primary'])
+  assert.equal(r.finalStatus, 'accepted')
+  assert.notEqual(r.strategy, 'CHEAP_EXECUTE_FRONTIER_REVIEW')
+  assert.equal(r.attempts[0].effort, 'medium', 'and at medium effort, not high')
+  assert.equal(r.routing.decision.domains.second_opinion.heldBy, 'risk')
+  assert.ok(!s.lastSamples.some((x) => x.domain === 'second_opinion'))
+  assert.doesNotMatch(r.assessments[0].why, /routing asked for a second opinion/)
+  // The inspector shows the plan's notes; the record carries them.
+  assert.ok(r.plan.notes.includes('second opinion not asked for: risk 0.01 is under riskBands.low 0.25'), r.plan.notes.join('; '))
 })
 
 test('through the real engine, a second-opinion yes at 0.55 gets its review and is the sample the run labels', async () => {

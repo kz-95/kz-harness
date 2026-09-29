@@ -1247,6 +1247,123 @@ test('dispose kills an install check under way', async (t) => {
   assert.equal((await checking).ok, false)
 })
 
+test('an install check from a supervisor that never swept (the command line\'s) stops a Laya an earlier session left before it writes over that record', async (t) => {
+  const h = await harness()
+  // Windows paths inside this test's own folder, so nothing it creates lands anywhere else.
+  const root = join(h.harnessDir, 'win')
+  const winPaths = layaPaths({ harnessDir: root, dataDir: h.dataDir, platform: 'win32' })
+  mkdirSync(dirname(winPaths.sidecarJson), { recursive: true })
+  writeFileSync(winPaths.sidecarJson, JSON.stringify({ pid: 401, interpreterPid: 402, port: 8091, startedAt: 'then' }))
+  const py = `${winPaths.engine}\\venv\\Scripts\\python.exe`
+  const procs = { 401: `${py}|"${py}" -I -u -X utf8 -m laya.serve`, 402: `${py}|"${py}" -I -u -X utf8 -m laya.serve` }
+  const run = async (cmd, args) => { const pid = /ProcessId=(\d+)/.exec(args.at(-1) ?? '')?.[1]; return cmd === 'powershell.exe' && procs[pid] ? `${procs[pid]}\r\n` : null }
+  const killed = []
+  const cli = createLayaSidecar({
+    harnessDir: root, dataDir: h.dataDir, pins: PINS, config: {}, platform: 'win32', run,
+    isAlive: () => true, killTree: (pid) => { killed.push(pid); return true }, readWorkingSet: async () => 2 * 1024 ** 3,
+  })
+  t.after(() => cli.dispose())
+  await cli.checkStart({ venv: winPaths.venvNew, device: 'cpu' })
+  assert.deepEqual(killed, [401, 402], 'the leftover is stopped, not forgotten')
+  assert.deepEqual(cli.status().orphanStopped, { pid: 401, ramGB: 4 })
+})
+
+/**
+ * A win32 supervisor whose harness folder is inside the test's own (so nothing it creates lands
+ * anywhere else), whose CIM answers come from `cim` (pid -> 'exe|cmdline') and `names`.
+ */
+function winSweeper(t, h, { cim = {}, names = {}, alive = () => true, onKill = () => {} } = {}) {
+  const root = join(h.harnessDir, 'win')
+  const paths = layaPaths({ harnessDir: root, dataDir: h.dataDir, platform: 'win32' })
+  mkdirSync(dirname(paths.sidecarJson), { recursive: true })
+  const run = async (cmd, args) => {
+    const script = args.at(-1) ?? ''
+    const pid = /ProcessId=(\d+)/.exec(script)?.[1]
+    if (cmd !== 'powershell.exe' || !pid) return null
+    if (/\$_\.Name \}/.test(script)) return names[pid] ?? null
+    return cim[pid] ?? null
+  }
+  const killed = []
+  const logs = []
+  const sidecar = createLayaSidecar({
+    harnessDir: root, dataDir: h.dataDir, pins: PINS, config: {}, platform: 'win32', run, log: (l) => logs.push(l),
+    isAlive: (pid) => alive(pid), killTree: (pid) => { killed.push(pid); onKill(pid); return true }, readWorkingSet: async () => 1.5 * 1024 ** 3,
+  })
+  t.after(() => sidecar.dispose())
+  return { paths, sidecar, killed, logs }
+}
+
+test('a Laya the sweep stops by its tree (taskkill /t) takes its interpreter with it, and that interpreter is not then named as maybe still running', async (t) => {
+  const h = await harness()
+  const engine = layaPaths({ harnessDir: join(h.harnessDir, 'win'), dataDir: h.dataDir, platform: 'win32' }).engine
+  const py = `${engine}\\venv\\Scripts\\python.exe`
+  const base = `${engine}\\python\\cpython-3.12.11-windows-x86_64-none\\python.exe`
+  // The venv's python.exe is a launcher; the interpreter it started is its child, so the tree kill of 401 ends 402.
+  const live = new Set([401, 402])
+  const cim = { 401: `${py}|"${py}" -I -u -X utf8 -m laya.serve`, 402: `${base}|"${base}" -I -u -X utf8 -m laya.serve` }
+  const w = winSweeper(t, h, { cim, alive: (pid) => live.has(pid), onKill: (pid) => { if (pid === 401) { live.delete(401); live.delete(402); delete cim[401]; delete cim[402] } } })
+  writeFileSync(w.paths.sidecarJson, JSON.stringify({ pid: 401, interpreterPid: 402, port: 8091, startedAt: 'then' }))
+  assert.deepEqual((await w.sidecar.sweepOrphans()).map((k) => k.pid), [401])
+  assert.deepEqual(w.sidecar.status().orphansUnchecked, [], 'no Laya is left to name')
+  assert.ok(!w.logs.some((l) => l.includes('may still be running')), w.logs.join(' | '))
+  assert.ok(!existsSync(w.paths.sidecarJson))
+})
+
+test('a Laya named as maybe still running stops being named once it has ended: at the next sweep, record or no record, and at the next write', async (t) => {
+  const h = await harness()
+  const live = new Set([601, 602])
+  const w = winSweeper(t, h, { cim: { 601: '|', 602: '|' }, names: { 601: 'python.exe', 602: 'python.exe' }, alive: (pid) => live.has(pid) })
+  writeFileSync(w.paths.sidecarJson, JSON.stringify({ pid: 601, interpreterPid: 602, port: 8091, startedAt: 'then' }))
+  await w.sidecar.sweepOrphans()
+  assert.deepEqual(w.sidecar.status().orphansUnchecked, [601, 602])
+  // The person ends it in Task Manager, and something else removes the record meanwhile.
+  live.clear()
+  rmSync(w.paths.sidecarJson)
+  await w.sidecar.sweepOrphans()
+  assert.deepEqual(w.sidecar.status().orphansUnchecked, [], 'the same supervisor stops naming it')
+})
+
+test('the orphan sweep leaves alone an install check another live process runs under install.lock, and keeps its record', async (t) => {
+  const h = await harness()
+  const py = `${layaPaths({ harnessDir: join(h.harnessDir, 'win'), dataDir: h.dataDir, platform: 'win32' }).engine}\\venv.new\\Scripts\\python.exe`
+  const w = winSweeper(t, h, { cim: { 501: `${py}|"${py}" -I -u -X utf8 -m laya.serve`, 502: `${py}|"${py}" -I -u -X utf8 -m laya.serve` } })
+  writeFileSync(w.paths.sidecarJson, JSON.stringify({ check: { pid: 501, interpreterPid: 502, port: 8092, startedAt: 'now' } }))
+  mkdirSync(dirname(w.paths.lock), { recursive: true })
+  writeFileSync(w.paths.lock, String(process.pid + 1))
+  assert.deepEqual(await w.sidecar.sweepOrphans(), [])
+  assert.deepEqual(w.killed, [], 'another installer\'s check is not an earlier session\'s')
+  assert.deepEqual(JSON.parse(readFileSync(w.paths.sidecarJson, 'utf8')).earlier, [{ pid: 501, interpreterPid: 502, port: 8092, startedAt: 'now', kind: 'check' }], 'and its record is kept')
+  assert.ok(w.logs.includes(`laya: an install check another process runs under install.lock (pid ${process.pid + 1}) was left alone.`))
+  // A lock whose pid another program has taken since (an installer is always node) holds nothing: the check is swept.
+  const reused = winSweeper(t, h, { cim: { 501: `${py}|"${py}" -I -u -X utf8 -m laya.serve`, 502: `${py}|"${py}" -I -u -X utf8 -m laya.serve` }, names: { [process.pid + 1]: 'svchost.exe' } })
+  writeFileSync(w.paths.sidecarJson, JSON.stringify({ check: { pid: 501, interpreterPid: 502, port: 8092, startedAt: 'now' } }))
+  assert.deepEqual((await reused.sidecar.sweepOrphans()).map((k) => k.pid), [501, 502])
+  writeFileSync(w.paths.sidecarJson, JSON.stringify({ check: { pid: 501, interpreterPid: 502, port: 8092, startedAt: 'now' } }))
+  // With the lock gone (its holder ended without releasing it), the same check is an earlier session's.
+  const lockless = winSweeper(t, h, { cim: { 501: `${py}|"${py}" -I -u -X utf8 -m laya.serve`, 502: `${py}|"${py}" -I -u -X utf8 -m laya.serve` }, alive: (pid) => pid !== process.pid + 1 })
+  assert.deepEqual((await lockless.sidecar.sweepOrphans()).map((k) => k.pid), [501, 502])
+  assert.ok(!existsSync(w.paths.sidecarJson))
+})
+
+test('a recorded Laya that is alive but cannot be read (run as administrator) is named and kept on record; a pid another program took over is dropped', async (t) => {
+  const h = await harness()
+  // CIM leaves an elevated process's path and command line empty, but not its name.
+  const alive = new Set([601, 602, 701])
+  const w = winSweeper(t, h, { cim: { 601: '|', 602: '|', 701: '|' }, names: { 601: 'python.exe', 602: 'python.exe', 701: 'svchost.exe' }, alive: (pid) => alive.has(pid) })
+  writeFileSync(w.paths.sidecarJson, JSON.stringify({ pid: 601, interpreterPid: 602, port: 8091, startedAt: 'then', check: { pid: 701, port: 8092, startedAt: 'then' } }))
+  assert.deepEqual(await w.sidecar.sweepOrphans(), [])
+  assert.deepEqual(w.killed, [])
+  assert.deepEqual(w.sidecar.status().orphansUnchecked, [601, 602])
+  assert.deepEqual(JSON.parse(readFileSync(w.paths.sidecarJson, 'utf8')), { earlier: [{ pid: 601, interpreterPid: 602, port: 8091, startedAt: 'then', kind: 'main' }] }, 'kept; the svchost that took pid 701 is not Laya')
+  assert.ok(w.logs.includes(`laya: ${LAYA_TEXT.unchecked([601, 602])}`))
+  // A later sweep reads what was kept, and once it has ended the record goes.
+  alive.clear()
+  const next = winSweeper(t, h, { alive: () => false })
+  assert.deepEqual(await next.sidecar.sweepOrphans(), [])
+  assert.deepEqual(next.sidecar.status().orphansUnchecked, [])
+  assert.ok(!existsSync(w.paths.sidecarJson))
+})
+
 test('the orphan sweep also stops an install check an earlier session left', async (t) => {
   const h = await harness()
   const root = 'C:\\Harness'

@@ -176,3 +176,30 @@ test('overview: rows inside a section are ordered by time, with untimed rows las
   const keys = ledger.sections.flatMap((s) => s.rows.filter((r) => r.group === 'tasks').map((r) => r.key))
   assert.deepEqual(keys, ['task:a', 'task:b'])
 })
+
+test('overview: a read pass handed to the line reads as a warning in the ledger, not a failure, and never as a run still going', () => {
+  assert.equal(recordState('needs_write'), 'warn')
+  const { summarize } = loadPlugin().__test
+  const run = { id: 'R1', startedAt: 1000, task: 'how does it work', events: [
+    { type: 'start', at: 1000 }, { type: 'access', mode: 'read', at: 1001 },
+    { type: 'access', mode: 'write', from: 'read', why: 'claude said it needs to change files', at: 5000 },
+  ] }
+  const s = summarize(run)
+  assert.equal(s.running, false, 'a hand-back ends the pass')
+  assert.deepEqual([s.final?.status, s.final?.statusReason], ['needs_write', 'claude said it needs to change files'])
+  // Both of a task's passes are its own: neither shows as a run of its own beside the task.
+  const t = { jobId: 't1', sessionId: 's', state: 'running', runId: 'L2', runIds: ['L1', 'L2'], startedAt: 1000, task: 'how does it work' }
+  const pairs = [{ id: 'L1', live: { ...run, id: 'L1' }, record: null, at: 1000 }, { id: 'L2', live: { id: 'L2', startedAt: 9000, task: 'how does it work', events: [] }, record: null, at: 9000 }]
+  assert.equal(runLedgerRows(pairs, taskLedgerRows([t], 10_000)).length, 0)
+})
+
+test('overview: the history rows of both passes of a task are its own once the live log is gone', () => {
+  const t = { jobId: 't1', sessionId: 's', state: 'completed', runId: 'W1', runIds: ['R1', 'W1'], startedAt: 1000, task: 'how does it work', durationMs: 600_000 }
+  // The writer pass started ten minutes after the task did, far past any start-time match.
+  const records = [
+    { runId: 'R1', ts: new Date(2000).toISOString(), task: 'how does it work', finalStatus: 'needs_write', attempts: [{ durationMs: 500 }] },
+    { runId: 'W1', ts: new Date(700_000).toISOString(), task: 'how does it work', finalStatus: 'accepted', attempts: [{ durationMs: 60_000 }] },
+  ]
+  const pairs = pairRuns([], records)
+  assert.equal(runLedgerRows(pairs, taskLedgerRows([t], 800_000)).length, 0)
+})

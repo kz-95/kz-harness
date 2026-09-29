@@ -14,21 +14,28 @@ import { dirname, join } from 'node:path'
 import { createReview } from '../jev-review/index.js'
 import { kindOf, marginalCostOf } from './accounts.js'
 import { decidedBy, deviceName, timeoutSize } from './adapter.js'
-import { CHARS_PER_TOKEN, eligible, rank } from './capabilities.js'
+import { CHARS_PER_TOKEN, LOCK_UNAVAILABLE, READ_PASS_CAPABILITIES, eligible, needsLane, rank } from './capabilities.js'
 import { NO_CANDIDATES, contextEstimate } from './decision.js'
 import { effortFamily, toAgentEffort } from './effort.js'
 import { redactSecrets } from './export.js'
 import { tagIsAnswerOnly } from './feedback.js'
 import { offlinePick } from './local.js'
+import { SILENT_STATUSES, isWorkAttempt, succeeded } from './outcome.js'
 import { TEACHER, jevRecord, providerName } from './providers.js'
-import { assertWorkspace, changedSince, compareChecks, ensureHandoffIgnored, gatherContext, runChecks, snapshot } from './workspace.js'
+import { assertWorkspace, changedSince, compareChecks, ensureHandoffIgnored, gatherContext, headOf, runChecks, snapshot, snapshotDiff, unseenPaths } from './workspace.js'
 
 const pct = (n) => (typeof n === 'number' ? n.toFixed(2) : 'n/a')
 const hhmm = (iso) => new Date(iso).toTimeString().slice(0, 5)
 /** Earliest known reset among `{ until }` entries, or null. */
 const earliest = (list) => list.map((x) => x.until).filter(Boolean).sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null
 export const HANDOFF = '.kz-harness/handoff.md'
-const OUT_STATES = ['stopped', 'exhausted']
+export const OUT_STATES = ['stopped', 'exhausted']
+/**
+ * Why an agent readiness reports not ready cannot run: a local model is not ready on this PC (not
+ * installed, or ruled out by its hardware or the resource budget, as its detail says), any other
+ * is not signed in. Said the same by the router and at a task's intake.
+ */
+export const notReadyWhy = (a, ready) => (kindOf(a) === 'local' ? `not ready on this PC${ready?.[a.id]?.detail ? ` (${ready[a.id].detail})` : ''}` : 'not signed in')
 const PEERS = { claude: 'codex', codex: 'claude' }
 // Roles where a gated subscription is still the right spend: judging costs few tokens and
 // benefits most from the strongest agent. Everything else is bulk work.
@@ -252,24 +259,37 @@ export function pricingNow(peak = {}, at = Date.now()) {
  * runs still count overall, where no label is read.
  */
 export function trackRecord(records, cwd, agents, { availability = {}, pricing = {}, economics, n = 50 } = {}) {
-  const here = records.filter((r) => r.workspace === cwd).slice(-n)
-  const all = records.slice(-n)
+  // A run whose status says nothing about the work (outcome.js SILENT_STATUSES: out of allowance,
+  // stopped by a person, a read pass handed to its folder's line) credits and blames no attempt: a
+  // stop leaves the attempt it cut off unrecorded, so the completed ones before it would read as
+  // not accepted. Such a run still counts where it hit a usage limit, which is a fact of its own.
+  const silent = (r) => SILENT_STATUSES.includes(r.finalStatus)
+  const counted = records.filter((r) => !silent(r) || (r.attempts ?? []).some((a) => a.limitHit))
+  const here = counted.filter((r) => r.workspace === cwd).slice(-n)
+  const all = counted.slice(-n)
   const stats = (rows, id) => {
     let attempts = 0; let accepted = 0; let ms = 0; let limits = 0
     for (const r of rows) {
-      const work = (r.attempts ?? []).filter((a) => a.role === 'primary' || a.role === 'retry')
-      for (const a of work) {
+      const work = (r.attempts ?? []).filter(isWorkAttempt)
+      for (const a of r.attempts ?? []) {
         if (a.agent !== id) continue
         // A quota stop is not incompetence. Counting it as a failed attempt tells Jev the
         // agent cannot do the work, when it was only out of allowance, and the effect is
         // permanent: the run is in the denominator for the next 50 runs.
-        if (a.limitHit) { limits++; continue }
+        // A key spent by the call that answered (spentAfter) is a limit too, and the answer counts;
+        // so is a parallel opinion's own limit, whose attempt is otherwise not work.
+        if ((isWorkAttempt(a) || a.role === 'opinion') && (a.limitHit || a.spentAfter)) limits++
+        if (!isWorkAttempt(a) || a.limitHit) continue
+        if (silent(r)) continue
         attempts++
         ms += a.durationMs ?? 0
-        if (a === work.at(-1) && String(r.finalStatus).startsWith('accepted')) accepted++
+        if (a === work.at(-1) && succeeded(r.finalStatus)) accepted++
       }
     }
-    if (!attempts) return null
+    // Limit hits alone (an agent that ran only as a parallel opinion, or whose every attempt hit
+    // its limit) are still worth saying: the legacy named call, which carries this record, tells
+    // Jev to avoid repeated ones.
+    if (!attempts) return limits ? { attempts: 0, note: 'no work attempts counted, only usage-limit hits', limit_hits: limits } : null
     // A rate over one or two attempts is noise, and Jev is told to prefer the best rate, so
     // a single lucky run reads as "always works" and wins every future pick. Withhold the
     // number until there is enough to mean anything; the count still goes out, so Jev can
@@ -485,6 +505,42 @@ function retryPrompt(task, cwd, attempts, checks, opts) {
   ].join('\n')
 }
 
+/**
+ * The marker a locked agent writes when the task cannot be done by reading: the read pass then
+ * hands the task to its folder's line, where it runs as work that writes. On a line of its own, so
+ * an answer that merely quotes it mid-sentence is still an answer.
+ */
+export const NEEDS_WRITE_MARKER = 'NEEDS-WRITE-ACCESS'
+// Markdown around it (bold, code, a quote or a list mark) is still the marker on a line of its own.
+const NEEDS_WRITE_LINE = /^[\s>*_`#-]*NEEDS-WRITE-ACCESS[\s*_`.:]*$/m
+
+/**
+ * The prompt of a read pass: the task, on an agent locked against writing. It has no handoff line
+ * (a read pass neither reads, continues nor writes the note, which may be a writer's live file) and
+ * no near-limit line (that line asks for the note).
+ */
+function readPrompt(task, cwd, { skill } = {}) {
+  return [
+    task,
+    '',
+    `Workspace: ${cwd}. Read only inside this workspace.`,
+    skillLine(skill),
+    'This run is locked to reading: you cannot create, change or delete any file here, or run a command. Another agent may be changing files in this folder while you read.',
+    `If the task cannot be done without changing a file or running a command, write ${NEEDS_WRITE_MARKER} on a line of its own, then say what would have to change and why, and stop.`,
+    'Otherwise give the answer itself, and say which files you read and how you checked what you say.',
+  ].filter((l, i) => l !== '' || i === 1).join('\n')
+}
+
+/** A read pass's retry: the read prompt and what the earlier attempts said. They changed nothing. */
+function readRetryPrompt(task, cwd, attempts, opts) {
+  return [
+    readPrompt(task, cwd, opts),
+    '',
+    'Earlier attempts did not finish this task.',
+    ...attempts.map((a, i) => `Attempt ${i + 1} by ${a.agent} (${a.role}): ${a.stopReason}${a.limitHit ? ' (usage limit hit)' : ''}. ${a.diagnostic ?? ''}\n${(a.answerText ?? '').slice(0, 1500)}`),
+  ].join('\n')
+}
+
 function reviewPrompt(task, cwd, diff) {
   return [
     `Independently review the work another agent did for this task in ${cwd}.`,
@@ -580,15 +636,53 @@ function movedTo(kind, from, to, moves = []) {
   return { primaryAgent: to, [MOVE_FIELD[kind]]: from, moves: [...moves, { kind, from, to }] }
 }
 
-export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly = false, effort, config, deps, signal = new AbortController().signal }) {
+/**
+ * The admin's routing policy (config.routing): whether it allows a resource, and why not. One
+ * reading of it for the router and for index.js, which asks at enqueue whether any agent the policy
+ * allows can be locked for a read-only task.
+ */
+export function routingPolicy(config) {
+  const disabledResources = new Set(config.routing?.disabledResources ?? [])
+  const allowedResources = config.routing?.allowedResources?.length ? new Set(config.routing.allowedResources) : null
+  return {
+    allows: (id) => !disabledResources.has(id) && (!allowedResources || allowedResources.has(id)),
+    whyExcluded: (id) => (disabledResources.has(id) ? 'disabled by configuration' : 'not in the allowed resources'),
+  }
+}
+
+/**
+ * What the history row keeps of a run's access: for a read pass, the verdict, what locked each
+ * agent that ran and what the lock check measured; for a pass that writes, the verdict and why the
+ * task ran as work that writes when it was judged read only (no agent could be locked, or a read
+ * pass handed it back, `from`).
+ */
+function accessRecord(access, { lockOfId, lockedIds, besideOther, lockCheck }) {
+  const verdict = access.verdict ?? null
+  if (access.mode === 'read') {
+    return { mode: 'read', verdict, lock: Object.fromEntries(lockedIds.map((id) => [id, lockOfId(id).lock?.how ?? null])), besideOther, lockCheck }
+  }
+  const from = access.from ? { from: 'read', why: access.from.why, readPass: access.from.readPass ?? null } : access.why ? { why: access.why } : {}
+  return { mode: 'write', verdict, ...from }
+}
+
+export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: askedAnswerOnly = false, access = null, effort, config, deps, signal = new AbortController().signal }) {
   // Menu choice wins over the Settings default; 'auto' in the menu defers to that default.
   const level = effort && effort !== 'auto' ? effort : config.effort?.default ?? 'auto'
   const emit = (type, data = {}) => deps.emit?.({ type, at: Date.now(), ...data })
+  // A read pass (access.mode 'read'): a task the decider judged only reads, run beside any task
+  // changing its folder on agents locked against writing (docs/queue-and-cost-findings.md 1). In
+  // everything the router does it is an answer-shaped run, and whenever it cannot do the task
+  // locked it hands the task to its folder's line (NEEDS_LANE), where it runs as work that writes.
+  const readPass = access?.mode === 'read'
+  const answerOnly = askedAnswerOnly || readPass
   await assertWorkspace(cwd)
   // One id for the whole run, the caller's when it minted one, so its usage rows, its live log,
   // its samples, its history row and the Laya shadow's rows can all be joined.
   const runId = deps.runId ?? randomUUID()
   const runStartedAt = Date.now()
+  // When the run took its workspace's lane, which its caller knows and which comes before the
+  // decider is made ready (a Laya start among it): the time a waiting task waits behind it.
+  const heldSince = Number.isFinite(deps.startedAt) ? Math.min(deps.startedAt, runStartedAt) : runStartedAt
   // Who decides, and the bars its answers are read against. A caller that names no provider gets
   // Jev with the configured thresholds, every key a caller leaves out filled from Jev's defaults.
   const P = deps.provider ?? jevRecord({ thresholds: config.thresholds })
@@ -632,10 +726,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // router-side reassignment - the tie-break, the gate swap, the fallback pick, a retry - could
   // still hand the work to an excluded resource. Filtering the pool here means nothing later can
   // resurrect one, because it never enters `agents` in the first place.
-  const disabledResources = new Set(config.routing?.disabledResources ?? [])
-  const allowedResources = config.routing?.allowedResources?.length ? new Set(config.routing.allowedResources) : null
-  const policyAllows = (id) => !disabledResources.has(id) && (!allowedResources || allowedResources.has(id))
-  const whyExcluded = (id) => (disabledResources.has(id) ? 'disabled by configuration' : 'not in the allowed resources')
+  const { allows: policyAllows, whyExcluded } = routingPolicy(config)
   const switchedOn = config.agents.filter((a) => a.enabled)
   const policyExcluded = switchedOn.filter((a) => !policyAllows(a.id))
   const permitted = switchedOn.filter((a) => policyAllows(a.id))
@@ -669,6 +760,20 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   if (agents.length === 0 && remoteOnly) throw new Error(`this run is online only, and no cloud or subscription agent is ready${alsoExcluded(false)}. Sign one in at Settings → Jev setup, or pick Jev Auto to use the local models on this PC`)
   if (agents.length === 0) throw new Error(`no LLM agent is switched on and signed in${notReady.length ? ` (${notReady.map((a) => `${a.id}: ${deps.ready[a.id].detail}`).join('; ')})` : ''}. Open Settings → Plugins → Jev setup`)
   const byId = new Map(agents.map((a) => [a.id, a]))
+  // How each agent can be locked against writing for a read pass, or why it cannot (capabilities.js
+  // lockOf through deps.lockOf), read once per run. With no deps.lockOf nothing can be locked.
+  const images = (deps.inputModalities ?? ['text']).includes('image')
+  const locks = new Map()
+  const lockOfId = (id) => {
+    if (!locks.has(id)) {
+      const def = byId.get(id) ?? config.agents.find((a) => a.id === id)
+      let got = null
+      try { got = def && deps.lockOf ? deps.lockOf(def, { images }) : null } catch { got = null }
+      locks.set(id, got ?? { lock: null, why: 'no lock can be set here' })
+    }
+    return locks.get(id)
+  }
+  const lockable = (id) => !readPass || !!lockOfId(id).lock
   // A manual pick is a judgment too, and an admin exclusion outranks it: saying so is better than
   // silently routing the work somewhere else.
   if (policyExcluded.some((a) => a.id === forceAgent)) throw new Error(`${forceAgent} is excluded by the routing policy (${whyExcluded(forceAgent)})`)
@@ -730,7 +835,9 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   const unavailableIds = new Set([...policyExcluded, ...notReady, ...outAtStart].map((a) => a.id))
   // Read before the capability filter, because the note is part of what an agent must hold.
   const handoffFile = join(cwd, HANDOFF)
-  const priorHandoff = await readFile(handoffFile, 'utf8').catch(() => null)
+  // A read pass never reads it: the note may be a writer's live file, and a read pass continues
+  // nothing.
+  const priorHandoff = readPass ? null : await readFile(handoffFile, 'utf8').catch(() => null)
   // The part of the note Jev reads. It quotes whatever the earlier agent printed, so it is
   // scrubbed before it is cut: a key the cut splits keeps neither the prefix nor the length the
   // scrubber knows it by, and jev.js, which scrubs again, would see only an ordinary word. The
@@ -756,7 +863,16 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // restrictions rule out, is never offered to Jev at all. Handing it the whole enabled list and
   // rejecting the answer afterwards paid for a door that was already shut. `toolAllowed` below
   // still re-checks the pick against the capability Jev named, which is only known afterwards.
-  const tools = (config.tools ?? []).filter((t) => t.enabled !== false && (!executors.length || capableIds.has(`tool:${t.id}`)))
+  // Tools are never locked, so a read pass offers none.
+  const tools = readPass ? [] : (config.tools ?? []).filter((t) => t.enabled !== false && (!executors.length || capableIds.has(`tool:${t.id}`)))
+  // A read pass that no agent able to run now could do locked goes to its folder's line before any
+  // decider is asked, naming why each agent could not.
+  if (readPass && !agents.some((a) => (!executors.length || capableIds.has(a.id)) && lockOfId(a.id).lock)) {
+    const why = (a) => (notReady.includes(a) ? notReadyWhy(a, deps.ready) : outAtStart.includes(a) ? 'at its usage limit' : !agents.includes(a) ? 'not allowed in this run\'s mode'
+      : executors.length && !capableIds.has(a.id) ? 'cannot take this input' : lockOfId(a.id).why)
+    const reasons = [...permitted.map((a) => `${a.id}: ${why(a)}`), ...policyExcluded.map((a) => `${a.id}: excluded by the routing policy`)]
+    throw needsLane(`no agent that can run now can be locked against writing (${reasons.join('; ')})`)
+  }
   // Only narrow the field when the registry actually knows these agents; an unwired registry
   // must not silently empty the pool.
   const known = executors.filter((e) => e.kind !== 'chat').map((e) => e.id)
@@ -783,6 +899,10 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
    * weekly percent is kept for judgment; judgment roles may still use them. Falls back to the
    * ungated ranking rather than failing, because no agent at all is worse than an expensive one.
    */
+  // In a read pass, an agent that already did or tried the work (a primary, a retry, or a
+  // parallel opinion the primary's break-off did not stop), which is not asked again. A retry on
+  // the same agent's next key after a usage limit is the one exception (the limit branch).
+  const triedHere = (id) => readPass && attempts.some((a) => a.agent === id && (a.role === 'primary' || a.role === 'retry' || (a.role === 'opinion' && !a.cutOff)))
   const other = (probabilities, avoid, role = 'retry') => {
     if (JUDGMENT_ROLES.includes(role)) {
       // A reviewer may be gated or conserved (judging is what they are kept for), but not one a
@@ -794,7 +914,11 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     // work role is asked for), ungated first. The gate yields only when nothing ungated can do the
     // job; a retry handed to an agent that cannot read the input or reach the network is a
     // capability mismatch routed, whatever it saves.
-    const able = agents.filter((a) => canDo(a.id))
+    // In a read pass only an agent that can be locked may work, and never one that already worked
+    // in this pass (a locked retry of it is the same run again); with none, nobody, and the task
+    // goes to its folder's line.
+    const able = agents.filter((a) => canDo(a.id) && lockable(a.id) && !triedHere(a.id))
+    if (readPass && !able.length) return null
     const ungated = able.filter((a) => !gated(a.id))
     const pool = ungated.length ? ungated : able.length ? able : agents.filter((a) => !gated(a.id))
     return pickOther(probabilities, avoid, pool.length ? pool : agents)
@@ -804,12 +928,18 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   const { limits } = config
   const productionCritical = config.productionWorkspaces.some((p) => cwd.toLowerCase().startsWith(p.toLowerCase()))
   emit('start', { task, cwd, forceAgent })
+  if (readPass) emit('access', { mode: 'read', verdict: access.verdict ?? null })
   // The environment every git call in the workspace runs with, when the config gives one: the
   // capability benchmark's names its task's repository, kept outside the folder the agent writes to,
   // and holds no key of KzH's (docs/benchmark.md 3.7). KzH's own environment otherwise.
   const gitOpts = config.git?.env ? { env: config.git.env } : {}
-  await ensureHandoffIgnored(cwd, gitOpts).catch(() => {})
-  const { context, snapshot: startSnap } = await gatherContext(cwd, { productionCritical, signal, ...gitOpts })
+  // A read pass writes nothing, .git/info/exclude included.
+  if (!readPass) await ensureHandoffIgnored(cwd, gitOpts).catch(() => {})
+  // A read pass's snapshot also reads git's own files its lock check compares (.git/config, hooks).
+  const { context, snapshot: startSnap } = await gatherContext(cwd, { productionCritical, signal, meta: readPass, ...gitOpts })
+  // A commit or a checkout leaves `git status` as clean as it found it, so the lock check compares
+  // the commit too.
+  const startHead = readPass && startSnap.git ? await headOf(cwd, signal, gitOpts).catch(() => null) : null
   const history = await deps.history.recent(cwd, 10)
   // Agents billed by time of day (DeepSeek): Jev sees which are on their cheap rate right now.
   const pricing = pricingNow(config.pricing?.peak)
@@ -902,8 +1032,9 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   routing = { ...routing, decider: P.id }
   // Jev has now said what the request needs, so the filter runs a second time with that answer
   // in hand: a `web_research` job must not run on an agent with no network, and a read-only
-  // request must not demand - or be granted - write permission. This is what makes the
-  // capability answer binding rather than decorative.
+  // request must not demand - or be granted - write permission (a read pass is not: every agent
+  // it starts is locked against writing). This is what makes the capability answer binding rather
+  // than decorative.
   const READ_ONLY_CAPABILITIES = ['quick_answer', 'reasoned_answer', 'project_read', 'web_research', 'image_inspection', 'ocr']
   // `other` is the choice's escape hatch and `human_required` is the "stop and ask" answer:
   // neither is a capability any executor can declare, so filtering on them would empty the field
@@ -1086,7 +1217,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // The parallel answerer answers the whole task and the planner writes the plan: both are WORK,
   // so both must pass what the worker passed, and neither may be the resource conservation kept
   // back. One that fails is replaced by the strongest agent that passes, or dropped with a note.
-  const canWorkBeside = (id) => !!id && id !== workerAgent && id !== conservedFrom && couldPick(id)
+  const canWorkBeside = (id) => !!id && id !== workerAgent && id !== conservedFrom && couldPick(id) && lockable(id)
   const workerBeside = () => {
     const ranked = (routing.decision?.candidates ?? []).map((c) => c.id).filter(canWorkBeside)
     return ranked.length ? strongestOther({ decision: { candidates: (routing.decision?.candidates ?? []).filter((c) => ranked.includes(c.id)) } }, workerAgent, byId) : null
@@ -1134,6 +1265,21 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   if (routing.handler && routing.handler !== 'agent' && !tool) {
     emit('capability', { from: `tool:${routing.handler}`, to: routing.primaryAgent, capability: routing.capability ?? null })
   }
+  // A read pass whose routing says the task writes, or whose worker cannot be locked, goes to its
+  // folder's line before any agent runs. The router's pick stays the router's: a read-only task it
+  // hands to Codex waits in the line, as the owner decided. A run about to stop for a person needs
+  // no agent, so it is not sent to the line for one.
+  const stopsForPerson = !forceAgent && routing.mode === 'jev' && routing.capability === 'human_required' && (routing.capabilityConfidence ?? 1) >= T.humanRequired
+  if (readPass && !stopsForPerson) {
+    const cap = routing.capability
+    const sure = typeof routing.capabilityConfidence === 'number' ? ` (${Math.round(routing.capabilityConfidence * 100)}%)` : ''
+    if (cap && cap !== 'human_required' && !READ_PASS_CAPABILITIES.includes(cap)) {
+      throw needsLane(cap === 'other' ? `${P.name}'s routing could not name what it needs (other), and unsure means it may write`
+        : cap === 'web_research' ? `${P.name}'s routing named web_research${sure}, and no locked agent is known to reach the web`
+          : `${P.name}'s routing named ${cap}${sure}, which may change files`)
+    }
+    if (!lockOfId(workerAgent).lock) throw needsLane(`${workerAgent}, the agent picked for it, cannot be locked against writing: ${lockOfId(workerAgent).why}`)
+  }
   emit('routed', { routing, context, ms: Date.now() - routeStarted, tool: tool?.id, plan: { strategy: plan.strategy, steps: plan.steps, reviewer: plan.reviewer, forceReview: plan.forceReview, parallelWith: plan.parallelWith } })
 
   // 2. Baseline checks, so later failures can be told apart from pre-existing ones.
@@ -1180,6 +1326,9 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // 3. Execute / review loop. A tool, when Jev picked one, goes first; if the
   //    review does not accept its output, the run escalates to the routed agent.
   const attempts = []
+  // Every agent this read pass really started locked, as runAgent reports it: a Stop leaves the
+  // attempt off the record, and its agent must still be covered by the lock check.
+  const startedLocked = new Set()
   const assessments = []
   const limitEvents = []
   let lastChecks = []
@@ -1200,8 +1349,8 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // never an agent a router swap just moved the work off (the order was written before the swap),
   // and only one that passes the same hard checks as the pick.
   const handOverOrder = () => [...(workerAgent !== routing.primaryAgent ? [routing.primaryAgent] : []), ...(plan.fallbackOrder ?? [])]
-  const fallbackAfter = (avoid) => handOverOrder().find((id) => id !== avoid && !swappedFrom.has(id) && couldPick(id)
-    && !attempts.some((a) => a.agent === id && (a.role === 'primary' || a.role === 'retry')))
+  const fallbackAfter = (avoid) => handOverOrder().find((id) => id !== avoid && !swappedFrom.has(id) && couldPick(id) && lockable(id)
+    && !attempts.some((a) => a.agent === id && (a.role === 'primary' || a.role === 'retry')) && !triedHere(id))
   // Only a strategy whose primary step is someone other than the routed resource PROMISED a
   // hand-over. broker.js gives every plan a fallbackOrder, so consulting it on every retry let a
   // generic strongest-first list outrank Jev's own ranking for this very failure.
@@ -1217,8 +1366,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   // would guess at an answer it is not allowed to give, and a confident "this needs you" is more
   // useful than a plausible wrong answer. Below the decider's own bar the run proceeds as normal,
   // so one unsure answer cannot stall ordinary work; Laya's bar sits higher than Jev's for that.
-  if (!forceAgent && routing.mode === 'jev' && routing.capability === 'human_required'
-    && (routing.capabilityConfidence ?? 1) >= T.humanRequired) {
+  if (stopsForPerson) {
     status = 'needs_human'
     statusReason = `${P.name} read this as needing a person (confidence ${pct(routing.capabilityConfidence)})`
     next = null
@@ -1230,17 +1378,21 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
   let stoppedBy = null
   try {
     while (next) {
-      const workCount = attempts.filter((a) => a.role !== 'review').length
+      // An opinion the primary's break-off stopped is no attempt of its own (triedHere).
+      const workCount = attempts.filter((a) => a.role !== 'review' && !a.cutOff).length
       const reviewCount = attempts.length - workCount
       if (attempts.length >= limits.maxRounds) { status = 'limit_reached'; statusReason = `maxRounds (${limits.maxRounds}) reached`; break }
       if (next.role !== 'review' && workCount >= limits.maxAttempts) { status = 'limit_reached'; statusReason = `maxAttempts (${limits.maxAttempts}) reached`; break }
       if (next.role === 'review' && reviewCount >= limits.maxReviews) { status = 'limit_reached'; statusReason = `maxReviews (${limits.maxReviews}) reached`; break }
 
       if (next.role !== 'tool' && !answerOnly) await ensureBaseline()
-      const before = await snapshot(cwd, signal, gitOpts)
-      const diffSoFar = attempts.length ? await changedSince(cwd, startSnap, signal, gitOpts) : { stat: '', patch: '' }
+      // A read pass reads no diff: `git diff` rewrites the index whatever GIT_OPTIONAL_LOCKS says,
+      // and nothing it runs can have changed a file.
+      const before = readPass ? null : await snapshot(cwd, signal, gitOpts)
+      const diffSoFar = attempts.length && !readPass ? await changedSince(cwd, startSnap, signal, gitOpts) : { stat: '', patch: '' }
       const opts = { near: near(next.agent), handoff: handoffNote, plan: planText, skill: plan.skill }
-      const prompt = next.role === 'tool' ? '' : next.role === 'primary' ? basePrompt(task, cwd, opts)
+      const prompt = next.role === 'tool' ? '' : readPass ? (next.role === 'primary' ? readPrompt(task, cwd, { skill: plan.skill }) : readRetryPrompt(task, cwd, attempts, { skill: plan.skill }))
+        : next.role === 'primary' ? basePrompt(task, cwd, opts)
         : next.role === 'plan' ? planPrompt(task, cwd, { skill: plan.skill })
         : next.role === 'review' ? reviewPrompt(task, cwd, diffSoFar)
         : retryPrompt(task, cwd, attempts, lastChecks, opts)
@@ -1250,39 +1402,83 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       // end must not be reported as "the last attempt": the inspector pairs starts with ends by
       // index, and the primary would show no result at all.
       const attemptIndex = attempts.length
-      emit('attempt_start', { index: attemptIndex, agent: next.agent, role: next.role, ...(next.role === 'tool' ? { args: routing.toolArgs } : {}) })
       const agentDef = byId.get(next.agent)
       const family = effortFamily(agentDef)
       const eff = next.role === 'tool' ? null
         : toAgentEffort(level, agentDef, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[family], model: deps.modelOf?.(agentDef), bands: T.effortBands })
       const speed = family === 'codex' ? config.effort?.codexSpeed : undefined
+      // The effort as the attempt's record will say it, told as it starts: what a run holding the
+      // lane is, for the estimate of the tasks waiting behind it (waits.js), before it has ended.
+      const effortWord = eff ? `${eff}${speed === 'fast' ? ' 1.5x' : ''}` : null
+      emit('attempt_start', { index: attemptIndex, agent: next.agent, role: next.role, ...(effortWord ? { effort: effortWord } : {}), ...(next.role === 'tool' ? { args: routing.toolArgs } : {}) })
       let result
+      let lockLost = null
+      let neverStarted = false
       // A parallel second opinion is read-only work by construction (broker.js offers it only for
       // answer-only requests), so two agents answering at once cannot collide in the working tree.
+      // In a read pass both are started locked, beside whatever task is writing the folder.
       const opinionAgent = next.role === 'primary' && answerOnly && !parallelDone && plan.parallelWith && byId.get(plan.parallelWith) ? byId.get(plan.parallelWith) : null
       let opinion = null
       // Each agent's own time limit, which a wait before its work starts does not use up (attemptClock).
       const clock = attemptClock(signal, config.agentTimeoutMs)
-      const sideClock = opinionAgent ? attemptClock(signal, config.agentTimeoutMs) : null
+      // The opinion can be stopped on its own: a primary that breaks off stops it (below).
+      const sideStop = opinionAgent ? new AbortController() : null
+      const sideClock = opinionAgent ? attemptClock(AbortSignal.any([signal, sideStop.signal]), config.agentTimeoutMs) : null
+      // An opinion the primary's break-off stopped while it still worked did not try the task: a
+      // read pass may still ask it (triedHere), it uses up no attempt, and its record says why it
+      // stopped. It has ended once its agent's result is in (onEnded, before its process is
+      // disposed of) or it failed before it started; one its own time limit had stopped, one
+      // refused its own lock or one that answered was not stopped by the break-off.
+      let sideEnded = false
+      let brokeOffFirst = false
+      // When each side ended: with a parallel opinion both are waited for, and each is timed to its
+      // own end, not to the slower one's.
+      let mainEndAt = null
+      let sideEndAt = null
+      const sideEnd = () => { sideEnded = true; sideEndAt ??= Date.now() }
+      // The key and account each call starts on: a limit spends that key, not whichever is active
+      // by the time it is handled (a parallel opinion on the same key provider may have rotated it
+      // first), and its usage.jsonl row names the account that made the call.
+      const mainAt = next.role === 'tool' ? null : deps.accountAt?.(agentDef.id) ?? null
+      const sideAt = opinionAgent ? deps.accountAt?.(opinionAgent.id) ?? null : null
       try {
-        const main = next.role === 'tool'
+        const main = Promise.resolve(next.role === 'tool'
           ? deps.runTool(tool, routing.toolArgs ?? {}, task, clock.signal)
-          : deps.execute(agentDef, prompt, clock.signal, { effort: eff, speed, untimed: clock.untimed })
+          : deps.execute(agentDef, prompt, clock.signal, { effort: eff, speed, untimed: clock.untimed, ...(readPass ? { locked: true, images, onStarted: () => startedLocked.add(agentDef.id) } : {}) }))
+          .then((r) => { mainEndAt = Date.now(); return r }, (err) => { mainEndAt = Date.now(); throw err })
         if (opinionAgent) {
           parallelDone = true
           emit('attempt_start', { index: attemptIndex + 1, agent: opinionAgent.id, role: 'opinion' })
-          const side = deps.execute(opinionAgent, prompt, sideClock.signal, { effort: toAgentEffort(level, opinionAgent, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[effortFamily(opinionAgent)], model: deps.modelOf?.(opinionAgent), bands: T.effortBands }), untimed: sideClock.untimed })
-            .then((r) => r, (err) => (signal.aborted ? Promise.reject(err) : { stopReason: 'error', diagnostic: describeError(err), answerText: '' }))
-          ;[result, opinion] = await Promise.all([main, side])
+          const side = deps.execute(opinionAgent, prompt, sideClock.signal, { effort: toAgentEffort(level, opinionAgent, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[effortFamily(opinionAgent)], model: deps.modelOf?.(opinionAgent), bands: T.effortBands }), untimed: sideClock.untimed, onEnded: sideEnd, ...(readPass ? { locked: true, images, onStarted: () => startedLocked.add(opinionAgent.id) } : {}) })
+            .then((r) => { sideEnd(); return r }, (err) => { sideEnd(); return signal.aborted ? Promise.reject(err) : { stopReason: 'error', diagnostic: describeError(err), answerText: '', ...(err?.code === LOCK_UNAVAILABLE ? { notStarted: true, lockLost: true } : err?.notStarted ? { notStarted: true } : {}) } })
+          // A primary that breaks off (it throws: it could not start locked, or its agent failed
+          // outright) stops the opinion and waits for it to end: one left running would work on
+          // outside the run's slot, time limit and record, beside the pass that comes next. It is
+          // stopped with a reason of its own, since the primary's error (a lock refusal, say) is not
+          // the opinion's. One that ends with a failed answer lets the opinion finish, whose answer
+          // is then the one shown.
+          const [m, o] = await Promise.allSettled([main.catch((err) => { if (!sideEnded && !sideClock.signal.aborted) brokeOffFirst = true; sideStop.abort(new DOMException(`stopped when ${agentDef.id} broke off`, 'AbortError')); throw err }), side])
+          if (o.status === 'rejected') throw o.reason
+          opinion = o.value
+          if (m.status === 'rejected') throw m.reason
+          result = m.value
         } else result = await main
       } catch (err) {
         if (signal.aborted) throw err
+        // An agent that could not be started locked is no answer from it: the read pass hands the
+        // task to its folder's line once this attempt is on the record.
+        if (err?.code === LOCK_UNAVAILABLE) lockLost = err.message
+        // Stopped before it started (its own time limit while it waited its turn on this PC): no
+        // answer, and nothing it could have written.
+        else if (err?.notStarted) neverStarted = true
         result = { stopReason: 'error', diagnostic: describeError(err), answerText: '' }
       } finally {
         clock.end()
         sideClock?.end()
       }
-      const changes = await changedSince(cwd, before, signal, gitOpts)
+      // Locked against writing, a read pass changed nothing by construction; it is never credited
+      // with what a task writing beside it changed.
+      const changes = readPass ? { files: [] } : await changedSince(cwd, before, signal, gitOpts)
       let limit = next.role === 'tool' ? { hit: false }
         : (deps.isLimitError ? deps.isLimitError(byId.get(next.agent), result) : builtinLimit(result)) ?? { hit: false }
       const attempt = {
@@ -1294,25 +1490,107 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
         answerText: result.answerText,
         // Its own time: a wait before its work started is kept apart, so an average of these says
         // how long the agent works, not how long it was held back.
-        durationMs: Date.now() - started - clock.waitedMs,
+        durationMs: (mainEndAt ?? Date.now()) - started - clock.waitedMs,
         ...(clock.waitedMs ? { waitedMs: clock.waitedMs } : {}),
         changedFiles: changes.files,
         ...(next.role === 'tool' ? {} : { model: deps.modelOf?.(agentDef) }),
         ...(next.role === 'tool' ? {} : servedModel(result)),
-        ...(eff ? { effort: `${eff}${speed === 'fast' ? ' 1.5x' : ''}` } : {}),
+        ...(effortWord ? { effort: effortWord } : {}),
         ...(limit.hit ? { limitHit: true } : {}),
+        // Why it never started: its lock could not be had, or it was stopped first (lockLost says which).
+        ...(readPass ? (lockLost ? { notStarted: true, lockLost: true } : neverStarted ? { notStarted: true } : { locked: true }) : {}),
       }
       attempts.push(attempt)
       if (opinion) {
-        const o = { agent: opinionAgent.id, role: 'opinion', stopReason: opinion.stopReason, diagnostic: opinion.diagnostic, answerText: opinion.answerText, durationMs: Date.now() - started - sideClock.waitedMs, ...(sideClock.waitedMs ? { waitedMs: sideClock.waitedMs } : {}), changedFiles: [], model: deps.modelOf?.(opinionAgent), ...servedModel(opinion) }
+        const cutOff = brokeOffFirst && opinion.stopReason !== 'completed' && !opinion.lockLost
+        const o = { agent: opinionAgent.id, role: 'opinion', stopReason: opinion.stopReason, diagnostic: cutOff ? `stopped when ${attempt.agent} broke off` : opinion.diagnostic, answerText: opinion.answerText, ...(cutOff ? { cutOff: true } : {}), durationMs: (sideEndAt ?? Date.now()) - started - sideClock.waitedMs, ...(sideClock.waitedMs ? { waitedMs: sideClock.waitedMs } : {}), changedFiles: [], model: deps.modelOf?.(opinionAgent), ...servedModel(opinion), ...(readPass ? (opinion.notStarted ? { notStarted: true, ...(opinion.lockLost ? { lockLost: true } : {}) } : { locked: true }) : {}) }
         attempts.push(o)
+        // The opinion's own usage limit and its call's row in usage.jsonl, as for the primary's
+        // below: a spent key is rotated, or the agent is out for the rest of the run (never asked
+        // again on it), and its tokens are counted whether or not its answer is the one shown. One
+        // that never started spent nothing; one cut off hit no limit of its own.
+        if (!o.notStarted) {
+          const oLimit = cutOff ? { hit: false } : (deps.isLimitError ? deps.isLimitError(opinionAgent, opinion) : builtinLimit(opinion)) ?? { hit: false }
+          // A complete answer stands, as a primary's does, and the key is spent all the same.
+          if (oLimit.hit) { if (opinion.stopReason === 'completed' && opinion.answerText?.trim()) o.spentAfter = true; else o.limitHit = true }
+          const entry = { ts: new Date().toISOString(), runId, workspace: cwd, agent: opinionAgent.id, role: 'opinion', durationMs: o.durationMs, tokens: opinion.usage ?? null, costUsd: opinion.costUsd ?? null, stopReason: opinion.stopReason, limitHit: !!oLimit.hit, ...(sideAt ? { account: sideAt.account } : {}) }
+          await (async () => deps.logAttempt?.(entry))().catch(() => {})
+          if (oLimit.hit) {
+            const until = oLimit.until ?? null
+            const reason = diagText(opinion.diagnostic || opinion.stopReason).slice(0, 300)
+            const { rotated } = (await (async () => deps.onLimit?.(opinionAgent.id, { until, reason, ...(sideAt ? { key: sideAt.key } : {}) }))().catch(() => null)) ?? {}
+            if (!rotated && byId.has(opinionAgent.id)) {
+              out.push({ id: opinionAgent.id, until })
+              agents.splice(agents.findIndex((a) => a.id === opinionAgent.id), 1)
+              byId.delete(opinionAgent.id)
+            }
+            // Marked as the opinion's: its key moved on saves a failed run only when work then runs
+            // on it (usage.js computeSavings).
+            const action = rotated ? 'rotated' : 'set_aside'
+            limitEvents.push({ agent: opinionAgent.id, until, action, role: 'opinion' })
+            emit('limit', { agent: opinionAgent.id, until, action, role: 'opinion' })
+          }
+        }
         emit('attempt_end', { index: attemptIndex + 1, attempt: { ...o, answerText: (o.answerText ?? '').slice(0, 4000) } })
         // PARALLEL_SECOND_OPINION promises that the two answers are COMPARED. Without this the
         // opinion was run, pushed and then silently dropped, which is two bills for one answer.
         // The comparison is deterministic and coarse, so it never picks a winner: the primary's
         // answer stands and the person is told, with the number, when the second does not match.
-        secondOpinion = { agent: opinionAgent.id, ...compareAnswers(result.answerText, opinion.answerText) }
+        // Only two finished answers are compared: a cut-off primary's partial text is no answer.
+        const done = (x) => x?.stopReason === 'completed' && !!x.answerText?.trim()
+        const unfinished = !done(result) ? 'primary' : !done(opinion) ? 'opinion' : null
+        secondOpinion = { agent: opinionAgent.id, ...(unfinished ? { compared: false, similarity: null, agree: null, unfinished } : compareAnswers(result.answerText, opinion.answerText)) }
         emit('second_opinion', { agent: opinionAgent.id, primary: attempt.agent, ...secondOpinion })
+      }
+      // The primary failed or ran out of allowance, but its parallel second opinion answered: that
+      // answer is the run's, and no retry is paid for on top of it. The opinion's attempt is marked
+      // `answered`, so every reader that learns from runs (outcome.js isWorkAttempt) credits the
+      // agent that answered, not the primary. A locked opinion that says the task needs files
+      // changed hands the task back as a locked primary would. False when there is no such answer.
+      const adoptOpinion = () => {
+        if (!answerOnly || next.role !== 'primary' || opinion?.stopReason !== 'completed' || !opinion.answerText?.trim()) return false
+        if (result.stopReason === 'completed' && result.answerText?.trim()) return false
+        const wants = readPass ? NEEDS_WRITE_LINE.exec(opinion.answerText) : null
+        if (wants) {
+          const said = opinion.answerText.slice(wants.index + wants[0].length).replace(/\s+/g, ' ').trim().slice(0, 200)
+          status = 'needs_write'
+          statusReason = `${opinionAgent.id} said it needs to change files${said ? `: ${said}` : ''}`
+          return true
+        }
+        const answered = attempts.findLast((a) => a.role === 'opinion')
+        if (answered) answered.answered = true
+        status = 'answered'
+        return true
+      }
+      // How an answer-only attempt ends the run, or null when it does not and a retry follows:
+      // 'line' when a locked agent says the task needs files changed (it goes to its folder's
+      // line), 'answered' for a complete answer, 'opinion' when a primary that failed or answered
+      // nothing gives way to its parallel opinion that answered (adoptOpinion). An empty answer is
+      // no answer.
+      const answerOutcome = () => {
+        const answered = result.stopReason === 'completed' && !!result.answerText?.trim()
+        const wantsWrite = readPass && answered ? NEEDS_WRITE_LINE.exec(result.answerText) : null
+        if (wantsWrite) {
+          const said = result.answerText.slice(wantsWrite.index + wantsWrite[0].length).replace(/\s+/g, ' ').trim().slice(0, 200)
+          status = 'needs_write'
+          statusReason = `${attempt.agent} said it needs to change files${said ? `: ${said}` : ''}`
+          return 'line'
+        }
+        if (answered) { status = 'answered'; return 'answered' }
+        if (adoptOpinion()) return status === 'needs_write' ? 'line' : 'opinion'
+        return null
+      }
+
+      // Never started, so the primary ran nothing: the attempt is on the record and the task goes to
+      // the line, unless its parallel opinion's complete answer had already come back, which is then
+      // the run's (adoptOpinion).
+      if (readPass && lockLost) {
+        emit('attempt_end', { index: attemptIndex, attempt: { ...attempt, answerText: '' } })
+        if (!adoptOpinion()) {
+          status = 'needs_write'
+          statusReason = `${attempt.agent} could not be started locked: ${lockLost}`
+        }
+        break
       }
 
       // A metered key is read once at routing time from a cached figure, so a long run could
@@ -1334,7 +1612,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       }
 
       if (next.role !== 'tool') {
-        const entry = { ts: new Date().toISOString(), runId, workspace: cwd, agent: next.agent, role: next.role, durationMs: attempt.durationMs, tokens: result.usage ?? null, costUsd: result.costUsd ?? null, stopReason: result.stopReason, limitHit: !!limit.hit }
+        const entry = { ts: new Date().toISOString(), runId, workspace: cwd, agent: next.agent, role: next.role, durationMs: attempt.durationMs, tokens: result.usage ?? null, costUsd: result.costUsd ?? null, stopReason: result.stopReason, limitHit: !!limit.hit, ...(mainAt ? { account: mainAt.account } : {}) }
         await (async () => deps.logAttempt?.(entry))().catch(() => {})
       }
 
@@ -1344,8 +1622,21 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
         emit('attempt_end', { index: attemptIndex, attempt: { ...attempt, answerText: (attempt.answerText ?? '').slice(0, 4000) } })
         const until = limit.until ?? null
         const reason = diagText(result.diagnostic || result.stopReason).slice(0, 300)
-        const { rotated } = (await (async () => deps.onLimit?.(next.agent, { until, reason }))().catch(() => null)) ?? {}
-        handoffNote = await saveHandoff(started).catch((err) => { emit('error', { message: `handoff not saved: ${err.message}` }); return handoffNote })
+        const { rotated } = (await (async () => deps.onLimit?.(next.agent, { until, reason, ...(limit.spent ? { floor: true } : {}), ...(mainAt ? { key: mainAt.key } : {}) }))().catch(() => null)) ?? {}
+        // An answer-only attempt that still ends the run: its own complete answer (a metered key
+        // whose balance crossed its floor with this very call), or a parallel opinion that answered
+        // beside a primary that did not. Nothing more is started, and the limit is on the record.
+        const ended = answerOnly && (next.role === 'primary' || next.role === 'retry') ? answerOutcome() : null
+        // Its own answer stands: the limit came after the work, which every reader that learns from
+        // runs then credits as work done, not as an attempt a limit stopped. The key is still spent.
+        if (ended === 'answered') { delete attempt.limitHit; attempt.spentAfter = true }
+        if (ended) {
+          limitEvents.push({ agent: attempt.agent, until, action: ended })
+          emit('limit', { agent: attempt.agent, until, action: ended })
+          break
+        }
+        // A read pass writes no note: the file may be a writer's live one, and it changed nothing.
+        if (!readPass) handoffNote = await saveHandoff(started).catch((err) => { emit('error', { message: `handoff not saved: ${err.message}` }); return handoffNote })
         const isReview = next.role === 'review'
         let action
         if (rotated) {
@@ -1359,7 +1650,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
           // Work may go only to an agent that can do what the run needs (the attached input, the
           // named capability, the context); a review only to one no fact excludes. The peer table
           // says who is the usual stand-in, not that it can stand in for THIS job.
-          const candidates = isReview ? agents.filter((a) => a.id !== producer && !hardOut.has(a.id)) : agents.filter((a) => canDo(a.id))
+          const candidates = isReview ? agents.filter((a) => a.id !== producer && !hardOut.has(a.id)) : agents.filter((a) => canDo(a.id) && lockable(a.id) && !triedHere(a.id))
           // The peer is the cheap first choice, but not when it is itself past its weekly gate:
           // handing work to a spent subscription just moves the problem. Then the ranking runs,
           // which skips gated agents for work roles and so lands on the api agent.
@@ -1371,7 +1662,10 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
         }
         limitEvents.push({ agent: attempt.agent, until, action })
         emit('limit', { agent: attempt.agent, until, action })
-        if (!next) { status = 'paused_limit'; statusReason = `all agents at their usage limits${outLabel()}` }
+        // A read pass with nobody locked left to take over is handed to its folder's line, where
+        // any agent may take it; it pauses there if they are all spent too.
+        if (!next && readPass) { status = 'needs_write'; statusReason = `no other agent that can be locked is left to try${outLabel()}` }
+        else if (!next) { status = 'paused_limit'; statusReason = `all agents at their usage limits${outLabel()}` }
         continue
       }
 
@@ -1404,8 +1698,12 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
       // A plain question needs an answer, not project checks or a code review.
       if (answerOnly) {
         emit('attempt_end', { index: attemptIndex, attempt: { ...attempt, answerText: (attempt.answerText ?? '').slice(0, 4000) } })
-        if (result.stopReason === 'completed') { status = 'answered'; break }
-        next = { agent: fallbackAfter(next.agent) ?? other({}, next.agent, 'retry'), role: 'retry' }
+        if (answerOutcome()) break
+        const retry = fallbackAfter(next.agent) ?? other({}, next.agent, 'retry')
+        // A read pass with no lockable agent left that has not tried it already goes to its
+        // folder's line, where any agent may take it (other() and fallbackAfter leave those out).
+        if (!retry || triedHere(retry)) { status = 'needs_write'; statusReason = 'no other agent that can be locked is left to try'; break }
+        next = { agent: retry, role: 'retry' }
         continue
       }
 
@@ -1485,16 +1783,18 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     }
   } catch (err) {
     if (!signal.aborted) throw err
-    // Record it, then rethrow: callers still treat an abort as an abort.
-    stoppedBy = err
+    // Record it, then rethrow: callers still treat an abort as an abort. The stop's own reason, not
+    // whichever agent's error came back with it (an opinion stopped when its primary broke off, say).
+    stoppedBy = signal.reason ?? err
     status = 'stopped'
     statusReason = 'stopped by the user'
   }
 
   // Accepted work closes the note it continued or wrote, so it never leaks into a later task;
   // a note from other unfinished work stays for its own next session.
-  const wroteNote = (await stat(handoffFile).catch(() => null))?.mtimeMs >= runStartedAt - 1000
-  if (status?.startsWith('accepted') && (continuing || wroteNote)) {
+  // A read pass never archives it: it continued nothing, and the note may be a writer's live one.
+  const wroteNote = !readPass && (await stat(handoffFile).catch(() => null))?.mtimeMs >= runStartedAt - 1000
+  if (!readPass && status?.startsWith('accepted') && (continuing || wroteNote)) {
     await rename(handoffFile, join(cwd, '.kz-harness', `handoff-done-${new Date().toISOString().replace(/[:.]/g, '-')}.md`)).catch(() => {})
   }
 
@@ -1506,8 +1806,46 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     routing = { ...routing, deciderErrors, deciderMs, ...(device ? { deciderDevice: device } : {}) }
   }
 
+  // The lock check: after a read pass, the folder is compared with how it was before. A file that
+  // changed while no other run went on in the repository means a person edited it or the lock did
+  // not hold, and the agents that ran locked are then not trusted with read-only work until restart.
+  // Beside another run (a writer, or another read pass whose own lock may have failed) nothing can
+  // be told apart, so it says it could not measure rather than blame this run's agents.
+  // A pass the person stopped is checked too: a Stop is what a person does on seeing files change.
+  const lockedIds = [...new Set([...attempts.filter((a) => a.locked).map((a) => a.agent), ...startedLocked])]
+  let lockCheck = null
+  let besideOther = false
+  if (readPass && lockedIds.length) {
+    const after = startSnap.git ? await snapshot(cwd, undefined, { ...gitOpts, meta: true }).catch(() => null) : null
+    const endHead = startHead ? await headOf(cwd, undefined, gitOpts).catch(() => null) : null
+    // Asked after the folder is read, so a run that started before that read is seen; not asked of
+    // a folder outside git, which is not measured whatever went on beside it.
+    if (startSnap.git) { try { besideOther = !!(await deps.besideOther?.()) } catch { besideOther = true } }
+    const changed = after ? snapshotDiff(startSnap, after) : null
+    if (changed && startHead && endHead && endHead !== startHead) changed.push(`HEAD (moved from ${startHead.slice(0, 7)} to ${endHead.slice(0, 7)})`)
+    if (!startSnap.git) lockCheck = { measured: false, reason: 'not a git repository' }
+    else if (besideOther) lockCheck = { measured: false, reason: 'another run was going on in this repository at the same time' }
+    else if (!changed) lockCheck = { measured: false, reason: 'git could not read the folder afterwards' }
+    else if (!changed.length && unseenPaths(startSnap, after).length) {
+      // Nothing that git could read changed, but some changed paths it cannot read into at all.
+      const unseen = unseenPaths(startSnap, after)
+      lockCheck = { measured: false, reason: `git cannot see inside ${unseen.slice(0, 3).join(', ')}${unseen.length > 3 ? ` and ${unseen.length - 3} more` : ''}, so a change there would not show` }
+    } else {
+      lockCheck = { measured: true, changed }
+      if (changed.length) {
+        emit('error', { message: `files changed while a locked run read this folder: ${changed.slice(0, 10).join(', ')}${changed.length > 10 ? ` and ${changed.length - 10} more` : ''}` })
+        try { deps.onLockBreach?.(lockedIds, changed) } catch { /* the warning is already out */ }
+      }
+    }
+  }
+
   const record = {
     ts: new Date().toISOString(),
+    // When the run took its lane and how long it held it: the time a person waits for it, checks,
+    // review calls and the steps between attempts included, which the attempts' own times leave
+    // out. The waiting line's estimate is drawn from it (waits.js).
+    startedAt: new Date(heldSince).toISOString(),
+    wallMs: Date.now() - heldSince,
     runId,
     // Which conversation this run belongs to. Without it consecutive runs look unrelated, so
     // "that was wrong, do it again" reads as a brand new job and the correction is lost.
@@ -1529,17 +1867,82 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly =
     assessments,
     finalStatus: status,
     statusReason,
+    // An answer asked for in chat, whatever it came to: the wait estimate leaves it out (waits.js
+    // sampleOf), as one that failed says as little of how long work takes as one that answered.
+    ...(askedAnswerOnly ? { answerOnly: true } : {}),
+    ...(access ? { access: accessRecord(access, { lockOfId, lockedIds, besideOther, lockCheck }) } : {}),
   }
   // The work is done either way; a failed history write must not swallow the report.
   await deps.history.append(record).catch((err) => emit('error', { message: `history not saved: ${err.message}` }))
   if (stoppedBy) throw stoppedBy
+  // A read pass that could not do the task locked is on the record; the task goes to its folder's
+  // line and never records a final status of its own from this pass.
+  if (status === 'needs_write') {
+    // Who read, and for how long: the first work attempt that really ran locked, else a parallel
+    // opinion that did, if any did.
+    const reader = attempts.find((a) => a.locked && (a.role === 'primary' || a.role === 'retry')) ?? attempts.find((a) => a.locked && a.role === 'opinion')
+    // A breach the lock check measured goes with the task: the writer that runs after it starts from
+    // the changed files, and nothing else would ever name them.
+    const breach = lockCheck?.measured && lockCheck.changed?.length ? { changed: lockCheck.changed, agents: lockedIds } : null
+    throw needsLane(statusReason, { readPass: { runId, agent: reader?.agent ?? null, durationMs: reader?.durationMs ?? null, ...(lockCheck ? { lockCheck } : {}), ...(breach ? { breach } : {}) } })
+  }
   emit('final', { status, statusReason })
   // Whose words the person is shown: the PRIMARY's answer. A parallel second opinion is pushed
   // after it, so "the last attempt with any text" handed the run's answer to the opinion and cut
-  // the primary's down to a 1000-char excerpt in the record. The opinion speaks only when the
-  // primary produced nothing at all.
+  // the primary's down to a 1000-char excerpt in the record. The opinion speaks only when no work
+  // attempt completed an answer.
   const last = answeringAttempt(attempts)
   return { ...record, lastAnswer: last?.answerText ?? '', lastAnswerBy: last ? `${last.agent}${last.model || last.effort ? ` (${[last.model, last.effort].filter(Boolean).join(', ')})` : ''}, ${last.role}` : '' }
+}
+
+/** A read verdict in words: who judged it, how sure, against which bar. */
+const verdictWords = (v) => `${providerName(v?.by ?? TEACHER)} ${Math.round((v?.p ?? 0) * 100)}%, bar ${Math.round((v?.bar ?? 0) * 100)}%`
+
+/** What a lock check that measured no change says, and over what. */
+const LOCK_CHECK_CLEAN = 'nothing changed in this repository while it ran (measured over the files git lists as changed or untracked, HEAD, .git/config and its hooks folder when that is in the repository; ignored files are not checked)'
+
+/**
+ * The report's read-only lines: a read pass says who judged it read only, what locked each agent
+ * that ran and what the lock check measured; a pass that writes after being judged read only says
+ * why it needed the folder and what its read pass's lock check came to. Nothing for a run with no
+ * verdict, or one judged to write.
+ */
+export function accessLines(r) {
+  const a = r?.access
+  if (!a?.verdict) return []
+  if (a.mode === 'read') {
+    const locks = Object.entries(a.lock ?? {})
+    const c = a.lockCheck
+    const breached = !!(c?.measured && c.changed?.length)
+    // What the lock did is said by the lock check below, over what it can see: never that the agent
+    // could not change files, which no check here can show.
+    const out = [`- Read only: ${providerName(a.verdict.by ?? TEACHER)} judged it only reads the project (${Math.round(a.verdict.p * 100)}%, bar ${Math.round(a.verdict.bar * 100)}%)${locks.length ? `; ${locks.map(([id, how]) => `${id} ran locked${how ? ` (${how})` : ''}`).join(', ')}` : ''}`]
+    if (c?.measured && !breached) out.push(`- Lock check: ${LOCK_CHECK_CLEAN}`)
+    else if (breached) {
+      const ids = locks.map(([id]) => id).join(' and ')
+      out.push(`- Warning: ${c.changed.join(', ')} changed in this repository while this locked run was reading and no other run was going on in it. Either you edited it, or the lock on ${ids} did not hold; ${ids} ${locks.length > 1 ? 'take' : 'takes'} no read-only work until the harness restarts.`)
+    } else if (c?.reason === 'another run was going on in this repository at the same time') out.push(`- Lock check: not measured: ${c.reason}, so a change there cannot be told from one this run made, and what it read may include that run's unfinished edits`)
+    else if (c) out.push(`- Lock check: not measured: ${c.reason}`)
+    return out
+  }
+  if (a.from === 'read') {
+    const rp = a.readPass
+    const first = rp?.agent && Number.isFinite(rp.durationMs) ? `; ${rp.agent} read for ${Math.round(rp.durationMs / 1000)} s first, locked` : ''
+    const out = [`- Judged read only (${verdictWords(a.verdict)}), then needed the folder: ${a.why}${first}`]
+    // What the read pass's own lock check came to, which no other report shows.
+    const rc = rp?.lockCheck
+    if (rc?.measured && !rc.changed?.length) out.push(`- Its read pass's lock check: ${LOCK_CHECK_CLEAN}`)
+    else if (rc && !rc.measured) out.push(`- Its read pass's lock check: not measured: ${rc.reason}`)
+    // A breach the read pass measured: this run started from those files, so only this line names them.
+    const b = rp?.breach
+    if (b?.changed?.length) {
+      const ids = (b.agents ?? []).join(' and ') || 'the agent that read'
+      out.push(`- Warning: ${b.changed.join(', ')} changed in this repository while the read pass before this run was reading and no other run was going on. Either you edited it, or the lock on ${ids} did not hold; ${ids} ${(b.agents ?? []).length > 1 ? 'take' : 'takes'} no read-only work until the harness restarts. This run started from those changes.`)
+    }
+    return out
+  }
+  if (a.why) return [`- Judged read only (${verdictWords(a.verdict)}), but ran as work that writes: ${a.why}`]
+  return []
 }
 
 // Label and scheme of the invisible chain marker at the end of a report. client.js
@@ -1571,7 +1974,11 @@ const STRIP_PREFIX = 'kzh-agents-1-'
 // answered at all. The report carries excerpts, the live record carries the full text; either
 // one marks the step. The same rule runRouted uses to pick lastAnswer.
 const hasText = (a) => !!(a.answerExcerpt || a.answerText)
-const answeringAttempt = (attempts) => attempts.findLast((a) => hasText(a) && a.role !== 'opinion') ?? attempts.findLast(hasText)
+// A completed answer first, the work's before an opinion's: a failed primary's partial text never
+// wins over an opinion that answered in full.
+const answeringAttempt = (attempts) => attempts.findLast((a) => hasText(a) && a.role !== 'opinion' && a.stopReason === 'completed')
+  ?? attempts.findLast((a) => hasText(a) && a.stopReason === 'completed')
+  ?? attempts.findLast((a) => hasText(a) && a.role !== 'opinion') ?? attempts.findLast(hasText)
 
 /** The chain as data: Jev, then one step per agent, in the order the work moved. */
 export function answeredSteps(r) {
@@ -1679,6 +2086,7 @@ export function formatReport(r) {
   if (r.routing?.conservedFrom) lines.push(`- Work kept off ${r.routing.conservedFrom} to conserve it for harder work; it stays available to review`)
   for (const m of movesOf(R)) lines.push(`- ${moveLine(m, R)}`)
   if (r.continuedFromHandoff) lines.push(`- Continuing from handoff (${HANDOFF})`)
+  lines.push(...accessLines(r))
   const av = r.availability
   if (av?.out.length || av?.near.length) {
     lines.push(`- ${[av.out.length ? `Out: ${av.out.map((o) => `${o.id}${o.until ? ` until ${hhmm(o.until)}` : ''}`).join(', ')}` : '', av.near.length ? `near limit: ${av.near.join(', ')}` : ''].filter(Boolean).join('; ')}`)
@@ -1695,11 +2103,12 @@ export function formatReport(r) {
   r.attempts.forEach((a, i) => {
     const s = a.limitHit ? undefined : r.assessments[k++]
     lines.push(`${i + 1}. ${a.agent} (${a.role}): ${a.stopReason} in ${Math.round(a.durationMs / 1000)}s${a.diagnostic ? `, ${a.diagnostic}` : ''}`)
-    lines.push(`   Changed files: ${a.changedFiles === null ? 'unknown (not git)' : a.changedFiles.length ? a.changedFiles.join(', ') : 'none'}`)
+    const breach = r.access?.lockCheck?.measured && r.access.lockCheck.changed?.length
+    lines.push(`   Changed files: ${a.notStarted ? (a.lockLost ? 'none (it could not be started locked)' : 'none (it was stopped before it started)') : a.locked ? (breach ? 'none credited to it (it ran locked; see the warning above)' : 'none (locked against writing)') : a.changedFiles === null ? 'unknown (not git)' : a.changedFiles.length ? a.changedFiles.join(', ') : 'none'}`)
     if (a.checks?.length) lines.push(`   Checks: ${a.checks.map((c) => `${c.name} ${c.passed ? 'pass' : `FAIL(${c.exitCode})`}`).join(', ')}`)
     if (s) lines.push(`   Assessment: ${s.why} → **${s.action}**`)
   })
-  for (const l of r.limits ?? []) lines.push(`- Usage limit: ${l.agent}${l.until ? ` (resets ${hhmm(l.until)})` : ''} → ${{ rotated: 'next API key', peer: 'handed to another agent', paused: 'paused' }[l.action]}`)
+  for (const l of r.limits ?? []) lines.push(`- Usage limit: ${l.agent}${l.until ? ` (resets ${hhmm(l.until)})` : ''} → ${{ rotated: 'next API key', peer: 'handed to another agent', paused: 'paused', opinion: 'its second opinion had answered, and that answer stands', answered: 'its answer had come back complete, and it stands', line: 'the task went to its folder\'s line', set_aside: 'out until it resets; the run went on without it' }[l.action]}`)
   // Two resources answered independently, so the person is told what the comparison found rather
   // than being shown one answer as if only one had been asked. The overlap is a word count, not
   // a judgment, so it is named as such and the differing answer is shown instead of discarded.
@@ -1711,12 +2120,13 @@ export function formatReport(r) {
     const by = answeringAttempt(r.attempts ?? [])
     const whose = !by ? 'No answer came back.'
       : by.role === 'primary' ? 'The answer below is the primary\'s.'
-      : by.role === 'opinion' ? `The primary gave no answer; the answer below is the second opinion from ${by.agent}.`
+      : by.role === 'opinion' ? `The primary ${(r.attempts ?? []).find((a) => a.role === 'primary')?.stopReason === 'completed' ? 'gave no answer' : 'did not finish'}; the answer below is the second opinion from ${by.agent}.`
       : `The answer below is ${by.agent}'s (${by.role}).`
     // An old record has no `empty` field: it could only fail to compare on an empty side then.
     const found = so.compared
       ? `the two answers ${so.agree ? 'agree' : 'DIFFER'} - wording overlap ${pct(so.similarity)}, a word comparison rather than a judgment.`
-      : so.empty === false ? 'both answered, but their wording could not be compared word for word.' : 'nothing came back to compare.'
+      : so.unfinished ? `the ${so.unfinished === 'primary' ? 'primary' : 'second opinion'} ${(r.attempts ?? []).find((a) => a.role === so.unfinished)?.stopReason === 'completed' ? 'gave no answer' : 'did not finish'}, so there was nothing to compare.`
+        : so.empty === false ? 'both answered, but their wording could not be compared word for word.' : 'nothing came back to compare.'
     lines.push('', `**Second opinion (${so.agent})**: ${found} ${whose}`)
     const opinionText = (r.attempts ?? []).find((a) => a.role === 'opinion')?.answerExcerpt
     if (so.compared && !so.agree && opinionText) lines.push('', `Second opinion from ${so.agent} (excerpt):\n${opinionText}`)
@@ -1728,7 +2138,8 @@ export function formatReport(r) {
     accepted_pending_human_review: 'ACCEPTED, human review recommended before merging',
     needs_human: 'NEEDS HUMAN',
     limit_reached: 'STOPPED: limit reached',
-    paused_limit: `PAUSED: agents at their limits, handoff saved in ${HANDOFF}${reset ? ` (earliest reset ${hhmm(reset)})` : ''}`,
+    paused_limit: `PAUSED: agents at their limits${r.access?.mode === 'read' ? '' : `, handoff saved in ${HANDOFF}`}${reset ? ` (earliest reset ${hhmm(reset)})` : ''}`,
+    needs_write: 'HANDED TO THE FOLDER\'S LINE: it could not be done locked against writing',
   }[r.finalStatus] ?? r.finalStatus
   lines.push('', `**Final status: ${label}**${r.statusReason && r.finalStatus !== 'paused_limit' ? ` (${r.statusReason})` : ''}`)
   if (r.lastAnswer) lines.push('', r.lastAnswer.slice(0, 4000))

@@ -15,14 +15,38 @@ $DshVersion = '0.1.5-rc.2'
 # An existing $DSH_HOME (set by hand or by a parent shell) still wins.
 if (-not $env:DSH_HOME) { $env:DSH_HOME = Join-Path $HOME '.kzh' }
 
+# A Jev key stored in Settings: the one jev-router\accounts.json marks active, while its
+# KZ_KEY__jev__<name> line in $DSH_HOME\.env holds a value; its name, else $null. Jev uses
+# it before TYPESAFE_API_KEY; a line that is not the active key's is not used.
+function Get-StoredJevKey([string]$dataHome) {
+  try {
+    $acct = Get-Content (Join-Path $dataHome 'jev-router\accounts.json') -Raw -ErrorAction Stop | ConvertFrom-Json
+    $name = @($acct.keys.jev | Where-Object { $_.active })[0].name
+    $envFile = Join-Path $dataHome '.env'
+    if ($name -and (Test-Path $envFile)) {
+      # Its value read as the plugin reads .env: the last such line, quotes around it taken off.
+      $line = Select-String -Path $envFile -CaseSensitive -Pattern ('^\s*(?:export\s+)?KZ_KEY__jev__' + [regex]::Escape($name) + '\s*=(.*)$') | Select-Object -Last 1
+      if ($line) {
+        $v = $line.Matches[0].Groups[1].Value.Trim()
+        if ($v -match '^(["'']).*\1$') { $v = $v.Substring(1, $v.Length - 2) }
+        if ($v) { return $name }
+      }
+    }
+  } catch { }
+  return $null
+}
+
 # A terminal opened before Set-TypeSafeKey.ps1 ran will not have the key yet.
-# DSH also reads keys from $DSH_HOME\.env, so only warn when neither has it.
+# DSH also reads keys from $DSH_HOME\.env, so only warn when neither has it, and
+# no Jev key stored in Settings is in use either.
 if (-not $env:TYPESAFE_API_KEY) {
   $k = [Environment]::GetEnvironmentVariable('TYPESAFE_API_KEY', 'User')
   $dshEnv = Join-Path $env:DSH_HOME '.env'
   if ($k) { $env:TYPESAFE_API_KEY = $k }
   elseif (-not ((Test-Path $dshEnv) -and (Select-String -Path $dshEnv -Pattern '^\s*TYPESAFE_API_KEY\s*=' -Quiet))) {
-    Write-Warning 'TYPESAFE_API_KEY not set: Jev routing will use the labelled fallback agent. See C:\Harness\README.md step 2.'
+    $storedJev = Get-StoredJevKey $env:DSH_HOME
+    if ($storedJev) { Write-Host "Jev key '$storedJev' (stored in Settings) is in use." }
+    else { Write-Warning 'TYPESAFE_API_KEY not set: Jev routing will use the labelled fallback agent. See C:\Harness\README.md step 2.' }
   }
   Remove-Variable k -ErrorAction SilentlyContinue
 }
@@ -86,6 +110,9 @@ node (Join-Path $PSScriptRoot 'scripts\patch-dsh-branding.mjs')
 # Search, bookmarks and a taller scrolling list in the composer's model menu.
 node (Join-Path $PSScriptRoot 'scripts\patch-dsh-model-menu.mjs')
 
+# The engine prints nothing until it serves, most of the wait: this line is how the app's
+# splash (app/main.js stepFor) knows the boot has begun.
+Write-Host 'Starting the engine.'
 if ($dshBin) {
   & node $dshBin @dshArgs
 } else {

@@ -41,7 +41,7 @@ if (-not (Test-Path $electron)) { node (Join-Path $root 'app\node_modules\electr
 Ok 'electron'
 # The app as its own Kz-harness.exe (name, icon, version info, locked-down fuses).
 $appExe = Join-Path $root 'app\dist\Kz-harness-win32-x64\Kz-harness.exe'
-if (Get-Process Kz-harness -ErrorAction SilentlyContinue) { Warn 'Kz-harness is running; close it and run this again to rebuild Kz-harness.exe.' }
+if (Get-Process Kz-harness -ErrorAction SilentlyContinue) { Warn 'Kz-harness is running (closing its window leaves it in the tray): quit it (right-click its tray icon and choose Quit) and run this again to rebuild Kz-harness.exe.' }
 else {
   Push-Location (Join-Path $root 'app')
   try { npm run package | Out-Null; if ($LASTEXITCODE) { throw 'Building Kz-harness.exe failed' } } finally { Pop-Location }
@@ -80,10 +80,31 @@ Ok "projects folder $projects"
 
 Step 'Keys'
 $envFile = Join-Path $dshHome '.env'
+# A Jev key stored in Settings stands in for TYPESAFE_API_KEY: the one jev-router\accounts.json
+# marks active, while its KZ_KEY__jev__<name> line holds a value (Jev uses it first).
+function Get-StoredJevKey {
+  try {
+    $acct = Get-Content (Join-Path $dshHome 'jev-router\accounts.json') -Raw -ErrorAction Stop | ConvertFrom-Json
+    $n = @($acct.keys.jev | Where-Object { $_.active })[0].name
+    if ($n -and (Test-Path $envFile)) {
+      # Its value read as the plugin reads .env: the last such line, quotes around it taken off.
+      $line = Select-String -Path $envFile -CaseSensitive -Pattern ('^\s*(?:export\s+)?KZ_KEY__jev__' + [regex]::Escape($n) + '\s*=(.*)$') | Select-Object -Last 1
+      if ($line) {
+        $v = $line.Matches[0].Groups[1].Value.Trim()
+        if ($v -match '^(["'']).*\1$') { $v = $v.Substring(1, $v.Length - 2) }
+        if ($v) { return $n }
+      }
+    }
+  } catch { }
+  return $null
+}
+$storedJev = Get-StoredJevKey
 foreach ($name in 'TYPESAFE_API_KEY', 'DEEPSEEK_API_KEY') {
   $inFile = (Test-Path $envFile) -and (Select-String -Path $envFile -Pattern "^\s*$name\s*=" -Quiet)
   $inEnv = [Environment]::GetEnvironmentVariable($name, 'User')
-  if ($inFile -or $inEnv) { Ok "$name present" } else { Warn "$name missing: add it to $envFile (see README step 2)." }
+  if ($inFile -or $inEnv) { Ok "$name present" }
+  elseif ($name -eq 'TYPESAFE_API_KEY' -and $storedJev) { Ok "Jev key '$storedJev' present (stored in Settings)" }
+  else { Warn "$name missing: add it to $envFile (see README step 2)." }
 }
 
 if (-not $NoShortcuts) {

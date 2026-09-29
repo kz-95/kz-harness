@@ -25,7 +25,7 @@ test('the fixed calls are KzH\'s own shapes, built by the jev.js builders withou
   assert.deepEqual(protocol.map((c) => [c.name, c.phase]), [['intent.task', 'intent'], ['intent.question', 'intent'], ['route', 'route'], ['review', 'review']])
   assert.equal(protocol[0].state.message, 'Fix the failing test in src/parser.ts')
   assert.equal(protocol[1].state.message, 'What does the --fit flag in llama.cpp do?')
-  assert.deepEqual(Object.keys(protocol[0].questions), ['kind', 'depth', 'alsoWork'])
+  assert.deepEqual(Object.keys(protocol[0].questions), ['kind', 'depth', 'alsoWork', 'readOnly'])
   assert.equal(protocol[2].state.task, 'Rename the variable foo to bar in utils.js')
   assert.ok(protocol[2].questions.taskType && protocol[2].questions['req.coding'])
   assert.equal(Object.keys(protocol[2].questions.capability.criteria).length, 11, 'every capability offered, as KzH does')
@@ -223,8 +223,8 @@ test('createProbe against the fake: the warm-up, the protocol checks, no retries
 
   const warm = await probe.warmUp()
   assert.equal(warm.ok, true, warm.error ?? warm.problems.join('; '))
-  assert.deepEqual(warm.calls.map((c) => [c.name, c.phase, c.requests, c.rows]), [['intent.task', 'intent', 1, 3], ['intent.question', 'intent', 1, 3]])
-  assert.deepEqual(fake.requests.map((r) => Object.keys(r.body.questions)), [['kind', 'depth', 'alsoWork'], ['kind', 'depth', 'alsoWork']])
+  assert.deepEqual(warm.calls.map((c) => [c.name, c.phase, c.requests, c.rows]), [['intent.task', 'intent', 1, 4], ['intent.question', 'intent', 1, 4]])
+  assert.deepEqual(fake.requests.map((r) => Object.keys(r.body.questions)), [['kind', 'depth', 'alsoWork', 'readOnly'], ['kind', 'depth', 'alsoWork', 'readOnly']])
   // Each call reports what it cost, for the per-phase figures of 4.5.
   const sent = renderForLaya(warmUpCalls()[0])
   assert.equal(warm.calls[0].tokens, estimateRequestTokens(sent[0]))

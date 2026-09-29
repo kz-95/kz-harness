@@ -96,20 +96,22 @@ export function effortFamily(agentDef) {
 }
 
 /**
- * The decider's 'auto': cheap tasks medium, most high, hard or risky xhigh. Never ultra. `bands`
- * are the cuts on the larger of complexity and risk, from the record of the provider that
- * decided (thresholds.effortBands); the default is Jev's.
+ * The decider's 'auto': trivial tasks low, cheap ones medium, most high, hard or risky xhigh.
+ * Never max or ultra. `bands` are the cuts on the larger of complexity and risk, from the record of
+ * the provider that decided (thresholds.effortBands); the default is Jev's. Each key names the
+ * level under its cut, as riskBands does, so the ladder starts at low: with medium as the first
+ * cut, low could not be reached from any answer at all. Unknown reads 0.5.
  */
-export function autoLevel({ complexity, risk } = {}, bands = { medium: 0.25, high: 0.6 }) {
+export function autoLevel({ complexity, risk } = {}, bands = { low: 0.125, medium: 0.375, high: 0.6 }) {
   const x = Math.max(complexity ?? 0.5, risk ?? 0.5)
-  return x < bands.medium ? 'medium' : x < bands.high ? 'high' : 'xhigh'
+  return x < (bands.low ?? 0) ? 'low' : x < bands.medium ? 'medium' : x < bands.high ? 'high' : 'xhigh'
 }
 
 /**
  * Effort value to send to one agent, or null to leave its default.
  * @param {string} level  unified level (LEVELS)
  * @param {object} agentDef
- * @param {{complexity?: number, risk?: number, override?: string, model?: string, bands?: {medium: number, high: number}}} [jev]
+ * @param {{complexity?: number, risk?: number, override?: string, model?: string, bands?: {low?: number, medium: number, high: number}}} [jev]
  *   override: the agent's own value from Settings (wins over level); bands: autoLevel's cuts
  */
 export function toAgentEffort(level, agentDef, { complexity, risk, override, model, bands } = {}) {

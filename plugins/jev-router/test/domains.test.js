@@ -74,7 +74,7 @@ async function fill(store, domain, n, opts = {}) {
       label: s.label,
       labelSource: opts.teacherOnly ? 'teacher_confirmed' : 'verified_outcome',
       verified: true,
-      details: { finalStatus: opts.failing && i % 2 === 0 ? 'needs_human' : 'accepted', attempts: opts.attempts ?? 1, escalated: false },
+      details: { finalStatus: opts.status ?? (opts.failing && i % 2 === 0 ? 'needs_human' : 'accepted'), attempts: opts.attempts ?? 1, escalated: false },
     })
   }
 }
@@ -1321,4 +1321,24 @@ test('in a Laya run a flat disposition still decides, a domain a rule decides ke
   assert.deepEqual([r.authority, r.chosenKey, r.maturity], ['code', 'RESOURCE_A', null])
   assert.equal((await store.list()).length, 0, 'the Jev store holds nothing of the run')
   assert.equal((await sink.list()).length, 3)
+})
+
+test('a completed answer is not a failure in a domain\'s failure rate', async () => {
+  const root = dir()
+  const store = storeAt(root)
+  await fill(store, 'task_classification', 100)
+  await fill(store, 'task_classification', 30, { status: 'answered' })
+  const ev = await controller({ store, root }).evaluate()
+  assert.equal(ev.rates.failure.recent, 0, `answered runs did what they were asked (${JSON.stringify(ev.rates.failure)})`)
+  assert.equal(ev.rates.failure.baseline, 0)
+})
+
+test('a paused or stopped run a person tagged anyway is left out of a domain\'s failure rate', async () => {
+  const root = dir()
+  const store = storeAt(root)
+  await fill(store, 'task_classification', 100)
+  await fill(store, 'task_classification', 15, { status: 'paused_limit' })
+  await fill(store, 'task_classification', 15, { status: 'stopped' })
+  const ev = await controller({ store, root }).evaluate()
+  assert.deepEqual([ev.rates.failure.recent, ev.rates.failure.baseline], [0, 0], JSON.stringify(ev.rates.failure))
 })

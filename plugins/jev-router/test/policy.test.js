@@ -41,7 +41,9 @@ test('needsPerson goes to human; blockAccept always wins', async () => {
 })
 
 test('accept still asks for a second opinion and flags human review', async () => {
-  assert.equal((await run(nouls(0.9), { risk: 0.1, needsSecondOpinion: 0.9 })).action, 'second_review')
+  assert.equal((await run(nouls(0.9), { risk: 0.3, needsSecondOpinion: 0.9 })).action, 'second_review')
+  // Not under the low risk band, where no review is planned and a second opinion adds none either.
+  assert.equal((await run(nouls(0.9), { risk: 0.1, needsSecondOpinion: 0.9 })).action, 'accept')
   const r = await run(nouls(0.9), { risk: 0.1, needsSecondOpinion: 0.9, needsHumanReview: 0.9 }, { reviewed: true })
   assert.equal(r.action, 'accept')
   assert.equal(r.status, 'accepted_pending_human_review')

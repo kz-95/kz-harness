@@ -182,7 +182,7 @@ async function twoRuns(dir, { onCall } = {}) {
 /** A record with what differs between any two runs removed: its id, its times and its durations. */
 function comparable(v) {
   if (Array.isArray(v)) return v.map(comparable)
-  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).filter(([k]) => !['ts', 'runId', 'durationMs', 'ms'].includes(k)).map(([k, x]) => [k, comparable(x)]))
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).filter(([k]) => !['ts', 'startedAt', 'wallMs', 'runId', 'durationMs', 'ms'].includes(k)).map(([k, x]) => [k, comparable(x)]))
   return v
 }
 
@@ -267,8 +267,8 @@ test('a row pairs Jev\'s answer and Laya\'s by call id, in either order they arr
   for (const r of rows) {
     assert.equal(r.status, 'answered')
     assert.equal(r.runId, null, 'an intent row carries no run id')
-    assert.deepEqual(Object.keys(r.jev.questions), ['kind', 'depth', 'alsoWork'])
-    assert.deepEqual(Object.keys(r.laya.questions), ['kind', 'depth', 'alsoWork'])
+    assert.deepEqual(Object.keys(r.jev.questions), ['kind', 'depth', 'alsoWork', 'readOnly'])
+    assert.deepEqual(Object.keys(r.laya.questions), ['kind', 'depth', 'alsoWork', 'readOnly'])
     assert.equal(r.jev.questions.kind.answer, 'task')
     assert.equal(r.laya.questions.kind.answer, 'question')
     assert.deepEqual(r.jev.questions.kind.p, [0.8, 0.2])

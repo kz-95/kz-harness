@@ -702,6 +702,12 @@ test('a queued task Laya decides says Laya picks, with the reason it was queued 
   const why = 'Laya could not sort this message (timed out after 8 s); treating it as a task.'
   assert.equal(queuedLine({ ...base, decider: 'laya', why }), `Queued → Laya picks as **jev-4** (starting now in Harness). Keep chatting: the result posts here when done. ${why}`)
   assert.equal(queuedLine({ ...base, agent: 'codex', decider: 'laya' }), 'Queued → codex as **jev-4** (starting now in Harness). Keep chatting: the result posts here when done.', 'a forced agent is named as before')
+  // Where it will stand, with why, in the work board's words.
+  assert.equal(queuedLine({ ...base, wait: null }), 'Queued → Jev picks as **jev-4** (starting now in Harness). Keep chatting: the result posts here when done.')
+  assert.equal(queuedLine({ ...base, wait: { why: 'workspace', place: 2, ahead: 0 } }), 'Queued → Jev picks as **jev-4** (2nd in line for Harness: another task is running there). Keep chatting: the result posts here when done.')
+  assert.equal(queuedLine({ ...base, wait: { why: 'line', place: 2, ahead: 1 } }), 'Queued → Jev picks as **jev-4** (2nd in line for Harness: an earlier task there is waiting for a free slot). Keep chatting: the result posts here when done.')
+  assert.equal(queuedLine({ ...base, wait: { why: 'cap', place: 1, ahead: 0, slot: 1 } }), 'Queued → Jev picks as **jev-4** (next for a free slot to start in Harness: the resource budget caps how many tasks run at once). Keep chatting: the result posts here when done.', 'not "1st in line"')
+  assert.equal(queuedLine({ ...base, wait: { why: 'cap', place: 1, ahead: 0, slot: 3 } }).includes('(3rd for a free slot to start in Harness:'), true)
   assert.match(resultSection({ ...READY_RESULT, agent: null, model: null, decider: 'laya' }), /^Agent: Laya picks$/m, 'a result nobody was picked for yet says who would have')
   assert.match(resultSection({ ...READY_RESULT, agent: null, model: null }), /^Agent: Jev picks$/m)
 })
@@ -725,7 +731,7 @@ test('a Laya Auto message is sorted by Laya and read against Laya\'s bars, where
   const orchestrator = { results: () => [], live: () => 0, enqueue: (fields, extra) => { queued.push(extra); return 'queued' } }
   await runAs(make(jev.thresholds, both, orchestrator), 'jev-auto', 'how does it work, and fix it?')
   await runAs(make(laya.thresholds, both, orchestrator), 'laya-auto', 'how does it work, and fix it?')
-  assert.deepEqual(queued, [{ decider: 'jev' }], 'only Jev\'s bar queued the work')
+  assert.deepEqual(queued, [{ decider: 'jev', readVerdict: null }], 'only Jev\'s bar queued the work')
   // Laya's reason for the stronger model is Laya's.
   const deep = await runAs(make(laya.thresholds, { kind: 'question', confidence: 0.95, depth: 'deep' }), 'laya-auto', 'why does this deadlock?')
   assert.match(deep, /Laya judged this worth the stronger model, so Answered by: x\/y/)
@@ -747,7 +753,7 @@ test('a Laya Auto task is routed and queued as Laya\'s, and a Jev row\'s as Jev\
   })
   await runAs(b, 'laya-auto', 'fix the parser')
   await runAs(b, 'jev-auto', 'fix the parser')
-  assert.deepEqual(queued, [{ task: 'fix the parser', decider: 'laya', why: null }, { task: 'fix the parser', decider: 'jev', why: null }])
+  assert.deepEqual(queued, [{ task: 'fix the parser', decider: 'laya', why: null, readVerdict: null }, { task: 'fix the parser', decider: 'jev', why: null, readVerdict: null }])
   assert.equal(await runAs(b, 'laya-auto', ''), 'Type a task and Laya will route it.')
 })
 
@@ -791,4 +797,9 @@ test('a question answered directly tells the usage hook which row it came throug
   })
   for (const id of ['laya-auto', 'jev-auto']) assert.match(await runAs(a, id, 'what does this flag do?'), /^An answer\./, id)
   assert.deepEqual(hooked, [['number', aux2, { decider: 'laya' }], ['number', aux2, { decider: 'jev' }]])
+})
+
+test('a task queued behind a run from the chat says a run from the chat holds its folder', () => {
+  const base = { jobId: 'jev-4', position: 0, workspace: 'C:\\work\\Harness' }
+  assert.equal(queuedLine({ ...base, wait: { why: 'chat', place: 2, ahead: 0 } }), 'Queued → Jev picks as **jev-4** (2nd in line for Harness: a run started from the chat is using it). Keep chatting: the result posts here when done.')
 })

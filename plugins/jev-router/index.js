@@ -20,18 +20,19 @@ import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import { createJev } from './jev.js'
-import { formatReport, pricingNow, runRouted } from './router.js'
+import { OUT_STATES, formatReport, notReadyWhy, pricingNow, routingPolicy, runRouted } from './router.js'
 import { LEVELS, codexServiceTier } from './effort.js'
 import { run } from './workspace.js'
 import { authAction, canAuth, checkAgents } from './setup.js'
 import { JEV_PROVIDER, jevAdapter, line, nameOfAgent, queuedLine } from './adapter.js'
-import { executorsFrom } from './capabilities.js'
+import { LOCK_UNAVAILABLE, NEEDS_LANE, executorsFrom, lockOf } from './capabilities.js'
 import { createDelivery } from './delivery.js'
 import { createFormatter } from './format.js'
 import { CLEAR, createFeedback, validFeedback } from './feedback.js'
-import { TERMINAL_STATES, WAITING, createLanes, createTasks, laneKey, validJobId } from './tasks.js'
+import { TERMINAL_STATES, WAITING, createLanes, createMutex, createRunLog, createTasks, laneKey, runAdmitted, runKeysOf, validJobId } from './tasks.js'
+import { createWaitStats, waitEstimate } from './waits.js'
 import { SESSION_ID, exportSession, redactSecrets } from './export.js'
-import { KEY_NAME, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
+import { KEY_NAME, KEY_NAME_RULE, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
 import { createUsage, detectLimit, longWindowPercent } from './usage.js'
 import { DOMAINS, resolvePolicy } from './routing-policy.js'
 import { answererUnconfigured, createCapabilityRegistry, evidenceFromFeedback, evidenceFromRun, loadPriors, subjectOf } from './profiles.js'
@@ -496,7 +497,7 @@ export function createFeedbackRoute({ learn, ...deps }) {
  * @param {object} p.feedback     feedback.js's store for the log beside it
  * @param {object} [p.capabilities] the capability registry, whose creditedRun places a verdict
  */
-export function createHistoryDeps({ historyFile, feedback, capabilities }) {
+export function createHistoryDeps({ historyFile, feedback, capabilities, onAppend }) {
   const dataDir = dirname(historyFile)
   // ponytail: reads the whole file; switch to a tail read if history grows past a few MB.
   const allRecords = async () => {
@@ -532,6 +533,8 @@ export function createHistoryDeps({ historyFile, feedback, capabilities }) {
     async append(record) {
       await mkdir(dataDir, { recursive: true })
       await appendFile(historyFile, `${JSON.stringify(record)}\n`)
+      // Told once the row is on disk, so whatever counts runs as they end counts only real rows.
+      try { onAppend?.(record) } catch { /* the row is written; a listener's failure is its own */ }
     },
   }
 }
@@ -760,8 +763,13 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   try { capabilities.load() } catch (err) { process.stdout.write(`[jev] capability evidence not loaded: ${err.message}\n`) }
   // What the router reads its priors from: history.jsonl, the feedback log beside it, and the run
   // each verdict is about, placed with this registry's credit (createHistoryDeps).
-  const history = createHistoryDeps({ historyFile: config.historyFile, feedback, capabilities })
+  // What the waiting line's estimates are drawn from (waits.js): the history, read once at start and
+  // then added to as each run appends its row, never read on the task list's once-a-second poll.
+  // Until the first read lands the levels are simply short, and no estimate is given.
+  const waitStatsNow = createWaitStats()
+  const history = createHistoryDeps({ historyFile: config.historyFile, feedback, capabilities, onAppend: (record) => waitStatsNow.add(record) })
   const allRecords = history.records
+  allRecords().then((rows) => waitStatsNow.load(rows), () => {})
   const training = createTrainingStore({ file: join(dataDir, 'routing-samples.jsonl'), policy, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
   // Every decision of a run Laya decided goes to a store of its own (docs/laya-auto.md 6.1): no
   // local classifier reads it, and the Jev store refuses a Laya row, so Laya Auto's failures can
@@ -921,7 +929,9 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     jevCredentialRef: config.credentialRef,
     codexAccount: () => usage.codexAccount(),
   })
-  const usage = createUsage({ dataDir, accounts })
+  // Key rows are scored against the floors of every switched-on agent drawing on them, whichever
+  // agents a reading is for (a balance check after one agent's attempt, the benchmark's spend).
+  const usage = createUsage({ dataDir, accounts, floorAgents: () => enabledAgents(), jevKeyInUse: () => jevStoredKeyInUse() })
 
   // Local models (llama-server on 127.0.0.1), installed module by module from config/local-models.json.
   let modules = []
@@ -1225,20 +1235,40 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     return w.filter((x) => x.usedPercent === top).map((x) => x.resetsAt).filter(Boolean).sort().at(-1) ?? null
   }
 
-  // A real limit error: api agents move to the next key of their provider (the same agent may run
-  // again); subscriptions, and api agents with no usable key left, count as exhausted until reset.
-  async function onLimit(a, { until, reason } = {}) {
-    if (!a) return { rotated: false }
+  // A limit. One the balance check after an attempt found (`floor`: the agent's own Stop below, or a
+  // mark already made) is the agent's own reading, which the next snapshot shows again: nothing is
+  // marked. A real limit error spends the stored key the call went out on (`key`, the one in use as
+  // the router started the call; null when it used none), which holds out every agent whose calls
+  // go out on it, and makes the next usable key active in its place, once: a limit on a key another
+  // limit already switched away from switches nothing more. That switch reaches agent calls only
+  // after a restart (accounts.launchKeyName), so no agent goes on with a new key within the run.
+  // An agent whose calls use no stored key is marked itself, until its reset.
+  async function onLimit(a, { until, reason, key, floor = false } = {}) {
+    if (!a || floor) return { rotated: false }
     const provider = kindOf(a) === 'api' ? keyProviderOf(a) : null
-    const active = provider && accounts.activeKey(provider)
-    if (active) {
-      await accounts.markExhausted(`${provider}:${active}`, { until: until ?? hoursFromNow(6), reason })
-      const next = accounts.nextKey(provider, (n) => keyOut(provider, n))
-      // A key that only applies after a restart cannot help this run.
-      if (next && !(await accounts.activate(provider, next)).restartRequired) return { rotated: true, key: next }
+    const spent = provider ? (key === undefined ? accounts.launchKeyName(provider) : key) : null
+    let keyHeld = false
+    if (spent) {
+      // Switched from only when the key marked is the active one: not another added under its name.
+      const marked = await accounts.markKeyExhausted(provider, spent, { until: until ?? hoursFromNow(6), reason })
+      keyHeld = marked || !!accounts.launchKeyGone(provider)?.spent
+      if (marked && accounts.activeKey(provider) === spent) {
+        const next = accounts.nextKey(provider, (n) => keyOut(provider, n))
+        if (next) await accounts.activate(provider, next).catch(() => {})
+      }
     }
-    await accounts.markExhausted(a.id, { until: until ?? (kindOf(a) === 'subscription' ? resetOf(a.id) : null) ?? hoursFromNow(1), reason })
+    // A key's own mark holds the agent out while its calls go out on that key, and no longer:
+    // after a restart onto another key it is usable at once.
+    if (!keyHeld) await accounts.markExhausted(a.id, { until: until ?? (kindOf(a) === 'subscription' ? resetOf(a.id) : null) ?? hoursFromNow(1), reason })
     return { rotated: false }
+  }
+
+  // The stored Jev key Jev's calls go out on, as makeDecider resolves one per call: the active one
+  // while its value is there, else null (Jev falls back to its credential, or has none).
+  const jevStoredKeyInUse = async () => {
+    await accounts.ready().catch(() => {})
+    const name = accounts.activeKey('jev')
+    return name && (await accounts.resolveKey('jev', name).catch(() => undefined)) ? name : null
   }
 
   // Before routing: an active key already known to be spent gives way to the next usable one.
@@ -1278,6 +1308,9 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     return null
   }
   const stoppers = new Map() // run id -> AbortController, while the run is active (POST /runs/stop)
+  // Setting the process-wide effort variables and starting the Claude Code or Codex agent that reads
+  // them, one start at a time (runAgent).
+  const envStarts = createMutex()
 
   // The token counts of an agent's usage as usage.jsonl keeps them, whatever names its provider gives them.
   const usageTokens = (u) => (u ? { input: u.inputTokens ?? u.input ?? 0, output: u.outputTokens ?? u.output ?? 0, cacheRead: u.cacheReadTokens ?? u.cacheRead ?? 0, reasoning: u.reasoningTokens ?? u.reasoning ?? 0 } : null)
@@ -1303,7 +1336,9 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     await rotateSpentKeys(agents)
     const quota = await quotaFor(agents)
     const byId = new Map(agents.map((a) => [a.id, a]))
-    const accountOf = (a) => (kindOf(a) === 'subscription' ? usage.last()?.out?.[a.id]?.account?.email ?? null : accounts.activeKey(keyProviderOf(a)) ?? a.credentialRef ?? null)
+    // The account a call goes out on: a subscription's login, the stored key an api agent's calls
+    // go out on (accounts.launchKeyName; still so once removed), else its own credential.
+    const accountOf = (a) => (kindOf(a) === 'subscription' ? usage.last()?.out?.[a.id]?.account?.email ?? null : accounts.launchKeyName(keyProviderOf(a)) ?? a.credentialRef ?? null)
 
     // A local agent's attempt is counted while it runs, so a speed benchmark is refused meanwhile,
     // and while one goes it waits before its subagent starts, with a line that says so
@@ -1313,10 +1348,15 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     const execute = async (agentDef, prompt, agentSignal, options = {}) => {
       const localAgent = kindOf(agentDef) === 'local'
       const report = onExecuted ? { agent: agentDef.id, timedOut: false, disposeError: null, tokens: null, ...(localAgent ? { engine: { before: local.engineCounters(), after: null } } : {}) } : null
+      let reached = false
       try {
         return await (localAgent
-          ? local.localAgentAttempt(() => runAgent(agentDef, prompt, agentSignal, options, report), { signal: agentSignal, onWait, untimed: options.untimed })
+          ? local.localAgentAttempt(() => { reached = true; return runAgent(agentDef, prompt, agentSignal, options, report) }, { signal: agentSignal, onWait, untimed: options.untimed })
           : runAgent(agentDef, prompt, agentSignal, options, report))
+      } catch (err) {
+        // A locked agent stopped while it still waited for its turn on this PC never started.
+        if (options.locked && localAgent && !reached && !signal.aborted) throw Object.assign(new Error(`stopped before ${agentDef.id} started: ${err?.message ?? err}`), { notStarted: true })
+        throw err
       } finally {
         if (report) {
           report.timedOut = timedOutBy(agentSignal, signal)
@@ -1325,12 +1365,23 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
         }
       }
     }
-    const runAgent = async (agentDef, prompt, agentSignal, { effort: eff, speed } = {}, report = null) => {
+    const runAgent = async (agentDef, prompt, agentSignal, { effort: eff, speed, locked = false, images = false, onStarted, onEnded } = {}, report = null) => {
+      // A read pass starts the agent locked against writing, or not at all (capabilities.js lockOf):
+      // Claude Code through its plan-mode provider row, a spawn agent with only the read tools its
+      // parent sees. The lock is read again here, at the start itself, so one that stopped holding
+      // since the router looked (a lock breach, a provider gone) is never started unlocked.
+      const lock = locked ? lockFor(agentDef, agent, { images }) : null
+      if (lock && !lock.lock) throw Object.assign(new Error(lock.why), { code: LOCK_UNAVAILABLE })
       // Claude Code and Codex executors take no per-run options: they read these from process.env
-      // when the run starts (Claude: SDK child env; Codex: patched turn/start, see README).
-      // ponytail: process-wide env, two workspaces starting Claude/Codex in the same instant can swap efforts.
-      if (agentDef.provider === 'claude-code') setEnv('CLAUDE_CODE_EFFORT_LEVEL', eff)
-      if (agentDef.provider === 'codex') { setEnv('KZ_CODEX_EFFORT', eff); setEnv('KZ_CODEX_SERVICE_TIER', codexServiceTier(speed)) }
+      // when the run starts (Claude: SDK child env, read as its start() builds the query; Codex:
+      // patched turn/start, see README). The variables are process-wide, and a read pass now starts
+      // beside a writer as a matter of course, so setting them and starting the agent is one step
+      // at a time (envStarts): two starts at once would otherwise swap their efforts.
+      const envBound = agentDef.provider === 'claude-code' || agentDef.provider === 'codex'
+      const setEffortEnv = () => {
+        if (agentDef.provider === 'claude-code') setEnv('CLAUDE_CODE_EFFORT_LEVEL', eff)
+        if (agentDef.provider === 'codex') { setEnv('KZ_CODEX_EFFORT', eff); setEnv('KZ_CODEX_SERVICE_TIER', codexServiceTier(speed)) }
+      }
       // A local run names the weights it ran on, so its history record keeps that version
       // however late it is read back (a verdict an hour on, a backfill), never the one
       // installed by then; profiles.js does not ask versionOf about a past run. It is read as the
@@ -1339,19 +1390,54 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       // (docs/benchmark.md 3.9).
       const version = versionOf(agentDef, agentDef.llm?.model ?? null)
       if (report && version) report.modelVersion = version
-      const sub = await ctx.subagents.start(agentDef.provider, {
+      // In-process children see global tools; hide the router so an agent never re-routes its own
+      // task. A locked child's allow list hides it too, with everything else that is not reading.
+      const toolFilter = lock?.lock?.toolFilter ?? (agentDef.provider === 'spawn' && config.registerTool ? { deny: ['jev_route'] } : null)
+      let sub
+      const start = () => ctx.subagents.start(lock?.lock?.provider ?? agentDef.provider, {
         label: `jev:${agentDef.id}`,
         prompt: [{ type: 'text', text: prompt }],
         parent: agent,
         signal: agentSignal,
         ...(agentDef.persona ? { persona: agentDef.persona } : {}),
-        // In-process children see global tools; hide the router so an agent never re-routes its own task.
-        ...(agentDef.provider === 'spawn' && config.registerTool ? { toolFilter: { deny: ['jev_route'] } } : {}),
+        ...(toolFilter ? { toolFilter } : {}),
         // Pin the model: a spawn child otherwise inherits the parent's (Jev) model and routes back into Jev.
         ...(agentDef.llm?.provider && agentDef.llm?.model ? { agentOptions: { provider: agentDef.llm.provider, model: agentDef.llm.model, ...(eff ? { reasoningEffort: eff } : {}) } } : {}),
       })
       try {
-        const r = await sub.result
+        sub = await (envBound ? envStarts(() => {
+          // Read once more at the start itself: a lock breach recorded while this start waited its
+          // turn is seen before anything starts.
+          if (locked) { const now = lockFor(agentDef, agent, { images }); if (!now.lock) throw Object.assign(new Error(now.why), { code: LOCK_UNAVAILABLE }) }
+          setEffortEnv()
+          return start()
+        }, agentSignal) : start())
+      } catch (err) {
+        if (lock && !agentSignal?.aborted) throw Object.assign(new Error(`could not start ${agentDef.id} locked: ${err?.message ?? err}`), { code: LOCK_UNAVAILABLE })
+        // Stopped before its child existed, by its own time limit or a primary that failed beside
+        // it rather than the run's Stop: it never ran, so it is never said to have run locked.
+        if (lock && !signal.aborted) throw Object.assign(new Error(`stopped before ${agentDef.id} started: ${err?.message ?? err}`), { notStarted: true })
+        throw err
+      }
+      // A child's own tools are outside the allow list (dsh-tools view()), so what a locked child can
+      // really call is read once it exists; anything beyond reading, or a view that cannot be read,
+      // and it is stopped before it works.
+      if (lock?.lock?.toolFilter) {
+        let seen = null
+        try { seen = sub.localAgent && typeof ctx.tools?.schemas === 'function' ? ctx.tools.schemas(sub.localAgent).map((t) => t.name) : null } catch { seen = null }
+        const beyond = seen ? seen.filter((n) => !lock.lock.toolFilter.allow.includes(n)) : null
+        if (!seen || beyond.length) {
+          await sub.dispose().catch(() => {})
+          throw Object.assign(new Error(seen ? `its child could still see ${beyond.join(', ')}` : 'what its child can see could not be read'), { code: LOCK_UNAVAILABLE })
+        }
+      }
+      // Started locked: the router's lock check covers it whatever this attempt comes to, a Stop included.
+      if (lock) { try { onStarted?.() } catch { /* the router's */ } }
+      try {
+        // The agent's result is in once this settles; the router is told before its process is
+        // disposed of, which can take a while, so a primary that breaks off meanwhile is not taken
+        // to have stopped it.
+        const r = await Promise.resolve(sub.result).finally(() => { try { onEnded?.() } catch { /* the router's */ } })
         if (report) report.tokens = usageTokens(r.usage)
         return { stopReason: r.stopReason, diagnostic: r.diagnostic, answerText: textOf(r.output), usage: r.usage, ...(version ? { modelVersion: version } : {}) }
       } finally {
@@ -1382,12 +1468,16 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
           economics: config.resources?.economics ?? {},
         }),
         execute,
+        // How each agent is locked against writing for a read pass, with this run's parent's view.
+        lockOf: (a, o) => lockFor(a, agent, o),
         runTool: runTool(cwd, config.agentTimeoutMs),
         modelOf,
         emit: onEvent,
         quota,
         isLimitError: detectLimit,
         onLimit: (agentId, info) => onLimit(byId.get(agentId), info),
+        // The key (an api agent's active key, else null) and the account a call starts on.
+        accountAt: (agentId) => { const a = byId.get(agentId); if (!a) return null; const p = kindOf(a) === 'api' ? keyProviderOf(a) : null; return { key: p ? accounts.launchKeyName(p) : null, account: accountOf(a) } },
         // Only metered keys need re-reading; a subscription's window is rationed by the gate,
         // and a local model costs nothing.
         checkBalance: async (agentId) => {
@@ -1402,7 +1492,8 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
           const { tokens: u, runId: _routerRunId, answerText: _a, ...rest } = entry
           const a = byId.get(entry.agent)
           return usage.logAttempt({
-            ...rest, runId, sessionId, workspace: cwd, provider: a?.provider ?? null, account: a ? accountOf(a) : null,
+            // The account the call started on, when the router says; else the one active now.
+            ...rest, runId, sessionId, workspace: cwd, provider: a?.provider ?? null, account: rest.account !== undefined ? rest.account : a ? accountOf(a) : null,
             tokens: usageTokens(u),
             costUsd: rest.costUsd ?? null, quotaBefore: quota[entry.agent]?.summary ?? null, quotaAfter: usage.last()?.out?.[entry.agent] ? summaryOf(usage.last().out[entry.agent]) : null,
             ...(purpose ? { purpose } : {}),
@@ -1420,10 +1511,76 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   const inScratch = (cwd) => sameDir(cwd, scratchRoot) || resolve(cwd).startsWith(scratchRoot + sep)
   const SCRATCH_ONLY = 'The KzH scratch workspace is for the capability benchmark only; open one of your projects to run tasks.'
 
-  // Subagents inherit the jev_route tool and would re-route their own prompt, nesting forever.
-  // Also stops two routes editing the same workspace at once.
-  const active = new Set()
-  async function route({ task, agent, forceAgent, answerOnly, effort, mode = 'auto', decider = 'jev', laneHeld = false, modalities, signal = new AbortController().signal, emit, onEntry }) {
+  // A routed agent is started as a child of the chat that routed it (runAgent's `parent`), and a
+  // child that called jev_route would route its own task again, waiting on the lane its own parent
+  // holds, forever. Spawn children cannot see the tool (runAgent's toolFilter); this refuses the
+  // call by who makes it, whatever the provider: a child (its session header's parentSession) of
+  // a chat with a route running now. Keyed on the caller, not the workspace, so another run in
+  // the same folder, a foreground /auto beside a background task, waits its turn in the lane.
+  const routing = new Map() // session id -> routes running now for it
+  const nestedIn = (agent) => { const up = agent?.session?.header?.parentSession; return !!up && (routing.get(up) ?? 0) > 0 }
+
+  // Read-only work (docs/queue-and-cost-findings.md 1). An agent whose lock did not hold (files
+  // changed while it ran locked and no task was changing the folder) takes no read-only work until
+  // the harness restarts; by agent id, with when and what changed.
+  const distrusted = new Map()
+  // How `a` can be locked against writing when `parent` starts it, or why not: the facts as the
+  // engine reports them now (capabilities.js lockOf), the parent's own view of the tools included.
+  const lockFor = (a, parent, { images = false } = {}) => {
+    let toolMode
+    try { toolMode = ctx.tools?.modeFor?.(parent) } catch { toolMode = undefined }
+    return lockOf(a, {
+      providerNamed: (n) => ctx.subagents.getProvider?.(n),
+      visibleTool: (n) => ctx.tools?.get?.(n, parent) !== undefined,
+      toolMode,
+      images,
+      distrusted: distrusted.get(a.id) ?? null,
+    })
+  }
+  // What Jev setup says of an agent's read-only work. A spawn agent's tools depend on the chat that
+  // starts it, so only what holds for every run is read here, and the rest as each run starts.
+  const readOnlyOf = (a) => {
+    const l = a.provider === 'spawn'
+      ? lockOf(a, { providerNamed: (n) => ctx.subagents.getProvider?.(n), visibleTool: () => true, toolMode: 'native', distrusted: distrusted.get(a.id) ?? null })
+      : lockFor(a, null)
+    return l.lock ? { how: a.provider === 'spawn' ? 'read tools only, checked as each run starts' : l.lock.how, why: null } : { how: null, why: l.why }
+  }
+  // Said once in the server log, the first time a task is judged read only: which agents can take
+  // such work and how, and which cannot and why.
+  let readOnlyLogged = false
+  const logReadOnly = (agents) => {
+    if (readOnlyLogged) return
+    readOnlyLogged = true
+    const parts = agents.map((a) => { const r = readOnlyOf(a); return r.how ? `${a.id} by ${r.how}` : `not ${a.id} (${r.why})` })
+    process.stdout.write(`[jev] read-only work: ${parts.join('; ') || 'no agent is switched on'}\n`)
+  }
+  // Every run going on, and every run that ended while one started before its end still goes on,
+  // each by the folders it works in as a repository sees them (runKeysOf) and when it started and ended
+  // (in one sequence). A read pass's lock check can only pin a change on its own agents when no
+  // other run, a writer or another read pass, went on at any time while it ran in a folder that
+  // holds its repository or sits inside it: `git status` sees the whole repository, and a run in a
+  // folder above it (a folder of projects, a repository holding a clone that is not a submodule)
+  // writes into it just the same. Linked worktrees of one repository share the .git/config and hooks
+  // the lock check compares, so runs in them are related too, and a folder reached through a link
+  // is known by both its spellings.
+  const runLog = createRunLog({ sep })
+  // Which run holds each workspace's lane, since when, and what it turned out to be, while it runs:
+  // a waiting task's estimate starts from how long that run has gone and what it runs (waits.js
+  // levels), taken from its own events as they pass (route()'s onEvent). A lane held by anything
+  // else, a benchmark, has no entry here and so no estimate.
+  // A run holding a lane is described on the lane itself (acquire's `who`): what kind of run it is,
+  // who decides it, since when it holds the lane and what it turned out to be. The lane hands it to
+  // whoever asks where a waiting task stands, so no second record keyed by workspace can drift from
+  // who really holds it.
+  // What a run holding a lane is, from its events: who decided it, which agent does the work (none
+  // for a tool), whether its plan has a review by a second agent, and the effort its first work
+  // attempt started at.
+  const noteShape = (held, e) => {
+    if (!held) return
+    if (e.type === 'routed') held.shape = { ...held.shape, decider: e.routing?.decider ?? held.shape?.decider, agent: e.tool ? null : e.routing?.primaryAgent ?? null, review: !!(e.plan?.forceReview && e.plan?.reviewer) }
+    if (e.type === 'attempt_start' && e.role === 'primary' && held.shape && held.shape.effort === undefined) held.shape = { ...held.shape, effort: e.effort ?? null }
+  }
+  async function route({ task, agent, forceAgent, answerOnly, effort, mode = 'auto', decider = 'jev', laneHeld = false, who: laneWho = null, access = null, modalities, signal = new AbortController().signal, emit, onEntry }) {
     const cwd = agent?.session?.header?.cwd
     if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
     if (inScratch(cwd)) throw new Error(SCRATCH_ONLY)
@@ -1434,24 +1591,36 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     if (laya) layaUnavailable('act')
     else if (decider !== 'jev') throw new Error(`jev-router: no decider named ${decider}`)
     const key = resolve(cwd).toLowerCase()
-    // A nested agent calling jev_route would deadlock on the lane its own parent holds,
-    // so that case still refuses outright rather than waiting.
-    if (active.has(key)) throw new Error('already routing a task in this workspace; wait for it to finish (a nested agent must do its task directly, not call jev_route)')
+    if (nestedIn(agent)) throw new Error('a routed agent must do its task directly, not call jev_route: it would wait for its own run to end')
+    // A read pass runs beside whatever holds its workspace, so it may only come from the task
+    // runner, which gave it a slot of its own (tasks.js runAdmitted).
+    const readPass = access?.mode === 'read'
+    if (readPass && !laneHeld) throw new Error('a read pass runs only from the task runner, on a slot of its own')
     // One queue per workspace for every caller. Background tasks and slash commands
     // used to hold two independent mutexes, which let both run in one working tree. The budget's
     // cap on tasks at once counts this run too, so when it has to wait it says so, in its live lines
     // and the log, rather than sitting silent until a task in another workspace ends.
-    const release = laneHeld ? () => {} : await lanes.acquire(key, `route-${randomUUID()}`, signal, { onWait: (why) => { emit?.({ type: 'queued', text: WAITING[why] }); process.stdout.write(`[jev] ${WAITING[why]}\n`) } })
-    active.add(key)
+    const who = laneHeld ? laneWho : { kind: 'chat', decider, answerOnly: !!answerOnly }
+    const release = laneHeld ? () => {} : await lanes.acquire(key, `route-${randomUUID()}`, signal, { who, onWait: (why) => { emit?.({ type: 'queued', text: WAITING[why] }); process.stdout.write(`[jev] ${WAITING[why]}\n`) } })
+    const routingFor = agent?.session?.id
+    if (routingFor) routing.set(routingFor, (routing.get(routingFor) ?? 0) + 1)
     const sessionId = sessionIdOf(agent) ?? cwd
     // One id for the whole run, minted before anything records it (2.4): the inspector's entry,
     // Stop, the task record, the router, usage.jsonl and the shadow's rows all carry it.
     const runId = randomUUID()
     const entry = logRun(sessionId, task, runId)
+    const held = who
+    if (held) Object.assign(held, { runId, startedAt: entry.startedAt, shape: { decider } })
     onEntry?.(entry)
     const stop = new AbortController()
     stoppers.set(runId, stop)
     signal = AbortSignal.any([signal, stop.signal])
+    // Every run is counted as it starts, by the folder its repository is known by, which git looks
+    // up meanwhile: nothing is awaited for it, so no run waits on it (a Laya start included), and
+    // until it is known the run counts as related to every other (createRunLog). Only after
+    // onEntry: nothing may be awaited between the lane letting a task in and its record saying so,
+    // or a Remove meant for a waiting task would stop one that already holds its lane.
+    const counted = runLog.track(() => runKeysOf(cwd), laneKey(cwd))
     // From the moment a Laya-decided run starts to its return, Laya is held: neither the idle stop
     // nor the RAM watchdog takes it away between the run's calls, which can be minutes apart (7.6).
     if (laya) sidecar.hold(runId)
@@ -1460,7 +1629,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // background, and nothing else of the shadow reaches the live stream (3.3).
     const withShadowNote = (e) => (e.type === 'routed' && !laya && client && shadowOn() ? { ...e, shadow: sidecar.isReady() ? 'answering' : 'not_running' } : e)
     // Each step also goes to the server log, which the Kz-harness app shows in its log window.
-    const onEvent = (event) => { const e = withShadowNote(event); entry.events.push({ ...e, text: line(e) }); emit?.(e); logStep(line(e)) }
+    const onEvent = (event) => { const e = withShadowNote(event); noteShape(held, e); entry.events.push({ ...e, text: line(e) }); emit?.(e); logStep(line(e)) }
     try {
       const onTrace = (trace) => onEvent({ type: 'jev', at: Date.now(), trace })
       // A call that did not answer is a line of its own, and never a usage row (2.4, 3.3).
@@ -1509,15 +1678,31 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
         forceAgent,
         answerOnly,
         effort,
+        access,
         config: { ...config, agents, effort: await readEffort() },
         signal,
         deps: {
           ...deps,
+          // A read pass's lock check: whether any other run went on in a related folder while it
+          // ran (one was going at its start, one is going now, or one started and ended since),
+          // and what to do when files changed with none of that.
+          ...(readPass ? {
+            // Asked once the folder has been read again: the runs that count are fixed then, and
+            // their folder lookups still pending are waited for (createRunLog besideNow).
+            besideOther: () => runLog.besideNow(counted),
+            onLockBreach: (ids, files) => {
+              for (const id of ids) distrusted.set(id, { at: Date.now(), files })
+              process.stdout.write(`[jev] read-only lock did not hold: ${files.join(', ')} changed in ${cwd} while ${ids.join(', ')} ran locked; ${ids.join(', ')} takes no read-only work until the harness restarts\n`)
+            },
+          } : {}),
           // Whoever decides, and always its record beside it, so the run's bars are its bars even
           // when there is no client (docs/laya-auto.md 2.4).
           decider: client,
           provider: laya ? LAYA : providers.jev,
           runId,
+          // When this run took its lane: its history row's wall time counts from here, as the
+          // waiting line's figure for a run holding the lane does (waits.js).
+          startedAt: entry.startedAt,
           offline,
           localOnly,
           remoteOnly,
@@ -1550,11 +1735,15 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       }).catch(() => {})
       return withRunMark(formatReport(result), result.runId)
     } catch (err) {
-      onEvent({ type: 'error', at: Date.now(), message: err.message })
+      // A read pass that cannot do the task locked is no error: the task goes to its folder's line
+      // (tasks.js runAdmitted), and its record and row say why. Nothing is learned from it.
+      if (err?.code === NEEDS_LANE) onEvent({ type: 'access', at: Date.now(), mode: 'write', from: 'read', why: err.message, ...(err.readPass?.breach ? { breach: err.readPass.breach } : {}) })
+      else onEvent({ type: 'error', at: Date.now(), message: err.message })
       throw err
     } finally {
       if (laya) sidecar.release(runId)
-      active.delete(key)
+      runLog.close(counted)
+      if (routingFor) { const n = (routing.get(routingFor) ?? 1) - 1; if (n > 0) routing.set(routingFor, n); else routing.delete(routingFor) }
       release()
       stoppers.delete(runId)
     }
@@ -1587,7 +1776,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // Who stopped the task, if anyone: the person from the inspector, or the benchmark's own Stop.
     const stoppedBy = () => (stop.signal.aborted ? 'person' : signal.aborted ? 'benchmark' : null)
     try {
-      release = await lanes.acquire(laneKey(folder), `benchmark-${runId}`, signal, { onWait: (why) => onWait?.(WAITING[why]) })
+      release = await lanes.acquire(laneKey(folder), `benchmark-${runId}`, signal, { who: { kind: 'benchmark' }, onWait: (why) => onWait?.(WAITING[why]) })
       onStart?.()
       const entry = logRun(session, prompt, runId)
       stoppers.set(runId, stop)
@@ -1668,19 +1857,28 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // The result goes to its conversation the moment the task settles, and keeps trying if
     // that first attempt does not land.
     onSettled: (result, owner) => { delivery.deliverWithRetry(result, owner).catch(() => {}) },
+    // How long a waiting task may still wait, from the runs like the one holding its workspace.
+    wait: ({ workspace, holder, aheadWho, ...where }) => waitEstimate(waitStatsNow, where, { holder: holder?.startedAt ? { shape: holder.shape, elapsedMs: Date.now() - holder.startedAt, answerOnly: holder.answerOnly } : null, ahead: aheadWho, workspace }),
     log: (m) => process.stdout.write(`[jev] ${m}
 `),
     run: (t, { signal, emit, onEntry }) => {
-      // Read before the first emit: `t.agent` becomes the agent the router picked.
+      // Read before the first emit: `t.agent` becomes the agent the router picked and a read pass
+      // sets `t.effort` to its own, so a writer pass after one runs with what the task was queued with.
       const forceAgent = t.agent ?? undefined
+      const effort = t.effort ?? undefined
+      const verdict = t.readVerdict ?? null
+      const writeWhy = t.accessWhy ?? null
       // Only say "waiting" when it will wait, and what for: its workspace, or the cap on tasks at once.
-      return lanes.acquire(laneKey(t.workspace), t.jobId, signal, { onWait: (why) => emit({ type: 'queued', text: WAITING[why] }) }).then(async (release) => {
-        try {
-          // Whoever the task was queued for decides it, and route() asks now whether Laya can be
-          // asked, however long ago the task was queued.
-          return await route({ task: t.task, agent: t.owner, forceAgent, effort: t.effort ?? undefined, mode: t.mode ?? 'auto', decider: t.decider ?? 'jev', laneHeld: true, modalities: t.modalities ?? ['text'], signal, emit, onEntry })
-        } finally { release() }
-      })
+      // A task judged read only takes a slot of its own first, and its workspace's lane only if its
+      // read pass hands it back (tasks.js runAdmitted).
+      // Whoever the task was queued for decides it, and route() asks now whether Laya can be
+      // asked, however long ago the task was queued.
+      return runAdmitted({ lanes, task: t, signal, who: { kind: 'task', decider: t.decider ?? 'jev' }, onWait: (why) => emit({ type: 'queued', text: WAITING[why] }),
+        run: (pass) => route({
+          task: t.task, agent: t.owner, forceAgent, effort, mode: t.mode ?? 'auto', decider: t.decider ?? 'jev', laneHeld: true, who: pass.who,
+          access: verdict || pass.mode === 'read' ? { mode: pass.mode, verdict, ...(pass.from ? { from: pass.from } : pass.mode === 'write' && writeWhy ? { why: writeWhy } : {}) } : null,
+          modalities: t.modalities ?? ['text'], signal, emit, onEntry,
+        }) })
     },
   })
   // Filled in now that the registry exists; onSettled above only dereferences it once a task
@@ -1704,23 +1902,49 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     /** Queue one chat task; returns the chat line, or null when background jobs are unavailable. */
     // `modalities` rides along: dropped here the task record falls back to text, the capability
     // filter stops requiring image support, and an attached picture reaches an agent that is blind to it.
-    enqueue({ agent, task, effort, forceAgent, mode, sessionId, modalities }) {
+    async enqueue({ agent, task, effort, forceAgent, mode, sessionId, modalities }) {
       // The adapter's second argument: `decider`, the row's, kept on the task so it decides the run
-      // whenever it starts, and `why`, the reason a message the decider could not sort was queued
-      // as a task, said in the line. Read from `arguments` so this signature stays the one
-      // test/tasks.test.js checks the task's own fields against.
-      const { decider = 'jev', why } = arguments[1] ?? {}
+      // whenever it starts; `why`, the reason a message the decider could not sort was queued as a
+      // task, said in the line; and `readVerdict`, the decider's verdict on whether the message only
+      // reads the project (adapter.js readOnlyVerdict). Read from `arguments` so this signature
+      // stays the one test/tasks.test.js checks the task's own fields against.
+      const { decider = 'jev', why, readVerdict = null } = arguments[1] ?? {}
       const cwd = agent?.session?.header?.cwd
       if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
       if (inScratch(cwd)) throw new Error(SCRATCH_ONLY)
+      // A task judged read only runs as a read pass only when some agent this run could pick can be
+      // locked against writing now; otherwise it waits in its workspace's line, and says why. The
+      // verdict is kept either way: set against what the task changed, it is how the bars are judged.
+      let access = 'write'
+      let accessWhy = null
+      if (readVerdict?.reads) {
+        const { allows } = routingPolicy(config)
+        const local = mode === 'local' || mode === 'offline'
+        // Only agents that could run it now, as the router will judge them: switched on, allowed,
+        // in this mode, the one asked for when one was, signed in and not at its usage limit (the
+        // last usage read, which the router reads afresh). Any other lock is no promise, and the
+        // read pass would only hand it back.
+        const on = (await enabledAgents()).filter((a) => a.enabled)
+        logReadOnly(on)
+        const ready = await readiness().catch(() => ({}))
+        const out = usage.last()?.out ?? {}
+        // At its limit by the last reading, unless the time it resets has passed since.
+        const spent = (q) => OUT_STATES.includes(q?.state) && !(q.until && Date.parse(q.until) <= Date.now())
+        const could = on.filter((a) => allows(a.id) && (!local || a.kind === 'local') && (mode !== 'online' || a.kind !== 'local') && (!forceAgent || a.id === forceAgent))
+        // One that is signed out or out of allowance is no lock, and the queued line says why.
+        const unready = (a) => (ready?.[a.id] && !ready[a.id].loggedIn ? notReadyWhy(a, ready) : spent(out[a.id]) ? 'at its usage limit' : null)
+        const images = (modalities ?? []).includes('image')
+        const locks = could.map((a) => (unready(a) ? { id: a.id, lock: null, why: unready(a) } : { id: a.id, ...lockFor(a, agent, { images }) }))
+        if (locks.some((l) => l.lock)) access = 'read'
+        else accessWhy = `no agent here can be locked against writing (${locks.map((l) => `${l.id}: ${l.why}`).join('; ') || (on.length ? 'none of the agents switched on may take this task' : 'no agent is switched on')})`
+      }
       // sessionId comes from the caller that will also read the results back.
-      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode, decider, modalities })
+      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode, decider, modalities, readVerdict, access, accessWhy })
       if (!t) return null
-      // Counted, not read from the lane: the job joins the lane a tick after enqueue returns.
-      const key = laneKey(cwd)
-      const ahead = tasks.list().filter((x) => x.jobId !== t.jobId && laneKey(x.workspace) === key && !TERMINAL_STATES.includes(x.state)).length
-      // Nothing ahead in this workspace can still mean waiting: the cap on tasks at once may be full.
-      return queuedLine({ jobId: t.jobId, agent: t.agent, position: ahead ? ahead + 1 : lanes.waits(key) ? 1 : 0, workspace: cwd, decider: t.decider, why })
+      // Read from the line the task joined as it was queued (tasks.enqueue starts its runner, which
+      // joins before enqueue returns), which counts every run holding or waiting for it, a foreground
+      // one as much as a task. A read task's own lane is read the same way: it waits only for a slot.
+      return queuedLine({ jobId: t.jobId, agent: t.agent, wait: tasks.get(t.jobId)?.waiting ?? null, workspace: cwd, decider: t.decider, why, ...(readVerdict ? { access: { mode: t.access, verdict: readVerdict, why: accessWhy } } : {}) })
     },
   }
 
@@ -2252,7 +2476,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
           if (req.method === 'POST' && url.pathname.startsWith('/jev-router/tasks/')) {
             const body = JSON.parse(await readBody(req))
             try {
-              if (url.pathname === '/jev-router/tasks/stop') return send(200, { result: tasks.stop(validJobId(body.jobId)) })
+              if (url.pathname === '/jev-router/tasks/stop') return send(200, { result: tasks.stop(validJobId(body.jobId), { onlyIfWaiting: body.onlyIfWaiting === true }) })
               if (url.pathname === '/jev-router/tasks/reorder') { tasks.reorder(body.workspace, body.order ?? []); return send(200, { ok: true }) }
               if (url.pathname === '/jev-router/tasks/clear') return send(200, { cleared: tasks.clear(body.jobIds ?? []) })
               // The browser reporting that it has actually rendered these result messages. This
@@ -2335,18 +2559,23 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
             return send(200, { ok: true })
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/setup') {
-            const [agents, status, jevKey] = await Promise.all([
+            const [agents, status, jevKey, jevStored] = await Promise.all([
               enabledAgents(),
               readiness(url.searchParams.has('recheck')),
               resolveCredential(config.credentialRef).catch(() => undefined),
+              jevStoredKeyInUse(),
             ])
             return send(200, {
               // Where Jev calls go: TYPESAFE_BASE_URL still redirects Jev, and the card says so (8.1).
-              jev: { configured: !!jevKey?.value || !!accounts.activeKey('jev'), credentialRef: config.credentialRef, host: jevHostOf(), hostFromEnv: !!process.env.TYPESAFE_BASE_URL?.trim() },
+              // Which key Jev's calls go out on, as it resolves one per call: the active stored Jev key
+              // while its value is there, else the credential.
+              jev: { configured: !!jevStored || !!jevKey?.value, activeKey: jevStored, credentialSet: !!jevKey?.value, credentialRef: config.credentialRef, host: jevHostOf(), hostFromEnv: !!process.env.TYPESAFE_BASE_URL?.trim() },
               laya: sidecar.status(),
-              agents: agents.map((a) => ({ id: a.id, provider: a.provider, description: a.description, enabled: a.enabled, custom: !!a.custom, llm: a.llm?.provider ? a.llm : undefined, status: status[a.id] })),
+              agents: agents.map((a) => ({ id: a.id, provider: a.provider, description: a.description, enabled: a.enabled, custom: !!a.custom, llm: a.llm?.provider ? a.llm : undefined, status: status[a.id], readOnly: readOnlyOf(a) })),
               providers: await modelProviders(),
               tools: (config.tools ?? []).map((t) => ({ id: t.id, description: t.description, command: t.command, enabled: t.enabled })),
+              // The providers a restart would move onto another stored key: Settings says so while it would.
+              keysRestartPending: accounts.restartPendingProviders(),
             })
           }
           if (req.method === 'POST' && url.pathname === '/jev-router/agents') {
@@ -2378,6 +2607,11 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
               agents: Object.entries(snap).map(([id, q]) => ({ id, ...q, rateNow: rates[id] ?? null })),
               links: config.links ?? {},
               keys: usage.last().keys,
+              // Beside the key list, and polled with it: the providers a restart would move onto another
+              // key, and the stored Jev key Jev's calls go out on (Jev switches keys by itself).
+              keysRestartPending: accounts.restartPendingProviders(),
+              jevActiveKey: await jevStoredKeyInUse(),
+              jevCredentialSet: !!(await resolveCredential(config.credentialRef).catch(() => undefined))?.value,
               recent: lines.slice(-50),
               handoffs,
               savings: await usage.savings({ ...config.savings, historyFile: config.historyFile }).catch(() => null),
@@ -2386,11 +2620,12 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
           if (url.pathname === '/jev-router/keys' || url.pathname === '/jev-router/keys/activate') {
             const b = req.method === 'DELETE' ? Object.fromEntries(url.searchParams) : req.method === 'POST' ? JSON.parse(await readBody(req)) : {}
             if (!(await knownProviders()).includes(b.provider)) return send(400, { error: `unknown provider ${b.provider}` })
-            if (!KEY_NAME.test(b.name ?? '')) return send(400, { error: 'key name: lowercase letters, digits, - or _ (max 32)' })
+            if (!KEY_NAME.test(b.name ?? '')) return send(400, { error: KEY_NAME_RULE })
             let r
-            if (req.method === 'POST' && url.pathname === '/jev-router/keys') r = await accounts.addKey(b.provider, b.name, b.key)
+            // A key added beside an active key that is out (spent, or below its floor) takes over.
+            if (req.method === 'POST' && url.pathname === '/jev-router/keys') r = await accounts.addKey(b.provider, b.name, b.key, { isOut: (n) => keyOut(b.provider, n) })
             else if (req.method === 'POST') r = await accounts.activate(b.provider, b.name)
-            else if (req.method === 'DELETE' && url.pathname === '/jev-router/keys') r = await accounts.removeKey(b.provider, b.name)
+            else if (req.method === 'DELETE' && url.pathname === '/jev-router/keys') r = await accounts.removeKey(b.provider, b.name, { isOut: (n) => keyOut(b.provider, n) })
             else return send(404, { error: 'not found' })
             return send(200, { ok: true, restartRequired: !!r?.restartRequired })
           }

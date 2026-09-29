@@ -89,13 +89,17 @@ const DISPOSITION_OF_VERDICT = Object.freeze({ accept: 'PASS', second_review: 'S
  * the sample the run labels, so acting on anything else would have an accepted run confirm a
  * 'yes' that never happened (a yes at 0.55 under a 0.6 bar, or a yes on a run that changed no
  * file). The question the domain answers is about the result of the task, not about a diff, so a
- * yes is acted on whether or not files changed. Without a domain answer (routing switched off,
- * a legacy route) the task profile's own estimate is all there is, and nothing is labelled from
- * it, so the configured bar and the changed-code condition still govern.
+ * yes is acted on whether or not files changed, except a yes the routing held (`heldBy: 'risk'`,
+ * a task under the low risk band), which labels nothing and is not acted on. Without a domain
+ * answer (routing switched off, a legacy route) the task profile's own estimate is all there is,
+ * and nothing is labelled from it, so the configured bar and the changed-code condition still
+ * govern, under the same risk floor when the route carries a risk.
  */
 export function wantsSecondOpinion(routing, thresholds, touchedCode) {
-  const label = routing?.decision?.domains?.second_opinion?.label
-  if (label === 'yes' || label === 'no') return label === 'yes'
+  const domain = routing?.decision?.domains?.second_opinion
+  if (domain?.label === 'yes' || domain?.label === 'no') return domain.label === 'yes' && !domain.heldBy
+  const low = thresholds.riskBands?.low ?? RISK_BANDS.low
+  if (Number.isFinite(routing?.risk) && routing.risk < low) return false
   return (routing?.needsSecondOpinion ?? 0) >= thresholds.secondOpinion && !!touchedCode
 }
 

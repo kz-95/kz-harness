@@ -23,6 +23,7 @@
 import { createHash } from 'node:crypto'
 import { reviewAction } from '../jev-review/index.js'
 import { CLEAR } from './feedback.js'
+import { isWorkAttempt } from './outcome.js'
 import { TASK_TYPES } from './jev.js'
 import { DISPOSITIONS, SKILLS, STRATEGIES } from './routing-policy.js'
 
@@ -59,12 +60,11 @@ const REVIEW_GROUPS = new Set(['outcome_disposition', 'review_action'])
 const NO_RUN_FAILURE = new Set(['task_classification', 'skill_selection'])
 const ACCEPTS = new Set(['accept', 'PASS'])
 const REVIEW_NOULS = ['addressed', 'complete', 'unrelatedChanges', 'regressionRisk', 'needsPerson']
-const WORK_ROLES = new Set(['primary', 'retry'])
 const CONTRADICTING = new Set(['verified_outcome', 'verified_negative', 'later_review'])
 // The profile fields task_classification hands over besides its label (6.7).
 const PROFILE_FIELDS = ['risk', 'complexity', 'humanReview', 'needsTests', 'capability', 'minimumCapability', 'preferredCapability']
 // A noul's bar per provider, by the thresholds key that holds it; the rest feed the review's quality.
-const NOUL_BARS = { alsoWork: 'alsoWork', humanReview: 'humanReview', needsTests: 'needsTests', continueHandoff: 'continueHandoff', needsPerson: 'needsPerson', secondOpinion: 'judgmentYes' }
+const NOUL_BARS = { alsoWork: 'alsoWork', readOnly: 'readOnly', humanReview: 'humanReview', needsTests: 'needsTests', continueHandoff: 'continueHandoff', needsPerson: 'needsPerson', secondOpinion: 'judgmentYes' }
 const SKIPS = ['not_running', 'starting', 'queue_full', 'too_old', 'jev_failed', 'yielded']
 const PHASES = ['intent', 'route', 'review']
 const DAY_MS = 86_400_000
@@ -239,7 +239,7 @@ function independentEvidence(runId, k, idx) {
   const attempts = Array.isArray(record?.attempts) ? record.attempts : null
   if (!attempts || !Number.isInteger(k) || !attempts[k]) return out
   const after = attempts.slice(k + 1)
-  const laterWork = after.some((a) => a && WORK_ROLES.has(a.role) && !a.limitHit)
+  const laterWork = after.some((a) => isWorkAttempt(a) && !a.limitHit)
   const verdict = idx.verdicts.get(runId)
   if (verdict && !laterWork) out.push({ source: 'person', outcome: { labelSource: 'human', verdict } })
   const reviewedByOther = after.some((a) => a?.role === 'review' && a.stopReason === 'completed' && a.agent !== attempts[k].agent)

@@ -396,6 +396,14 @@ test('a Laya its warm-up measured is never called unmeasured when the server giv
   assert.deepEqual(seen(h, status({ state: 'ready', running: fresh })).lines, [`Running on the GPU (${GPU}): 2.3 GB VRAM, 1.9 GB RAM. Not measured on this PC yet.`])
 })
 
+test('a Laya an earlier session left that the sweep could not check (run as administrator) is named, with how to stop it', () => {
+  const h = helpers()
+  assert.deepEqual(seen(h, status({ orphansUnchecked: [601, 602] })).lines, [
+    'A Laya an earlier session left may still be running (pid 601, 602); it could not be checked or stopped from here (it may run as administrator). End it in Task Manager (Details, right-click pid 601, End process tree; run Task Manager as administrator if it says access is denied), or restart the PC.',
+    'Installed, not running. Laya 0.3.20, English checkpoint 1a2b3c4, PyTorch 2.14.0+cu128 (for the GPU, CUDA 12.8).',
+  ])
+})
+
 test('a Laya left running by an earlier session whose memory the sweep could not read is named by its pid alone', () => {
   const h = helpers()
   assert.deepEqual(seen(h, status({ orphanStopped: { pid: 4321, ramGB: null } })).lines, [
@@ -959,4 +967,84 @@ test('the Jev router card says where Jev calls go, and when TYPESAFE_BASE_URL se
   assert.equal(ran, 1)
   assert.equal(asked(), undefined)
   view.unmount()
+})
+
+test('Jev setup says to restart while the server says a restart would move a provider onto another key, and names the Jev key in use, both following the polled reading', async () => {
+  let pending = ['deepseek']
+  let jevActiveKey = 'fresh'
+  let jevCredentialSet = true
+  let busy = 0
+  let giveNames
+  const namesArrive = new Promise((r) => { giveNames = r })
+  const fetch = async (path) => {
+    busy++
+    try {
+      // The names come late, after the page has settled once.
+      if (path === '/jev-router/names') { busy--; await namesArrive; busy++ }
+      const body = path === '/jev-router/setup' ? { agents: [], providers: [], tools: [], jev: { configured: true, activeKey: 'fresh', credentialRef: 'TYPESAFE_API_KEY' }, keysRestartPending: ['deepseek'] }
+        : path.startsWith('/jev-router/usage') ? { agents: [], keys: {}, keysRestartPending: pending, jevActiveKey, jevCredentialSet }
+        : path === '/jev-router/names' ? { providers: { deepseek: 'DeepSeek' }, models: {}, agents: {} } : {}
+      return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(body)) }
+    } finally { busy-- }
+  }
+  const polls = []
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const { SetupSection, RestartLine } = loadPlugin(React, { fetch, document, setInterval: (fn, ms) => { polls.push([fn, ms]); return polls.length }, clearInterval: () => {} }).__test
+  let renders = 0
+  const view = mount((p) => { renders++; return SetupSection(p) }, {}, { shallow: true })
+  const settle = async () => { for (let quiet = 0; quiet < 2; quiet = !busy && !view.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  await settle()
+  const line = () => nodes(view.tree).find((n) => n.type === RestartLine)
+  assert.ok(line(), 'the page renders the restart line')
+  // The provider names arrive: the page renders again with them.
+  const before = renders
+  giveNames()
+  await settle()
+  assert.ok(renders > before, 'the page follows the names as they arrive')
+  assert.equal(textOf(RestartLine(line().props)), 'Restart the harness to apply the DeepSeek key change (Kz-harness → Restart harness)')
+  const jevCard = () => view.tree.children.filter((n) => n && typeof n === 'object').find((n) => n.props.className === 'card' && textOf(n.children[0]) === 'Jev router')
+  assert.match(textOf(jevCard()), /Jev key 'fresh' is active\. Jev routes and reviews\./)
+  // A run moved the active DeepSeek key back to the one in use, and Jev on to its next key: the
+  // next reading says so, and the page follows.
+  pending = []
+  jevActiveKey = 'second'
+  for (const [fn, ms] of polls) if (ms === 30000) fn()
+  await settle()
+  assert.equal(RestartLine(line().props), null)
+  assert.match(textOf(jevCard()), /Jev key 'second' is active\. Jev routes and reviews\./)
+  // That key's value gone, and no credential to fall back to: the card says so, its dot off.
+  jevActiveKey = null
+  jevCredentialSet = false
+  for (const [fn, ms] of polls) if (ms === 30000) fn()
+  await settle()
+  assert.match(textOf(jevCard()), /^Jev routerTYPESAFE_API_KEY missing\. Routing falls back to the default agent\./)
+  assert.ok(nodes(jevCard()).some((n) => n.props?.className === 'dot off'))
+})
+
+test('Jev setup reads the page back after an action that failed, and still shows why it failed', async () => {
+  let setupReads = 0
+  let busy = 0
+  const fetch = async (path, init) => {
+    busy++
+    try {
+      if (path === '/jev-router/agents' && init?.method === 'POST') return { ok: false, status: 500, json: async () => ({ error: 'the setup file could not be written' }) }
+      if (path === '/jev-router/setup') setupReads++
+      const body = path === '/jev-router/setup' ? { agents: [{ id: 'deepseek', enabled: setupReads > 1 }], providers: [], tools: [], jev: { configured: false, credentialRef: 'TYPESAFE_API_KEY' }, keysRestartPending: [] }
+        : path.startsWith('/jev-router/usage') ? { agents: [], keys: {} } : {}
+      return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(body)) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const { SetupSection } = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  const view = mount(SetupSection, {}, { shallow: true })
+  const settle = async () => { for (let quiet = 0; quiet < 2; quiet = !busy && !view.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  await settle()
+  const chips = nodes(view.tree).find((n) => typeof n.props?.onToggle === 'function')
+  chips.props.onToggle('deepseek', true)
+  await settle()
+  assert.equal(setupReads, 2, 'read back after the failed action')
+  assert.equal(nodes(view.tree).find((n) => typeof n.props?.onToggle === 'function').props.agents[0].enabled, true, 'showing the state the server is in')
+  assert.equal(textOf(nodes(view.tree).find((n) => n.props?.role === 'alert')), 'the setup file could not be written')
 })

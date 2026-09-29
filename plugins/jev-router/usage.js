@@ -6,7 +6,8 @@ import { spawn as nodeSpawn } from 'node:child_process'
 import { appendFile, mkdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { DEFAULT_LIMITS, keyProviderOf, kindOf } from './accounts.js'
+import { DEFAULT_LIMITS, keyProviderOf, kindOf, readsKeyAtLaunch } from './accounts.js'
+import { SILENT_STATUSES, isWorkAttempt, succeeded } from './outcome.js'
 import { DEFAULT_JEV, JEV_USD_PER_INPUT_TOKEN } from './providers.js'
 import { canAuth } from './setup.js'
 
@@ -144,11 +145,13 @@ function cached(fetcher, ttl = TTL) {
  * @param {object} p
  * @param {string} p.dataDir
  * @param {object} p.accounts   createAccounts() result
+ * @param {Function} [p.floorAgents] async () => every configured agent, for scoring key rows by all their floors
+ * @param {Function} [p.jevKeyInUse] async () => the stored Jev key Jev's calls go out on, or null when they use its credential
  * @param {Function} [p.fetch]
  * @param {Function} [p.spawn]
  * @param {string} [p.home]
  */
-export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn = nodeSpawn, home = homedir() }) {
+export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn = nodeSpawn, home = homedir(), floorAgents = null, jevKeyInUse = null }) {
   const file = join(dataDir, 'usage.jsonl')
 
   const claude = cached(async () => {
@@ -184,9 +187,12 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     return { windows: [win(rl.primary, 'primary'), win(rl.secondary, 'secondary')].filter(Boolean), email: acct?.email ?? null, plan: acct?.planType ?? rl.planType ?? null, limitReached: rl.rateLimitReachedType ?? null, via: 'codex-app-server' }
   })
 
-  const balances = new Map() // keyName -> cached fetcher
-  const deepseekBalance = (name) => {
-    if (!balances.has(name)) balances.set(name, cached(async () => {
+  // Per stored key, by name and id: a key removed and added again under its name is another key,
+  // whose balance is not the old one's.
+  const balances = new Map() // `${name}\0${id}` -> cached fetcher
+  const deepseekBalance = (name, id) => {
+    const at = `${name}\0${id ?? ''}`
+    if (!balances.has(at)) balances.set(at, cached(async () => {
       const key = await accounts.resolveKey('deepseek', name)
       if (!key) throw new Error('key value missing')
       const r = await fetch('https://api.deepseek.com/user/balance', { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) })
@@ -197,7 +203,7 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
       const b = [...(j.balance_infos ?? [])].sort((x, y) => Number(y.total_balance) - Number(x.total_balance))[0]
       return { balance: b ? { amount: Number(b.total_balance), currency: b.currency, available: j.is_available } : null, available: j.is_available }
     }))
-    return balances.get(name)
+    return balances.get(at)
   }
 
   const lines = () => readJsonl(file)
@@ -211,15 +217,14 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
   const limitsOf = (id, kind) => ({ ...(DEFAULT_LIMITS[kind] ?? {}), ...accounts.cached().limits[id] })
   const exhaustedOf = (k) => accounts.cached().exhausted[k]
 
-  /** Per-key state for api providers: exhausted mark, else balance below the provider agent's minBalance. */
-  async function keyStates(force, minBalance) {
+  /** Per-key state for api providers: exhausted mark, else balance below the provider agent's minBalance. `spent`: the month's Jev spend by key. */
+  async function keyStates(force, minBalance, spent = {}) {
     const keys = accounts.cached().keys
-    const spent = keys.jev?.length ? await jevSpent() : {}
     const out = {}
     for (const [provider, list] of Object.entries(keys)) {
       out[provider] = await Promise.all(list.map(async (k) => {
         const row = { name: k.name, active: !!k.active }
-        const q = provider === 'deepseek' ? await deepseekBalance(k.name)(force) : null
+        const q = provider === 'deepseek' ? await deepseekBalance(k.name, k.id ?? k.addedAt)(force) : null
         if (q) {
           row.balance = q.balance ?? null
           if (q.error) row.error = q.error
@@ -241,9 +246,22 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
     const needs = new Set(agents.map((a) => a.provider))
     const [cq, xq] = await Promise.all([needs.has('claude-code') ? claude(force) : null, needs.has('codex') ? codex(force) : null])
     const claudeEmail = needs.has('claude-code') ? (await claudeLogin()).email : null
+    // A key's own row is scored against the lowest floor of the switched-on agents drawing on it
+    // (all of them, `floorAgents`, not only the ones this reading is for), or of any agent on it
+    // when none is on; each agent is then judged against its own (below).
+    const known = [...agents, ...(((await floorAgents?.().catch(() => null)) ?? []).filter((x) => !agents.some((a) => a.id === x.id)))]
     const minBalance = {}
-    for (const a of agents) { const p = keyProviderOf(a); if (p) minBalance[p] = limitsOf(a.id, 'api').minBalance }
-    const keys = await keyStates(force, minBalance)
+    for (const on of [true, false]) {
+      for (const a of known) {
+        const p = keyProviderOf(a)
+        if (!p || (on && a.enabled === false) || (!on && minBalance[p] != null)) continue
+        const m = limitsOf(a.id, 'api').minBalance
+        if (m != null) minBalance[p] = Math.min(minBalance[p] ?? Infinity, m)
+      }
+    }
+    // The month's Jev spend by key, read once: each Jev key's row and Jev's own row (every call).
+    const jevByKey = await jevSpent()
+    const keys = await keyStates(force, minBalance, jevByKey)
     const checkedAt = new Date().toISOString()
     const out = {}
     for (const a of agents) {
@@ -260,21 +278,40 @@ export function createUsage({ dataDir, accounts, fetch = globalThis.fetch, spawn
       }
       const provider = keyProviderOf(a)
       const list = keys[provider] ?? []
-      const active = list.find((k) => k.active)
-      Object.assign(base, { account: { label: kind === 'local' ? 'free, local' : active?.name ?? a.credentialRef ?? provider ?? a.id }, balance: active?.balance ?? null, creditPercent: active?.creditPercent ?? null, creditPeak: active?.creditPeak ?? null, error: active?.error ?? null })
-      const own = stateOf({ ...base, exhausted: exhaustedOf(a.id) })
-      // With keys, the agent is out only when every key is: rotation moves past a spent active key.
-      const usable = list.filter((k) => k.state === 'ok' || k.state === 'unknown')
-      out[a.id] = own.state === 'exhausted' || !list.length ? { ...base, ...own }
-        // The active key's own state carries the soft tier: keys are scored against minBalance
-        // only, so without this "hand over below" never fires for an api agent.
-        : usable.length ? { ...base, state: usable.some((k) => k.state === 'ok') ? (own.state === 'near' ? 'near' : 'ok') : 'unknown', until: null }
-        : { ...base, state: list.every((k) => k.state === 'exhausted') ? 'exhausted' : 'stopped', until: list.map((k) => k.until).filter(Boolean).sort()[0] ?? null }
+      // An agent is judged by the stored key its calls go out on (accounts.keyInUse: DeepSeek's key
+      // from launch), against its own floors, never by another key: none is switched to within the
+      // run, so a funded key in reserve does not make an agent on a spent one usable. A key made
+      // active since waits for a restart (`pendingKey`). The launch key removed (or replaced under
+      // its name) is still the one calls go out on: judged by its last reading and by a limit met on
+      // it, both kept with the process's record of it (accounts.launchKeyGone), never taken for
+      // free; that reading is not given out as a balance read now (`lastBalance` carries it). Calls
+      // that use no stored key are judged by the agent alone.
+      const atLaunch = readsKeyAtLaunch(provider)
+      const inUse = list.find((k) => k.name === accounts.keyInUse(provider))
+      if (inUse) accounts.noteKeyInUse(provider, inUse)
+      const gone = atLaunch ? accounts.launchKeyGone(provider) : null
+      const judged = inUse ?? gone?.reading ?? undefined
+      const activeKey = list.find((k) => k.active)
+      const pending = atLaunch && activeKey && activeKey !== inUse ? activeKey : null
+      Object.assign(base, { account: { label: kind === 'local' ? 'free, local' : gone ? `${gone.name} (removed)` : inUse?.name ?? a.credentialRef ?? provider ?? a.id, ...(pending ? { pendingKey: pending.name } : {}) }, balance: inUse?.balance ?? null, creditPercent: inUse?.creditPercent ?? null, creditPeak: inUse?.creditPeak ?? null, error: inUse?.error ?? null, ...(gone?.reading?.balance ? { lastBalance: { ...gone.reading.balance, at: gone.reading.at } } : {}) })
+      const own = stateOf({ ...base, balance: judged?.balance ?? null, error: judged?.error ?? null, exhausted: exhaustedOf(a.id) })
+      out[a.id] = own.state === 'exhausted' ? { ...base, ...own }
+        : gone?.spent ? { ...base, state: 'exhausted', until: gone.spent.until ?? null }
+        // The key's own spent mark (a limit met on it), while it lasts; its balance is judged by `own`.
+        : judged?.state === 'exhausted' && future(judged.until) ? { ...base, state: 'exhausted', until: judged.until }
+        : gone && !judged ? { ...base, state: 'unknown', until: null }
+        : { ...base, ...own }
     }
     const jevKeys = keys.jev ?? []
-    const jevActive = jevKeys.find((k) => k.active)
-    out.jev = { kind: 'api', provider: 'jev', keyProvider: 'jev', account: { label: jevActive?.name ?? 'default' }, windows: [], balance: null, spentUsd: jevKeys.reduce((s, k) => s + (k.spentUsd ?? 0), 0), limits: limitsOf('jev', 'jev'), state: jevKeys.length && jevKeys.every((k) => k.state === 'exhausted') ? 'exhausted' : 'ok', until: null, error: null, checkedAt }
-    last = { out, keys }
+    // Jev's row names the key its calls go out on, as Jev resolves one per call (a stored key only
+    // while its value is there, else its credential, 'default'), and counts every Jev call this
+    // month, whichever key made it.
+    const jevName = jevKeyInUse ? await jevKeyInUse().catch(() => null) : jevKeys.find((k) => k.active)?.name ?? null
+    const jevMonth = Object.values(jevByKey).reduce((s, v) => s + v, 0)
+    out.jev = { kind: 'api', provider: 'jev', keyProvider: 'jev', account: { label: jevName ?? 'default' }, windows: [], balance: null, spentUsd: jevMonth, limits: limitsOf('jev', 'jev'), state: jevKeys.length && jevKeys.every((k) => k.state === 'exhausted') ? 'exhausted' : 'ok', until: null, error: null, checkedAt }
+    // Kept per agent: a reading of one agent (a balance check after its attempt) leaves the others'
+    // last readings in place, each with its own checkedAt, rather than dropping them.
+    last = { out: { ...(last?.out ?? {}), ...out }, keys: { ...(last?.keys ?? {}), ...keys } }
     return out
   }
   let last = null
@@ -339,8 +376,8 @@ const median = (xs) => { const s = [...xs].sort((a, b) => a - b); const m = s.le
  *     Jev cost = logged costUsd (input x $0.042/M, output free); time saved = latencyMs - Jev ms (800 when unlogged).
  *   direct answer (question answered by the chat model, no agent): time saved = agent median - answer time.
  *   tool run (a tool did the work, review accepted, no agent ran): time saved = agent median - tool time.
- *   limits avoided: agents skipped at routing for being stopped/exhausted, plus limit hits moved to a
- *     rotated key or a peer, in runs that did not end paused. Counted, not priced.
+ *   limits avoided: agents skipped at routing for being stopped/exhausted, plus limit hits handed to
+ *     a peer, in runs that did not end paused. Counted, not priced.
  * Agent median = median durationMs of completed primary agent attempts, all time; agentMedianFallbackMs when none.
  *   An attempt of the capability benchmark (`purpose: 'benchmark'`) is left out: a small synthetic
  *   task at a fixed effort says nothing about how long the person's own work takes.
@@ -389,9 +426,14 @@ export function computeSavings(usage, runs, { baseline = DEFAULT_BASELINE, agent
       }
       if (r.finalStatus !== 'paused_limit') {
         const ev = r.limits ?? []
-        // availability.out = agents out at routing + agents that hit a limit without a key to rotate to.
-        const skipped = (r.availability?.out?.length ?? 0) - ev.filter((e) => e.action !== 'rotated').length
-        p.limitsAvoided += Math.max(0, skipped) + ev.filter((e) => e.action === 'rotated' || e.action === 'peer').length
+        // availability.out = agents out at routing + agents that hit a limit without a key to rotate
+        // to, which the limit events that handed the work on, paused or set a parallel opinion's agent
+        // aside added ('peer', 'paused', 'set_aside').
+        const skipped = (r.availability?.out?.length ?? 0) - ev.filter((e) => e.action === 'peer' || e.action === 'paused' || e.action === 'set_aside').length
+        // A limit hit handed to another agent. A key moved on never counts: no call ever went out on a
+        // key switched to within a run (DeepSeek reads its key at launch, and no other provider's
+        // agent uses a stored key), so a 'rotated' event, from older runs, saved nothing.
+        p.limitsAvoided += Math.max(0, skipped) + ev.filter((e) => e.action === 'peer').length
       }
     }
     p.savedUsd = p.llmCostUsd - p.jevCostUsd
@@ -416,14 +458,16 @@ export function computeSavings(usage, runs, { baseline = DEFAULT_BASELINE, agent
 // higher here, and a bucket under it reports its count with no rate at all.
 export const MIN_CALIBRATION_SAMPLES = 10
 
-const workAttempts = (r) => (r.attempts ?? []).filter((a) => a.role === 'primary' || a.role === 'retry')
+const workAttempts = (r) => (r.attempts ?? []).filter(isWorkAttempt)
 /**
- * A usage limit stops a run for lack of allowance, and a continued run did not start from this
- * route, so neither says anything about the pick. Dropped, not counted as failures.
+ * A run whose status says nothing about the work (outcome.js SILENT_STATUSES: out of allowance,
+ * stopped by a person, a read pass handed to its folder's line), one that hit a usage limit, and a
+ * continued run, which did not start from this route, say nothing about the pick. Dropped, not
+ * counted as failures.
  */
-const scorable = (r) => !r.continuedFromHandoff && r.finalStatus !== 'paused_limit' && !(r.attempts ?? []).some((a) => a.limitHit)
-/** The agent Jev picked did the work that was accepted, and the run never fell through to a peer. */
-const pickWorked = (r) => String(r.finalStatus).startsWith('accepted') && workAttempts(r).at(-1)?.agent === r.routing?.primaryAgent
+const scorable = (r) => !r.continuedFromHandoff && !SILENT_STATUSES.includes(r.finalStatus) && !(r.attempts ?? []).some((a) => a.limitHit)
+/** The agent Jev picked did the work that was done (accepted or answered), and the run never fell through to a peer. */
+const pickWorked = (r) => succeeded(r.finalStatus) && workAttempts(r).at(-1)?.agent === r.routing?.primaryAgent
 const r2 = (x) => Math.round(x * 100) / 100
 
 /**

@@ -248,3 +248,61 @@ export function executorsFrom({ agents = [], tools = [], chat = [], seesImages =
   }
   return out
 }
+
+// ---------------------------------------------------------------- read-only work
+// A task the decider judged only reads the project runs beside a task changing its folder, but only
+// on an agent locked so it cannot write, never on trust (docs/queue-and-cost-findings.md 1). The
+// lock is a fact of one start, not of the agent: executors keep `mutation: true`.
+
+/** The Claude Code provider row in plan mode (config/cordis.patch.yml) a read pass starts Claude on. */
+export const READ_ONLY_CLAUDE = 'claude-code-readonly'
+/** The tools a locked spawn agent keeps: reading files and finding them, nothing that writes or runs. */
+export const READ_TOOLS = Object.freeze(['read', 'read_image', 'glob', 'grep'])
+/**
+ * What a read pass may carry out. web_research waits in the lane until a locked agent is shown to
+ * reach the web: a spawn agent locked to READ_TOOLS has no web tool at all.
+ */
+export const READ_PASS_CAPABILITIES = Object.freeze(['quick_answer', 'reasoned_answer', 'project_read', 'image_inspection', 'ocr'])
+/** A read pass that finds it cannot do the task locked hands the task to its folder's line. */
+export const NEEDS_LANE = 'NEEDS_LANE'
+/** An agent that could not be started locked, at start or once started. */
+export const LOCK_UNAVAILABLE = 'LOCK_UNAVAILABLE'
+export const needsLane = (why, extra = {}) => Object.assign(new Error(why), { code: NEEDS_LANE, ...extra })
+
+const clock = (at) => new Date(at).toISOString().slice(11, 16)
+
+/**
+ * How one agent can be locked against writing for a read pass, or why it cannot. Every fact is
+ * read through an accessor, and one that throws or answers nothing means it cannot: a lock that
+ * cannot be shown is no lock.
+ * @param {object} agent  an enabled agent definition
+ * @param {object} facts
+ * @param {(name: string) => object|undefined} facts.providerNamed  ctx.subagents.getProvider
+ * @param {(name: string) => boolean} facts.visibleTool  whether the parent agent sees this tool
+ * @param {string} [facts.toolMode]  how the parent's tools are presented ('native', 'ptc', ...)
+ * @param {boolean} [facts.images]  the task carries an image the agent must open
+ * @param {{ at: number, files: string[] } | null} [facts.distrusted]  a lock that did not hold
+ * @returns {{ lock: { how: string, provider?: string, toolFilter?: { allow: string[] } } } | { lock: null, why: string }}
+ */
+export function lockOf(agent, { providerNamed, visibleTool, toolMode, images = false, distrusted = null } = {}) {
+  const no = (why) => ({ lock: null, why })
+  const read = (fn) => { try { return fn() } catch { return undefined } }
+  if (distrusted) return no(`files changed while it ran locked at ${clock(distrusted.at)} UTC (${(distrusted.files ?? []).slice(0, 3).join(', ')}), so its lock is not trusted until the harness restarts`)
+  if (agent?.provider === 'claude-code') {
+    const p = read(() => providerNamed?.(READ_ONLY_CLAUDE))
+    if (!p) return no(`the ${READ_ONLY_CLAUDE} row (Claude Code in plan mode) is not in this profile; config/cordis.patch.yml has it and scripts/Update-Harness.ps1 lists the lines to copy`)
+    const mode = read(() => p.config?.permissionMode)
+    if (mode !== 'plan') return no(`the ${READ_ONLY_CLAUDE} provider runs in ${mode ?? 'an unknown'} mode, not plan mode`)
+    return { lock: { how: 'Claude Code plan mode', provider: READ_ONLY_CLAUDE } }
+  }
+  if (agent?.provider === 'spawn') {
+    if (read(() => providerNamed?.('spawn')?.capabilities?.toolFilter) !== true) return no('its provider takes no per-start tool filter')
+    if (toolMode !== 'native') return no(`its tools are presented through run_code (${toolMode ?? 'an unknown'} mode), which an allow list cannot confine to reading`)
+    const allow = READ_TOOLS.filter((n) => read(() => visibleTool?.(n)) === true)
+    if (!allow.includes('read')) return no('no read tool is mounted for it')
+    if (images && !allow.includes('read_image')) return no('it cannot open the attached image: read_image is not mounted')
+    return { lock: { how: `read tools only (${allow.join(', ')})`, toolFilter: { allow } } }
+  }
+  if (agent?.provider === 'codex') return no('Codex cannot be locked through its provider')
+  return no(`${agent?.provider ?? 'this agent'} has no read-only mode KzH can set`)
+}
