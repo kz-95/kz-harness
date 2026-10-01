@@ -54,6 +54,24 @@ test('the Router tab never says the local router decides a domain whose classifi
   assert.equal(maturityWords(states.task_classification), 'Jev decides; the local router is not trained yet')
 })
 
+test('the Router tab lists the message intent, whose local router decides only that a message is a task, at the rungs where it decides at all', () => {
+  const root = mkdtempSync(join(tmpdir(), 'kz-routerview-'))
+  const reg = createDomainRegistry({ policy: resolvePolicy(), store: createTrainingStore({ file: join(root, 'samples.jsonl') }), artifactsDir: join(root, 'classifiers'), stateDir: root })
+  const states = reg.states()
+  assert.ok(states.intent, 'the registry reports it, so the tab lists it with its rung')
+  assert.deepEqual(states.intent.localLabels, ['task'], 'and says what its local router may decide')
+  const only = ', and only when it answers task: Jev decides every other answer'
+  assert.equal(maturityWords({ ...states.intent, maturity: 'GUARDED_LOCAL' }), `the local router decides when it is confident and the case is familiar${only}`)
+  assert.equal(maturityWords({ ...states.intent, maturity: 'LOCAL_ONLY' }), `the local router decides normal cases with no Jev call${only}`)
+  // Below the rungs where it decides, and back down from them, Jev decides everything anyway.
+  assert.equal(maturityWords(states.intent), 'Jev decides; the local router is not trained yet')
+  assert.equal(maturityWords({ ...states.intent, maturity: 'SHADOW' }), 'Jev decides; the local router predicts alongside it and is being scored')
+  assert.equal(maturityWords({ ...states.intent, maturity: 'ROLLBACK' }), 'local authority suspended; Jev decides until it is earned back')
+  // A domain with no such limit keeps the words for its rung.
+  assert.equal(states.task_classification.localLabels, null)
+  assert.equal(maturityWords({ ...states.task_classification, maturity: 'GUARDED_LOCAL' }), 'the local router decides when it is confident and the case is familiar')
+})
+
 // ---------- Jev and Laya, side by side (docs/laya-auto.md 5.6, 8.4) ----------
 
 // The same client, with a React whose createElement records what it was asked for, so the card

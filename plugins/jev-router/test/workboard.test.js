@@ -1,9 +1,12 @@
 // The work board header: the live indicator that opens the Overview tab. The button and the
 // panel helpers need a browser, so the decisions the header makes are extracted into pure
-// functions and pinned here - including the contract that a live count counts live tasks only.
+// functions and pinned here - including the contract that a live count counts live tasks only,
+// and the one that reads a finished task's result notice, by its last field, as the result.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { TASK_LABELS } from '../adapter.js'
+import { TASK_STATES, TERMINAL_STATES } from '../tasks.js'
 
 // client.js is a classic browser script - window.__ModuleLoader__.load({ id, factory }) - not an ES
 // module, so node cannot import it. Run the real file body as a function of `window` (which is the
@@ -18,7 +21,8 @@ function loadPlugin() {
   return registration.factory((id) => { if (id === 'react') return React; throw new Error(`unexpected require: ${id}`) })
 }
 
-const { liveTasks, liveSummary, workBoardHeader, taskRowModel, stopOneWords, stopAllWords } = loadPlugin().__test
+const t = loadPlugin().__test
+const { liveTasks, liveSummary, workBoardHeader, taskRowModel, stopOneWords, stopAllWords } = t
 
 /** One canonical task record as tasks.js view(t) hands it to the list. */
 const task = (over = {}) => ({
@@ -138,4 +142,22 @@ test('one task is stopped or removed in words that fit it, and Stop all counts r
   assert.match(stopAllWords([q1, back], 0).body, /\. One of them ran only a read pass, locked against writing, and the rest have not started, so nothing in the workspace changes\.$/)
   assert.match(stopAllWords([{ ...back, readBreach: { changed: ['src/a.ts'], agents: ['claude'] } }, q1], 0).body, /\. Files changed in the repository of one of them while its read pass read, so its lock may not have held; nothing more of them runs\.$/)
   for (const w of [stopAllWords([run, q1, q2], 0), stopOneWords({ title: 't', stopWord: 'Remove' })]) assert.doesNotMatch(Object.values(w).join(' '), /[\u2013\u2014]|undefined/)
+})
+
+test('resultIdOf reads the last field: \'jev-3 · a · b · Completed\' is jev-3 and resultOf\'s name is \'a · b\'; \'jev-3 · Fix · Running\' and \'jev-3 started: Codex\' are null', () => {
+  assert.equal(typeof t.resultOf, 'function', 'a result notice\'s summary is read for its task name too')
+  const { resultIdOf, resultOf } = t
+  assert.equal(resultIdOf('jev-3 · a · b · Completed'), 'jev-3')
+  assert.deepEqual(resultOf('jev-3 · a · b · Completed'), { id: 'jev-3', name: 'a · b' }, 'a task name may hold the separator')
+  assert.deepEqual(resultOf('jev-12·Tidy up·Failed'), { id: 'jev-12', name: 'Tidy up' })
+  // Only a finished task's notice is a result: a live state, or a progress notice with no such last field, is not.
+  for (const summary of ['jev-3 · Fix · Running', 'jev-3 started: Codex', 'jev-3 · Fix · Completed later', 'jev-3 · Completed']) {
+    assert.equal(resultIdOf(summary), null, summary)
+    assert.equal(resultOf(summary), null, summary)
+  }
+  // The label of every finished state ends a result, word for word as the server says it (adapter.js
+  // TASK_LABELS, which delivery.js puts last), and no other state's does.
+  for (const state of TASK_STATES) {
+    assert.equal(resultIdOf(`jev-5 · Fix the parser · ${TASK_LABELS[state]}`), TERMINAL_STATES.includes(state) ? 'jev-5' : null, state)
+  }
 })

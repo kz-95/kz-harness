@@ -91,6 +91,21 @@ test('No project workspace: questions answered, tasks politely refused, agents n
   assert.equal(routed, false)
 })
 
+test('the intent call is told the folder the message was sent in, where its task would run, No project included, where a question it reads is answered', async () => {
+  const { fileURLToPath } = await import('node:url')
+  const noProject = fileURLToPath(new URL('../../../no-project', import.meta.url))
+  const told = []
+  const classify = async (message, mode, decider, o) => { told.push(o?.cwd); return { kind: 'question', confidence: 0.95 } }
+  const ok = [{ type: 'block-start', index: 0, blockType: 'text' }, { type: 'text-delta', index: 0, text: 'Use flexbox.' }, { type: 'finish', reason: { kind: 'stop' } }]
+  const ctxIn = (cwd) => ({ agents: { get: () => ({ session: { header: { cwd } } }) }, llm: { async *stream() { yield* ok } } })
+  let routed = false
+  const route = async () => { routed = true; return '' }
+  assert.ok((await run(jevAdapter({ ctx: ctxIn(noProject), route, classify, auxModel: aux }), 'how do I center a div?')).startsWith('Use flexbox.'))
+  assert.ok((await run(jevAdapter({ ctx: ctxIn('/work/kz-harness'), route, classify, auxModel: aux }), 'how do I center a div?')).startsWith('Use flexbox.'))
+  assert.deepEqual(told, [noProject, '/work/kz-harness'], 'each sorted knowing where it was sent')
+  assert.equal(routed, false)
+})
+
 // ---------- one pickable model per agent, next to Jev Auto ----------
 
 const AGENTS = [
@@ -639,6 +654,15 @@ test('the routed line names who decided: (laya), (laya, local), and Jev\'s reads
   assert.equal(routed({ mode: 'jev', decider: 'jev' }, { shadow: 'not_running' }), 'Routed to claude (jev)\nLaya is not running, so this run is not compared')
 })
 
+test('the routed line of a run the router stops for a person names no agent, only who read it so', () => {
+  // As router.js emits it: its routing still says whom the decider would have picked.
+  const stops = (routing, extra = {}) => line({ type: 'routed', routing: { primaryAgent: 'claude', mode: 'jev', capability: 'human_required', ...routing }, plan: { strategy: 'STANDARD_DIRECT' }, stopsForPerson: true, ...extra })
+  assert.equal(stops({ decider: 'jev' }), 'Jev read this as needing a person: no agent runs')
+  assert.equal(stops({ decider: 'laya' }), 'Laya read this as needing a person: no agent runs')
+  assert.equal(stops({}), 'Jev read this as needing a person: no agent runs', 'a record from before `decider` was kept')
+  assert.equal(stops({ decider: 'jev' }, { shadow: 'not_running' }), 'Jev read this as needing a person: no agent runs\nLaya is not running, so this run is not compared')
+})
+
 test('decidedBy names Laya in its place among the authorities, and the decision line counts Laya\'s calls', () => {
   const domains = { task_classification: { authority: 'laya' }, skill_selection: { authority: 'laya' }, resource_selection: { authority: 'code' } }
   assert.equal(decidedBy(domains), 'Laya and routing rules decided')
@@ -731,7 +755,7 @@ test('a Laya Auto message is sorted by Laya and read against Laya\'s bars, where
   const orchestrator = { results: () => [], live: () => 0, enqueue: (fields, extra) => { queued.push(extra); return 'queued' } }
   await runAs(make(jev.thresholds, both, orchestrator), 'jev-auto', 'how does it work, and fix it?')
   await runAs(make(laya.thresholds, both, orchestrator), 'laya-auto', 'how does it work, and fix it?')
-  assert.deepEqual(queued, [{ decider: 'jev', readVerdict: null }], 'only Jev\'s bar queued the work')
+  assert.deepEqual(queued, [{ decider: 'jev', readVerdict: null, message: 'how does it work, and fix it?' }], 'only Jev\'s bar queued the work')
   // Laya's reason for the stronger model is Laya's.
   const deep = await runAs(make(laya.thresholds, { kind: 'question', confidence: 0.95, depth: 'deep' }), 'laya-auto', 'why does this deadlock?')
   assert.match(deep, /Laya judged this worth the stronger model, so Answered by: x\/y/)
@@ -753,7 +777,7 @@ test('a Laya Auto task is routed and queued as Laya\'s, and a Jev row\'s as Jev\
   })
   await runAs(b, 'laya-auto', 'fix the parser')
   await runAs(b, 'jev-auto', 'fix the parser')
-  assert.deepEqual(queued, [{ task: 'fix the parser', decider: 'laya', why: null, readVerdict: null }, { task: 'fix the parser', decider: 'jev', why: null, readVerdict: null }])
+  assert.deepEqual(queued, [{ task: 'fix the parser', decider: 'laya', why: null, readVerdict: null, message: 'fix the parser' }, { task: 'fix the parser', decider: 'jev', why: null, readVerdict: null, message: 'fix the parser' }])
   assert.equal(await runAs(b, 'laya-auto', ''), 'Type a task and Laya will route it.')
 })
 
@@ -802,4 +826,510 @@ test('a question answered directly tells the usage hook which row it came throug
 test('a task queued behind a run from the chat says a run from the chat holds its folder', () => {
   const base = { jobId: 'jev-4', position: 0, workspace: 'C:\\work\\Harness' }
   assert.equal(queuedLine({ ...base, wait: { why: 'chat', place: 2, ahead: 0 } }), 'Queued → Jev picks as **jev-4** (2nd in line for Harness: a run started from the chat is using it). Keep chatting: the result posts here when done.')
+})
+
+// ---------- the start reply: A, B and C, its marks, and the wait for the pick (docs/live-agent-view.md Feature 2) ----------
+const KEY = '5f8d6c1e-2b3a-4c5d-8e9f-0a1b2c3d4e5f'
+const PLAN = { agent: 'claude', model: 'claude-opus-4-1', effort: 'high', level: 'high', speed: null }
+const PICKED = { plan: PLAN, gen: 1, runId: 'run-4', ms: 2400, decidedBy: { by: 'decider', decider: 'jev', taskType: 'implementation', complexity: 0.4, risk: 0.5, from: 'auto' } }
+/** What orchestrator.enqueue answers for a task that starts at once (index.js). */
+const startsNow = (over = {}) => ({ line: 'the reply without a wait', jobId: 'jev-4', key: KEY, runId: null, startsNow: true, forcedPlan: null, waitMs: 15_000, progress: 'milestones', waiting: null, access: null, ...over })
+const strip = (text) => JSON.parse(Buffer.from(/^\[jev-agents\]: kzh-agents-1-(\S+)$/m.exec(text)?.[1] ?? '', 'base64url').toString() || 'null')
+const textOf = (chunks) => chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+const settle = async () => { for (let i = 0; i < 30; i++) await new Promise((r) => setImmediate(r)) }
+/** Stream one typed message, collecting every chunk; `signal` may stop it. */
+async function streamOf(adapter, text, { model = 'jev-auto', signal = new AbortController().signal, messages } = {}) {
+  const chunks = []
+  let error = null
+  try {
+    for await (const c of adapter.stream({ messages: messages ?? [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }], sessionId: 's', model, signal })) chunks.push(c)
+  } catch (err) { error = err }
+  return { chunks, text: textOf(chunks), error }
+}
+
+test('with enqueue returning {line, jobId, key, startsNow:true} and watchPlan resolving in 10 ms, the text starts \'OK, I\'ll run **Claude Code** with **claude-opus-4-1** (effort high)\', carries the job, run and agents marks, emits no reasoning chunk, and calls noteAck with gen 1', async () => {
+  const acks = []
+  const waited = []
+  const a = jevAdapter({
+    ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+    orchestrator: {
+      results: () => [], live: () => 0,
+      enqueue: async () => startsNow(),
+      watchPlan: (key, o) => { waited.push([key, o.waitMs]); return new Promise((r) => setTimeout(() => r(PICKED), 10)) },
+      noteAck: (key, ack) => acks.push([key, ack]),
+    },
+  })
+  const { chunks, text } = await streamOf(a, 'fix the parser')
+  assert.ok(text.startsWith('OK, I\'ll run **Claude Code** with **claude-opus-4-1** (effort high)'), text)
+  assert.equal(text.split('\n\n[jev-job]')[0], 'OK, I\'ll run **Claude Code** with **claude-opus-4-1** (effort high) in the background as **jev-4** in kz-harness. I\'ll report back here when it\'s done. Keep chatting.\n\n> Picked by Jev in 2.4 s: a code change, medium risk, so effort high.')
+  assert.match(text, new RegExp(`^\\[jev-job\\]: kzh-job-1-${KEY}$`, 'm'), 'the task, by its key')
+  assert.match(text, /^\[jev-run\]: kzh-run-1-run-4$/m, 'the run')
+  assert.deepEqual(strip(text), [{ agent: 'Jev', model: '', roles: [] }, { agent: 'claude', model: 'claude-opus-4-1, high', roles: ['work'] }], 'who picked, then the worker by its id')
+  assert.deepEqual(chunks.filter((c) => c.type === 'reasoning-delta' || c.blockType === 'reasoning'), [], 'a quick pick shows no reasoning block')
+  assert.deepEqual(waited, [[KEY, 15_000]], 'it waited on the task\'s key, for the setting\'s bound')
+  assert.deepEqual(acks, [[KEY, { gen: 1, said: { agent: 'claude', effort: 'high' } }]])
+  assert.equal(chunks.at(-1).type, 'finish')
+})
+
+test('a pick that gives the work to a tool names no effort in its credit: the effort is the fallback agent\'s, which runs only if the tool fails', async () => {
+  // The router fills in the agent that takes over from the tool, with its effort (router.js routed).
+  const plan = { agent: 'codex', model: null, effort: 'medium', level: 'medium', speed: null, tool: 'lint' }
+  const a = jevAdapter({
+    ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+    orchestrator: {
+      results: () => [], live: () => 0, enqueue: async () => startsNow(), noteAck: () => {},
+      watchPlan: async () => ({ plan, gen: 1, runId: 'run-4', ms: 1200, decidedBy: { by: 'decider', decider: 'jev', taskType: 'simple_change', complexity: 0.2, risk: 0.2, from: 'auto' } }),
+    },
+  })
+  const { text } = await streamOf(a, 'lint the parser')
+  const said = text.split('\n\n[jev-job]')[0]
+  assert.equal(said, 'OK, I\'ll run the **lint** tool on this in the background as **jev-4** in kz-harness. I\'ll report back here when it\'s done. Keep chatting.\n\n> Picked by Jev in 1.2 s: a small change, low risk.')
+  assert.doesNotMatch(said, /effort/)
+})
+
+test('reply A names the reviewer and the planner the plan has, and says a local model goes first only when the plan says so', async () => {
+  /** Reply A's words before its marks, for the plan `plan`. */
+  const replyOf = async (plan) => {
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux,
+      agents: async () => [...AGENTS, { id: 'qwen-local', name: 'Qwen (local)', description: 'A local model on this PC.', enabled: true }],
+      orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow(), noteAck: () => {}, watchPlan: async () => ({ ...PICKED, plan }) },
+    })
+    return (await streamOf(a, 'fix the parser')).text.split('\n\n[jev-job]')[0]
+  }
+  const credit = '\n\n> Picked by Jev in 2.4 s: a code change, medium risk, so effort high.'
+  const reviewed = { ...PLAN, reviewer: { agent: 'codex', model: 'gpt-5.5' }, planner: { agent: 'claude', model: 'claude-opus-4-1' } }
+  assert.equal(await replyOf(reviewed), `OK, I'll run **Claude Code** with **claude-opus-4-1** (effort high) in the background as **jev-4** in kz-harness, and **Codex (GPT)** reviews it before it's accepted. **Claude Code** (claude-opus-4-1) writes a plan for it first. I'll report back here when it's done. Keep chatting.${credit}`)
+  // A local model kept in front of the routed resource, which takes over if it fails (tasks.js planOf).
+  const local = { agent: 'qwen-local', model: 'qwen3-8b', effort: null, level: null, speed: null, localFirst: true }
+  assert.equal(await replyOf(local), `OK, I'll run **Qwen (local)** with **qwen3-8b** in the background as **jev-4** in kz-harness. If the local model can't finish it, a stronger agent takes over. I'll report back here when it's done. Keep chatting.${credit.replace(', so effort high', '')}`)
+  assert.doesNotMatch(await replyOf({ ...local, localFirst: undefined }), /local model/, 'a plan that keeps no local step in front says nothing of one')
+})
+
+test('reply A carries the agent strip the orchestrator works out for the pick, its router step first, rather than one of its own', async () => {
+  // As index.js planned() gives it: router.js routerStep for the routing (here the local router, which
+  // decided every domain), then the worker by its id.
+  const steps = [{ agent: 'Local router', model: '', roles: [] }, { agent: 'claude', model: 'claude-opus-4-1, high', roles: ['work'] }]
+  const a = jevAdapter({
+    ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+    orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow(), noteAck: () => {}, watchPlan: async () => ({ ...PICKED, steps }) },
+  })
+  const { text } = await streamOf(a, 'fix the parser')
+  assert.ok(text.startsWith('OK, I\'ll run **Claude Code** with **claude-opus-4-1** (effort high)'), text)
+  assert.deepEqual(strip(text), steps, 'the chain as the orchestrator named it')
+})
+
+test('reply A credits the pick to whoever the orchestrator says made it, and one made on this PC after the decider was asked says it could not pick, never that no call was made', async () => {
+  /** Reply A's credit, for a pick decided as `decidedBy` says (index.js planned()). */
+  const creditOf = async (decidedBy) => {
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+      orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow(), noteAck: () => {}, watchPlan: async () => ({ ...PICKED, decidedBy: { ...PICKED.decidedBy, ...decidedBy } }) },
+    })
+    return (await streamOf(a, 'fix the parser')).text.split('\n\n[jev-job]')[0].split('\n\n')[1]
+  }
+  const reason = 'Error: 503 Service Unavailable'
+  assert.equal(await creditOf({ by: 'local', called: true, reason }), `> Picked on this PC in 2.4 s, since Jev could not pick (${reason}): a code change, medium risk, so effort high.`)
+  assert.equal(await creditOf({ by: 'local', called: true }), '> Picked on this PC in 2.4 s, since Jev could not pick: a code change, medium risk, so effort high.', 'asked, and its answers too flat to use')
+  assert.equal(await creditOf({ by: 'local', called: false }), '> Picked on this PC in 2.4 s, no Jev call: a code change, medium risk, so effort high.')
+  assert.equal(await creditOf({ by: 'rules', called: true, reason }), `> Picked by the routing rules in 2.4 s, since Jev could not pick (${reason}); effort high (Auto in Settings).`)
+})
+
+test('watchPlan never resolving with waitMs 100: the reasoning block opens only after 600 ms of silence (manual timers) and reply C follows', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const acks = []
+  const make = (waitMs) => jevAdapter({
+    ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+    orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow({ waitMs }), watchPlan: () => new Promise(() => {}), noteAck: (key, ack) => acks.push(ack) },
+  })
+  const reasoning = (chunks) => chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join('')
+  // A bound under the quiet time: C at the bound, and no block at all.
+  const quick = { chunks: [], done: null }
+  quick.done = (async () => { for await (const c of make(100).stream({ messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'fix the parser' }] }], sessionId: 's', model: 'jev-auto', signal: new AbortController().signal })) quick.chunks.push(c) })()
+  await settle()
+  t.mock.timers.tick(100)
+  await settle()
+  await quick.done
+  assert.equal(reasoning(quick.chunks), '', 'no block opens before 600 ms')
+  assert.equal(textOf(quick.chunks), `OK, **jev-4** is starting in kz-harness, and Jev is still choosing the agent (0.1 s so far). I'll say here which one it picks, and report back when it's done. Keep chatting.\n\n[jev-job]: kzh-job-1-${KEY}`)
+  // A longer bound: nothing for 599 ms, then the block with the wait's own line, then C at the bound.
+  const slow = { chunks: [], done: null }
+  slow.done = (async () => { for await (const c of make(1500).stream({ messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'fix the parser' }] }], sessionId: 's2', model: 'jev-auto', signal: new AbortController().signal })) slow.chunks.push(c) })()
+  await settle()
+  t.mock.timers.tick(599)
+  await settle()
+  assert.equal(slow.chunks.length, 0, 'nothing yet: a quick pick would look instant')
+  t.mock.timers.tick(1)
+  await settle()
+  assert.deepEqual(slow.chunks.map((c) => c.type), ['block-start', 'reasoning-delta'])
+  assert.equal(slow.chunks[0].blockType, 'reasoning')
+  assert.equal(reasoning(slow.chunks), 'Queued as jev-4. Choosing the agent (I reply once it\'s picked, at most 1.5 s). Stop here ends this reply only; the task keeps going (stop it on the work board).\n')
+  t.mock.timers.tick(900)
+  await settle()
+  await slow.done
+  const blocks = slow.chunks.filter((c) => c.type === 'block-start').map((c) => [c.blockType, c.index])
+  assert.deepEqual(blocks, [['reasoning', 0], ['text', 1]], 'the reply is numbered after the block')
+  assert.ok(textOf(slow.chunks).startsWith('OK, **jev-4** is starting in kz-harness, and Jev is still choosing the agent (1.5 s so far).'), textOf(slow.chunks))
+  assert.deepEqual(acks, [{ gen: 0, said: null, bound: true }, { gen: 0, said: null, bound: true }], 'each named no plan, so its started notice follows, and went out when its wait ran out')
+})
+
+test('a forced agent replies A without calling watchPlan', async () => {
+  let watched = false
+  const acks = []
+  const line = 'OK, I\'ll run **Codex (GPT)** with **gpt-5.5** (effort medium) in the background as **jev-4** in kz-harness. I\'ll report back here when it\'s done. Keep chatting.\n\n> You picked Codex (GPT); effort medium (Auto in Settings).'
+  const forcedPlan = { agent: 'codex', model: 'gpt-5.5', effort: 'medium', level: 'medium', speed: null }
+  const a = jevAdapter({
+    ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+    orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow({ line, runId: 'run-4', forcedPlan }), watchPlan: async () => { watched = true; return PICKED }, noteAck: (key, ack) => acks.push(ack) },
+  })
+  const { text } = await streamOf(a, 'fix the parser', { model: 'agent-codex' })
+  assert.equal(text.split('\n\n[jev-job]')[0], line, 'the plan, known as it was queued')
+  assert.match(text, /^\[jev-run\]: kzh-run-1-run-4$/m)
+  assert.deepEqual(strip(text), [{ agent: 'codex', model: 'gpt-5.5, medium', roles: ['work'] }], 'nobody picked: the worker alone')
+  assert.equal(watched, false, 'nothing to wait for')
+  assert.deepEqual(acks, [{ gen: 1, said: { agent: 'codex', effort: 'medium' } }], 'it named the plan its first routing will have')
+})
+
+test('an abort during the wait yields no text and never calls noteAck or stop', async () => {
+  const stop = new AbortController()
+  const calls = []
+  const a = jevAdapter({
+    ctx: projectCtx('C:\\work\\kz-harness'), route: async () => { calls.push('route'); return 'ran' }, classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+    orchestrator: {
+      results: () => [], live: () => 0,
+      // Stopped while the reply waits for the pick.
+      enqueue: async () => { setTimeout(() => stop.abort(), 5); return startsNow() },
+      watchPlan: () => new Promise(() => {}),
+      noteAck: () => calls.push('noteAck'),
+      stop: () => calls.push('stop'),
+    },
+  })
+  const { chunks, error } = await streamOf(a, 'fix the parser', { signal: stop.signal })
+  assert.deepEqual(chunks.filter((c) => c.type === 'text-delta'), [], 'no text')
+  assert.equal(error?.name, 'AbortError', 'the reply ends as stopped')
+  assert.deepEqual(calls, [], 'the task goes on: nothing stops it, and the reply named nothing')
+})
+
+test('a legacy string from enqueue yields exactly today\'s line', async () => {
+  const line = 'Queued → Jev picks as **jev-4** (starting now in kz-harness). Keep chatting: the result posts here when done.'
+  const asked = []
+  const a = jevAdapter({
+    ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+    orchestrator: { results: () => [], live: () => 0, enqueue: async () => line, watchPlan: () => { asked.push('watchPlan'); return new Promise(() => {}) }, noteAck: () => { asked.push('noteAck') } },
+  })
+  const { chunks, text, error } = await streamOf(a, 'fix the parser')
+  assert.equal(error, null)
+  assert.equal(text, line)
+  assert.deepEqual(chunks.map((c) => c.type), ['block-start', 'text-delta', 'block-end', 'usage', 'finish'])
+  assert.deepEqual(asked, [], 'a line with no task key is the reply as it always was: nothing waits, and nothing is noted on a task')
+})
+
+test('alsoWork appends C\'s sentence without waiting', async () => {
+  let watched = false
+  const acks = []
+  const a = jevAdapter({
+    ctx: { ...projectCtx('C:\\work\\kz-harness'), llm: { async *stream() { yield* OK_TEXT } } }, route: async () => 'unused', classify: async () => BOTH, auxModel: aux, agents: async () => AGENTS,
+    orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow(), watchPlan: () => { watched = true; return new Promise(() => {}) }, noteAck: (key, ack) => acks.push(ack) },
+  })
+  const { text } = await streamOf(a, 'what does the parser do, and also fix the typo in it?')
+  assert.ok(text.startsWith('An answer.'), text)
+  assert.ok(text.endsWith('\n\nOK, **jev-4** is starting in kz-harness, and Jev is choosing the agent.'), text)
+  assert.equal(watched, false, 'the answer is out; nothing waits for the pick')
+  assert.deepEqual(acks, [{ gen: 0, said: null, now: true }], 'it named no plan, so a started notice follows, and went out at once beside a task that starts at once')
+  // One that waits its turn says where it stands instead.
+  const b = jevAdapter({
+    ctx: { ...projectCtx('C:\\work\\kz-harness'), llm: { async *stream() { yield* OK_TEXT } } }, route: async () => 'unused', classify: async () => BOTH, auxModel: aux,
+    orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow({ startsNow: false, waiting: { why: 'workspace', place: 2, ahead: 0 } }), noteAck: () => {} },
+  })
+  assert.ok((await streamOf(b, 'what does the parser do, and also fix the typo in it?')).text.endsWith('\n\nOK, **jev-4** is queued: 2nd in line for kz-harness (another task is running there).'))
+})
+
+test('the person\'s own words ride beside each task the adapter queues, for the reply ledger, while the task carries the line that hands the agent the picture: a task asked for, and work asked for beside a question answered directly', async () => {
+  const queued = []
+  const orchestrator = { results: () => [], live: () => 0, enqueue: async (fields, extra) => { queued.push([fields.task, extra?.message ?? null]); return startsNow() }, watchPlan: async () => null, noteAck: () => {} }
+  const sent = (classify) => jevAdapter({ ctx: projectCtx(), route: async () => 'unused', classify, auxModel: aux, canSeeImages: async () => true, handOffImages: async () => ['C:\\ws\\.kz-harness\\attachments\\a1.png'], orchestrator })
+  await runWith(sent(async () => ({ kind: 'task' })), [{ type: 'text', text: 'match this layout' }, IMAGE])
+  const answered = await runWith(sent(async () => BOTH), [{ type: 'text', text: 'what is in this, and can you also match it?' }, IMAGE])
+  assert.match(answered, /^An answer\./, 'the question was answered directly, and its work queued behind it')
+  const line = 'The person attached an image. Open `C:\\ws\\.kz-harness\\attachments\\a1.png` and look at it before you answer.\n\n'
+  assert.deepEqual(queued, [
+    [`${line}match this layout`, 'match this layout'],
+    [`${line}what is in this, and can you also match it?`, 'what is in this, and can you also match it?'],
+  ])
+})
+
+test('the intent call taking over 600 ms opens the \'Jev is reading your message\' block', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  for (const [model, who] of [['jev-auto', 'Jev'], ['laya-auto', 'Laya']]) {
+    let sorted
+    const a = jevAdapter({ ctx: chat(OK_TEXT), route: async () => 'unused', classify: () => new Promise((r) => { sorted = r }), auxModel: aux })
+    const chunks = []
+    const done = (async () => { for await (const c of a.stream({ messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'what is a parser?' }] }], sessionId: model, model, signal: new AbortController().signal })) chunks.push(c) })()
+    await settle()
+    t.mock.timers.tick(599)
+    await settle()
+    assert.equal(chunks.length, 0, 'a quick call shows nothing')
+    t.mock.timers.tick(1)
+    await settle()
+    assert.deepEqual(chunks.map((c) => c.type), ['block-start', 'reasoning-delta'])
+    assert.equal(chunks[1].text, `${who} is reading your message (task or question)…\n`)
+    sorted({ kind: 'question' })
+    await settle()
+    await done
+    const blocks = chunks.filter((c) => c.type === 'block-start').map((c) => [c.blockType, c.index])
+    assert.deepEqual(blocks.slice(0, 2), [['reasoning', 0], ['text', 1]], 'the answer follows the block, numbered after it')
+    assert.ok(textOf(chunks).startsWith('An answer.'))
+  }
+})
+
+test('answerDirectly\'s messages drop jev-router progress notices and keep result notices; ABOUT carries the live sentence when tasks are live', async () => {
+  const seen = []
+  const ctx = { agents: { get: () => ({}) }, llm: { async *stream(o) { seen.push(o.messages); yield* OK_TEXT } } }
+  const live = 'Right now in this chat: jev-4 is running on Claude Code (6 min, last: running claude (primary)…); jev-5 waits 2nd in line.'
+  const notice = (summary) => ({ role: 'user', source: { kind: 'plugin', plugin: 'jev-router', form: 'notice', summary }, content: [{ type: 'text', text: `body of ${summary}` }] })
+  const messages = [
+    { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'fix the parser' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'OK, **jev-4** is starting in kz-harness, and Jev is choosing the agent.' }] },
+    notice('jev-4 started: Claude Code, claude-opus-4-1, effort high'),
+    notice('jev-3 · Fix the sidebar · Completed'),
+    notice('jev-2 moved to Codex'),
+    { role: 'user', source: { kind: 'plugin', plugin: 'tool-jobs', form: 'notice', summary: 'job x' }, content: [{ type: 'text', text: 'another plugin\'s notice' }] },
+    { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'how is it going?' }] },
+  ]
+  const make = (status) => jevAdapter({ ctx, route: async () => 'unused', classify: async () => ({ kind: 'question' }), auxModel: aux, orchestrator: { results: () => [], live: () => 1, liveStatus: async () => status, enqueue: () => null } })
+  assert.ok((await streamOf(make(live), null, { messages })).text.startsWith('An answer.'))
+  const sent = seen.at(-1)
+  assert.deepEqual(sent.map((m) => m.source?.summary ?? null), [null, null, 'jev-3 · Fix the sidebar · Completed', 'job x', null], 'progress notices are left out; a result and another plugin\'s notice stay')
+  const about = sent.at(-1).content[0].text
+  assert.ok(about.startsWith('You are talking with the person who runs this app'), about)
+  assert.ok(about.endsWith(` ${live}`), 'the live sentence follows ABOUT')
+  assert.equal(sent.at(-1).content[1].text, 'how is it going?')
+  // Nothing live, nothing said: ABOUT as it always was.
+  await streamOf(make(''), null, { messages })
+  assert.doesNotMatch(seen.at(-1).at(-1).content[0].text, /Right now/)
+})
+
+test('reply C notes that its wait for the pick ran out when it did, and no other reply does: not C written at once with no wait, nor one after a hand-back, nor one whose wait ended early with nothing to say', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  /** What the reply noted for a task that starts at once, with watchPlan and the wait as given, and the clock moved on `ms` once the wait began. */
+  const ackOf = async (watchPlan, { waitMs = 100, ms = 0 } = {}) => {
+    const acks = []
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+      orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow({ waitMs }), watchPlan, noteAck: (key, ack) => acks.push(ack) },
+    })
+    const done = (async () => { for await (const _ of a.stream({ messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'fix the parser' }] }], sessionId: 's', model: 'jev-auto', signal: new AbortController().signal })) { /* the reply */ } })()
+    await settle()
+    if (ms) t.mock.timers.tick(ms)
+    await settle()
+    await done
+    return acks
+  }
+  assert.deepEqual(await ackOf(() => new Promise(() => {}), { ms: 100 }), [{ gen: 0, said: null, bound: true }], 'its wait ran out: C at the bound')
+  assert.deepEqual(await ackOf(async () => null), [{ gen: 0, said: null }], 'a wait that ended at once with nothing to say, a task watchPlan could not find, did not run out')
+  assert.deepEqual(await ackOf(async () => { throw new Error('the watch failed') }), [{ gen: 0, said: null }], 'nor did one whose watch failed')
+  assert.deepEqual(await ackOf(() => new Promise(() => {}), { waitMs: 0 }), [{ gen: 0, said: null, now: true }], 'nor C written at once, with the wait set to none, which notes that it went out at once')
+  assert.deepEqual(await ackOf(async () => ({ handedBack: true, waiting: null, why: 'it needs to change files' })), [{ gen: 0, said: null }], 'nor a reply after a read pass handed its task back')
+})
+
+test('a task that ends during the wait is answered that it ended, with its job mark, no agents mark, and a noteAck that names no plan', async () => {
+  const acks = []
+  const a = jevAdapter({
+    ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+    orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow({ runId: 'run-4' }), watchPlan: async () => ({ settled: 'failed' }), noteAck: (key, ack) => acks.push([key, ack]) },
+  })
+  const { chunks, text } = await streamOf(a, 'fix the parser')
+  assert.equal(text.split('\n\n[jev-job]')[0], '**jev-4** ended before Jev picked its agent (Failed). Its result is posted here as its own message.', 'not C, which would say it is starting')
+  assert.match(text, new RegExp(`^\\[jev-job\\]: kzh-job-1-${KEY}$`, 'm'), 'the task, by its key')
+  assert.match(text, /^\[jev-run\]: kzh-run-1-run-4$/m, 'the run it had begun')
+  assert.equal(strip(text), null, 'nobody was picked, so no agent strip')
+  assert.deepEqual(chunks.filter((c) => c.type === 'reasoning-delta' || c.blockType === 'reasoning'), [], 'it ended at once: no block opened')
+  assert.deepEqual(acks, [[KEY, { gen: 0, said: null }]], 'it named no plan')
+  assert.equal(chunks.at(-1).type, 'finish')
+})
+
+test('reply C, written once its task has started, carries the run the task began, and so does a reply that it ended', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  /** The reply for a task queued before its run began, which began run-5 since (orchestrator.runOf), with watchPlan as given. */
+  const replyOf = async (watchPlan) => {
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+      orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow({ waitMs: 100, runId: null }), watchPlan, noteAck: () => {}, runOf: (key) => (key === KEY ? 'run-5' : null) },
+    })
+    const chunks = []
+    const done = (async () => { for await (const c of a.stream({ messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'fix the parser' }] }], sessionId: 's', model: 'jev-auto', signal: new AbortController().signal })) chunks.push(c) })()
+    await settle()
+    t.mock.timers.tick(100)
+    await settle()
+    await done
+    return textOf(chunks)
+  }
+  const c = await replyOf(() => new Promise(() => {}))
+  assert.ok(c.startsWith('OK, **jev-4** is starting in kz-harness, and Jev is still choosing the agent (0.1 s so far).'), c)
+  assert.match(c, /^\[jev-run\]: kzh-run-1-run-5$/m, 'C names the run its task has begun by now')
+  const ended = await replyOf(async () => ({ settled: 'failed' }))
+  assert.ok(ended.startsWith('**jev-4** ended before Jev picked its agent (Failed).'), ended)
+  assert.match(ended, /^\[jev-run\]: kzh-run-1-run-5$/m, 'as does the reply that its task ended')
+})
+
+test('a start reply written after a read pass handed its task back carries the run the task is on by then: B, where it waits for its folder again, and C, where it starts again at once', async () => {
+  /** The reply for a task queued before its run began, whose read pass handed it back before its pick, and which is on run-5 by now (orchestrator.runOf). */
+  const replyOf = async (waiting) => {
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+      orchestrator: {
+        results: () => [], live: () => 0, enqueue: async () => startsNow({ waitMs: 100, runId: null }), noteAck: () => {},
+        watchPlan: async () => ({ handedBack: true, waiting, why: 'it needs to change files' }), runOf: (key) => (key === KEY ? 'run-5' : null),
+      },
+    })
+    return (await streamOf(a, 'fix the parser')).text
+  }
+  const b = await replyOf({ why: 'workspace', place: 2, ahead: 0 })
+  assert.ok(b.startsWith('OK, **jev-4** is queued: 2nd in line for kz-harness (another task is running there).'), b)
+  assert.match(b, /^\[jev-run\]: kzh-run-1-run-5$/m, 'B names the run its task has begun')
+  const c = await replyOf(null)
+  assert.ok(c.startsWith('OK, **jev-4** is starting in kz-harness, and Jev is choosing the agent.'), c)
+  assert.match(c, /^\[jev-run\]: kzh-run-1-run-5$/m, 'and so does C')
+})
+
+test('with Progress in chat off, C at the bound and B or C after a hand-back promise only the result', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  /** The reply's words before its marks, with watchPlan as given and the clock moved on `ms` once the wait began. */
+  const replyOf = async (watchPlan, ms = 0) => {
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+      orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow({ waitMs: 100, progress: 'off' }), watchPlan, noteAck: () => {} },
+    })
+    const chunks = []
+    const done = (async () => { for await (const c of a.stream({ messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'fix the parser' }] }], sessionId: 's', model: 'jev-auto', signal: new AbortController().signal })) chunks.push(c) })()
+    await settle()
+    if (ms) t.mock.timers.tick(ms)
+    await settle()
+    await done
+    return textOf(chunks).split('\n\n[jev-job]')[0]
+  }
+  const only = ' I\'ll report back here when it\'s done. Keep chatting.'
+  assert.equal(await replyOf(() => new Promise(() => {}), 100), `OK, **jev-4** is starting in kz-harness, and Jev is still choosing the agent (0.1 s so far).${only}`, 'C at the bound says nothing of saying the pick')
+  assert.equal(await replyOf(async () => ({ handedBack: true, waiting: { why: 'workspace', place: 2, ahead: 0 }, why: 'it needs to change files' })), `OK, **jev-4** is queued: 2nd in line for kz-harness (another task is running there). Jev picks the agent when it starts;${only}`, 'nor B, once a read pass handed it back to a folder that is busy')
+  assert.equal(await replyOf(async () => ({ handedBack: true, waiting: null, why: 'it needs to change files' })), `OK, **jev-4** is starting in kz-harness, and Jev is choosing the agent.${only}`, 'nor C, once one handed it back to a folder that is free')
+})
+
+test('the wait\'s block shows the router\'s own lines after its choosing line, those heard before it opened first, and a pick within 600 ms shows none of them', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const reasoning = (chunks) => chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join('')
+  /** One reply whose watchPlan keeps where the router's lines go (`tell`) and picks when the test says (`pick`). */
+  const reply = (sessionId) => {
+    const w = { chunks: [], tell: null, pick: null, done: null }
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task' }), auxModel: aux, agents: async () => AGENTS,
+      orchestrator: { results: () => [], live: () => 0, enqueue: async () => startsNow({ waitMs: 1500 }), watchPlan: (key, o) => { w.tell = o.onLine; return new Promise((r) => { w.pick = r }) }, noteAck: () => {} },
+    })
+    w.done = (async () => { for await (const c of a.stream({ messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'fix the parser' }] }], sessionId, model: 'jev-auto', signal: new AbortController().signal })) w.chunks.push(c) })()
+    return w
+  }
+  const slow = reply('s1')
+  await settle()
+  assert.equal(typeof slow.tell, 'function', 'the reply waits on watchPlan, and tells it where the router\'s lines go')
+  slow.tell('Jev route: 9/9 questions in 400 ms')
+  t.mock.timers.tick(599)
+  await settle()
+  assert.equal(slow.chunks.length, 0, 'a line heard before the block opens waits for it, so a quick pick still looks instant')
+  t.mock.timers.tick(1)
+  await settle()
+  slow.tell('Routed to claude (jev)')
+  await settle()
+  slow.pick(PICKED)
+  await settle()
+  await slow.done
+  const choosing = 'Queued as jev-4. Choosing the agent (I reply once it\'s picked, at most 1.5 s). Stop here ends this reply only; the task keeps going (stop it on the work board).'
+  assert.equal(reasoning(slow.chunks), `${choosing}\nJev route: 9/9 questions in 400 ms\nRouted to claude (jev)\n`, 'the choosing line, then each router line in the order it came')
+  assert.deepEqual(slow.chunks.filter((c) => c.type === 'block-start').map((c) => [c.blockType, c.index]), [['reasoning', 0], ['text', 1]], 'the block, then reply A after it')
+  assert.ok(textOf(slow.chunks).startsWith('OK, I\'ll run **Claude Code** with **claude-opus-4-1** (effort high)'), textOf(slow.chunks))
+  // A pick within 600 ms opens no block, whatever lines came before it.
+  const quick = reply('s2')
+  await settle()
+  quick.tell('Jev route: 9/9 questions in 100 ms')
+  quick.tell('Routed to claude (jev)')
+  quick.pick(PICKED)
+  await settle()
+  await quick.done
+  assert.deepEqual(quick.chunks.filter((c) => c.type === 'reasoning-delta' || c.blockType === 'reasoning'), [], 'no block for a quick pick')
+  assert.ok(textOf(quick.chunks).startsWith('OK, I\'ll run **Claude Code**'), textOf(quick.chunks))
+})
+
+test('a task queued after a direct answer says, when it is judged read only, that it runs locked or why it waits like work that writes', async () => {
+  const verdict = { p: 0.93, bar: 0.8, by: 'jev', reads: true }
+  /** What follows the answer, for a task queued as `queued` says. */
+  const tail = async (queued) => {
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => BOTH, auxModel: aux, agents: async () => AGENTS,
+      orchestrator: { results: () => [], live: () => 0, enqueue: async () => queued, noteAck: () => {} },
+    })
+    const { text } = await streamOf(a, 'what does the parser do, and also check whether the lexer has the same bug?')
+    assert.ok(text.startsWith('An answer.\n\n'), text)
+    return text.split('\n\n').at(-1)
+  }
+  const locked = 'Read only: Jev judged it only reads the project (93%, its bar is 80%), so it runs on an agent locked against writing, beside any task changing kz-harness.'
+  assert.equal(await tail(startsNow({ access: { mode: 'read', verdict } })), `OK, **jev-4** is starting in kz-harness, and Jev is choosing the agent. ${locked}`)
+  const why = 'no agent here can be locked against writing (codex: Codex cannot be locked through its provider)'
+  assert.equal(await tail(startsNow({ startsNow: false, waiting: { why: 'workspace', place: 2, ahead: 0 }, access: { mode: 'write', verdict, why } })), `OK, **jev-4** is queued: 2nd in line for kz-harness (another task is running there). Read only: Jev judged it only reads the project (93%, its bar is 80%), but ${why}, so it waits for kz-harness like work that writes.`)
+  assert.equal(await tail(startsNow({ access: { mode: 'write', verdict, why } })), `OK, **jev-4** is starting in kz-harness, and Jev is choosing the agent. Read only: Jev judged it only reads the project (93%, its bar is 80%), but ${why}, so it runs as work that writes, and a task changing kz-harness waits for it.`)
+  assert.equal(await tail(startsNow({ startsNow: false, waiting: { why: 'cap', place: 1, ahead: 0, slot: 1 }, access: { mode: 'read', verdict } })), `OK, **jev-4** is queued: next for a free slot to start in kz-harness (the resource budget caps how many tasks run at once). ${locked}`)
+  assert.equal(await tail(startsNow({ startsNow: false, waiting: { why: 'cap', place: 1, ahead: 0, slot: 1 }, access: { mode: 'write', verdict, why } })), `OK, **jev-4** is queued: next for a free slot to start in kz-harness (the resource budget caps how many tasks run at once). Read only: Jev judged it only reads the project (93%, its bar is 80%), but ${why}, so it runs as work that writes, and a task changing kz-harness waits for it.`, 'one waiting only for a free slot does not wait for the folder, since nothing holds it')
+  assert.equal(await tail(startsNow()), 'OK, **jev-4** is starting in kz-harness, and Jev is choosing the agent.', 'a task not judged read only says nothing of it')
+})
+
+test('a message Laya could not sort says why it runs as a task in the start reply the adapter writes: A once the pick lands, C at the bound, and B or C once a read pass hands it back', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const why = 'Laya could not sort this message (timed out after 8 s); treating it as a task.'
+  const enqueued = []
+  /** The reply's words before its marks, with watchPlan as given and the clock moved on `ms` once the wait began. */
+  const replyOf = async (watchPlan, ms = 0) => {
+    const a = jevAdapter({
+      ctx: projectCtx('C:\\work\\kz-harness'), route: async () => 'unused', classify: async () => ({ kind: 'task', unsure: true, why }), auxModel: aux, agents: async () => AGENTS,
+      orchestrator: { results: () => [], live: () => 0, enqueue: async (fields, extra) => { enqueued.push(extra); return startsNow({ waitMs: 100 }) }, watchPlan, noteAck: () => {} },
+    })
+    const chunks = []
+    const done = (async () => { for await (const c of a.stream({ messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'what is wrong with the parser?' }] }], sessionId: 's', model: 'laya-auto', signal: new AbortController().signal })) chunks.push(c) })()
+    await settle()
+    if (ms) t.mock.timers.tick(ms)
+    await settle()
+    await done
+    return textOf(chunks).split('\n\n[jev-job]')[0]
+  }
+  const picked = { ...PICKED, decidedBy: { ...PICKED.decidedBy, decider: 'laya' } }
+  assert.equal(await replyOf(async () => picked), `OK, I'll run **Claude Code** with **claude-opus-4-1** (effort high) in the background as **jev-4** in kz-harness. ${why} I'll report back here when it's done. Keep chatting.\n\n> Picked by Laya on this PC in 2.4 s: a code change, medium risk, so effort high.`)
+  assert.equal(await replyOf(() => new Promise(() => {}), 100), `OK, **jev-4** is starting in kz-harness, and Laya is still choosing the agent (0.1 s so far). ${why} I'll say here which one it picks, and report back when it's done. Keep chatting.`)
+  assert.equal(await replyOf(async () => ({ handedBack: true, waiting: { why: 'workspace', place: 2, ahead: 0 }, why: 'it needs to change files' })), `OK, **jev-4** is queued: 2nd in line for kz-harness (another task is running there). ${why} Laya picks the agent when it starts; I'll say which here, and report back when it's done. Keep chatting.`)
+  assert.equal(await replyOf(async () => ({ handedBack: true, waiting: null, why: 'it needs to change files' })), `OK, **jev-4** is starting in kz-harness, and Laya is choosing the agent. ${why} I'll say here which one it picks, and report back when it's done. Keep chatting.`)
+  assert.deepEqual(enqueued.map((e) => e?.why), [why, why, why, why], 'and the orchestrator is told it, for the reply it writes itself')
+})
+
+test('a message\'s intent sample rides its queued task and its run, and a question answered directly ends with its mark after the credit', async () => {
+  const SAMPLE = '9b2f4c1e-7a6d-4e3b-9c8a-1f2e3d4c5b6a'
+  const seen = []
+  /** A classify that says `cls`, keeping the modalities each message was sorted with. */
+  const says = (cls) => async (message, mode, decider, o) => { seen.push(o?.modalities); return cls }
+  const enqueued = []
+  const orchestrator = { results: () => [], live: () => 0, enqueue: async (fields, extra) => { enqueued.push(extra); return 'Queued as jev-4.' } }
+  await run(jevAdapter({ ctx: projectCtx(), route: async () => 'unused', classify: says({ kind: 'task', intentSample: SAMPLE }), auxModel: aux, orchestrator }), 'fix the parser')
+  assert.equal(enqueued.at(-1)?.intentSample, SAMPLE, 'the queued task carries the sample beside who decides it')
+  const routed = []
+  await run(jevAdapter({ ctx: projectCtx(), route: async (o) => { routed.push(o.intentSample); return 'report' }, classify: says({ kind: 'task', intentSample: SAMPLE }), auxModel: aux }), 'fix the parser')
+  assert.deepEqual(routed, [SAMPLE], 'a run the person waits on carries it too')
+  const answered = await run(jevAdapter({ ctx: chat(OK_TEXT), route: async () => '', classify: says({ kind: 'question', confidence: 0.95, intentSample: SAMPLE }), auxModel: aux }), 'what does the parser do?')
+  assert.ok(answered.endsWith(`Answered by: x/y, directly: a question, no agents or project work\n\n[jev-intent]: kzh-intent-1-${SAMPLE}`), answered)
+  enqueued.length = 0
+  await run(jevAdapter({ ctx: chat(OK_TEXT), route: async () => '', classify: says({ ...BOTH, intentSample: SAMPLE }), auxModel: aux, orchestrator }), 'what does the parser do, and also fix the typo in it?')
+  assert.equal(enqueued.length, 1, 'the work behind the answer is queued')
+  assert.equal('intentSample' in enqueued[0], false, 'and carries no sample: the message was a question, whatever its extra work does')
+  // No sample, nothing new: no mark, and no sample among the task's extras.
+  const plain = await run(jevAdapter({ ctx: chat(OK_TEXT), route: async () => '', classify: says({ kind: 'question', confidence: 0.95 }), auxModel: aux }), 'what does the parser do?')
+  assert.ok(plain.endsWith('directly: a question, no agents or project work'), plain)
+  enqueued.length = 0
+  await run(jevAdapter({ ctx: projectCtx(), route: async () => 'unused', classify: says({ kind: 'task' }), auxModel: aux, orchestrator }), 'fix the parser')
+  assert.deepEqual(Object.keys(enqueued[0]).sort(), ['decider', 'message', 'readVerdict', 'why'])
+  // The intent call is told whether the message carries an image.
+  await runWith(jevAdapter({ ctx: chat(OK_TEXT), route: async () => '', classify: says({ kind: 'question', confidence: 0.95 }), auxModel: aux }), [{ type: 'text', text: 'what is this?' }, IMAGE])
+  assert.deepEqual([seen[0], seen.at(-1)], [['text'], ['text', 'image']])
 })

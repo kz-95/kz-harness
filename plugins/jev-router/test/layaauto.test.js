@@ -482,7 +482,7 @@ test('while Laya starts the message waits with the Starting line, then is asked;
   assert.deepEqual(routed, ['laya'])
   const orchestrator = { results: () => [], live: () => 0, enqueue: (fields, extra) => { queued.push({ fields, extra }); return 'queued' } }
   const later = await send(make({ kind: 'task', unsure: true, why }, orchestrator), 'what is a parser?')
-  assert.deepEqual(queued[0].extra, { decider: 'laya', why, readVerdict: null }, 'a queued task carries who decides it and why it is a task, and an unsure Laya gives no read verdict')
+  assert.deepEqual(queued[0].extra, { decider: 'laya', why, readVerdict: null, message: 'what is a parser?' }, 'a queued task carries who decides it, why it is a task and the person\'s own words, and an unsure Laya gives no read verdict')
   assert.deepEqual([blocks(later.chunks, 'reasoning'), blocks(later.chunks, 'text')], [[0], [1]])
   assert.equal(queued[0].fields.task, 'what is a parser?')
 })

@@ -230,6 +230,9 @@ export function createLayaSidecar({
   let lastSelfTest = stored.lastSelfTest ?? null
   let saving = Promise.resolve()
   function persist() {
+    // Disposed of, it saves no more: the plugin applied again has read laya.json and saves its own
+    // settings there, which a copy of what this supervisor holds would be written over.
+    if (disposed) return saving
     saving = saving.then(async () => {
       await mkdir(dataDir, { recursive: true })
       await writeFile(`${paths.settings}.tmp`, JSON.stringify({ ...settings, measured, lastSelfTest }, null, 2))
@@ -264,7 +267,8 @@ export function createLayaSidecar({
   let currentStart = null
   let suspended = null
   let install = null
-  // Set for good by dispose(): nothing starts or restarts Laya afterwards, however it was chained.
+  // Set for good by dispose(): nothing starts or restarts Laya afterwards, however it was chained,
+  // and laya.json is saved no more (persist).
   let disposed = false
   let priority = 'normal'
   let priorityWarned = false

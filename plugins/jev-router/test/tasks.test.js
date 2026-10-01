@@ -5,8 +5,10 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { TERMINAL_STATES, WAITING, createLanes, createTasks, laneKey, validJobIds } from '../tasks.js'
-import { line } from '../adapter.js'
+import { TERMINAL_STATES, WAITING, createLanes, createTasks, laneKey, runAdmitted, validJobIds } from '../tasks.js'
+import { line, resultSection } from '../adapter.js'
+import { needsLane } from '../capabilities.js'
+import { createDelivery } from '../delivery.js'
 
 const tick = () => new Promise((r) => setImmediate(r))
 
@@ -530,7 +532,7 @@ test('index.js takes the cap on tasks at once from the local settings, at start 
   assert.match(ways[1], /^lanes\.acquire\(laneKey\(folder\), `benchmark-\$\{runId\}`, signal, \{ who: \{ kind: 'benchmark' \}, onWait: \(why\) => onWait\?\.\(WAITING\[why\]\) \}\)$/, 'a benchmark task tells its card')
   assert.ok(index.indexOf(ways[1]) > index.indexOf('async function runBenchmarkTask('), 'that one is the benchmark\'s')
   assert.match(index, /runAdmitted\(\{ lanes, task: t, signal, who: \{ kind: 'task', decider: t\.decider \?\? 'jev' \}, onWait: \(why\) => emit\(\{ type: 'queued', text: WAITING\[why\] \}\),/, 'a background task tells its row')
-  assert.match(index, /wait: tasks\.get\(t\.jobId\)\?\.waiting \?\? null/, 'and the chat line says where it stands and why, read off the line it joined as it was queued, so it does not promise "starting now" when the cap is full')
+  assert.match(index, /const waiting = tasks\.get\(t\.jobId\)\?\.waiting \?\? null/, 'and the start reply says where it stands and why, read off the line it joined as it was queued, so it does not promise "starting now" when the cap is full')
 })
 
 test('a finished task is delivered to its own session exactly once', async () => {
@@ -550,6 +552,8 @@ test('a finished task is delivered to its own session exactly once', async () =>
   assert.equal(out[0].deliveryState, 'pending', 'unread until the renderer takes it')
   // Reading does NOT consume: a turn that dies before the text is shown must not lose it.
   assert.deepEqual(tasks.results('s1'), out, 'still offered until delivered')
+  // Its message is posted (delivery claims it first), and the browser says it rendered it.
+  tasks.delivering(t.jobId)
   tasks.delivered(t.jobId)
   assert.deepEqual(tasks.results('s1'), [], 'delivered once the message was accepted')
   assert.equal(tasks.get(t.jobId).deliveryState, 'delivered')
@@ -845,6 +849,51 @@ test('flushed() writes a progress line still waiting to be coalesced now, rather
   const row = readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).find((r) => r.jobId === t.jobId)
   assert.equal(row.progressText, 'halfway there', 'the latest line is on disk once flushed() resolves')
   hold('done')
+})
+
+test('a tasks store\'s dispose(), as the plugin closes or is applied again, resolves once every write asked of it before has landed: the claim of a result just posted, and a progress line still waiting to be coalesced', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  let emit = null
+  const { tasks } = harness({ file, run: (t, o) => (t.task === 'still going' ? new Promise(() => { emit = o.emit }) : Promise.resolve('the report')) })
+  await tasks.ready
+  const done = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/a', task: 'done now' })
+  const going = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/b', task: 'still going' })
+  for (let i = 0; i < 20 && (tasks.get(done.jobId).state !== 'completed' || !emit); i++) await tick()
+  await tasks.flushed()
+  // A line of the task still going, written half a second later, and the claim of the result just
+  // posted, written at once; the plugin closes before either has landed.
+  emit({ type: 'note', text: 'halfway there' })
+  assert.equal(tasks.delivering(done.jobId), true)
+  await tasks.dispose?.()
+  const rows = readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  assert.equal(rows.find((r) => r.jobId === done.jobId)?.deliveryState, 'delivering', 'the claim is on disk, so the next start does not post the result as if it never had')
+  assert.equal(rows.find((r) => r.jobId === going.jobId)?.progressText, 'halfway there', 'and so is the line')
+})
+
+test('a tasks store disposed of, as the plugin closing or applied again leaves it, never rewrites tasks.jsonl from what it holds, since the plugin that replaces it has written its own records there, and claims no result or notice it could not save', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  let finish = null
+  const { tasks } = harness({ file, run: (t) => (t.task === 'still going' ? new Promise((r) => { finish = r }) : Promise.resolve('the report')) })
+  await tasks.ready
+  const done = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/a', task: 'done now' })
+  const going = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/b', task: 'still going' })
+  for (let i = 0; i < 20 && (tasks.get(done.jobId).state !== 'completed' || !finish); i++) await tick()
+  await tasks.flushed()
+  await tasks.dispose?.()
+  // The plugin that replaces it reads the file and writes a record of its own there.
+  const theirs = `${readFileSync(file, 'utf8')}${JSON.stringify({ jobId: 'jev-3', key: 'theirs', sessionId: 's1', workspace: 'C:/c', taskText: 'theirs', state: 'queued' })}\n`
+  writeFileSync(file, theirs)
+  // What the closed store still hears: a notice claimed for the task still going, which then
+  // settles; its finished result claimed for posting, put back on offer; a finished task cleared.
+  assert.equal(tasks.claimNotice(going.key, 'started'), false, 'no notice is claimed that could not be saved')
+  finish('the late report')
+  for (let i = 0; i < 20 && tasks.get(going.jobId).state !== 'completed'; i++) await tick()
+  assert.equal(tasks.get(going.jobId).state, 'completed', 'the task still going settles, in memory')
+  assert.equal(tasks.delivering(done.jobId), false, 'no result is claimed for posting that could not be saved, so it stays unread on disk for the next start to post')
+  tasks.undeliver(done.jobId)
+  tasks.clear([done.jobId])
+  await tasks.flushed()
+  assert.equal(readFileSync(file, 'utf8'), theirs, 'tasks.jsonl is still what the plugin that replaced it wrote')
 })
 
 test('a failing task reports the error, is saved, and clears on request', async () => {
@@ -1238,4 +1287,660 @@ test('an estimate that failed says so on the line, rather than looking like a sh
   assert.equal(w.estimate, null)
   assert.equal(w.text, 'Waiting: another task is running in this workspace. No estimate: working it out failed, and the server log says why.')
   assert.match(logged.join('\n'), /history unreadable/)
+})
+
+// ---------------------------------------------------------------- the task's key, its plan, and what marks a result read
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const rowsOf = (file) => readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+
+test('delivered() on a running task returns false, deliveryState stays pending, and the later delivery posts exactly once', async () => {
+  let finish = null
+  let delivery
+  const posted = []
+  const own = { whenIdle: async () => {}, session: { append: (_type, msg) => posted.push(msg) } }
+  const tasks = createTasks({
+    file: join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl'),
+    lanes: createLanes(),
+    jobs: () => fakeJobs(),
+    run: (t, { onEntry }) => { onEntry({ id: 'run-1' }); return new Promise((r) => { finish = () => r('the report') }) },
+    // Posted the moment it settles, as index.js wires it.
+    onSettled: (result, owner) => { delivery.deliverWithRetry(result, owner).catch(() => {}) },
+  })
+  delivery = createDelivery({ tasks, setTimer: () => {} })
+  const t = tasks.enqueue({ owner: own, sessionId: 's1', workspace: 'C:/work', task: 'fix the parser' })
+  for (let i = 0; i < 5 && !finish; i++) await tick()
+  assert.equal(tasks.get(t.jobId).state, 'routing', 'it is running')
+  // An acknowledgement of its id while it runs: an old notice in the chat under an id the engine handed out again.
+  assert.equal(tasks.delivered(t.jobId), false, 'a running task has no result to mark read')
+  assert.equal(tasks.delivered(t.jobId, { name: 'fix the parser' }), false, 'not even under its own name')
+  assert.deepEqual([tasks.get(t.jobId).deliveryState, tasks.get(t.jobId).deliveredAt], ['pending', null])
+  finish()
+  for (let i = 0; i < 20 && !posted.length; i++) await tick()
+  assert.equal(posted.length, 1, 'its result posts once it ends')
+  assert.equal(posted[0].source.summary, `${t.jobId} · fix the parser · Completed`)
+  assert.equal(tasks.get(t.jobId).deliveryState, 'delivering', 'and it is unread until the browser says it rendered it')
+  assert.equal(tasks.delivered(t.jobId, { name: 'fix the parser' }), true, 'which it then says, under the task\'s name')
+  for (let i = 0; i < 20; i++) await tick()
+  assert.equal(posted.length, 1, 'posted exactly once')
+  assert.equal(tasks.get(t.jobId).deliveryState, 'delivered')
+})
+
+test('delivered() refuses a task still waiting in line, which has no result either', async () => {
+  const { tasks, holds } = queue()
+  tasks.enqueue({ ...own, workspace: 'C:/w', task: 'a' })
+  const b = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'b' })
+  for (let i = 0; i < 5; i++) await tick()
+  assert.equal(tasks.get(b.jobId).state, 'queued')
+  assert.equal(tasks.delivered(b.jobId, { name: 'b' }), false)
+  assert.equal(tasks.get(b.jobId).deliveryState, 'pending')
+  holds.get('a')()
+  for (let i = 0; i < 5; i++) await tick()
+  holds.get('b')()
+  for (let i = 0; i < 5 && tasks.get(b.jobId).state !== 'completed'; i++) await tick()
+  assert.ok(tasks.results('s1').some((r) => r.jobId === b.jobId), 'its result is on offer once it ends')
+})
+
+test('delivered() with a name that is not the task\'s leaves it unread (a job id reused after a restart)', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const first = harness({ file, run: async () => 'the parser report' })
+  await first.tasks.ready
+  const old = first.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'fix the parser' })
+  for (let i = 0; i < 10; i++) await tick()
+  // Its notice is posted (delivery claims it first), and the browser says it rendered it.
+  first.tasks.delivering(old.jobId)
+  assert.equal(first.tasks.delivered(old.jobId, { name: 'fix the parser' }), true, 'its own name marks it read')
+  await first.tasks.flushed()
+  // The app restarts, and the engine counts its job ids from 1 again.
+  const second = harness({ file, run: async () => 'the lexer report' })
+  await second.tasks.ready
+  const now = second.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'fix the lexer · then the docs' })
+  assert.equal(now.jobId, old.jobId, 'the new task has the old one\'s job id')
+  for (let i = 0; i < 10; i++) await tick()
+  assert.equal(second.tasks.get(now.jobId).state, 'completed')
+  // Its notice is posted beside the old task's, which is still in the chat, and a fresh page
+  // acknowledges both by their ids and names.
+  second.tasks.delivering(now.jobId)
+  assert.equal(second.tasks.delivered(now.jobId, { name: 'fix the parser' }), false, 'another task\'s name marks nothing read')
+  assert.equal(second.tasks.get(now.jobId).deliveryState, 'delivering', 'the new result is still unread')
+  // Its own notice names it, however the separator is spaced.
+  assert.equal(second.tasks.delivered(now.jobId, { name: 'fix the lexer·then the docs' }), true)
+  assert.equal(second.tasks.get(now.jobId).deliveryState, 'delivered')
+})
+
+test('an old notice naming the same task under a reused job id cannot mark the new result read before its own notice has posted', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  // Before the restart: 'run the tests' ran as jev-1, its notice was posted, and the browser said it rendered it.
+  const first = harness({ file, run: async () => 'the first report' })
+  await first.tasks.ready
+  const old = first.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'run the tests' })
+  for (let i = 0; i < 10; i++) await tick()
+  first.tasks.delivering(old.jobId)
+  assert.equal(first.tasks.delivered(old.jobId, { name: 'run the tests' }), true)
+  await first.tasks.flushed()
+  // After the restart the same words are sent again, and the engine hands the new task jev-1 too. It
+  // settles while an answer is streaming, so its result waits for the chat to go idle before it posts.
+  let idle
+  const streaming = new Promise((r) => { idle = r })
+  const posted = []
+  const own = { whenIdle: () => streaming, session: { append: (_type, msg) => posted.push(msg) } }
+  let delivery
+  const jobs = fakeJobs()
+  const tasks = createTasks({
+    file, lanes: createLanes(), jobs: () => jobs, run: async () => 'the second report',
+    onSettled: (result, owner) => { delivery.deliverWithRetry(result, owner).catch(() => {}) },
+  })
+  delivery = createDelivery({ tasks, setTimer: () => {} })
+  await tasks.ready
+  const now = tasks.enqueue({ owner: own, sessionId: 's1', workspace: 'C:/work', task: 'run the tests' })
+  assert.equal(now.jobId, old.jobId, 'the new task has the old one\'s job id, and its name')
+  for (let i = 0; i < 10; i++) await tick()
+  assert.deepEqual([tasks.get(now.jobId).state, tasks.get(now.jobId).deliveryState, posted.length], ['completed', 'pending', 0], 'finished, its result waiting to post')
+  // A page opened now renders the old notice, which names the new task's id and name as well, and acknowledges it.
+  assert.equal(tasks.delivered(now.jobId, { name: 'run the tests' }), false, 'no notice of the new task is in the chat yet')
+  assert.equal(tasks.delivered(now.jobId), false, 'nor does an older page\'s bare id mark it read')
+  assert.equal(tasks.get(now.jobId).deliveryState, 'pending')
+  idle()
+  for (let i = 0; i < 20 && !posted.length; i++) await tick()
+  assert.deepEqual(posted.map((m) => m.source.summary), [`${now.jobId} · run the tests · Completed`], 'the new result posts once the chat is idle')
+  // Its own notice, once rendered, marks it read.
+  assert.equal(tasks.delivered(now.jobId, { name: 'run the tests' }), true)
+  for (let i = 0; i < 20; i++) await tick()
+  assert.equal(posted.length, 1, 'posted exactly once')
+  assert.equal(tasks.get(now.jobId).deliveryState, 'delivered')
+})
+
+/** A run of the app before a restart: `task` runs as jev-1 in chat `sessionId`, its notice is posted, and the browser says it rendered it. */
+async function readBeforeRestart(file, { task = 'run the tests', sessionId = 's1' } = {}) {
+  const { tasks } = harness({ file, run: async () => 'the first report' })
+  await tasks.ready
+  const old = tasks.enqueue({ owner: {}, sessionId, workspace: 'C:/work', task })
+  for (let i = 0; i < 10; i++) await tick()
+  tasks.delivering(old.jobId)
+  assert.equal(tasks.delivered(old.jobId, { name: task, sessionId }), true, 'its own notice marks it read')
+  await tasks.flushed()
+  return old
+}
+
+/** createTasks over `file` whose results are posted the moment they settle, as index.js wires it. */
+function posting(file, run) {
+  let delivery
+  const jobs = fakeJobs()
+  const tasks = createTasks({ file, lanes: createLanes(), jobs: () => jobs, run, onSettled: (result, owner) => { delivery.deliverWithRetry(result, owner).catch(() => {}) } })
+  delivery = createDelivery({ tasks, setTimer: () => {} })
+  return tasks
+}
+
+test('a task the restart stopped never had a notice, so an older notice naming it under its reused job id leaves it unread, after the next restart too', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const old = await readBeforeRestart(file)
+  // After the restart the same words are sent again, the engine hands the new task jev-1 too, and the
+  // app is closed while it runs.
+  const second = harness({ file, run: (_t, { onEntry }) => { onEntry({ id: 'run-2' }); return new Promise(() => {}) } })
+  await second.tasks.ready
+  const now = second.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'run the tests' })
+  assert.equal(now.jobId, old.jobId, 'the new task has the old one\'s job id, and its name')
+  for (let i = 0; i < 10; i++) await tick()
+  assert.equal(second.tasks.get(now.jobId).state, 'routing')
+  await second.tasks.flushed()
+  // The next start stops it, and nothing posts a notice of it. A page opened now renders the old
+  // notice, which names it.
+  const third = harness({ file })
+  await third.tasks.ready
+  assert.deepEqual([third.tasks.get(now.jobId).state, third.tasks.get(now.jobId).deliveryState], ['stopped', 'pending'])
+  assert.equal(third.tasks.delivered(now.jobId, { name: 'run the tests', sessionId: 's1' }), false, 'no notice of it can be in the chat')
+  assert.equal(third.tasks.delivered(now.jobId), false, 'nor does an older page\'s bare id mark it read')
+  assert.deepEqual(third.tasks.results('s1').map((r) => r.jobId), [now.jobId], 'it stays unread, so the person is told what happened to it')
+  await third.tasks.flushed()
+  // It is a finished, unread record on disk now, as one a restart caught posted is, and still refused.
+  const fourth = harness({ file })
+  await fourth.tasks.ready
+  assert.equal(fourth.tasks.delivered(now.jobId, { name: 'run the tests' }), false, 'after the next restart too')
+  assert.equal(fourth.tasks.get(now.jobId).deliveryState, 'pending')
+  // A task an older build left running, whose row says nothing of a notice either way, is refused alike.
+  const older = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  writeFileSync(older, `${JSON.stringify({ jobId: 'jev-1', sessionId: 's1', workspace: 'C:/work', taskName: 'run the tests', taskText: 'run the tests', state: 'running', startedAt: 1, deliveryState: 'pending', seq: 3 })}\n`)
+  const loaded = harness({ file: older })
+  await loaded.tasks.ready
+  assert.equal(loaded.tasks.get('jev-1').state, 'stopped')
+  assert.equal(loaded.tasks.delivered('jev-1', { name: 'run the tests' }), false)
+})
+
+test('a result the app was closed on before it was posted stays unread after the restart, whatever older notice names it under its reused job id', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const old = await readBeforeRestart(file)
+  // After the restart the same words take jev-1 again. The task ends while an answer is streaming,
+  // so its result waits for the chat to go idle, and the app is closed before it does.
+  const posted = []
+  const own = { whenIdle: () => new Promise(() => {}), session: { append: (_type, msg) => posted.push(msg) } }
+  const tasks = posting(file, async () => 'the second report')
+  await tasks.ready
+  const now = tasks.enqueue({ owner: own, sessionId: 's1', workspace: 'C:/work', task: 'run the tests' })
+  assert.equal(now.jobId, old.jobId)
+  for (let i = 0; i < 10; i++) await tick()
+  assert.deepEqual([tasks.get(now.jobId).state, tasks.get(now.jobId).deliveryState, posted.length], ['completed', 'pending', 0], 'finished, its result waiting to post')
+  await tasks.flushed()
+  // Nothing posts it after the next start, and a page opened then renders the old notice, which names it.
+  const after = harness({ file })
+  await after.tasks.ready
+  assert.equal(after.tasks.delivered(now.jobId, { name: 'run the tests', sessionId: 's1' }), false, 'no notice of it can be in the chat')
+  assert.deepEqual(after.tasks.results('s1').map((r) => [r.jobId, r.report]), [[now.jobId, 'the second report']], 'its report is still on offer, unread')
+})
+
+test('a result a restart caught posted and not yet seen is marked read by its notice, after the next restart too', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const first = harness({ file, run: async () => 'the report' })
+  await first.tasks.ready
+  const t = first.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'run the tests' })
+  for (let i = 0; i < 10; i++) await tick()
+  // Its notice is posted, and the app is closed before the chat is opened.
+  first.tasks.delivering(t.jobId)
+  await first.tasks.flushed()
+  const second = harness({ file })
+  await second.tasks.ready
+  assert.equal(second.tasks.get(t.jobId).deliveryState, 'pending', 'on offer again')
+  await second.tasks.flushed()
+  // Closed once more before the chat was opened: its notice is still in the chat, and the row the
+  // browser renders marks it read.
+  const third = harness({ file })
+  await third.tasks.ready
+  assert.equal(third.tasks.delivered(t.jobId, { name: 'run the tests', sessionId: 's1' }), true)
+  assert.equal(third.tasks.get(t.jobId).deliveryState, 'delivered')
+})
+
+test('delivered() with the chat named: an older notice in another chat under a reused job id and the same name leaves the new result unread', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const old = await readBeforeRestart(file, { sessionId: 'chat-A' })
+  // After the restart the same words, sent in chat B, take jev-1 again, and the result is posted there.
+  const posted = []
+  const own = { whenIdle: async () => {}, session: { append: (_type, msg) => posted.push(msg) } }
+  const tasks = posting(file, async () => 'the second report')
+  await tasks.ready
+  const now = tasks.enqueue({ owner: own, sessionId: 'chat-B', workspace: 'C:/work', task: 'run the tests' })
+  assert.equal(now.jobId, old.jobId)
+  for (let i = 0; i < 20 && !posted.length; i++) await tick()
+  assert.equal(posted.length, 1)
+  assert.equal(tasks.get(now.jobId).deliveryState, 'delivering', 'posted in chat B, and not seen there yet')
+  // Chat A is on screen, and its old row names the new task's id and name.
+  assert.equal(tasks.delivered(now.jobId, { name: 'run the tests', sessionId: 'chat-A' }), false, 'a row in another chat marks nothing read')
+  assert.equal(tasks.get(now.jobId).deliveryState, 'delivering')
+  assert.equal(tasks.delivered(now.jobId, { name: 'run the tests', sessionId: 'chat-B' }), true, 'its own row in chat B does')
+  assert.equal(tasks.get(now.jobId).deliveryState, 'delivered')
+})
+
+test('each task gets a key, kept across a restart, and a reused job id gets a different key', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const first = harness({ file, run: async () => 'the report' })
+  await first.tasks.ready
+  const a = first.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/a', task: 'fix the parser' })
+  const b = first.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/b', task: 'fix the lexer' })
+  const keyA = first.tasks.get(a.jobId).key
+  const keyB = first.tasks.get(b.jobId).key
+  assert.match(String(keyA), UUID, 'the list shows each task\'s key')
+  assert.notEqual(keyB, keyA, 'and no two tasks share one')
+  for (let i = 0; i < 10; i++) await tick()
+  await first.tasks.flushed()
+  assert.deepEqual(rowsOf(file).map((r) => [r.jobId, r.key]), [[a.jobId, keyA], [b.jobId, keyB]], 'both keys are on disk')
+  // The app restarts: every task keeps its key, and the engine counts job ids from 1 again.
+  const second = harness({ file, run: async () => 'the report' })
+  await second.tasks.ready
+  assert.deepEqual([second.tasks.get(a.jobId).key, second.tasks.get(b.jobId).key], [keyA, keyB], 'a restart keeps each key')
+  const reused = second.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/a', task: 'fix the docs' })
+  assert.equal(reused.jobId, a.jobId, 'the engine hands the old job id out again')
+  assert.match(String(second.tasks.get(reused.jobId).key), UUID)
+  assert.notEqual(second.tasks.get(reused.jobId).key, keyA, 'the new task under it has a key of its own')
+  // A record an older build wrote, with no key, is given one as it loads, and keeps it through the next restart.
+  const older = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  writeFileSync(older, `${JSON.stringify({ jobId: 'jev-7', sessionId: 's1', workspace: 'C:/old', taskName: 'old one', taskText: 'old one', state: 'completed', deliveryState: 'delivered', seq: 3 })}\n`)
+  const loaded = harness({ file: older })
+  await loaded.tasks.ready
+  const given = loaded.tasks.get('jev-7').key
+  assert.match(String(given), UUID, 'a record from before keys gets one')
+  await loaded.tasks.flushed()
+  const reloaded = harness({ file: older })
+  await reloaded.tasks.ready
+  assert.equal(reloaded.tasks.get('jev-7').key, given, 'and keeps it')
+})
+
+test('a task\'s plan is saved in tasks.jsonl, and a restart keeps it', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const first = harness({
+    file,
+    run: async (t, { emit, onEntry }) => {
+      onEntry({ id: 'run-1' })
+      emit({
+        type: 'routed', routing: { primaryAgent: 'codex', mode: 'jev' },
+        primary: { agent: 'codex', model: 'codex-model', effort: 'high', level: 'high', speed: null },
+        planner: { agent: 'claude', model: 'claude-model' }, reviewer: { agent: 'deepseek', model: null },
+      })
+      return 'the report'
+    },
+  })
+  await first.tasks.ready
+  const t = first.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'fix the parser' })
+  for (let i = 0; i < 10 && first.tasks.get(t.jobId).state !== 'completed'; i++) await tick()
+  await first.tasks.flushed()
+  const planned = { agent: 'codex', model: 'codex-model', effort: 'high', level: 'high', speed: null, planner: { agent: 'claude', model: 'claude-model' }, reviewer: { agent: 'deepseek', model: null } }
+  assert.deepEqual(rowsOf(file).find((r) => r.jobId === t.jobId)?.plan, planned, 'the plan is on the task\'s row')
+  const second = harness({ file })
+  await second.tasks.ready
+  assert.deepEqual(second.tasks.get(t.jobId).plan, planned, 'and a restart keeps it')
+})
+
+test('a routed plan says a local model goes first only when it keeps one in front of the routed resource, which takes over if it fails', async () => {
+  /** The plan a task keeps from a LOCAL_FIRST routing whose primary step is `worker` and whose pick is `pick`. */
+  const planOf = async (worker, pick, routing = {}, strategy = 'LOCAL_FIRST') => {
+    const { tasks } = harness({
+      run: async (t, { emit, onEntry }) => {
+        onEntry({ id: 'run-1' })
+        emit({
+          type: 'routed', routing: { primaryAgent: pick, mode: 'jev', strategy, ...routing },
+          plan: { strategy, steps: [{ role: 'primary', agent: worker }], reviewer: null, forceReview: false, parallelWith: null },
+          primary: { agent: worker, model: `${worker}-model`, effort: null, level: null, speed: null },
+        })
+        return 'the report'
+      },
+    })
+    await tasks.ready
+    const t = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'fix the parser' })
+    for (let i = 0; i < 10 && tasks.get(t.jobId).state !== 'completed'; i++) await tick()
+    return tasks.get(t.jobId).plan
+  }
+  assert.equal((await planOf('qwen-local', 'claude'))?.localFirst, true, 'the local model works first, and claude, the pick, takes over if it fails')
+  assert.equal((await planOf('claude', 'claude', { capabilityFrom: 'qwen-local' }))?.localFirst, undefined, 'a capability the local model lacked moved the pick off it and gave its step to claude, which works from the start')
+  assert.equal((await planOf('claude', 'claude', { feedbackFrom: 'qwen-local' }))?.localFirst, undefined, 'and so did your feedback')
+  assert.equal((await planOf('qwen-local', 'qwen-local'))?.localFirst, undefined, 'a local model that is the pick itself was promised no one to take over')
+  assert.equal((await planOf('claude', 'claude', {}, 'STANDARD_DIRECT'))?.localFirst, undefined)
+})
+
+test('a task whose plan keeps a local model in front of the routed resource names that local model from the pick on, as its reply did: in its row, in what a direct answer is told, and in its result, stopped or caught by a restart before its attempt starts', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  let routed = false
+  const first = harness({
+    file,
+    run: async (t, { emit, onEntry, signal }) => {
+      onEntry({ id: 'run-1' })
+      // As router.js emits it for LOCAL_FIRST: the routing picked claude, and the plan puts the local
+      // model to work first, claude taking over only if it fails. The run then holds before any
+      // attempt starts, as it does while the baseline checks run.
+      emit({
+        type: 'routed', routing: { primaryAgent: 'claude', mode: 'jev', strategy: 'LOCAL_FIRST' },
+        plan: { strategy: 'LOCAL_FIRST', steps: [{ role: 'primary', agent: 'qwen-local' }], reviewer: null, forceReview: false, parallelWith: null },
+        primary: { agent: 'qwen-local', model: 'qwen3-8b', effort: null, level: null, speed: null },
+      })
+      routed = true
+      await new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    },
+  })
+  await first.tasks.ready
+  const t = first.tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'fix the parser' })
+  for (let i = 0; i < 10 && !routed; i++) await tick()
+  const view = first.tasks.get(t.jobId)
+  assert.equal(view.agent, 'qwen-local', 'the row names the local model, not claude, which works only if the local model fails')
+  assert.deepEqual([view.state, view.plan?.agent, view.plan?.localFirst], ['running', 'qwen-local', true], 'the plan its start reply names')
+  const names = { 'qwen-local': 'Qwen (local)', claude: 'Claude Code' }
+  const { liveStatusSentence } = await import('../reply-words.js')
+  assert.match(liveStatusSentence([view], names), /^Right now in this chat: jev-1 is running on Qwen \(local\) \(/, 'a direct answer is told the local model runs it')
+  const headOf = (r) => /^Agent: .*$/m.exec(resultSection(r, { names }))?.[0]
+  // The app restarts before its attempt starts.
+  await first.tasks.flushed()
+  const after = harness({ file })
+  await after.tasks.ready
+  const [caught] = after.tasks.results('s1')
+  assert.deepEqual([caught?.state, caught?.agent, caught?.effort], ['stopped', 'qwen-local', null], 'caught by a restart, it names the local model')
+  assert.match(headOf(caught) ?? '', /^Agent: Qwen \(local\) · took \d+ s$/)
+  // And, in the app that ran it, it is stopped before its attempt starts.
+  first.tasks.stop(t.jobId)
+  for (let i = 0; i < 10 && !first.tasks.results('s1').length; i++) await tick()
+  const [stopped] = first.tasks.results('s1')
+  assert.deepEqual([stopped?.state, stopped?.agent, stopped?.effort], ['stopped', 'qwen-local', null], 'stopped, it names the local model its reply named, and no effort')
+  assert.match(headOf(stopped) ?? '', /^Agent: Qwen \(local\) · took \d+ s$/, 'not claude, which never ran')
+})
+
+test('a task keeps the intent sample it was queued with: on the record its run reads, and on disk', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const read = []
+  const { tasks } = harness({ file, run: async (t) => { read.push(t.intentSample); return 'the report' } })
+  await tasks.ready
+  const sampled = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/a', task: 'fix the parser', intentSample: 'sample-1' })
+  const plain = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/b', task: 'fix the lexer' })
+  for (let i = 0; i < 10; i++) await tick()
+  assert.deepEqual(read, ['sample-1', null], 'route() is handed it, for the run\'s history row')
+  await tasks.flushed()
+  assert.deepEqual(rowsOf(file).map((r) => [r.jobId, r.intentSample]), [[sampled.jobId, 'sample-1'], [plain.jobId, null]])
+})
+
+test('watch hears the task\'s router events; planGen is 2 after a read-pass handback and a writer pass; no watcher is left after 100 enqueue and settle cycles', async () => {
+  const lanes = createLanes()
+  const jobs = fakeJobs()
+  const routed = (agent) => ({ type: 'routed', routing: { primaryAgent: agent, mode: 'jev' }, primary: { agent, model: `${agent}-model`, effort: 'high', level: 'high', speed: null } })
+  const tasks = createTasks({
+    file: join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl'),
+    lanes,
+    jobs: () => jobs,
+    // index.js's runner: a task judged read only runs a read pass, which here is routed and then
+    // hands the task to its folder's line, and runs again as work that writes, routed once more.
+    run: (t, { signal, emit, onEntry }) => runAdmitted({ lanes, task: t, signal, run: async (pass) => {
+      onEntry({ id: `run-${t.jobId}-${pass.mode}` })
+      emit(routed(pass.mode === 'read' ? 'claude' : 'codex'))
+      if (pass.mode === 'read') {
+        emit({ type: 'access', mode: 'write', from: 'read', why: 'it needs to change files' })
+        throw needsLane('it needs to change files')
+      }
+      return 'the report'
+    } }),
+  })
+  assert.equal(typeof tasks.watch, 'function', 'a task can be watched')
+  const t = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'fix the parser', access: 'read' })
+  const key = tasks.get(t.jobId).key
+  const heard = []
+  tasks.watch(key, (e, seen) => heard.push([e.type, seen.planGen, seen.plan?.agent ?? null, seen.state]))
+  for (let i = 0; i < 30 && heard.at(-1)?.[0] !== 'settled'; i++) await tick()
+  assert.deepEqual(heard, [
+    ['routed', 1, 'claude', 'running'],
+    ['access', 1, null, 'queued'],
+    ['routed', 2, 'codex', 'running'],
+    ['settled', 2, 'codex', 'completed'],
+  ], 'each event once its record holds it, the plan cleared by the hand-back, and the end')
+  const v = tasks.get(t.jobId)
+  assert.deepEqual([v.planGen, v.plan], [2, { agent: 'codex', model: 'codex-model', effort: 'high', level: 'high', speed: null }])
+  assert.equal(tasks.watching, 0, 'the settled task\'s watcher was let go')
+  // A task that has ended, or a key nobody has, is never watched.
+  const none = []
+  tasks.watch(key, () => none.push('late'))
+  tasks.watch('no such key', () => none.push('stray'))
+  assert.equal(tasks.watching, 0)
+  // One hundred tasks, each watched twice and once let go early by hand: none of it is left.
+  for (let i = 0; i < 100; i++) {
+    const x = tasks.enqueue({ ...own, workspace: `C:/w${i}`, task: `task ${i}` })
+    const k = tasks.get(x.jobId).key
+    const off = tasks.watch(k, () => {})
+    tasks.watch(k, () => { throw new Error('a watcher that fails') })
+    if (i % 2) off()
+    for (let j = 0; j < 30 && !TERMINAL_STATES.includes(tasks.get(x.jobId).state); j++) await tick()
+    assert.equal(tasks.get(x.jobId).state, 'completed', `task ${i} ran to its end, whatever its watchers did`)
+  }
+  assert.equal(tasks.watching, 0, 'no watcher is left')
+  assert.deepEqual(none, [])
+})
+
+test('planGen counts routed events: a read pass handed back before its routing finished leaves the writer pass the task\'s first plan', async () => {
+  const lanes = createLanes()
+  const jobs = fakeJobs()
+  const tasks = createTasks({
+    file: join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl'),
+    lanes,
+    jobs: () => jobs,
+    // As router.js does when the routing names work that may change files, or no agent can be locked:
+    // the read pass goes to its folder's line before it emits `routed`, and only the writer pass is routed.
+    run: (t, { signal, emit, onEntry }) => runAdmitted({ lanes, task: t, signal, run: async (pass) => {
+      onEntry({ id: `run-${t.jobId}-${pass.mode}` })
+      if (pass.mode === 'read') {
+        emit({ type: 'access', mode: 'write', from: 'read', why: 'Jev\'s routing named code_change, which may change files' })
+        throw needsLane('Jev\'s routing named code_change, which may change files')
+      }
+      emit({ type: 'routed', routing: { primaryAgent: 'codex', mode: 'jev' }, primary: { agent: 'codex', model: 'codex-model', effort: 'high', level: 'high', speed: null } })
+      return 'the report'
+    } }),
+  })
+  const t = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'fix the parser', access: 'read' })
+  for (let i = 0; i < 30 && tasks.get(t.jobId).state !== 'completed'; i++) await tick()
+  const v = tasks.get(t.jobId)
+  assert.deepEqual([v.state, v.access, v.planGen, v.plan?.agent], ['completed', 'write', 1, 'codex'], 'handed back before it was routed, so routed once, as work that writes')
+})
+
+test('a job registry at its per-owner limit fails the enqueue with \'Too many background tasks in this chat (10)...\'', async () => {
+  // The engine's own refusal (dsh-jobs-local 0.1.5-rc.2), raised before it starts the job.
+  const refusing = (limit) => ({ start: () => { throw new Error(`background job limit reached for this owner (limit: ${limit}); use job_kill to stop an unneeded job, wait for it to finish, then retry`) } })
+  let ran = false
+  const at = (limit) => createTasks({ file: join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl'), lanes: createLanes(), jobs: () => refusing(limit), run: async () => { ran = true; return 'x' } })
+  const tasks = at(10)
+  await tasks.ready
+  assert.throws(() => tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'one too many' }), { message: 'Too many background tasks in this chat (10). Wait for one to finish or remove a waiting one, then send it again.' })
+  assert.deepEqual([tasks.list(), ran], [[], false], 'nothing was queued and nothing ran')
+  assert.throws(() => at(32).enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'one too many' }), /^Error: Too many background tasks in this chat \(32\)\./, 'the figure is the engine\'s')
+  // No job service serving this chat still runs the task in the chat, as it always did.
+  const none = createTasks({ file: join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl'), lanes: createLanes(), jobs: () => ({ start: () => { throw new Error('background jobs unavailable: no job controller serves this agent (load @deepseek-ai/dsh-tool-jobs in its composition)') } }), run: async () => 'x' })
+  assert.equal(none.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'x' }), null)
+})
+
+test('startedNoticeDue: null while the reply is pending, null when the reply named gen 1, \'started\' when it named none, \'again\' after a read-pass hand-back, at gen 2 and at gen 1 alike, \'change\' when said differs from the plan; progressPosted survives a restart', async () => {
+  const { startedNoticeDue } = await import('../tasks.js')
+  assert.equal(typeof startedNoticeDue, 'function', 'tasks.js says which milestone notice a task is owed')
+  const plan = { agent: 'claude', model: 'claude-model', effort: 'high', level: 'high', speed: null }
+  const said = { agent: 'claude', effort: 'high' }
+  const task = (over = {}) => ({ state: 'running', plan, planGen: 1, ackGen: null, said: null, progressPosted: {}, requeuedAt: null, ...over })
+  assert.equal(startedNoticeDue(task()), null, 'the reply is still out: it may yet name the plan')
+  assert.equal(startedNoticeDue(task({ ackGen: 1, said })), null, 'the reply named gen 1')
+  assert.equal(startedNoticeDue(task({ ackGen: 0 })), 'started', 'the reply named none')
+  assert.equal(startedNoticeDue(task({ ackGen: 0, plan: null, planGen: 0 })), null, 'not picked yet')
+  assert.equal(startedNoticeDue(task({ ackGen: 0, progressPosted: { started: 1 } })), null, 'posted already for this routing')
+  assert.equal(startedNoticeDue(task({ ackGen: 1, said, planGen: 2, requeuedAt: 5 })), 'again', 'handed back after it was routed: gen 2')
+  assert.equal(startedNoticeDue(task({ ackGen: 0, planGen: 1, requeuedAt: 5 })), 'again', 'handed back while it was routed: gen 1 alike')
+  assert.equal(startedNoticeDue(task({ ackGen: 0, planGen: 2, requeuedAt: 5, progressPosted: { started: 1 } })), 'again', 'a started notice for the read pass does not stand for the writer\'s')
+  assert.equal(startedNoticeDue(task({ ackGen: 0, planGen: 2, requeuedAt: 5, progressPosted: { started: 1, again: 2 } })), null)
+  assert.equal(startedNoticeDue(task({ ackGen: 0, plan: null, planGen: 1, requeuedAt: 5 })), null, 'back in line: not routed again yet')
+  assert.equal(startedNoticeDue(task({ ackGen: 1, said: { agent: 'codex', effort: 'high' } })), 'change', 'another agent')
+  assert.equal(startedNoticeDue(task({ ackGen: 1, said: { agent: 'claude', effort: 'xhigh' } })), 'change', 'another effort')
+  assert.equal(startedNoticeDue(task({ ackGen: 1, said: { agent: 'codex', effort: 'high' }, progressPosted: { change: 1 } })), null)
+  assert.equal(startedNoticeDue(task({ state: 'completed', ackGen: 0 })), null, 'a task that ended gets its result')
+  assert.equal(startedNoticeDue(null), null)
+
+  // On the record: a read pass routed and handed back, and the writer routed after it.
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const lanes = createLanes()
+  const jobs = fakeJobs()
+  let finish
+  const tasks = createTasks({
+    file, lanes, jobs: () => jobs,
+    run: (t, { signal, emit, onEntry }) => runAdmitted({ lanes, task: t, signal, run: async (pass) => {
+      onEntry({ id: `run-${t.jobId}-${pass.mode}` })
+      emit({ type: 'routed', routing: { primaryAgent: pass.mode === 'read' ? 'claude' : 'codex', mode: 'jev' }, primary: { agent: pass.mode === 'read' ? 'claude' : 'codex', model: 'm', effort: 'high', level: 'high', speed: null } })
+      if (pass.mode === 'read') {
+        emit({ type: 'access', mode: 'write', from: 'read', why: 'it needs to change files' })
+        throw needsLane('it needs to change files')
+      }
+      await new Promise((r) => { finish = r })
+      return 'the report'
+    } }),
+  })
+  await tasks.ready
+  const t = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'fix the parser', access: 'read' })
+  const key = tasks.get(t.jobId).key
+  for (let i = 0; i < 30 && !finish; i++) await tick()
+  const view = () => tasks.get(t.jobId)
+  assert.deepEqual([view().planGen, view().plan?.agent, view().ackGen], [2, 'codex', null], 'the writer is routed; no reply has said anything yet')
+  assert.equal(startedNoticeDue(view()), null)
+  assert.equal(tasks.noteAck(key, { gen: 1, said: { agent: 'claude', effort: 'high' } }), true, 'the reply named the read pass\'s plan')
+  assert.deepEqual([view().ackGen, view().said], [1, { agent: 'claude', effort: 'high' }])
+  assert.equal(startedNoticeDue(view()), 'again')
+  assert.equal(tasks.claimNotice(key, 'again'), true)
+  assert.equal(tasks.claimNotice(key, 'again'), false, 'one notice per kind per routing, whoever asks')
+  assert.equal(startedNoticeDue(view()), null)
+  assert.deepEqual(view().progressPosted, { again: 2 })
+  assert.equal(tasks.noteAck('no such key', { gen: 0 }), false)
+  assert.equal(tasks.claimNotice('no such key', 'started'), false)
+  // A restart keeps what was posted, so none of it is posted again.
+  await tasks.flushed()
+  assert.deepEqual(rowsOf(file).find((r) => r.jobId === t.jobId)?.progressPosted, { again: 2 }, 'on disk')
+  const again = harness({ file })
+  await again.tasks.ready
+  assert.deepEqual(again.tasks.get(t.jobId).progressPosted, { again: 2 }, 'and read back')
+  assert.equal(again.tasks.get(t.jobId).state, 'stopped', 'the restart stopped it')
+  assert.equal(again.tasks.noteAck(key, { gen: 0 }), false, 'an ended task hears no more of its reply')
+  finish()
+})
+
+test('a routed event for a run the router stops for a person leaves the task no plan, agent or effort, so no reply or result can name one and no started notice is due', async () => {
+  const { startedNoticeDue } = await import('../tasks.js')
+  assert.equal(typeof startedNoticeDue, 'function', 'tasks.js says which milestone notice a task is owed')
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const lanes = createLanes()
+  const jobs = fakeJobs()
+  let finish
+  const tasks = createTasks({
+    file, lanes, jobs: () => jobs,
+    run: (t, { signal, emit, onEntry }) => runAdmitted({ lanes, task: t, signal, run: async () => {
+      onEntry({ id: `run-${t.jobId}` })
+      // As router.js emits it for a run about to stop for a person: it names no agent to run it,
+      // though its routing still says whom the decider would have picked.
+      emit({ type: 'routed', routing: { primaryAgent: 'claude', mode: 'jev', capability: 'human_required', capabilityConfidence: 0.9 }, stopsForPerson: true })
+      await new Promise((r) => { finish = r })
+      emit({ type: 'final', status: 'needs_human', statusReason: 'Jev read this as needing a person (confidence 0.90)' })
+      return 'the report'
+    } }),
+  })
+  await tasks.ready
+  // Queued at a level picked in the model menu, which no attempt of this run ever starts at.
+  const t = tasks.enqueue({ ...own, workspace: 'C:/w', task: 'deploy it to production with my keys', effort: 'xhigh' })
+  const key = tasks.get(t.jobId).key
+  for (let i = 0; i < 30 && !finish; i++) await tick()
+  assert.equal(tasks.noteAck(key, { gen: 0, said: null }), true, 'its reply named no plan')
+  const view = tasks.get(t.jobId)
+  assert.deepEqual([view.plan, view.planGen], [null, 0], 'no plan, and no routing that planned one')
+  assert.equal(startedNoticeDue(view), null, 'no agent starts, so no notice says one did')
+  assert.deepEqual([view.agent, view.model, view.effort], [null, null, null], 'nor an agent, a model or an effort, whatever it was queued at')
+  finish()
+  for (let i = 0; i < 30 && !tasks.results('s1').length; i++) await tick()
+  const [result] = tasks.results('s1')
+  assert.deepEqual([result?.state, result?.agent, result?.model, result?.effort], ['needs_human', null, null, null], 'so its result names none of them either')
+})
+
+test('a routed task shows no effort until its working attempt starts at its own, so one stopped before that names none in its result', async () => {
+  let go
+  let started
+  const { tasks } = harness({
+    run: async (t, { emit, onEntry, signal }) => {
+      await new Promise((r) => { go = r })
+      onEntry({ id: 'run-1' })
+      emit({ type: 'routed', routing: { primaryAgent: 'claude', mode: 'jev' }, primary: { agent: 'claude', model: 'claude-model', effort: 'high', level: 'high', speed: null } })
+      started = true
+      await new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    },
+  })
+  await tasks.ready
+  const t = tasks.enqueue({ owner: {}, sessionId: 's1', workspace: 'C:/work', task: 'fix the parser', effort: 'xhigh' })
+  assert.equal(tasks.get(t.jobId).effort, 'xhigh', 'waiting, it shows the level it was queued at')
+  go()
+  for (let i = 0; i < 10 && !started; i++) await tick()
+  assert.deepEqual([tasks.get(t.jobId).agent, tasks.get(t.jobId).effort], ['claude', null], 'routed, it shows the agent picked and no effort: no attempt has started at one')
+  tasks.stop(t.jobId)
+  for (let i = 0; i < 10 && !tasks.results('s1').length; i++) await tick()
+  const [result] = tasks.results('s1')
+  assert.deepEqual([result?.state, result?.agent, result?.effort], ['stopped', 'claude', null], 'stopped before its first attempt, it names the agent picked and no effort')
+})
+
+test('a forced agent that ends before its working attempt starts names no effort in its row or its result, whatever level it was queued at: refused before it was routed, removed from the line, or caught in line by a restart', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-tasks-')), 'tasks.jsonl')
+  const lanes = createLanes()
+  const jobs = fakeJobs()
+  let release = null
+  const tasks = createTasks({
+    file, lanes, jobs: () => jobs,
+    run: (t, { signal, emit, onEntry }) => runAdmitted({ lanes, task: t, signal, run: async () => {
+      onEntry({ id: `run-${t.jobId}` })
+      // The router refuses the agent asked for before it routes anything, as one at its usage limit.
+      if (t.task === 'refused') throw new Error('claude is at its usage limit until 14:20')
+      // The one holding the folder is routed, and its working attempt starts at its own effort.
+      emit({ type: 'routed', routing: { primaryAgent: 'claude', mode: 'manual' }, primary: { agent: 'claude', model: 'claude-model', effort: 'high', level: 'high', speed: null } })
+      emit({ type: 'attempt_start', index: 0, agent: 'claude', role: 'primary', effort: 'high' })
+      await new Promise((r) => { release = r })
+      return 'the report'
+    } }),
+  })
+  await tasks.ready
+  const names = { claude: 'Claude Code', deepseek: 'DeepSeek agent' }
+  const headOf = (r) => /^Agent: .*$/m.exec(resultSection(r, { names }))?.[0]
+  const resultOf = async (jobId) => {
+    for (let i = 0; i < 30 && !tasks.results('s1').some((r) => r.jobId === jobId); i++) await tick()
+    return tasks.results('s1').find((r) => r.jobId === jobId)
+  }
+  // Each is an agent picked in the model menu at a level. This one is refused before it is routed.
+  const refused = tasks.enqueue({ ...own, workspace: 'C:/a', task: 'refused', forceAgent: 'claude', effort: 'high' })
+  const one = await resultOf(refused.jobId)
+  assert.deepEqual([one?.state, one?.agent, one?.effort], ['failed', 'claude', null], 'refused before it was routed, it never ran at that level')
+  assert.match(headOf(one) ?? '', /^Agent: Claude Code · took \d+ s$/, 'so its result\'s head names none')
+  assert.equal(tasks.get(refused.jobId).effort, null, 'nor does its row')
+  // One holds the folder, and the next waits behind it and is removed from the line.
+  const holder = tasks.enqueue({ ...own, workspace: 'C:/b', task: 'holder', forceAgent: 'claude', effort: 'high' })
+  for (let i = 0; i < 30 && !release; i++) await tick()
+  const removed = tasks.enqueue({ ...own, workspace: 'C:/b', task: 'removed', forceAgent: 'deepseek', effort: 'medium' })
+  assert.deepEqual([tasks.get(removed.jobId).state, tasks.get(removed.jobId).effort], ['queued', 'medium'], 'waiting, it shows the level it was queued at')
+  assert.equal(tasks.stop(removed.jobId, { onlyIfWaiting: true }), 'requested')
+  const two = await resultOf(removed.jobId)
+  assert.deepEqual([two?.state, two?.agent, two?.effort], ['stopped', 'deepseek', null], 'removed from the line, it never ran at that level')
+  assert.equal(headOf(two), 'Agent: DeepSeek agent')
+  assert.equal(tasks.get(removed.jobId).effort, null)
+  // Another waits behind the holder as the app restarts, which stops both: only the holder, whose
+  // working attempt had started, names an effort, its own.
+  const caught = tasks.enqueue({ ...own, workspace: 'C:/b', task: 'caught', forceAgent: 'deepseek', effort: 'max' })
+  await tasks.flushed()
+  const after = createTasks({ file, lanes: createLanes(), jobs: () => fakeJobs(), run: async () => 'never' })
+  await after.ready
+  const byId = Object.fromEntries(after.results('s1').map((r) => [r.jobId, r]))
+  assert.deepEqual([byId[caught.jobId]?.state, byId[caught.jobId]?.agent, byId[caught.jobId]?.effort], ['stopped', 'deepseek', null], 'caught in line by the restart, it never ran at that level')
+  assert.equal(headOf(byId[caught.jobId]), 'Agent: DeepSeek agent')
+  assert.equal(after.get(caught.jobId).effort, null)
+  assert.deepEqual([byId[holder.jobId]?.state, byId[holder.jobId]?.effort], ['stopped', 'high'], 'the holder had started at its own, and keeps it')
+  release()
 })

@@ -102,3 +102,120 @@ test('result acks: the acknowledge pass lands on a timer while no frame is ever 
     for (const restore of restores.reverse()) restore()
   }
 })
+
+test('result acks: each rendered result is posted by its job id and task name, once, and a progress notice or another plugin\'s row never is', async () => {
+  const posts = []
+  let scans = 0
+  let fail = true
+  const notice = (source, summary) => {
+    const row = { querySelector: (sel) => (sel === '[data-context-source]' ? { textContent: source } : null) }
+    return { textContent: summary, closest: () => row, parentElement: row }
+  }
+  // An old result under a job id the engine handed out again after a restart, the new task's result
+  // under the same id, a progress notice of ours, and another plugin's row.
+  const spans = [
+    notice('jev-router', 'jev-3 · Fix the parser · Completed'),
+    notice('jev-router', 'jev-3 · Fix the lexer · keep it small · Failed'),
+    notice('jev-router', 'jev-4 started: Codex, gpt-5.5, effort medium'),
+    notice('tool-jobs', 'job-1 · a job · Completed'),
+  ]
+  const restores = [...noFrames(), noObserver(),
+    stub('document', { body: {}, querySelectorAll: (sel) => { scans++; return sel === '[data-context-summary]' ? spans : [] } }),
+    // The first request fails, as a server restarting would; every later one is answered.
+    stub('fetch', async (path, init) => {
+      posts.push({ path, method: init.method, body: JSON.parse(init.body) })
+      if (fail) { fail = false; throw new TypeError('fetch failed') }
+      return { ok: true, json: async () => ({ acknowledged: [] }) }
+    })]
+  const pass = async () => {
+    const before = scans
+    const stop = startResultAcks()
+    await waitFor('a pass ran', () => scans, (n) => n > before)
+    await new Promise((r) => setImmediate(r))
+    stop()
+  }
+  try {
+    await pass()
+    // The failed request is forgotten, so the next pass asks again for both; after that, nothing more is posted.
+    await pass()
+    await pass()
+    const both = { results: [{ jobId: 'jev-3', name: 'Fix the parser' }, { jobId: 'jev-3', name: 'Fix the lexer · keep it small' }] }
+    assert.deepEqual(posts, [{ path: '/jev-router/tasks/seen', method: 'POST', body: both }, { path: '/jev-router/tasks/seen', method: 'POST', body: both }])
+  } finally {
+    for (const restore of restores.reverse()) restore()
+  }
+})
+
+test('result acks: a new result\'s row is posted even when an older row the server did not take reads the same, as the same words sent again after a restart do', async () => {
+  const posts = []
+  let scans = 0
+  const notice = (summary) => {
+    const row = { querySelector: (sel) => (sel === '[data-context-source]' ? { textContent: 'jev-router' } : null) }
+    return { textContent: summary, closest: () => row, parentElement: row }
+  }
+  // The chat holds 'run the tests' from before a restart, a result the server has already marked read.
+  const spans = [notice('jev-1 · run the tests · Completed')]
+  const restores = [...noFrames(), noObserver(),
+    stub('document', { body: {}, querySelectorAll: (sel) => { scans++; return sel === '[data-context-summary]' ? spans : [] } }),
+    // Every request is answered: the old row's acknowledges nothing, and the new row's acknowledges jev-1.
+    stub('fetch', async (_path, init) => {
+      posts.push(JSON.parse(init.body))
+      return { ok: true, json: async () => ({ acknowledged: posts.length > 1 ? ['jev-1'] : [] }) }
+    })]
+  const pass = async () => {
+    const before = scans
+    const stop = startResultAcks()
+    await waitFor('a pass ran', () => scans, (n) => n > before)
+    await new Promise((r) => setImmediate(r))
+    stop()
+  }
+  try {
+    await pass()
+    // The same words are sent again, the engine counts job ids from 1 again, and the new result's row
+    // reads exactly as the old one does.
+    spans.push(notice('jev-1 · run the tests · Completed'))
+    await pass()
+    await pass()
+    const one = { results: [{ jobId: 'jev-1', name: 'run the tests' }] }
+    assert.deepEqual(posts, [one, one], 'the old row once, then the new row once')
+  } finally {
+    for (const restore of restores.reverse()) restore()
+  }
+})
+
+test('result acks: each post names the chat on screen, and a row rendered while no chat is selected goes as an older page sends it', async () => {
+  const posts = []
+  let scans = 0
+  const notice = (summary) => {
+    const row = { querySelector: (sel) => (sel === '[data-context-source]' ? { textContent: 'jev-router' } : null) }
+    return { textContent: summary, closest: () => row, parentElement: row }
+  }
+  const spans = [notice('jev-1 · run the tests · Completed')]
+  let chat = 'chat-B'
+  const restores = [...noFrames(), noObserver(),
+    stub('document', { body: {}, querySelectorAll: (sel) => { scans++; return sel === '[data-context-summary]' ? spans : [] } }),
+    stub('fetch', async (_path, init) => {
+      posts.push(JSON.parse(init.body))
+      return { ok: true, json: async () => ({ acknowledged: [] }) }
+    })]
+  const pass = async () => {
+    const before = scans
+    const stop = startResultAcks(() => chat)
+    await waitFor('a pass ran', () => scans, (n) => n > before)
+    await new Promise((r) => setImmediate(r))
+    stop()
+  }
+  try {
+    await pass()
+    // The engine blanks its selected chat for a moment while it reads its list of chats again.
+    chat = undefined
+    spans.push(notice('jev-2 · tidy the docs · Failed'))
+    await pass()
+    assert.deepEqual(posts, [
+      { sessionId: 'chat-B', results: [{ jobId: 'jev-1', name: 'run the tests' }] },
+      { results: [{ jobId: 'jev-2', name: 'tidy the docs' }] },
+    ])
+  } finally {
+    for (const restore of restores.reverse()) restore()
+  }
+})

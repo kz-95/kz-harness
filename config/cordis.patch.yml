@@ -62,6 +62,18 @@
       - { provider: local, model: qwen3-8b, maxTokens: 1024 }
       - { provider: local, model: gemma4-e4b, maxTokens: 1024 }
 
+# Background jobs (the engine's jobs registry, @deepseek-ai/dsh-jobs-local): how
+# many one chat may hold at once. Every jev-router task holds one from the moment
+# it is queued until it ends, so tasks waiting their turn count as much as running
+# ones, and the engine's default of 10 refused the eleventh task typed into a busy
+# chat. How many run at once is still Tasks at once (Settings, Resource budget).
+# Add it to a live profile while no task runs: taking the new limit can restart
+# the job service, which stops every task it holds.
+# plugins/jev-router/test/jobs-config.test.js checks the figure.
+- id: jobs
+  config:
+    maxConcurrentJobsPerOwner: 32
+
 # Router plugin. Agents, limits and thresholds are configurable here; omitted
 # fields use the defaults in the plugin's Config schema.
 # jev-review holds the review code that judges every result (pass / second

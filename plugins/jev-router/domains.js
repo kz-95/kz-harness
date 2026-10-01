@@ -258,6 +258,10 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
   // DOMAINS). Such a domain asks no teacher, whatever a caller hands it, and the rule decides
   // wherever the local classifier does not.
   const codeTaught = spec.teacher === 'code'
+  // The only answers this domain's local classifier may decide, when its policy names them
+  // (routing-policy.js DOMAINS `localLabels`). Any other answer is recorded and the teacher is asked,
+  // however confident it is, so the classifier's authority runs one way only.
+  const localLabels = Array.isArray(spec.localLabels) ? spec.localLabels : null
   const artifactFile = artifactsDir ? join(artifactsDir, `${domain}.json`) : null
   const previousFile = artifactsDir ? join(artifactsDir, `${domain}.previous.json`) : null
 
@@ -292,9 +296,13 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
   }
   let artifact = null
   let artifactReason = 'not trained yet'
+  // Once the plugin closes or is applied again (dispose), neither the state nor an artifact is
+  // written again: the plugin that replaces this one has read them and saves its own, and a save
+  // from what this controller holds would put an older state back over it.
+  let disposed = false
 
   const persist = () => {
-    if (!stateFile) return
+    if (!stateFile || disposed) return
     try {
       mkdirSync(dirname(stateFile), { recursive: true })
       const tmp = `${stateFile}.tmp`
@@ -494,6 +502,8 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
         localDecides,
         // Likewise: where a rule in code decides, the rungs a teacher holds elsewhere are the rule's.
         teacher: codeTaught ? 'code' : 'jev',
+        // And where it may decide only some answers, its rung buys it only those.
+        localLabels,
         requiredConfidence: gates.confidenceThreshold,
         oodRate: r3(oodRate()),
         progress: progressOf(ev),
@@ -518,7 +528,9 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
      *   `localDecides: false` is held to that whatever this says: a caller can narrow the
      *   classifier's standing, never widen it
      *   A domain whose policy says `teacher: 'code'` is held to `codeAuthority`, and the teacher
-     *   call is ignored: the rule is its authority, not a stand-in for one
+     *   call is ignored: the rule is its authority, not a stand-in for one. A domain whose policy
+     *   names `localLabels` lets its classifier decide only those answers, at any rung and with the
+     *   teacher down too: any other is recorded, and the teacher or the fallback decides
      * @param {object} [p.context]    `extra` is stored on the training sample
      * @param {string} [p.answeredBy]  who answers this run: `jev`, the teacher, by default. Anything
      *   else (`laya`) is a run that provider decides, and `jev` is then its call: see decideFor.
@@ -547,10 +559,11 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       // back down rather than just deferring one decision.
       const significantOod = ood.reasons.some((r) => r.startsWith('unseen_category') || r.startsWith('unfamiliar_candidate')) || oodRate() > policy.drift.oodRateDegrade
 
-      // An answer this rung would act on: a usable classifier, a familiar input, and the confidence
-      // the risk class demands. Whether it may act on it is the domain's to say first and the
-      // caller's second, and both must let it.
-      const trusted = isLocal(maturity) && !!local && !ood.flag && local.confidence >= threshold
+      // An answer this rung would act on: a usable classifier, a familiar input, the confidence the
+      // risk class demands, and an answer the domain lets it decide. Whether it may act on it is the
+      // domain's to say first and the caller's second, and both must let it.
+      const labelAllowed = !localLabels || (!!local && localLabels.includes(local.label))
+      const trusted = isLocal(maturity) && !!local && !ood.flag && local.confidence >= threshold && labelAllowed
       const mayDecide = localDecides && localMayDecide !== false
       let authority = 'jev'
       let reason = ''
@@ -562,7 +575,8 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       } else if (isLocal(maturity)) {
         reason = !local ? `no usable local classifier (${artifactReason})`
           : ood.flag ? `out of distribution: ${ood.reasons.slice(0, 3).join(', ')}`
-            : `local confidence ${r3(local.confidence)} is under the ${threshold} this ${spec.risk} domain needs`
+            : !labelAllowed ? `local answer ${local.label} recorded; only ${localLabels.join(' or ')} may be decided on this PC`
+              : `local confidence ${r3(local.confidence)} is under the ${threshold} this ${spec.risk} domain needs`
         if (maturity === 'LOCAL_ONLY' && significantOod) {
           // Leaving LOCAL_ONLY is the point: an unfamiliar routing space is not something to
           // decide alone, and the domain re-earns the rung once the new shape is evidence.
@@ -782,7 +796,7 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
           setMaturity('SHADOW', { reason: why, severity: 'significant', samples: history })
         }
       }
-      if (artifactFile) {
+      if (artifactFile && !disposed) {
         try {
           if (artifact && previousFile) saveArtifact(previousFile, artifact)
           saveArtifact(artifactFile, fresh)
@@ -879,6 +893,9 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
 
     /** The artifact in force, for tests and the inspector. */
     artifact: () => artifact,
+
+    /** The plugin is closing or applied again: from now on the state and the artifact stay in memory only. */
+    dispose() { disposed = true },
   }
 
   // --- the gates, in one place --------------------------------------------------------------
@@ -909,6 +926,11 @@ export function createDomainController({ domain, policy = resolvePolicy(), store
       g.push({ name: 'a trained classifier', required: 1, actual: artifact ? 1 : 0, ok: !!artifact })
       return g
     }
+    // The classes the domain must have seen enough of before it decides anything (routing-policy.js
+    // `requiredClasses`), counted among the verified rows whatever share of them each holds: the
+    // significant-class gates below read only the classes the store already has, so a store of
+    // nearly one class would pass them.
+    for (const c of spec.requiredClasses ?? []) add(`verified samples of ${c}`, gates.perClassSamples, ev.classes?.counts?.[c] ?? 0)
     const bar = target === 'GUARDED_LOCAL' ? gates.guarded : gates.localOnly
     add('holdout accuracy', bar.accuracy, ev.holdout?.accuracy)
     // Recent accuracy means something only over a full window. The sample gate above counts
@@ -1271,5 +1293,7 @@ export function createDomainRegistry({ policy = resolvePolicy(), store, artifact
     evaluateAll: async (opts) => Object.fromEntries(await Promise.all([...byId].map(async ([id, c]) => [id, await c.evaluate(opts)]))),
     /** Tell every domain about a change in the world; each decides whether it is affected. */
     noteEnvironmentChange: (change) => [...byId.values()].map((c) => c.noteEnvironmentChange(change)),
+    /** The plugin is closing or applied again: no domain writes its state or artifact after. */
+    dispose: () => { for (const c of byId.values()) c.dispose() },
   }
 }

@@ -267,6 +267,10 @@ export const READ_PASS_CAPABILITIES = Object.freeze(['quick_answer', 'reasoned_a
 export const NEEDS_LANE = 'NEEDS_LANE'
 /** An agent that could not be started locked, at start or once started. */
 export const LOCK_UNAVAILABLE = 'LOCK_UNAVAILABLE'
+/**
+ * The hand-back of a read pass, `why` in words; `extra.changesFiles` says the work itself changes
+ * files (its agent said so, or its routing named work that may), as against a lock not had or kept.
+ */
 export const needsLane = (why, extra = {}) => Object.assign(new Error(why), { code: NEEDS_LANE, ...extra })
 
 const clock = (at) => new Date(at).toISOString().slice(11, 16)

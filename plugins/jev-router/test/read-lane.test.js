@@ -230,6 +230,32 @@ test('a task handed back is waiting again: it loses read, its agent and model, g
   assert.equal(tasks.get(r.jobId).durationMs, 63_000, '43 s reading and 20 s writing')
 })
 
+test('a task sent to an agent you picked keeps that agent when its read pass hands it back, as it keeps its own effort: its row names it while it waits and as its pass that writes starts, and a direct answer is told it starts on that agent', async () => {
+  const { tasks, passes } = readQueue()
+  tasks.enqueue({ ...own, workspace: 'C:/w', task: 'W' })
+  await tick()
+  // Picked in the model menu, as its own row: the read pass and the pass that writes run on it alike.
+  const r = tasks.enqueue(reader('R', { forceAgent: 'claude', effort: 'high' }))
+  await tick()
+  const { emit, handBack } = passes.get('R:read')
+  emit({ type: 'routed', routing: { primaryAgent: 'claude', mode: 'manual', capability: 'project_read' }, primary: { agent: 'claude', model: 'opus', effort: 'high', level: 'high', speed: null } })
+  emit({ type: 'attempt_start', agent: 'claude', role: 'primary', effort: 'high' })
+  emit({ type: 'attempt_end', attempt: { agent: 'claude', model: 'opus', effort: 'high' } })
+  handBack('claude said it needs to change files: the parser')
+  await tick()
+  const waiting = tasks.get(r.jobId)
+  assert.deepEqual([waiting.state, waiting.agent, waiting.model, waiting.effort], ['queued', 'claude', null, 'high'], 'waiting again, it names the agent it was sent to, not who would pick one')
+  passes.get('W:write').finish()
+  await tick()
+  const starting = tasks.get(r.jobId)
+  assert.deepEqual([starting.state, starting.agent], ['routing', 'claude'], 'its pass that writes starts on it')
+  const { liveStatusSentence } = await import('../reply-words.js')
+  assert.equal(liveStatusSentence([starting], { claude: 'Claude Code' }), `Right now in this chat: ${r.jobId} is starting on Claude Code.`, 'nobody is choosing its agent')
+  passes.get('R:write').finish()
+  await tick()
+  assert.equal(tasks.get(r.jobId).state, 'completed')
+})
+
 test('a task removed while back in line after its read pass counts only its read pass as running time', async () => {
   let clock = 1_000
   const { tasks, passes } = readQueue({ now: () => clock })

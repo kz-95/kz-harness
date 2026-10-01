@@ -11,6 +11,7 @@ A request goes through the same stages every time.
 
 ```
 your request
+  -> task or question        work in the project, or a question a chat model answers directly
   -> task profile            what this needs: type, complexity, risk, which capabilities, how much
   -> hard eligibility        who could possibly do it: available, capable, allowed, big enough
   -> resource choice         which of those should, given what they cost and how scarce they are
@@ -62,6 +63,25 @@ tag alone.
 | `second_opinion` | Whether an independent review is worth its cost | MEDIUM |
 | `frontier_escalation` | Whether the strongest resource must review | HIGH |
 | `outcome_disposition` | What happens after an attempt | HIGH |
+| `intent` | Whether a message on a Jev row is a task or a question; its local classifier may only ever decide `task` | LOW |
+
+One domain's authority runs one way.
+`intent` sorts a message on a Jev row into a task or a question (`intent.js` `classifyIntent`, which `index.js` `classify` calls), and its local classifier may decide only that a message is a task (`localLabels: ['task']` in `DOMAINS`).
+The two mistakes are not equal: a question taken for a task costs one agent run, while a task taken for a question goes to a chat model that cannot touch the project, so a question is always Jev's to say.
+The controller holds a domain with `localLabels` to them at every rung (`domains.js` `decide`): a confident local answer outside them is recorded and the teacher is asked, with the reason `local answer question recorded; only task may be decided on this PC`, and `intent.js` takes any local decision for a task besides, as a second lock.
+Such a domain also needs verified samples of each class it must tell apart before it may decide anything: `requiredClasses: ['task', 'question']` adds the gate `verified samples of <class>`, at the risk class's `perClassSamples` (100 for LOW), for each class at the GUARDED_LOCAL and LOCAL_ONLY targets, so a PC that mostly sends tasks cannot promote it on tasks alone.
+That count is `routing.gates.LOW.perClassSamples`, which a policy sets for every LOW domain, so a policy that sets it to 0 lets the domain climb on tasks alone, to decide nothing but `task` all the same.
+`resolvePolicy` refuses a `localLabels` or `requiredClasses` that is not a list of labels, a `localLabels` that adds a label the domain ships without (`routing policy: domain intent: localLabels can only narrow what its local classifier may decide (task)`), and a `requiredClasses` that drops a class the domain ships with (`routing policy: domain intent: requiredClasses cannot drop a class it ships with (task, question)`).
+Its features are the message's own (`features.js` `intentFeatures`: the text's shape signals, its hashed words and word pairs, and whether a picture came with it), with nothing of the workspace, since a message is sorted before any workspace is read.
+Jev's answer is kept whole for the caller (how deep a question is, whether it also asks for work, whether the work only reads the project), the domain learns only its kind, and while the domain learns Jev is still asked once per message.
+Once the domain decides, at GUARDED_LOCAL or LOCAL_ONLY, a message its classifier is sure is a task gets no Jev call, so there is no such answer: it runs as work that writes (`readOnly: null`), and its start reply has no `Read only` sentence.
+It decides only where a task can run: `index.js` `classify` is told the folder the message was sent in and passes `localMayDecide: false` for one with no folder, the No project space or the scratch workspace, where a task is refused, so a question taken for one would go unanswered; there Jev reads every message, and the local answer is recorded beside its.
+Since every message on a Jev row records its sample before it is answered, Jev's store is read as the plugin starts, in the background, where the domain is used, so the first question after a start does not wait for the whole file to be read.
+A question is verified only by a run routed as an answer that changed no file until a person's word can verify one, so that rung is slow to earn, but nothing bars it.
+Offline mode and Laya Auto sort a message as they always have and record nothing, and with routing or its learning off nothing is recorded either.
+The sample's id rides the message's task to its run (`intentSample` on the task and on its history record), and a direct answer carries it as a hidden mark, `[jev-intent]: kzh-intent-1-<id>`; work queued behind a direct answer does not carry it, since the message was a question whatever that work does.
+A finished run labels it (`training.js` `labelIntent`): `task` when the run was accepted with files changed, or its routing named a capability that is no answer (`other` and `human_required` name none); `question`, with the negative `task`, when it was accepted as an answer (`quick_answer` or `reasoned_answer`) and changed no file; and nothing for a run asked only for an answer, a run that proves nothing (stopped, paused, continued from a handoff), or a task whose words were changed after it was sent.
+A person's word comes before the run's, and `labelIntent` already reads it, though nothing gives it yet ([`live-agent-view.md`](live-agent-view.md) slice 6): the plan tag `should have been a question` and a liked direct answer say `question`, and a direct answer tagged `should have been a task` says `task`, each with what the message was taken for as its negative where the two differ.
 
 The skill is handed to the router in the plan as `plan.skill` (`{ primary, supporting, description, authority }`), always in the `SKILLS` vocabulary of `routing-policy.js`; a task type that is not a skill name is mapped through `TASK_SKILLS`.
 `router.js` gives it to whoever does the work: `skillLine` puts `Approach this mainly as <primary> work (<description>). It also draws on <supporting>.` straight after the Workspace line of the worker's prompt (`basePrompt`, so a retry gets it too) and into the plan step's prompt (`planPrompt`).
@@ -487,6 +507,8 @@ Recorded, in `~/.kzh/jev-router/` (the folder of `historyFile`):
 | `laya-samples.jsonl` | One row per domain decision of a run Laya decided, in the same shape as `routing-samples.jsonl` with `teacher: null` and Laya's answer as `provider`, then its outcome rows. Same cap and compaction. No classifier reads it. |
 | `laya-shadow.jsonl` | One row per Jev call in Jev Auto that Laya answered beside Jev, or was skipped for: both sides' answers as numbers and option keys (a tool parameter's as its index), the call's timings and why a comparison was skipped. Newest 10,000 rows. |
 | `laya-standing.jsonl` | Laya's standing per domain, appended at most once a minute after a run: a reading, never an authority. |
+| `reply-ledger.jsonl` | One row per task queued from the chat, for the start reply's predictor ([below](#the-start-replys-predictor)): ids, agents, models, efforts, times and hashed features, never the task text. Its newest 1000 tasks, one line each, once it is compacted. |
+| `reply-model.json` | The start reply's predictor of the pick. |
 
 Nothing redacts a key out of `history.jsonl`, `tasks.jsonl` or `feedback.jsonl`: a key pasted into a task or a reason is stored there as typed.
 
@@ -506,6 +528,7 @@ With the shipped gates the cap is 10000: HIGH needs 6000 samples for LOCAL_ONLY,
 The cap follows the resolved config, so raising `routing.gates` raises it.
 When `routing.split` has a holdout share of 0 the validation share carves the holdout (a split of 0.8/0.2/0 gives 7500), and a split with neither counts only `localOnlySamples`; the cap is always finite.
 The file is compacted once it holds `slack` rows past what the cap keeps, and the slack defaults to the cap; the check runs on load and after every `slack` appended rows.
+The append that runs the check waits for it, and for the rewrite when there is one, so about once every `slack` rows a routing decision, or a message on a Jev row, whose intent sample is appended before it is answered, waits for it: about a third of a second for a 36 MB store at its cap on the Linux machine the suite ran on.
 Compaction writes a temporary file, fsyncs it and renames it over the file, trying the rename up to 7 times in all while it fails with `EPERM`, `EACCES` or `EBUSY`.
 A rename that still fails leaves the file untouched and logs `[jev] routing samples not compacted: ...`.
 A file that exists but cannot be read (any error but `ENOENT`) is never rewritten, and `[jev] routing samples not read: ...` is logged.
@@ -592,6 +615,7 @@ Under the maturity pill it says what the rung means for who decides (`client.js`
 A domain whose state reports `localDecides: false` (the resource ranking) shows `a rule in code decides at every rung; the local router is recorded beside it for comparison and never decides` in place of the rung's words, while the pill still shows the rung.
 A domain Jev teaches whose local authority a policy took away (`localDecides: false` set in config) reads `Jev decides at every rung; ...` instead, because no rule in code decides it.
 With learning off the tab's heading reads `Learning is switched off: Jev and the rules in code decide, and nothing is recorded`.
+A domain whose local classifier may decide only some answers (`localLabels`, the message intent) adds at GUARDED_LOCAL and LOCAL_ONLY what it may decide: `the local router decides when it is confident and the case is familiar, and only when it answers task: Jev decides every other answer`.
 A `teacher: 'code'` domain whose classifier may decide (the frontier review) names the rule where the other domains name Jev:
 
 | Rung | Words for the frontier review |
@@ -605,6 +629,26 @@ A `teacher: 'code'` domain whose classifier may decide (the frontier review) nam
 When a code-decided domain is at a local rung and its classifier does not decide, the decision's reason keeps why (out of distribution, too little confidence, a classifier that never decides) and appends `; a rule in code decides this one`.
 It prints every limit figure with its own provenance and confidence, so a DeepSeek balance reads, for example, `balance 60.0% used (estimated, little evidence), 40 USD left (from the provider, well evidenced)`, and scarcity is shown at its own confidence.
 The run view says when the weekly gate yielded or the decision engine kept a gated frontier resource, on the decision card or, where that card is not shown (the Overview ledger, a stored run), on the run itself, and it names every move the router made, each with where it went.
+
+## The start reply's predictor
+
+The start reply ([`live-agent-view.md`](live-agent-view.md) Feature 3) learns too, beside the domains and apart from them.
+`reply-ledger.js` keeps one row per task queued from the chat in `reply-ledger.jsonl`: who decides it, the row's mode, whether its agent was picked by hand, the message's `intentFeatures`, as the person wrote it and never with the line that hands an agent a picture, with the pool it was picked from (`avail:<id>` for each agent the router could pick now and each tool switched on, `mode:<mode>`, `level:<menu effort>`, `decider:<id>`, `modal:image`), the predictor's guess, what the start reply named, how (`routed`, `forced`, `bound` for a reply whose wait for the pick ran out first, `now` for one that went out at once beside a task that starts at once, or `waited`) and how long after the task was queued, and what the router ran from its first routing (`routed.primary`).
+A guess is scored once both it and what ran are in: right when the agent and the level of its effort both match.
+The predictor is a `classifier.js` multiclass artifact over those features, labelled `<agent>|<level>`, trained in a worker thread on the newest 500 labelled rows once there are 60, and again after every 25 more: the oldest four fifths fitted and the newest fifth calibrated, never shuffled, and with no class balancing, since it is asked what the router will most likely pick.
+A ledger read after a start with rows enough and no predictor trained through them, as with `reply-model.json` deleted or never saved, trains one as it is read, not once the next task is routed for.
+A predictor trained through a task the ledger no longer holds, as with `reply-ledger.jsonl` alone deleted, takes every task on record as new, so it is trained again once 60 are on record.
+Once the plugin closes or is applied again, the ledger it leaves starts no retrain, though a task of the old plugin still running notes its rows there, and it rewrites the file no more, only appending to it, since the plugin that replaced it appends its own rows there.
+It is saved as `reply-model.json` with the domain `reply_predictor`, writes to no routing store and has no ladder, so it can never promote a routing domain.
+A save the disk refuses is tried again over about a tenth of a second, as a reader holding the file on Windows refuses a rename for a moment; one that still fails is logged as `[jev] reply predictor not saved: ...`, and the predictor it trained is used all the same, as a routing domain's is, while the next start, which loads an older one or none, trains one again as it reads the ledger.
+Its guess is masked to the agents available now, and trusted only when the top answer unmasked is the same.
+Its gates are its measured record per decider, Jev's and Laya's apart: `quick`, right 45 of the last 50, and `likely`, right 16 of the last 20 (`config.replies`, `reply-ledger.js` `replyGates`).
+A start reply that named a tool the router gave the work to is kept as naming that tool (`tool:<id>`, no effort or model), as what ran is, not as the agent that takes over only if the tool fails.
+A start reply that goes out once its task has ended, as one whose wait for the pick ended as routing read the task as needing a person, is kept as any other, and reply A for an agent picked by hand as `forced`.
+The file is rewritten to one line per task, its newest 1000, once it has grown 1000 lines past them, through a temporary file renamed over it; never when it exists and could not be read (any error but `ENOENT`, logged as `[jev] reply ledger not read: ...`), and after a rewrite that failed, only once another 1000 lines are appended.
+Each rewrite reads the file again first and keeps each task's newest line there, so it keeps the rows the ledger of a plugin applied again appended since it was read, and the ledgers of one file append and rewrite it one at a time.
+No reply reads a guess yet; `GET /jev-router/replies/summary` and the How Jev replies card in Settings show its record.
+With learning off nothing is recorded and nothing is trained from what the ledger holds, and the card says so rather than show a record that no longer grows.
 
 ## A second decider: Laya
 

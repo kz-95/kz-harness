@@ -254,6 +254,10 @@ export function createShadow({ file, laya, enabled = () => true, log = () => {},
   let queue = Promise.resolve()
   const serial = (task) => { const run = queue.then(task); queue = run.catch(() => {}); return run }
   const cache = new Map()
+  // Once the plugin closes or is applied again (dispose), the file is compacted no more: the shadow
+  // that replaces this one appends its own rows there, and a rewrite under way would lose the ones
+  // it appends meanwhile. A row that settles after is still appended.
+  let disposed = false
 
   const index = (row) => {
     memory.push(row)
@@ -284,6 +288,7 @@ export function createShadow({ file, laya, enabled = () => true, log = () => {},
   }).catch((err) => log(`laya shadow: ${file} not read: ${err.message}`))
 
   async function compact() {
+    if (disposed) return
     checkedAt = lines
     try {
       lines = (await inWorker({ job: 'compact', file, cap })).lines
@@ -376,7 +381,7 @@ export function createShadow({ file, laya, enabled = () => true, log = () => {},
     if (p.done || (p.jev === undefined && !p.jevError) || p.laya === undefined) return
     p.done = true
     setImmediate(() => {
-      try { finish(p) } catch (err) { log(`laya shadow: ${err.message}`) }
+      try { finish(p) } catch (err) { log(`laya shadow: ${err.message}`) } finally { p.land() }
     })
   }
 
@@ -391,6 +396,8 @@ export function createShadow({ file, laya, enabled = () => true, log = () => {},
       try { on = !!laya && !!enabled() } catch { on = false }
       if (!on) return undefined
       const p = { callId, runId: phase === 'intent' ? null : runId ?? null, phase, state, questions, context, jev: undefined, jevError: null, laya: undefined, done: false }
+      // Resolves once its row is in the queue, for dispose() to wait on.
+      p.landed = new Promise((r) => { p.land = r })
       pending.set(callId, p)
       try {
         const r = laya.offerShadow({ callId, runId: p.runId, phase, state, questions, context, onDone: (res) => { if (p.laya === undefined) { p.laya = res ?? { status: 'failed', reason: 'error' }; settled(p) } } })
@@ -413,6 +420,12 @@ export function createShadow({ file, laya, enabled = () => true, log = () => {},
   }
 
   const sinceOf = (since) => (since == null ? null : typeof since === 'number' ? since : at(since))
+  // Every row settled so far on disk: a tick first, since a settled call's row is built on the next (settled()).
+  async function flush() {
+    await new Promise((r) => setImmediate(r))
+    await loaded
+    await queue
+  }
 
   return {
     offerer,
@@ -432,10 +445,17 @@ export function createShadow({ file, laya, enabled = () => true, log = () => {},
     /** Resolves once the rows read at start are in memory. */
     loaded: () => loaded,
     /** Resolves once every row settled so far is on disk. */
-    async flush() {
-      await new Promise((r) => setImmediate(r))
-      await loaded
-      await queue
+    flush,
+    /**
+     * The plugin is closing or applied again: the file is compacted no more, and a row that settles
+     * after is only appended. Resolves once every row settled so far is on disk, and the row of each
+     * call Jev has answered whose Laya side is still out, which the Laya client's dispose ends; a call
+     * still waiting for Jev belongs to a run still going, and its row is appended when it settles.
+     */
+    async dispose() {
+      disposed = true
+      await Promise.all([...pending.values()].filter((p) => p.jev !== undefined || p.jevError).map((p) => p.landed))
+      await flush()
     },
     /**
      * The comparison of 8.4, computed in a worker over the files and reused for 60 s or until 100

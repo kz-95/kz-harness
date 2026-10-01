@@ -86,14 +86,21 @@ async function installLaya(harnessDir, dataDir) {
  * The plugin on a PC of its own, closed when the test ends. Its one agent, `big-local`, runs Big on
  * this PC; `world.work` is what its subagent does before it finishes (a promise to hold it at work).
  * With `laya`, Laya is installed and its supervisor keeps a fake laya.serve, found in `world.fakes`.
- * `config` is laid over the plugin config below.
+ * `config` is laid over the plugin config below. `tasks` are task records the plugin finds saved in
+ * tasks.jsonl as it starts, as an earlier run of the app left them, and `files` other files of its
+ * data folder, by name. With `jobs` the engine has a job service, so a task typed into the chat runs
+ * in the background; `world.onJob(id)` hears each job it starts. `replies` goes to apply() as its
+ * seam of that name. Everything the plugin appends to the chat is in `world.appended`, and
+ * `adapter()` is the chat's adapter, for a test that reads a reply's chunks itself.
  */
-async function plugin(t, { laya = false, config = {} } = {}) {
+async function plugin(t, { laya = false, config = {}, tasks = null, files = {}, jobs = false, replies = null } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'kz-speed-'))
   made.push(root)
   const dataDir = join(root, 'data')
   const harnessDir = join(root, 'harness')
   mkdirSync(dataDir, { recursive: true })
+  if (tasks) writeFileSync(join(dataDir, 'tasks.jsonl'), tasks.map((r) => `${JSON.stringify(r)}\n`).join(''))
+  for (const [name, body] of Object.entries(files)) writeFileSync(join(dataDir, name), body)
   const pinsFile = join(harnessDir, 'config', 'laya.json')
   mkdirSync(dirname(pinsFile), { recursive: true })
   copyFileSync(join(REPO, 'config', 'laya.json'), pinsFile)
@@ -114,7 +121,7 @@ async function plugin(t, { laya = false, config = {} } = {}) {
   const g = (...a) => execFileSync('git', a, { cwd: workspace })
   g('init', '-q'); g('add', '-A'); g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init')
 
-  const world = { work: null, started: [], fakes: [], children: [] }
+  const world = { work: null, started: [], fakes: [], children: [], appended: [], onJob: null }
   const spawnLaya = (cmd, args, opts) => {
     const child = nodeSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)'], opts)
     world.children.push(child)
@@ -135,14 +142,22 @@ async function plugin(t, { laya = false, config = {} } = {}) {
       return { result, dispose: async () => {} }
     },
   }
-  const agent = { id: SESSION, session: { id: SESSION, header: { cwd: workspace }, append: () => {} }, whenIdle: async () => {} }
+  let jobCount = 0
+  const jobService = {
+    start: (spec) => { const id = `jev-${++jobCount}`; spec.run(); world.onJob?.(id); return id },
+    wait: () => new Promise(() => {}),
+    read: (id) => ({ text: '', snapshot: { id } }),
+    kill: () => 'requested',
+  }
+  const agent = { id: SESSION, session: { id: SESSION, header: { cwd: workspace }, append: (_kind, msg, opts) => world.appended.push({ msg, opts }) }, whenIdle: async () => {} }
   const effects = []
   const effect = (f) => { const d = f(); if (typeof d === 'function') effects.push(d) }
   const commands = new Map()
   const routes = []
+  let adapter = null
   const runtime = {
     effect,
-    llm: { registerAdapter: () => () => {}, stream: () => (async function* () {})(), resolveModel: async () => null, listProviders: () => [], listModels: async () => [] },
+    llm: { registerAdapter: (ids, a) => { if (ids.includes('jev')) adapter = a; return () => {} }, stream: () => (async function* () {})(), resolveModel: async () => null, listProviders: () => [], listModels: async () => [] },
     emit: () => {}, get: () => null,
     agents: { get: () => agent, currentInitiator: () => agent },
     webServer: { register: (r) => { routes.push(r); return () => {} } },
@@ -152,7 +167,7 @@ async function plugin(t, { laya = false, config = {} } = {}) {
   const ctx = {
     credentials: { resolve: async () => undefined },
     effect, subagents,
-    get: () => null,
+    get: (name) => (name === 'jobs' && jobs ? jobService : null),
     commands: { register: (cmd) => { commands.set(cmd.name, cmd) } },
     tools: { register: () => {} },
     inject: (_deps, fn) => fn(runtime),
@@ -168,6 +183,7 @@ async function plugin(t, { laya = false, config = {} } = {}) {
   }), {
     laya: { harnessDir, spawn: spawnLaya, run: async () => null, timing: { readyPollMs: 20, healthTimeoutMs: 1000, idleCheckMs: 20, exitWaitMs: 2000 } },
     localModels: { modules: MODULES, engineDir, modelsDir, specs: async () => PC, port: 0, spawn: server.spawn, fetch: server.fetch },
+    ...(replies ? { replies } : {}),
   })
   t.after(async () => {
     for (const d of effects.reverse()) { try { await d() } catch { /* already gone */ } }
@@ -185,11 +201,23 @@ async function plugin(t, { laya = false, config = {} } = {}) {
     })
   }
   const slash = (name, rawInput) => commands.get(name).handler({ agent, rawInput, signal: new AbortController().signal })
+  // One message typed into Jev Auto, as the engine streams it through the adapter: the reply's text,
+  // or the error that ended it. The chat so far goes with it, as the engine sends it.
+  const chat = []
+  async function say(text, { signal } = {}) {
+    chat.push({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
+    const out = { text: '', error: null }
+    try {
+      for await (const e of adapter.stream({ model: 'jev-auto', messages: [...chat], sessionId: SESSION, signal: signal ?? new AbortController().signal })) if (e.type === 'text-delta') out.text += e.text
+    } catch (err) { out.error = err }
+    chat.push({ role: 'assistant', content: [{ type: 'text', text: out.text }] })
+    return out
+  }
   const local = async () => (await http('GET', '/jev-router/local')).body
   assert.ok((await local()).modules.some((m) => m.id === 'big'), "the local models are this test's, not the harness's")
   // Big is hashed once, in the background, the first time its state is read.
   await until('Big is installed', local, (s) => s.modules?.find((m) => m.id === 'big')?.state === 'installed')
-  return { http, slash, local, world, server, dataDir }
+  return { http, slash, say, local, world, server, dataDir, workspace, adapter: () => adapter }
 }
 
 test('POST /jev-router/local/benchmark queues the models, answers 409 while a run goes and 400 with the reason otherwise; Cancel stops it; GET /jev-router/local follows the run', async (t) => {
@@ -285,4 +313,209 @@ test('a speed run is refused while Laya is answering a call', async (t) => {
   assert.deepEqual(await p.http('POST', '/jev-router/local/benchmark', {}), { status: 400, body: { error: 'Laya is answering a call right now, and would slow the measurement. Try again when it is idle.' } })
   assert.equal((await p.local()).speedRun.state, 'idle', 'nothing was started')
   void selftest
+})
+
+test('POST /jev-router/tasks/seen {results:[{jobId, name}]} acknowledges only a finished task with that name', async (t) => {
+  // Two finished results posted and not yet seen when the app was closed, so their notices are in the
+  // chat and can still be read. The engine counts job ids from 1 again after a restart, so the chat
+  // can still hold an older task's notice under jev-2. The third record is in a state this build does
+  // not know, which it keeps as it loads: not finished, it has no result to read even under its own
+  // name (one still running when the app was closed would come back stopped instead).
+  const row = (jobId, taskName, state = 'completed') => ({ jobId, sessionId: SESSION, workspace: 'C:/w', taskName, taskText: taskName, state, finishedAt: 1, deliveryState: 'delivering', seq: 2, report: `${taskName} report` })
+  const p = await plugin(t, { tasks: [row('jev-1', 'Fix the parser · keep the tests green'), row('jev-2', 'Tidy the docs'), row('jev-3', 'Wait for approval', 'archived')] })
+  const seen = (body) => p.http('POST', '/jev-router/tasks/seen', body)
+  const unread = async () => Object.fromEntries((await p.http('GET', '/jev-router/tasks')).body.tasks.map((x) => [x.jobId, x.deliveryState]))
+  // jev-1 under its own name, however the separator is spaced; jev-2 under the older task's name;
+  // jev-3 under its own; an id nobody has; and an entry with no name, which a page that names
+  // results never sends.
+  assert.deepEqual(await seen({ results: [{ jobId: 'jev-1', name: 'Fix the parser·keep the tests green' }, { jobId: 'jev-2', name: 'Write the changelog' }, { jobId: 'jev-3', name: 'Wait for approval' }, { jobId: 'jev-9', name: 'x' }, { jobId: 'jev-2' }] }), { status: 200, body: { acknowledged: ['jev-1'] } })
+  assert.deepEqual(await unread(), { 'jev-1': 'delivered', 'jev-2': 'pending', 'jev-3': 'pending' }, 'the older task\'s notice marked nothing read, and the unfinished task\'s own name nothing either')
+  assert.deepEqual(await seen({ results: [{ jobId: 'jev-2', name: 'Tidy the docs' }] }), { status: 200, body: { acknowledged: ['jev-2'] } })
+  assert.deepEqual(await unread(), { 'jev-1': 'delivered', 'jev-2': 'delivered', 'jev-3': 'pending' })
+  // A page from before, which names only ids, is still heard.
+  const q = await plugin(t, { tasks: [row('jev-1', 'Fix the parser')] })
+  assert.deepEqual(await q.http('POST', '/jev-router/tasks/seen', { jobIds: ['jev-1', 'not an id'] }), { status: 200, body: { acknowledged: ['jev-1'] } })
+})
+
+test('POST /jev-router/tasks/seen {sessionId, results} marks read only a result of the chat the rows are in', async (t) => {
+  // A result posted in this chat and not yet seen when the app was closed, so its notice is in the chat.
+  const p = await plugin(t, { tasks: [{ jobId: 'jev-1', sessionId: SESSION, workspace: 'C:/w', taskName: 'run the tests', taskText: 'run the tests', state: 'completed', finishedAt: 1, deliveryState: 'delivering', seq: 2, report: 'the report' }] })
+  const seen = (sessionId) => p.http('POST', '/jev-router/tasks/seen', { sessionId, results: [{ jobId: 'jev-1', name: 'run the tests' }] })
+  const state = async () => (await p.http('GET', '/jev-router/tasks')).body.tasks.find((x) => x.jobId === 'jev-1').deliveryState
+  // Another chat is on screen, whose older row names the same id and task, as the same words sent
+  // there before a restart leave it; and chats that are no session id, which match nothing.
+  for (const chat of ['session-other', 'not a chat/..', 7, { id: SESSION }]) {
+    assert.deepEqual(await seen(chat), { status: 200, body: { acknowledged: [] } }, JSON.stringify(chat))
+  }
+  assert.equal(await state(), 'pending', 'still unread')
+  assert.deepEqual(await seen(SESSION), { status: 200, body: { acknowledged: ['jev-1'] } })
+  assert.equal(await state(), 'delivered')
+})
+
+// ---------------------------------------------------------------- the start reply and its notices
+// A result's summary names its task between `·`s (delivery.js); a milestone notice's never holds one.
+const isResult = (a) => String(a.msg.source?.summary ?? '').includes('·')
+const noticesOf = (p) => p.world.appended.filter((a) => a.msg.source?.plugin === 'jev-router' && a.msg.source?.form === 'notice' && !isResult(a))
+const resultsOf = (p) => p.world.appended.filter(isResult)
+const folderOf = (dir) => dir.split(/[\\/]/).filter(Boolean).at(-1)
+
+test('a task whose reply was aborted gets exactly one started notice via the guard timer', async (t) => {
+  // The reply waits 200 ms for the pick, and one that said nothing is taken to have named nothing
+  // 100 ms after that.
+  const p = await plugin(t, { jobs: true, files: { 'chat-replies.json': JSON.stringify({ waitMs: 200 }) }, replies: { graceMs: 100 } })
+  let finish = null
+  p.world.work = () => new Promise((r) => { finish = r })
+  // Stopped the moment the task is queued, so the reply is stopped in its wait for the pick.
+  const stop = new AbortController()
+  p.world.onJob = () => stop.abort()
+  const said = await p.say('Fix the state file', { signal: stop.signal })
+  await until('the agent is at work', () => p.world.started.length, (n) => n === 1)
+  const posted = await until('the started notice is posted', () => noticesOf(p), (n) => n.length > 0, { timeoutMs: 5000 }).catch(() => noticesOf(p))
+  finish?.()
+  await until('the result is posted', () => resultsOf(p).length, (n) => n === 1).catch(() => 0)
+  assert.equal(said.text, '', 'the stopped reply said nothing')
+  assert.equal(said.error?.name, 'AbortError')
+  assert.deepEqual(posted.map((a) => a.msg.source.summary), ['jev-1 started: Big (local), big'])
+  assert.equal(posted[0].msg.content[0].text, `**jev-1** started: **Big (local)** (big) is working on it in ${folderOf(p.workspace)}. Watch it on the work board; the result posts here when it's done.`)
+  assert.deepEqual(posted[0].opts, { surfaceOp: 'append' })
+  assert.equal(noticesOf(p).length, 1, 'exactly one notice, beside its result')
+  assert.equal(resultsOf(p).length, 1)
+})
+
+test('a task queued behind another whose reply B is dropped before it goes out gets exactly one started notice via the guard timer', async (t) => {
+  // The guard fires 200 ms and then 100 ms after the task is queued, long before the first task ends.
+  // The first task's own guard fires too, while it still works, and must leave alone the plan its
+  // reply A already named.
+  const p = await plugin(t, { jobs: true, files: { 'chat-replies.json': JSON.stringify({ waitMs: 200 }) }, replies: { graceMs: 100 } })
+  const finishes = []
+  p.world.work = () => new Promise((r) => finishes.push(r))
+  await p.say('Fix the state file')
+  await until('the first task is at work', () => p.world.started.length, (n) => n === 1)
+  // The second waits its turn. Its reply is read up to its first words and dropped there, as the
+  // engine drops a stream once Stop lands, so it never says what it named. p.say would read on.
+  const reply = p.adapter().stream({ model: 'jev-auto', messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Now tidy the state file' }] }], sessionId: SESSION, signal: new AbortController().signal })
+  let said = ''
+  while (!said) { const { value, done } = await reply.next(); if (done) break; if (value.type === 'text-delta') said = value.text }
+  await reply.return()
+  await tick(500)
+  finishes.shift()?.()
+  await until('the second task is at work', () => p.world.started.length, (n) => n === 2).catch(() => 0)
+  const two = () => noticesOf(p).filter((a) => a.msg.source.summary.startsWith('jev-2'))
+  const posted = await until('its started notice is posted', two, (n) => n.length > 0, { timeoutMs: 5000 }).catch(() => two())
+  finishes.shift()?.()
+  await until('both results are posted', () => resultsOf(p).length, (n) => n === 2).catch(() => 0)
+  assert.match(said, /^OK, \*\*jev-2\*\* is queued: /, 'reply B, which names no plan')
+  assert.deepEqual(posted.map((a) => a.msg.source.summary), ['jev-2 started: Big (local), big'])
+  assert.equal(two().length, 1, 'exactly one, beside its result')
+  assert.deepEqual(noticesOf(p).map((a) => a.msg.source.summary), ['jev-2 started: Big (local), big'], 'none for jev-1, whose reply A named its plan before its guard fired')
+  assert.equal(resultsOf(p).length, 2)
+})
+
+test('a task in an idle folder gets reply A naming the agent and model its row shows, and one queued behind it gets B and then exactly one started notice', async (t) => {
+  const p = await plugin(t, { jobs: true })
+  const finishes = []
+  p.world.work = () => new Promise((r) => finishes.push(r))
+  const one = await p.say('Fix the state file')
+  await until('the first task is at work', () => p.world.started.length, (n) => n === 1)
+  const two = await p.say('Now tidy the state file')
+  // The second waits over a second for the folder, which its started notice says.
+  await tick(1500)
+  finishes.shift()?.()
+  await until('the second task is at work', () => p.world.started.length, (n) => n === 2).catch(() => 0)
+  const notices = await until('its started notice is posted', () => noticesOf(p), (n) => n.length > 0, { timeoutMs: 5000 }).catch(() => noticesOf(p))
+  finishes.shift()?.()
+  await until('both results are posted', () => resultsOf(p).length, (n) => n === 2).catch(() => 0)
+  const rows = (await p.http('GET', '/jev-router/tasks')).body.tasks
+  const first = rows.find((x) => x.jobId === 'jev-1')
+  const where = folderOf(p.workspace)
+  // The reply said what the task list later shows for the run: its agent (by name), its model and no effort.
+  assert.deepEqual([first.agent, first.model, first.effort], ['big-local', 'big', null])
+  const [said, credit, job, run, agents] = one.text.split('\n\n')
+  assert.equal(said, `OK, I'll run **Big (local)** with **big** in the background as **jev-1** in ${where}. I'll report back here when it's done. Keep chatting.`)
+  assert.match(credit ?? '', /^> Picked on this PC in (under 0\.1|\d+(\.\d)?) s, no Jev call\.$/, 'offline, the rule on this PC picked it')
+  assert.equal(job, `[jev-job]: kzh-job-1-${first.key}`)
+  assert.equal(run, `[jev-run]: kzh-run-1-${first.runId}`)
+  assert.deepEqual(JSON.parse(Buffer.from(/kzh-agents-1-(\S+)$/.exec(agents ?? '')?.[1] ?? '', 'base64url').toString() || 'null'), [{ agent: 'big-local', model: 'big', roles: ['work'] }])
+  assert.equal(two.text, `OK, **jev-2** is queued: 2nd in line for ${where} (another task is running there). Jev picks the agent when it starts; I'll say which here, and report back when it's done. Keep chatting.\n\n[jev-job]: kzh-job-1-${rows.find((x) => x.jobId === 'jev-2').key}`)
+  assert.deepEqual(notices.map((a) => a.msg.source.summary), ['jev-2 started: Big (local), big'], 'a notice for the task whose reply named no plan, and none for the one whose reply did')
+  assert.match(notices[0].msg.content[0].text, new RegExp(`^\\*\\*jev-2\\*\\* started: \\*\\*Big \\(local\\)\\*\\* \\(big\\) is working on it in ${where}\\. It waited \\d+ s for the folder\\. Watch it on the work board; the result posts here when it's done\\.$`), 'and how long it waited, for what')
+  assert.equal(noticesOf(p).length, 1)
+})
+
+test('GET and POST /jev-router/chat-replies/settings: 15 s and milestones as shipped, a patch changes its own fields and is kept, and a wrong field is refused with what it takes', async (t) => {
+  const p = await plugin(t)
+  const settings = (body) => p.http(body === undefined ? 'GET' : 'POST', '/jev-router/chat-replies/settings', body)
+  assert.deepEqual(await settings(), { status: 200, body: { waitMs: 15_000, progress: 'milestones', askWhenWrong: true } })
+  assert.deepEqual(await settings({ waitMs: 5000 }), { status: 200, body: { waitMs: 5000, progress: 'milestones', askWhenWrong: true } })
+  assert.deepEqual(await settings({ progress: 'off', askWhenWrong: false, unknown: 1 }), { status: 200, body: { waitMs: 5000, progress: 'off', askWhenWrong: false } })
+  for (const [patch, error] of [
+    [{ waitMs: 60_001 }, 'waitMs: whole milliseconds from 0 to 60000 (0 replies at once)'],
+    [{ waitMs: 1.5, progress: 'milestones' }, 'waitMs: whole milliseconds from 0 to 60000 (0 replies at once)'],
+    [{ progress: 'sometimes' }, "progress: 'milestones', or 'off' for the start reply and the result only"],
+    [{ askWhenWrong: 'yes' }, 'askWhenWrong: true or false'],
+    [[1], 'chat replies: an object of the settings to change'],
+  ]) assert.deepEqual(await settings(patch), { status: 400, body: { error } }, JSON.stringify(patch))
+  const saved = readFileSync(join(p.dataDir, 'chat-replies.json'), 'utf8')
+  assert.deepEqual(JSON.parse(saved), { waitMs: 5000, progress: 'off', askWhenWrong: false }, 'a refused patch saved nothing')
+  // As the app starts again, it reads them back.
+  const q = await plugin(t, { files: { 'chat-replies.json': saved } })
+  assert.deepEqual((await q.http('GET', '/jev-router/chat-replies/settings')).body, { waitMs: 5000, progress: 'off', askWhenWrong: false })
+})
+
+test('a task that fails before its pick, while its reply waits for it, is answered that it ended, and its result follows as its own message', async (t) => {
+  // Every agent is excluded by the routing policy, so the router fails the task before it picks one.
+  const p = await plugin(t, { jobs: true, config: { routing: { disabledResources: ['big-local'] } } })
+  const said = await p.say('Fix the state file')
+  const [result] = await until('the result is posted', () => resultsOf(p), (r) => r.length === 1)
+  const [row] = (await p.http('GET', '/jev-router/tasks')).body.tasks
+  assert.equal(row.state, 'failed')
+  assert.equal(said.text, `**jev-1** ended before Jev picked its agent (Failed). Its result is posted here as its own message.\n\n[jev-job]: kzh-job-1-${row.key}\n\n[jev-run]: kzh-run-1-${row.runId}`, 'not C, which would say it is starting and promise the pick; and with the run that ended')
+  assert.equal(result.msg.source.summary, 'jev-1 · Fix the state file · Failed')
+  assert.match(result.msg.content[0].text, /every agent is excluded by the routing policy: big-local \(disabled by configuration\)/, 'the result says why')
+  assert.deepEqual([p.world.started.length, noticesOf(p).length], [0, 0], 'no agent started, and nothing but its result is posted')
+})
+
+test('a started notice owed once the reply says what it named is posted then, not at the guard, when the pick lands before the reply is out', async (t) => {
+  // The reply waits 1 ms for the pick, so it is C; the guard would post the started notice only 20 s on.
+  const p = await plugin(t, { jobs: true, files: { 'chat-replies.json': JSON.stringify({ waitMs: 1 }) }, replies: { graceMs: 20_000 } })
+  let finish = null
+  p.world.work = () => new Promise((r) => { finish = r })
+  // The reply is read up to its text and held there, as a reader slower than the pick would.
+  const reply = p.adapter().stream({ model: 'jev-auto', messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Fix the state file' }] }], sessionId: SESSION, signal: new AbortController().signal })
+  let text = ''
+  while (!text) { const { value, done } = await reply.next(); if (done) break; if (value.type === 'text-delta') text = value.text }
+  assert.match(text, /^OK, \*\*jev-1\*\* is starting in [^,]+, and Jev is still choosing the agent/, text)
+  await until('the agent is at work', () => p.world.started.length, (n) => n === 1)
+  assert.deepEqual(noticesOf(p), [], 'picked, but the reply has not yet said that it named nothing')
+  for (;;) { const { done } = await reply.next(); if (done) break }
+  const posted = await until('the started notice is posted', () => noticesOf(p), (n) => n.length > 0, { timeoutMs: 5000 })
+  assert.deepEqual(posted.map((a) => a.msg.source.summary), ['jev-1 started: Big (local), big'])
+  finish?.()
+  await until('the result is posted', () => resultsOf(p).length, (n) => n === 1)
+  assert.equal(noticesOf(p).length, 1, 'exactly one notice, beside its result')
+  const [row] = (await p.http('GET', '/jev-router/tasks')).body.tasks
+  assert.match(text, new RegExp(`\\n\\n\\[jev-run\\]: kzh-run-1-${row.runId}$`, 'm'), 'C was written once its task had begun its run, and carries it')
+})
+
+test('with Start and result only saved, the replies promise only the result and no milestone notice is posted, the started one included', async (t) => {
+  // The reply waits 1 ms for the pick, so the first is C, built from what the task's enqueue answers;
+  // one that said nothing is taken to have named nothing 100 ms after that.
+  const p = await plugin(t, { jobs: true, files: { 'chat-replies.json': JSON.stringify({ waitMs: 1 }) }, replies: { graceMs: 100 } })
+  assert.equal((await p.http('POST', '/jev-router/chat-replies/settings', { progress: 'off' })).status, 200)
+  const finishes = []
+  p.world.work = () => new Promise((r) => finishes.push(r))
+  const one = await p.say('Fix the state file')
+  await until('the first task is at work', () => p.world.started.length, (n) => n === 1)
+  const two = await p.say('Now tidy the state file')
+  finishes.shift()?.()
+  await until('the second task is at work', () => p.world.started.length, (n) => n === 2)
+  // Long enough for a started notice to have been posted, and past each task's guard.
+  await tick(500)
+  const notices = noticesOf(p)
+  finishes.shift()?.()
+  await until('both results are posted', () => resultsOf(p).length, (n) => n === 2)
+  assert.equal(one.text.split('\n\n')[0], `OK, **jev-1** is starting in ${folderOf(p.workspace)}, and Jev is still choosing the agent (0 s so far). I'll report back here when it's done. Keep chatting.`, 'C promises no word of the pick')
+  assert.equal(two.text.split('\n\n[jev-job]')[0], `OK, **jev-2** is queued: 2nd in line for ${folderOf(p.workspace)} (another task is running there). Jev picks the agent when it starts; I'll report back here when it's done. Keep chatting.`)
+  assert.deepEqual(notices, [], 'both tasks started on an agent their replies did not name, and no notice said so')
+  assert.deepEqual(noticesOf(p), [])
 })

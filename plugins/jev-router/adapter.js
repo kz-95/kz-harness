@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import { eligible, rank } from './capabilities.js'
 import { isLocalLevel, localAgentFor } from './effort.js'
 import { TEACHER, providerName } from './providers.js'
+import { WAIT_WORDS, accessSentence, choosingLine, creditLine, endedReply, folderOf, intentMark, planReply, queuedReply, queuedSentence, readingLine, resultAgent, startingReply, startingSentence, withMarks, workerStep } from './reply-words.js'
 import { placeText } from './waits.js'
 import { fileURLToPath } from 'node:url'
 
@@ -181,6 +182,8 @@ const typedByPerson = (m) => m.role === 'user' && (m.source?.kind ?? 'user') ===
 // A background job's completion notice (dsh-tool-jobs): { kind: 'plugin', plugin: 'tool-jobs', form: 'notice' }.
 const isJobNotice = (m) => m.role === 'user' && m.source?.kind === 'plugin' && (m.source.plugin === 'tool-jobs' || m.source.form === 'notice')
 const ordinal = (n) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] ?? 'th')}`
+// How long a wait shows nothing before its reasoning block opens, so a quick answer looks instant.
+const QUIET_MS = 600
 
 /**
  * The user-facing label for every task state. Kept beside `line()` because the chat and the
@@ -199,17 +202,34 @@ export const TASK_LABELS = Object.freeze({
   paused_limit: 'Paused by limit',
 })
 
+/** The labels of the finished states, which a result notice's summary ends with (delivery.js). */
+const RESULT_LABELS = new Set(['completed', 'failed', 'stopped', 'needs_human', 'paused_limit'].map((s) => TASK_LABELS[s]))
+
+/**
+ * A jev-router notice that is not a result: a milestone notice (index.js), whose summary never
+ * holds `·`, where a result's reads `jev-3 · <task name> · Completed` (client.js resultOf reads it
+ * the same way). A direct answer's chat model is not shown these: they are the chat's, not the
+ * person's words, and a result says all of it once the task ends.
+ */
+export function isProgressNotice(m) {
+  const s = m?.source
+  if (m?.role !== 'user' || s?.kind !== 'plugin' || s.plugin !== 'jev-router' || s.form !== 'notice') return false
+  const parts = String(s.summary ?? '').split('·').map((x) => x.trim())
+  return !(parts.length >= 3 && RESULT_LABELS.has(parts.at(-1)) && /^[a-z][\w-]{0,40}$/.test(parts[0]))
+}
+
 /**
  * One finished background task as a self-contained, attributed section: who did it, which
  * task it was, how it ended, and the result. It never borrows the chat model's voice, so a
- * reader can always tell where the assistant stopped and the background work began.
+ * reader can always tell where the assistant stopped and the background work began. `names`
+ * maps agent ids to the names the start reply used for them.
  */
-export function resultSection(r) {
+export function resultSection(r, { names } = {}) {
   const head = [
     '**Background task result**',
     `Task: ${r.taskName ?? r.task}`,
     `Task ID: ${r.jobId}`,
-    `Agent: ${r.agent ?? `${providerName(r.decider ?? TEACHER)} picks`}${r.model ? ` · ${r.model}` : ''}`,
+    `Agent: ${resultAgent(r, names)}`,
     `Status: ${TASK_LABELS[r.state] ?? r.state}`,
   ]
   // A task that did not complete says why first: the reason is the useful part.
@@ -329,6 +349,9 @@ export function line(e) {
     }
     case 'routed': {
       const note = SHADOW_NOTE[e.shadow] ? `\n${SHADOW_NOTE[e.shadow]}` : ''
+      // A run the router stops for a person routes nothing (router.js stopsForPerson): its line names
+      // no agent, since whom the decider would have picked never runs.
+      if (e.stopsForPerson) return `${providerName(e.routing.decider ?? TEACHER)} read this as needing a person: no agent runs${note}`
       if (e.tool) return `Routed to tool ${e.tool}${note}`
       const strategy = e.plan?.strategy && e.plan.strategy !== 'STANDARD_DIRECT' ? `, ${e.plan.strategy.toLowerCase().replace(/_/g, ' ')}` : ''
       const reviewer = e.plan?.reviewer ? `, ${e.plan.reviewer} reviews` : ''
@@ -397,15 +420,23 @@ export function layaRowSentence(row) {
  * @param {object} p
  * @param {object} p.ctx     cordis context with `llm` and `agents`
  * @param {Function} p.route the router's route({ task, agent, forceAgent, mode, decider, signal, emit })
- * @param {Function} [p.classify] (message, mode, decider, { onWait, signal }) -> { kind: 'task' | 'question', thresholds?, unsure?, why? };
- *   `onWait(line)` is each line of what it waits for (Laya starting on this PC), shown as it comes
+ * @param {Function} [p.classify] (message, mode, decider, { onWait, signal, modalities, cwd }) -> { kind: 'task' | 'question', thresholds?, unsure?, why?, intentSample? };
+ *   `onWait(line)` is each line of what it waits for (Laya starting on this PC), shown as it comes,
+ *   `cwd` the folder the message was sent in, where its task would run, and `intentSample` the
+ *   sample the intent domain recorded the message as (intent.js), which its task and its run carry,
+ *   and a direct answer marks
  * @param {{provider: string, model: string}} p.auxModel real model for title and compaction requests
  * @param {(ms: number, model: {provider: string, model: string}, row: {decider: 'jev'|'laya'}) => void} [p.onDirectAnswer] a question in a project was answered by a chat model, no agent;
  *   `row.decider` is who decides the row the question came through, for the usage row: "Saved by Jev" counts only Jev's
  * @param {(decider: 'jev'|'laya') => Promise<boolean>} [p.isOffline] true when the internet is unreachable, probed where the
  *   row's decider says: a Laya Auto session never contacts a TypeSafe host
  * @param {() => Promise<{provider: string, model: string}|null>} [p.localChat] the local chat model, when one is installed
- * @param {object} [p.orchestrator] background tasks: { pending(sessionId) -> string[], ackPending(sessionId), enqueue({ agent, task, effort, forceAgent, mode, sessionId, modalities }, { decider, why }) -> chat text, or null to run blocking }
+ * @param {object} [p.orchestrator] background tasks (index.js orchestrator): results(sessionId), live(sessionId),
+ *   enqueue({ agent, task, effort, forceAgent, mode, sessionId, modalities }, { decider, why, readVerdict, intentSample?, message }) -> the start
+ *   reply's facts ({ line, jobId, key, runId, startsNow, forcedPlan, waitMs, progress, waiting, access }), a bare line from an
+ *   older one, or null to run blocking; watchPlan(key, { signal, waitMs, onLine }) -> the plan once picked, or null at the
+ *   bound; noteAck(key, { gen, said, bound, now }), what the reply named, `bound` when its wait for the pick ran out
+ *   first, `now` when it went out at once beside a task that starts at once; liveStatus(sessionId) -> a sentence of what runs now
  * @param {() => Promise<Array<{id: string, description?: string, kind?: string, enabled?: boolean}>>} [p.agents] enabled agents, each offered as its own model
  * @param {(model: {provider: string, model: string}) => Promise<boolean>} [p.canSeeImages] does this model's own catalog entry declare image input?
  * @param {(agentId: string) => Promise<boolean>} [p.agentSeesImages] can this agent be handed an image (its tools open the file)?
@@ -423,6 +454,9 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
   // would make that turn look like a repeat of the last one and never run.
   const hasImage = (m) => (m?.content ?? []).some((b) => b?.type === 'image')
   const isTyped = (m) => typedByPerson(m) && (!!textOf(m.content) || hasImage(m))
+
+  // Each agent's own name by its id, for the start reply, which names agents as the menu does.
+  const agentNames = async () => Object.fromEntries((await agents?.().catch(() => []) ?? []).map((a) => [a.id, nameOfAgent(a)]))
 
   // Does anything downstream of this row really read a picture? Asked of the catalog rather
   // than assumed: the same declaration the engine's own gate consults.
@@ -615,7 +649,10 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       // One classifier call for both branches below. `depth` is the decider saying how much
       // answering this well depends on real reasoning: it decides which model answers, not how
       // hard anyone works. While it waits (Laya starting on this PC) it says what it waits for,
-      // as it happens, in a reasoning block of its own that opens only if there is something to say.
+      // as it happens, in a reasoning block of its own that opens only if there is something to say;
+      // a call that takes a moment with nothing said says that it is reading the message. It is told
+      // the folder the message was sent in, since where no task can run (No project) a question taken
+      // for one would be refused rather than answered, so there Jev reads every message (index.js).
       let cls = null
       // The first block free for what the message shows next: 0, or after the waiting lines.
       let first = 0
@@ -623,15 +660,16 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
         const waits = []
         let wake
         let settled = false
-        const onWait = (w) => { waits.push(typeof w === 'string' ? w : w?.text ?? line(w)); wake?.() }
+        let at = null
+        let said = ''
+        const reading = setTimeout(() => { if (at === null && !waits.length) { waits.push(readingLine(decider)); wake?.() } }, QUIET_MS)
+        const onWait = (w) => { clearTimeout(reading); waits.push(typeof w === 'string' ? w : w?.text ?? line(w)); wake?.() }
         const onStop = () => wake?.()
         options.signal?.addEventListener('abort', onStop, { once: true })
         Promise.resolve()
-          .then(() => classify(task, mode, decider, { onWait, signal: options.signal }))
+          .then(() => classify(task, mode, decider, { onWait, signal: options.signal, modalities: images.length ? ['text', 'image'] : ['text'], cwd: agent?.session?.header?.cwd }))
           .then((r) => { cls = r ?? null }, () => { cls = null })
-          .finally(() => { settled = true; wake?.() })
-        let at = null
-        let said = ''
+          .finally(() => { settled = true; clearTimeout(reading); wake?.() })
         try {
           while ((!settled || waits.length) && !options.signal?.aborted) {
             if (!waits.length) { await new Promise((r) => { wake = r }); wake = undefined; continue }
@@ -640,16 +678,23 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
             said += text
             yield { type: 'reasoning-delta', index: at, text }
           }
-        } finally { options.signal?.removeEventListener('abort', onStop) }
+        } finally { clearTimeout(reading); options.signal?.removeEventListener('abort', onStop) }
         if (at !== null) { yield { type: 'block-end', index: at, block: { type: 'reasoning', text: said } }; pos.last = at; first = at + 1 }
         if (!settled) throw new DOMException('Stopped', 'AbortError')
       }
       const deep = cls?.depth === 'deep'
+      // The intent sample the message was recorded as (intent.js), when one was: its task and its run
+      // carry it, and a direct answer carries its mark, so a verdict on the answer can label it.
+      const intentSample = cls?.intentSample ?? null
+      const sampled = intentSample ? { intentSample } : {}
       const answer = async function* (plan, note, onAnswered) {
         // Whatever this message already showed (the lines of a Laya start) keeps its blocks: the
         // model's own blocks are numbered after them.
         pos.shift = first
-        return yield* answerWithAny(ctx, options, plan, onAnswered, note, pos)
+        // What this chat's tasks are doing now, so "how is it going?" gets a true answer.
+        let status = ''
+        try { status = (await orchestrator?.liveStatus?.(sid)) ?? '' } catch {}
+        return yield* answerWithAny(ctx, options, plan, onAnswered, note, pos, status, intentMark(intentSample))
       }
       // An image cannot ride the agent prompt: that prompt is one string, and the Claude Code
       // and Codex bridges flatten content blocks to text before their CLI ever sees them. So
@@ -702,13 +747,27 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
         const answered = yield* answer(choices, deepNote(deep, mode, decider), (m) => onDirectAnswer?.(Date.now() - started, m, { decider }))
         if (answered === true) {
           // "One message may do both": a message can be a question and also ask for work. The
-          // answer has just gone out, so the work is queued behind it and the queue line rides
-          // at the end of this same message - the person is answered now and the work starts.
-          // Who decides rides beside the task's own fields: the queued run is the row's.
+          // answer has just gone out, so the work is queued behind it and the task's first sentence
+          // rides at the end of this same message - the person is answered now and the work starts.
+          // It never waits for the pick: a started notice names the agent once it is picked.
+          // Who decides rides beside the task's own fields: the queued run is the row's, and so do the
+          // person's own words, which the reply ledger reads. The message's intent sample does not: the
+          // message was a question, and what its extra work does next says nothing about that, so only a
+          // verdict on the answer labels it.
           if (alsoWork(cls) && orchestrator) {
             try {
-              const queued = await orchestrator.enqueue({ agent, task: (await imageLine()) + task, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider, readVerdict: readOnlyVerdict(cls, decider) })
-              if (queued) yield* textBlock(`\n\n${queued}`, pos.last + 1)
+              const queued = await orchestrator.enqueue({ agent, task: (await imageLine()) + task, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider, readVerdict: readOnlyVerdict(cls, decider), message: task })
+              const q = typeof queued === 'string' ? { line: queued } : queued
+              const where = agent?.session?.header?.cwd
+              if (q?.key) {
+                // Its first sentence, then, for a task judged read only, that it runs locked or why it
+                // waits like work that writes, as every start reply says it.
+                const first = q.startsNow ? startingSentence({ jobId: q.jobId, workspace: where, decider }) : queuedSentence({ jobId: q.jobId, workspace: where, waiting: q.waiting })
+                yield* textBlock(`\n\n${first}${accessSentence(q.access, folderOf(where), !q.startsNow && q.waiting?.why !== 'cap')}`, pos.last + 1)
+                // It named no plan, so the task's started notice follows once the agent is picked. For a
+                // task that starts at once it went out at once, with nothing waiting (`now`).
+                try { orchestrator.noteAck?.(q.key, q.startsNow ? { gen: 0, said: null, now: true } : { gen: 0, said: null }) } catch {}
+              } else if (q?.line) yield* textBlock(`\n\n${q.line}`, pos.last + 1)
             } catch (err) { yield* textBlock(`\n\njev-router: ${err.message}`, pos.last + 1) }
           }
           return
@@ -729,17 +788,138 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
         routeTask = (await imageLine()) + routeTask
       }
 
-      // A message the decider could not sort is run as a task, and the person is told why: with
-      // the queued line (queuedLine appends it), or first among the live lines. The decider's
-      // verdict on whether it only reads rides along: a task that reads may run beside the task
-      // changing its folder, locked against writing (index.js orchestrator.enqueue).
+      // A message the decider could not sort is run as a task, and the person is told why: in the
+      // start reply, or first among the live lines. The decider's verdict on whether it only reads
+      // rides along: a task that reads may run beside the task changing its folder, locked against
+      // writing (index.js orchestrator.enqueue).
       const why = cls?.why ?? null
+      /**
+       * The reply to a task queued in the background (docs/live-agent-view.md Feature 2), with its
+       * hidden marks: A with the plan for a forced agent, B for a task that waits its turn, and for
+       * one that starts at once A when the router picks within the wait the chat replies setting
+       * allows, else C. A bare line from an older orchestrator is the reply as it always was.
+       */
+      const startReply = async function* (queued) {
+        const q = typeof queued === 'string' ? { line: queued } : queued
+        if (!q.key) { yield* textReply(q.line, first); return }
+        const cwd = agent?.session?.header?.cwd
+        // What the reply named is noted once its text is out (tasks.js noteAck), before the turn
+        // ends. A reply stopped before that notes nothing, and the task's guard timer then posts its
+        // started notice instead (index.js).
+        const out = async function* (text, index, ack) {
+          yield* textBlock(text, index)
+          try { orchestrator.noteAck?.(q.key, ack) } catch {}
+          yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        }
+        const namedNone = { gen: 0, said: null }
+        // The run the task has begun by the time a reply is written after its wait: the one read as
+        // it was queued is none for a task that starts at once, which reaches its run a moment later.
+        const runNow = () => { try { return orchestrator.runOf?.(q.key) ?? q.runId } catch { return q.runId } }
+        if (q.forcedPlan) {
+          const p = q.forcedPlan
+          yield* out(withMarks(q.line, { key: q.key, runId: q.runId, steps: [workerStep(p)] }), first, { gen: 1, said: { agent: p.agent, effort: p.effort ?? null } })
+          return
+        }
+        if (!q.startsNow || !(q.waitMs > 0) || !orchestrator.watchPlan) {
+          // B waits its turn; C written with no wait for the pick went out at once, beside a task that
+          // starts at once, with nothing waiting (`now`).
+          yield* out(withMarks(q.line, { key: q.key, runId: runNow() }), first, q.startsNow ? { ...namedNone, now: true } : namedNone)
+          return
+        }
+        // The wait for the pick, bounded by the setting. Its lines go to a reasoning block that opens
+        // only after a moment with nothing to show, so a quick pick looks instant.
+        let outcome = null
+        let over = false
+        let quiet = false
+        let wake
+        const heard = []
+        const bump = () => wake?.()
+        Promise.resolve()
+          .then(() => orchestrator.watchPlan(q.key, { signal: options.signal, waitMs: q.waitMs, onLine: (l) => { heard.push(l); bump() } }))
+          .then((o) => { outcome = o ?? null }, () => { outcome = null })
+          .finally(() => { over = true; bump() })
+        // The reply keeps the bound itself as well, whatever watchPlan does, and so knows when its wait
+        // ran out there rather than ending early with nothing to say (a task it could not find).
+        let ranOut = false
+        const bound = setTimeout(() => { ranOut = true; over = true; bump() }, q.waitMs)
+        const opener = setTimeout(() => { quiet = true; bump() }, QUIET_MS)
+        options.signal?.addEventListener('abort', bump, { once: true })
+        let at = null
+        let trace = ''
+        const think = (text) => { trace += `${text}\n`; return { type: 'reasoning-delta', index: at, text: `${text}\n` } }
+        try {
+          while ((!over || (at !== null && heard.length)) && !options.signal?.aborted) {
+            if (at === null && quiet) {
+              at = pos.last + 1
+              yield { type: 'block-start', index: at, blockType: 'reasoning' }
+              yield think(choosingLine({ jobId: q.jobId, waitMs: q.waitMs }))
+              continue
+            }
+            if (at !== null && heard.length) { yield think(heard.shift()); continue }
+            await new Promise((r) => { wake = r })
+            wake = undefined
+          }
+        } finally {
+          clearTimeout(bound)
+          clearTimeout(opener)
+          options.signal?.removeEventListener('abort', bump)
+        }
+        if (at !== null) { yield { type: 'block-end', index: at, block: { type: 'reasoning', text: trace } }; pos.last = at }
+        // Stop here ends this reply only: the task goes on, and its started notice still comes.
+        if (options.signal?.aborted) throw new DOMException('Stopped', 'AbortError')
+        const index = at === null ? first : at + 1
+        if (outcome?.plan) {
+          const p = outcome.plan
+          const d = outcome.decidedBy ?? {}
+          const names = await agentNames()
+          const nameOf = (id) => names[id] ?? id
+          // A tool that takes the work runs at no effort: the plan's is the agent's that takes over
+          // only if the tool fails, which the reply does not name.
+          const effort = p.tool ? null : p.effort
+          const speed = p.tool ? null : p.speed
+          const credit = creditLine({ by: d.by, called: d.called, decider: d.decider ?? decider, ms: outcome.ms, agent: nameOf(p.agent), taskType: d.taskType, complexity: d.complexity, risk: d.risk, effort, speed, from: d.from, movedOff: d.movedOff ? nameOf(d.movedOff) : null, reason: d.reason })
+          const text = planReply({
+            jobId: q.jobId, workspace: cwd, agent: nameOf(p.agent), model: p.model, effort, speed,
+            reviewer: p.reviewer ? { name: nameOf(p.reviewer.agent), model: p.reviewer.model } : null,
+            planner: p.planner ? { name: nameOf(p.planner.agent), model: p.planner.model } : null,
+            localFirst: !!p.localFirst, tool: p.tool, access: q.access, why, credit,
+          })
+          // The strip's chain as the orchestrator worked it out (index.js planned(): router.js
+          // routerStep, then the worker), which it always gives; one that gives none (an older one, or
+          // a stand-in) gets who picked by name alone, then the worker.
+          const steps = outcome.steps ?? [...(d.by === 'you' ? [] : [{ agent: providerName(d.decider ?? decider), model: '', roles: [] }]), workerStep(p)]
+          yield* out(withMarks(text, { key: q.key, runId: outcome.runId ?? q.runId, steps }), index, { gen: outcome.gen ?? 1, said: { agent: p.agent, effort: p.effort ?? null } })
+          return
+        }
+        if (outcome?.settled) {
+          yield* out(withMarks(endedReply({ jobId: q.jobId, decider, label: TASK_LABELS[outcome.settled] ?? outcome.settled }), { key: q.key, runId: runNow() }), index, namedNone)
+          return
+        }
+        if (outcome?.handedBack) {
+          // Its read pass handed it back before the pick: it runs as work that writes, and says why.
+          // Its run has begun, so the reply names the run it is on by now, as C at the bound does: the
+          // pass that writes, which starts at once in a free folder, else the read pass, whose run ended
+          // before its pick and so credits a verdict to nothing rather than to an earlier run.
+          const access = q.access?.verdict ? { mode: 'write', verdict: q.access.verdict, why: outcome.why ?? null } : q.access
+          const text = outcome.waiting
+            ? queuedReply({ jobId: q.jobId, workspace: cwd, waiting: outcome.waiting, decider, access, why, progress: q.progress })
+            : startingReply({ jobId: q.jobId, workspace: cwd, decider, access, why, progress: q.progress })
+          yield* out(withMarks(text, { key: q.key, runId: runNow() }), index, namedNone)
+          return
+        }
+        // The bound passed with no pick: the task has started, and its agent is still being chosen. A
+        // reply whose wait ran out says so with what it named (`bound`), and the reply ledger times it
+        // with the replies that named the pick (index.js noteSaid).
+        yield* out(withMarks(startingReply({ jobId: q.jobId, workspace: cwd, decider, waitedMs: q.waitMs, access: q.access, why, progress: q.progress }), { key: q.key, runId: runNow() }), index, ranOut ? { ...namedNone, bound: true } : namedNone)
+      }
       // Project work runs in the background (one at a time per workspace); the chat stays free.
       if (!answerOnly && orchestrator) {
         let queued
-        // routeTask, not task: a queued run needs the image path with its prompt too.
-        try { queued = await orchestrator.enqueue({ agent, task: routeTask, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider, why, readVerdict: readOnlyVerdict(cls, decider) }) } catch (err) { yield* textReply(`jev-router: ${err.message}`, first); return }
-        if (queued) { yield* textReply(queued, first); return }
+        // routeTask, not task: a queued run needs the image path with its prompt too. The person's own
+        // words ride beside it (`message`), which is what the reply ledger reads of the message.
+        try { queued = await orchestrator.enqueue({ agent, task: routeTask, effort, forceAgent, mode, sessionId: sid, modalities: images.length ? ['text', 'image'] : ['text'] }, { decider, why, readVerdict: readOnlyVerdict(cls, decider), message: task, ...sampled }) } catch (err) { yield* textReply(`jev-router: ${err.message}`, first); return }
+        if (queued) { yield* startReply(queued); return }
       }
       // Live routing progress first, then the report. `pos` keeps the block indices honest so a
       // finished result can be appended after all of it instead of in front.
@@ -756,7 +936,7 @@ export function jevAdapter({ ctx, route, classify, auxModel, onDirectAnswer, isO
       let result
       let error
       const emit = (e) => { queue.push(line(e)); wake?.() }
-      route({ task: routeTask, answerOnly, agent, forceAgent, mode, decider, effort, modalities: images.length ? ['text', 'image'] : ['text'], signal: ac.signal, emit })
+      route({ task: routeTask, answerOnly, agent, forceAgent, mode, decider, effort, modalities: images.length ? ['text', 'image'] : ['text'], signal: ac.signal, emit, ...sampled })
         .then((r) => { result = r }, (e) => { error = e })
         .finally(() => { done = true; wake?.() })
 
@@ -795,14 +975,18 @@ const deepNote = (deep, mode, decider = TEACHER) => (deep && mode !== 'offline'
   ? `${providerName(decider)} judged this worth the stronger model, so `
   : '')
 
-/** Try each chat model in order until one answers; returns true, or the last failure reason. */
-async function* answerWithAny(ctx, options, { offline, models }, onAnswered, note = '', pos) {
+/**
+ * Try each chat model in order until one answers; returns true, or the last failure reason. `status`
+ * is what this chat's tasks are doing now (reply-words.js liveStatusSentence), told with ABOUT, and
+ * `mark` the hidden mark the answer ends with (reply-words.js intentMark), or ''.
+ */
+async function* answerWithAny(ctx, options, { offline, models }, onAnswered, note = '', pos, status = '', mark = '') {
   let why = offline ? 'offline and no local model installed' : 'no chat model configured'
   let i = 0
   for (const m of models) {
     // The first model gets Jev's own reason for the pick; a later one is a hand-off.
     const said = i === 0 ? note : `${models[0].provider === 'local' ? 'the local model could not answer this, so ' : 'the first model could not answer, so '}`
-    const r = yield* answerDirectly(ctx, options, m, offline, said, pos)
+    const r = yield* answerDirectly(ctx, options, m, offline, said, pos, status, mark)
     if (r === true) { onAnswered?.(m); return true }
     process.stdout.write(`[jev] Chat model ${m.provider}/${m.model} could not answer (${r})\n`)
     why = r
@@ -816,8 +1000,10 @@ async function* answerWithAny(ctx, options, { offline, models }, onAnswered, not
  * Stream the answer from the chat model. Returns true, or the failure reason (having yielded nothing)
  * when that model fails before producing text, so the caller can fall back to an agent.
  * `pos` records the highest block index used, so a finished result can be appended after the answer.
+ * `status` is one sentence of what this chat's tasks are doing now, told after ABOUT when there is one.
+ * `mark` is a hidden mark the credit ends with, after a blank line (reply-words.js intentMark), or ''.
  */
-async function* answerDirectly(ctx, options, auxModel, offline = false, note = '', pos) {
+async function* answerDirectly(ctx, options, auxModel, offline = false, note = '', pos, status = '', mark = '') {
   // Ask the catalog what this model is actually called: "deepseek-flash" is an api
   // id, and says nothing about which DeepSeek model answered.
   const pair = `${auxModel.provider}/${auxModel.model}`
@@ -825,8 +1011,12 @@ async function* answerDirectly(ctx, options, auxModel, offline = false, note = '
   const label = named?.name?.trim() || pair
   // No tools: a direct answer must not start work (or call the router) on its own.
   const { reasoningEffort: _r, purpose: _p, tools: _t, toolChoice: _tc, ...rest } = options
-  const messages = options.messages.map((m, i) => (i === options.messages.length - 1 && m.role === 'user'
-    ? { ...m, content: [{ type: 'text', text: ABOUT }, ...m.content] }
+  // A milestone notice is left out: the live sentence says what runs now, where an old notice would
+  // say what ran then. A result stays, since it is the chat's record of what a task did.
+  const kept = options.messages.filter((m) => !isProgressNotice(m))
+  const about = status ? `${ABOUT} ${status}` : ABOUT
+  const messages = kept.map((m, i) => (i === kept.length - 1 && m.role === 'user'
+    ? { ...m, content: [{ type: 'text', text: about }, ...m.content] }
     : m))
   const held = []
   let flowing = false
@@ -834,7 +1024,7 @@ async function* answerDirectly(ctx, options, auxModel, offline = false, note = '
   const shift = pos?.shift ?? 0
   let lastIndex = shift
   // The name the picker shows, plus the id a bug report needs.
-  const credit = `\n\n> ${offline ? 'OFFLINE: local models only. ' : ''}${note}Answered by: ${label}${label === pair ? '' : ` (\`${pair}\`)`}, directly: a question, no agents or project work`
+  const credit = `\n\n> ${offline ? 'OFFLINE: local models only. ' : ''}${note}Answered by: ${label}${label === pair ? '' : ` (\`${pair}\`)`}, directly: a question, no agents or project work${mark ? `\n\n${mark}` : ''}`
   try {
     for await (const raw of ctx.llm.stream({ ...rest, messages, provider: auxModel.provider, model: auxModel.model })) {
       const chunk = shift && typeof raw.index === 'number' ? { ...raw, index: raw.index + shift } : raw
@@ -856,38 +1046,22 @@ async function* answerDirectly(ctx, options, auxModel, offline = false, note = '
 }
 
 /**
- * The chat line for a queued task. With no agent forced, whoever decides the task picks one; `why`
- * is the reason a message the decider could not sort was queued as a task (classify), said after.
- */
-/**
- * The chat's line for a queued task. `wait` is where it will stand (waits.js joinWait over lanes
- * wouldWait(), null for starting now), said with why in the words the work board uses; a caller that
- * has only a `position` gets the place alone. `access`, for a task the decider judged read only,
- * adds one sentence: that it runs locked beside work that writes, or why it waits like that work.
+ * The chat's line for a queued task, as it read before the start reply (reply-words.js), kept for a
+ * caller that has no task key. With no agent forced, whoever decides the task picks one; `why` is the
+ * reason a message the decider could not sort was queued as a task (classify), said after. `wait` is
+ * where it will stand (tasks.js waitingOf, null for starting now), said with why in the words the
+ * work board uses; a caller that has only a `position` gets the place alone. `access`, for a task the
+ * decider judged read only, adds one sentence: that it runs locked beside work that writes, or why it
+ * waits like that work.
  */
 export function queuedLine({ jobId, agent, position, wait, workspace, decider = TEACHER, why, access }) {
-  const where = String(workspace).split(/[\\/]/).filter(Boolean).at(-1) ?? workspace
-  const WHY = { workspace: 'another task is running there', chat: 'a run started from the chat is using it', line: 'an earlier task there is waiting for a free slot', cap: 'the resource budget caps how many tasks run at once' }
+  const where = folderOf(workspace)
   const at = wait !== undefined
-    ? (!wait ? `starting now in ${where}` : wait.why === 'cap' ? `${placeText(wait)} to start in ${where}: ${WHY.cap}` : `${placeText(wait)} for ${where}: ${WHY[wait.why]}`)
+    ? (!wait ? `starting now in ${where}` : wait.why === 'cap' ? `${placeText(wait)} to start in ${where}: ${WAIT_WORDS.cap}` : `${placeText(wait)} for ${where}: ${WAIT_WORDS[wait.why]}`)
     : position > 0 ? `${ordinal(position)} in line for ${where}` : `starting now in ${where}`
   // Waiting for the folder, not only for a free slot under the cap.
   const waits = wait !== undefined ? !!wait && wait.why !== 'cap' : position > 0
   return `Queued → ${agent ?? `${providerName(decider ?? TEACHER)} picks`} as **${jobId}** (${at}). Keep chatting: the result posts here when done.${why ? ` ${why}` : ''}${accessSentence(access, where, waits)}`
-}
-
-/**
- * The queued line's sentence on read-only work, or nothing for a task not judged read only. One that
- * cannot be locked runs as work that writes: it waits for the folder when something holds it, and
- * otherwise takes it, so a task that changes it waits instead.
- */
-function accessSentence(access, where, waits) {
-  const v = access?.verdict
-  if (!v?.reads) return ''
-  const judged = ` Read only: ${providerName(v.by ?? TEACHER)} judged it only reads the project (${Math.round(v.p * 100)}%, its bar is ${Math.round(v.bar * 100)}%)`
-  return access.mode === 'read'
-    ? `${judged}, so it runs on an agent locked against writing, beside any task changing ${where}.`
-    : `${judged}, but ${access.why ?? 'no agent here can be locked against writing'}, so ${waits ? `it waits for ${where} like work that writes` : `it runs as work that writes, and a task changing ${where} waits for it`}.`
 }
 
 async function* textReply(text, index = 0) {

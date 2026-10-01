@@ -32,6 +32,18 @@ export const RISK_CLASSES = Object.freeze(['LOW', 'MEDIUM', 'HIGH'])
  * each of these is a comparison of numbers, which a snap-judgment classifier cannot make. The
  * rule decides wherever the local classifier does not, so the rungs where Jev would decide
  * elsewhere are the rule's here. Without it the teacher is Jev.
+ *
+ * `localLabels` lists the only answers the local classifier may decide; any other answer, however
+ * confident, is recorded and the teacher is asked. The message intent is the one domain with it,
+ * and its authority is one way: a mature classifier may say "task" on this PC, and only Jev may
+ * say "question". The two mistakes are not equal. A question taken for a task costs one agent run,
+ * while a task taken for a question goes to a chat model that cannot touch the project, where the
+ * work cannot be done at all, so the cheap side is the only one the classifier is given.
+ *
+ * `requiredClasses` lists the labels the domain must have seen enough of, each with the risk
+ * class's `perClassSamples` verified rows, before a rung that decides: the significant-class gates
+ * read only what the store already holds, so a store of nearly one class would pass them and teach
+ * a classifier that every message is a task.
  */
 export const DOMAINS = Object.freeze({
   task_classification: { risk: 'LOW', kind: 'multiclass', label: 'task classification' },
@@ -41,6 +53,7 @@ export const DOMAINS = Object.freeze({
   second_opinion: { risk: 'MEDIUM', kind: 'multiclass', label: 'second opinion' },
   frontier_escalation: { risk: 'HIGH', kind: 'multiclass', label: 'frontier escalation', teacher: 'code' },
   outcome_disposition: { risk: 'HIGH', kind: 'multiclass', label: 'outcome disposition' },
+  intent: { risk: 'LOW', kind: 'multiclass', label: 'message intent', localLabels: Object.freeze(['task']), requiredClasses: Object.freeze(['task', 'question']) },
 })
 
 /** Execution strategies the router may choose. Eligibility is decided in code (broker.js). */
@@ -407,6 +420,15 @@ export function resolvePolicy(overrides = {}) {
     // would only make the Router tab and the controller disagree with what happens.
     if (d.teacher !== undefined && !['jev', 'code'].includes(d.teacher)) throw new Error(`routing policy: domain ${id}: teacher must be jev or code`)
     if (DOMAINS[id] && (d.teacher ?? 'jev') !== (DOMAINS[id].teacher ?? 'jev')) throw new Error(`routing policy: domain ${id}: teacher cannot be changed; it is ${DOMAINS[id].teacher ?? 'jev'}`)
+    // The same rule for the answers a local classifier may decide, and for the classes a rung waits
+    // on: a policy may narrow the first and add to the second, never the other way, since either
+    // way would let a classifier decide what the code keeps for its teacher.
+    for (const f of ['localLabels', 'requiredClasses']) {
+      if (d[f] !== undefined && !(Array.isArray(d[f]) && d[f].length && d[f].every((x) => typeof x === 'string' && x))) throw new Error(`routing policy: domain ${id}: ${f} must be a list of labels`)
+    }
+    const shipped = DOMAINS[id] ?? {}
+    if (shipped.localLabels && !(d.localLabels ?? []).every((l) => shipped.localLabels.includes(l))) throw new Error(`routing policy: domain ${id}: localLabels can only narrow what its local classifier may decide (${shipped.localLabels.join(', ')})`)
+    if (shipped.requiredClasses && !shipped.requiredClasses.every((c) => (d.requiredClasses ?? []).includes(c))) throw new Error(`routing policy: domain ${id}: requiredClasses cannot drop a class it ships with (${shipped.requiredClasses.join(', ')})`)
   }
   for (const rc of RISK_CLASSES) {
     const g = p.gates[rc]

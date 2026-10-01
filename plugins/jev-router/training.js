@@ -27,6 +27,7 @@ import { appendFile, mkdir, open, readFile, rename } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { FEATURE_SCHEMA_VERSION, validateFeatures } from './features.js'
 import { ROUTING_TAGS } from './feedback.js'
+import { ANSWER_CAPABILITIES, INTENT_TAGS, QUESTION, TASK } from './intent.js'
 import { SILENT_STATUSES, isWorkAttempt, succeeded } from './outcome.js'
 import { TEACHER } from './providers.js'
 import { DISPOSITIONS, STRATEGIES, resolvePolicy, tierAtLeast } from './routing-policy.js'
@@ -191,7 +192,7 @@ export function samplesCap(policy = resolvePolicy()) {
  * @param {object} [p.policy]      resolvePolicy() result, which the cap is derived from
  * @param {number} [p.cap]         samples kept per domain; samplesCap(policy) when not given
  * @param {number} [p.slack]       how many rows past what the cap keeps the file may grow before
- *   it is rewritten. One cap's worth by default. At the cap the file holds, for each of seven
+ *   it is rewritten. One cap's worth by default. At the cap the file holds, for each of eight
  *   domains, about a cap's worth of samples and as many outcome rows, so that is about a
  *   sixteenth of it, and with some sixteen rows to a routed run a rewrite comes every six hundred
  *   or so runs, never on every append.
@@ -214,6 +215,10 @@ export function createTrainingStore({ file, kind = 'jev', now = () => new Date()
   let checkedAt = 0 // `lines` when the file was last measured against the cap
   let unread = false // the file exists and could not be read
   let queue = Promise.resolve()
+  // Once the plugin closes or is applied again (dispose), the file is rewritten no more: the plugin
+  // that replaces this one appends its own rows there, which this store does not hold, so a row
+  // recorded after, as a run of the old plugin still going ends, is only appended.
+  let disposed = false
 
   // Every change to the file goes through here, one at a time. An append that ran while a
   // compaction was between writing its copy and renaming it over the file would land in the file
@@ -332,7 +337,7 @@ export function createTrainingStore({ file, kind = 'jev', now = () => new Date()
     for (const id of [...samples.keys()]) if (!keep.has(id)) samples.delete(id)
     for (const id of [...outcomes.keys()]) if (!samples.has(id)) outcomes.delete(id)
     dropped = count
-    if (unread || lines - list.length < slack) return
+    if (disposed || unread || lines - list.length < slack) return
     try {
       await rewrite(list)
       lines = checkedAt = list.length
@@ -463,6 +468,16 @@ export function createTrainingStore({ file, kind = 'jev', now = () => new Date()
         }
       }
       return out
+    },
+    /**
+     * The plugin is closing or applied again: the file is compacted no more, and a row recorded
+     * after is only appended. Resolves once every change asked for so far has landed or failed, one
+     * still waiting for the first read of the file included (it joins the queue as that read ends,
+     * before this looks at it).
+     */
+    dispose() {
+      disposed = true
+      return Promise.resolve(loading).catch(() => {}).then(() => queue)
     },
   }
   return api
@@ -655,6 +670,44 @@ function labelDisposition(sample, record) {
 }
 
 /**
+ * What a message turned out to be, a task or a question (intent.js), from what a person said of it
+ * and what its run did. A person's word comes first: `should have been a question` on its start reply
+ * (a verdict about the pick, bound to the task by its key), a Like on its direct answer, or `should
+ * have been a task` on a direct answer, each found by the message's intent sample. Then the run: a
+ * task when it was accepted with files changed, or when its routing named a capability that is no
+ * answer (an `other` or a `human_required` names none); a question when it was accepted as an answer
+ * and changed no file. Where the label is not what the message was treated as (a run means it was
+ * taken for a task, a direct answer for a question), that is its negative. Nothing for a run asked
+ * only for an answer, a run that proves nothing (stopped, paused, continued from a handoff), or a
+ * task whose words were changed after it was sent (steered or amended). `record` is `{}` for a
+ * message that ran nothing, a direct answer, which only a person's word labels.
+ */
+function labelIntent(sample, record, feedback) {
+  if (record.steered > 0 || record.amended) return null
+  const base = { verified: true, details: details(record) }
+  const ran = typeof record.runId === 'string' && !!record.runId
+  const treated = ran ? TASK : QUESTION
+  const labelled = (truth, labelSource) => ({ label: truth, ...(truth !== treated ? { negativeLabel: treated } : {}), labelSource, ...base })
+  const about = (f) => !!f && typeof f === 'object' && (f.intentSample === sample.id || (f.about === 'plan' && !!record.taskKey && f.taskKey === record.taskKey))
+  const rows = (Array.isArray(feedback) ? feedback : []).filter(about)
+  const onAnswer = (f) => (f.about ?? 'answer') === 'answer' && f.intentSample === sample.id
+  if (rows.some((f) => f.about === 'plan' && f.tag === INTENT_TAGS.question)) return labelled(QUESTION, 'human')
+  if (rows.some((f) => onAnswer(f) && f.tag === INTENT_TAGS.task)) return labelled(TASK, 'human')
+  if (rows.some((f) => onAnswer(f) && f.verdict === 'like')) return labelled(QUESTION, 'human')
+  if (!ran || record.answerOnly || noEvidence(record)) return null
+  const work = workAttempts(record)
+  const changed = work.some((a) => Array.isArray(a.changedFiles) && a.changedFiles.length > 0)
+  // Measured to be none: a folder git could not read says nothing either way.
+  const unchanged = work.length > 0 && work.every((a) => Array.isArray(a.changedFiles) && !a.changedFiles.length)
+  const capability = record.routing?.capability
+  const named = typeof capability === 'string' && capability !== 'other' && capability !== 'human_required'
+  if (accepted(record) && changed) return labelled(TASK, 'verified_outcome')
+  if (named && !ANSWER_CAPABILITIES.includes(capability)) return labelled(TASK, 'verified_outcome')
+  if (accepted(record) && unchanged && ANSWER_CAPABILITIES.includes(capability)) return labelled(QUESTION, 'verified_outcome')
+  return null
+}
+
+/**
  * The outcome a finished run justifies for one sample, or null when the run gives no evidence.
  * The rules are per domain (see the file header): a pick that did the accepted work is
  * confirmed, a rescue by another resource or strategy becomes the label with the pick as the
@@ -665,7 +718,8 @@ function labelDisposition(sample, record) {
  * the store gets: conservation is a hard limit now, with nothing for a run to confirm.
  * @param {string} domain   a routing domain id
  * @param {object} sample   the stored sample row
- * @param {object} record   the history.jsonl record of the run
+ * @param {object} record   the history.jsonl record of the run; for the message intent, `{}` for a
+ *   message that ran nothing (a direct answer), which only feedback labels (labelIntent)
  * @param {{ feedback?: object[], until?: string }} [deps] feedback rows (feedback.js shape), and
  *   the end of the next run in the same session when the caller knows it (see feedbackFor)
  */
@@ -679,6 +733,7 @@ export function labelFromRun(domain, sample, record, { feedback = [], until } = 
     case 'second_opinion':
     case 'frontier_escalation': return labelStrategy(domain, sample, record)
     case 'outcome_disposition': return labelDisposition(sample, record)
+    case 'intent': return labelIntent(sample, record, feedback)
     default: return null
   }
 }

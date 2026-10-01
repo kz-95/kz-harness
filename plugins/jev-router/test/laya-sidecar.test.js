@@ -1247,6 +1247,20 @@ test('dispose kills an install check under way', async (t) => {
   assert.equal((await checking).ok, false)
 })
 
+test('a supervisor disposed of, as the plugin closing or applied again leaves it, saves laya.json no more, so the settings the plugin that replaces it saved there stay', async (t) => {
+  const h = await harness()
+  const { sidecar: closed } = await sidecarFor(t, h)
+  await closed.dispose()
+  // The plugin that replaces it reads laya.json and saves a setting of its own.
+  const { sidecar: next } = await sidecarFor(t, h)
+  await next.setSettings({ idleMinutes: 5 })
+  const theirs = readFileSync(h.paths.settings, 'utf8')
+  // What the closed plugin's routes still had under way as it closed: a setting, and Test Laya's result.
+  await closed.setSettings({ keepLoaded: true })
+  await closed.noteSelfTest({ ok: true, at: 'then' })
+  assert.equal(readFileSync(h.paths.settings, 'utf8'), theirs, 'laya.json is still what the plugin that replaced it saved')
+})
+
 test('an install check from a supervisor that never swept (the command line\'s) stops a Laya an earlier session left before it writes over that record', async (t) => {
   const h = await harness()
   // Windows paths inside this test's own folder, so nothing it creates lands anywhere else.

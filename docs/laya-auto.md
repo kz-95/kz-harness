@@ -484,6 +484,8 @@ It never contacts TypeSafe, and neither does anything else in a Laya Auto sessio
 While Laya is not ready, the message waits for the start with the `Starting Laya` line, bounded as a routing call is, and is then asked: a message treated as a task without asking would wait for the same start inside `route()` anyway, and would send a question to agents as a full run.
 Only a refusal, a failed start or a timeout makes it a task without an answer, with the line `Laya could not sort this message (<reason>); treating it as a task`, because unsure means task (`adapter.js:49-56`) and a word rule would send "why does this test fail?" to a chat model that cannot touch files.
 In the No project space, where no agent can run, that unsure result is answered as a question instead of refused (2.4).
+Under Jev Auto the message intent is a routing domain of its own since slice 3 of [`live-agent-view.md`](live-agent-view.md) (`intent`, [`adaptive-routing.md`](adaptive-routing.md)), which records each message as a sample with Jev's answer as the teacher's.
+Laya Auto keeps its intent exactly as above and records no intent sample in either store (`index.js` `classify`): Laya is no teacher, so its answer must not reach Jev's store, and a row in Laya's store would have nothing to label it, since a Laya Auto message carries no sample to its run.
 
 ### 3.5 When Laya is missing, loading, failed, too slow, or offline
 
@@ -842,6 +844,7 @@ Task type, capability, strategy and second opinion are compared only where Laya'
 For the review it also counts, per provider, how many actions were `second_review` or `human` because the quality stayed under that provider's accept bar, so the cost of Laya's higher bars (2.6 rows 13-15) is a number, not a guess.
 
 Per domain, through the question that teaches it: `taskType` for `task_classification`, `skill` for `skill_selection`, `strategy` for `execution_strategy`, `secondOpinion` in the judgments group for `second_opinion`, `disposition` for `outcome_disposition`; plus two groups that are no routing domain, `review_action` and `intent` (agreement only, since intent has no verified label).
+As built in slice 3 of [`live-agent-view.md`](live-agent-view.md), `intent` is a routing domain of Jev's, with labels in `routing-samples.jsonl`, but Laya's standing still reads it for agreement only: a shadow intent row carries no run and no sample id (`runId: null`), so no label reaches it.
 
 The outcome judge, `judge(answer, outcome, domain)`, decides for each answer on each row with an outcome whether it was right, wrong or undetermined.
 A yes/no domain is one whose labels are exactly `{ yes, no }`, whatever its `kind` in `routing-policy.js` (`second_opinion` is declared `multiclass` there).

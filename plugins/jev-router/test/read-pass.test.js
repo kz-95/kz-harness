@@ -416,6 +416,28 @@ test('a hand-back names the agent that read, with its own time, and none when no
     ['- Judged read only (Jev 93%, bar 80%), then needed the folder: claude could not be started locked: its child could still see write'], 'it read nothing, so it says nothing of reading')
 })
 
+test('a hand-back says whether the work itself changes files: an agent\'s NEEDS-WRITE-ACCESS, its parallel opinion\'s and a routing that names work that may change files do; a lock not had or kept, an unsure routing and a look-up do not', async () => {
+  const limitThenWrite = async (a) => (a.id === 'claude' ? { stopReason: 'error', diagnostic: 'You have hit your usage limit', answerText: '' } : { stopReason: 'completed', answerText: 'NEEDS-WRITE-ACCESS\nA file has to be created.' })
+  // Each run starts only once the one before it has been read, so no hand-back is left unheard.
+  const cases = [
+    [() => readRun({ execute: () => ({ stopReason: 'completed', answerText: 'NEEDS-WRITE-ACCESS\nThe parser has to change.' }) }), /^claude said it needs to change files/, true],
+    [() => readRun({ deps: { decide: parallel('claude', 'deepseek'), execute: limitThenWrite } }), /^deepseek said it needs to change files/, true],
+    [() => readRun({ route: routeResult({ capability: 'project_change' }) }), /which may change files$/, true],
+    [() => readRun({ route: routeResult({ capability: 'other' }) }), /unsure means it may write$/, false],
+    [() => readRun({ route: routeResult({ capability: 'web_research' }) }), /no locked agent is known to reach the web$/, false],
+    [() => readRun({ route: routeResult({ primaryAgent: 'codex', agentProbabilities: { codex: 0.8, claude: 0.1, deepseek: 0.1 } }) }), /^codex, the agent picked for it, cannot be locked against writing/, false],
+    [() => readRun({ deps: { lockOf: lockOf(['deepseek']), ready: { deepseek: { loggedIn: false, detail: 'no key' } } } }), /^no agent that can run now can be locked against writing/, false],
+    [() => readRun({ execute: () => { throw Object.assign(new Error('its child could still see write'), { code: 'LOCK_UNAVAILABLE' }) } }), /^claude could not be started locked/, false],
+    [() => readRun({ execute: () => ({ stopReason: 'error', diagnostic: 'usage limit reached', answerText: '' }), deps: { lockOf: lockOf(['claude']), isLimitError: () => ({ hit: true }) } }), /^no other agent that can be locked is left to try/, false],
+  ]
+  for (const [start, re, changesFiles] of cases) {
+    let err = null
+    await assert.rejects(start().run, (e) => { err = e; return e.code === 'NEEDS_LANE' })
+    assert.match(err.message, re)
+    assert.equal(err.changesFiles === true, changesFiles, err.message)
+  }
+})
+
 test('after a measured breach the report never says the lock held, and names every locked agent in agreement', () => {
   const verdict = { p: 0.93, bar: 0.8, by: 'jev', reads: true }
   const r = {

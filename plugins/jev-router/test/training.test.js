@@ -211,6 +211,45 @@ test('outcome disposition: what the run needed after the decided attempt', () =>
   assert.equal(labelFromRun('outcome_disposition', disp('PASS'), record({ continuedFromHandoff: true })), null, 'an accepted handoff continuation proves no disposition')
 })
 
+test('labelIntent: accepted run with changes is task verified; answer capability with no changes is question verified with negative task; plan tag gives human question; liked direct answer gives human question; \'should have been a task\' gives human task; steered or amended gives null', () => {
+  // A message Jev sorted as a task, which ran, and one it sorted as a question, answered directly.
+  const task = sample({ id: 'intent-1', domain: 'intent', teacher: { label: 'task', probabilities: { task: 0.8 }, confidence: 0.8, model: 'jev-1' } })
+  const question = sample({ id: 'intent-2', domain: 'intent', teacher: { label: 'question', probabilities: { question: 0.9 }, confidence: 0.9, model: 'jev-1' } })
+  const run = (over = {}) => record({ taskKey: 'key-1', intentSample: 'intent-1', routing: { capability: 'project_change' }, attempts: [attempt('deepseek', 'primary', { changedFiles: ['src/a.js'] })], ...over })
+  const asAnswer = (changedFiles) => run({ routing: { capability: 'quick_answer' }, attempts: [attempt('deepseek', 'primary', { changedFiles })] })
+  const details = { finalStatus: 'accepted', attempts: 1, escalated: false }
+  assert.deepEqual(labelFromRun('intent', task, run()), { label: 'task', labelSource: 'verified_outcome', verified: true, details })
+  assert.deepEqual(labelFromRun('intent', task, run({ routing: { capability: 'project_read' }, attempts: [attempt('deepseek', 'primary', { changedFiles: [] })] })).label, 'task', 'a capability that is no answer is work in the project, changed or not')
+  for (const finalStatus of ['failed', 'needs_human']) {
+    const label = labelFromRun('intent', task, run({ finalStatus, attempts: [attempt('deepseek', 'primary', { changedFiles: [] })] }))
+    assert.deepEqual([label?.label, label?.labelSource, label?.verified, label?.details?.finalStatus], ['task', 'verified_outcome', true, finalStatus], `${finalStatus}: routed as work in the project, it was a task whether or not it was accepted`)
+  }
+  assert.deepEqual(labelFromRun('intent', task, asAnswer([])), { label: 'question', negativeLabel: 'task', labelSource: 'verified_outcome', verified: true, details })
+  assert.equal(labelFromRun('intent', task, asAnswer(['notes.md'])).label, 'task', 'an answer that changed a file was work')
+  assert.equal(labelFromRun('intent', task, asAnswer(null)), null, 'a folder git could not read says nothing either way')
+  assert.equal(labelFromRun('intent', task, { ...asAnswer([]), finalStatus: 'failed' }), null, 'nor does an answer that was not accepted')
+  for (const capability of ['other', 'human_required']) assert.equal(labelFromRun('intent', task, run({ finalStatus: 'needs_human', routing: { capability }, attempts: [] })), null, `${capability} names no capability`)
+  // A person's word: the start reply's plan verdict, bound to the task by its key, comes before the run.
+  const planTag = (over = {}) => ({ ts: AFTER, sessionId: 'sess-1', messageId: 'm1', verdict: 'dislike', about: 'plan', taskKey: 'key-1', tag: 'should have been a question', ...over })
+  assert.deepEqual(labelFromRun('intent', task, run(), { feedback: [planTag()] }), { label: 'question', negativeLabel: 'task', labelSource: 'human', verified: true, details })
+  assert.equal(labelFromRun('intent', task, run({ finalStatus: 'stopped' }), { feedback: [planTag()] }).label, 'question', 'whatever the run did next: it may be stopped for it')
+  assert.equal(labelFromRun('intent', task, run(), { feedback: [planTag({ taskKey: 'key-2' })] }).labelSource, 'verified_outcome', 'a verdict on another task is about another message')
+  // A direct answer ran nothing, so its record is empty and only a person labels it.
+  const answered = { ts: AFTER, sessionId: 'sess-1', messageId: 'm2', intentSample: 'intent-2' }
+  const none = { finalStatus: null, attempts: 0, escalated: false }
+  assert.deepEqual(labelFromRun('intent', question, {}, { feedback: [{ ...answered, verdict: 'like' }] }), { label: 'question', labelSource: 'human', verified: true, details: none })
+  assert.deepEqual(labelFromRun('intent', question, {}, { feedback: [{ ...answered, verdict: 'dislike', tag: 'should have been a task' }] }), { label: 'task', negativeLabel: 'question', labelSource: 'human', verified: true, details: none })
+  assert.equal(labelFromRun('intent', question, {}, { feedback: [{ ...answered, verdict: 'dislike' }] }), null, 'a dislike is about the answer unless it says otherwise')
+  assert.equal(labelFromRun('intent', question, {}, { feedback: [{ ...answered, intentSample: 'intent-9', verdict: 'like' }] }), null, 'a verdict on another message is about another message')
+  assert.equal(labelFromRun('intent', question, {}), null)
+  // Nothing for a task whose words changed after it was sent, an answer asked of an agent, or a run that proves nothing.
+  assert.equal(labelFromRun('intent', task, run({ steered: 1 })), null)
+  assert.equal(labelFromRun('intent', task, run({ amended: true }), { feedback: [planTag()] }), null)
+  assert.equal(labelFromRun('intent', task, run({ answerOnly: true })), null)
+  for (const finalStatus of ['stopped', 'paused_limit']) assert.equal(labelFromRun('intent', task, run({ finalStatus })), null, finalStatus)
+  assert.equal(labelFromRun('intent', task, run({ continuedFromHandoff: true })), null)
+})
+
 test('labelFromRun: an unknown domain or a missing record is null, never a throw', () => {
   assert.equal(labelFromRun('nope', sample(), record()), null)
   assert.equal(labelFromRun('task_classification', sample(), null), null)
@@ -521,6 +560,22 @@ test('a row appended while a load compacts the file is never lost', async () => 
   await Promise.all([store.append(sample({ id: 'x' })), store.load()])
   assert.ok(onDisk(file).samples.includes('x'), 'the row is on disk')
   assert.ok((await store.list()).map((r) => r.id).includes('x'), 'and in memory')
+})
+
+test('a store disposed of, as the plugin closing or applied again leaves it, has the row it was writing on disk once its dispose resolves, compacts the file no more and only appends, so the rows the plugin that replaces it appended stay', async () => {
+  const file = tmp()
+  const store = createTrainingStore({ file, now: clock(), cap: 2, slack: 1 })
+  await store.append(sample({ id: 'old' }))
+  // What a finished run taught, still being written as the plugin closes.
+  const writing = store.append(sample({ id: 'last' }))
+  await store.dispose?.()
+  assert.deepEqual(onDisk(file).samples, ['old', 'last'], 'the row under way has landed')
+  await writing
+  // The plugin that replaces it appends a row of its own.
+  await createTrainingStore({ file, now: clock(), cap: 2, slack: 1 }).append(sample({ id: 'theirs' }))
+  // A run of the closed plugin still going ends, past the cap: its rows are appended all the same.
+  for (const id of ['late1', 'late2', 'late3']) await store.append(sample({ id }))
+  assert.deepEqual(onDisk(file).samples, ['old', 'last', 'theirs', 'late1', 'late2', 'late3'], 'appended, and never rewritten from what the closed store holds')
 })
 
 test('a file that could not be read is never rewritten, since the copy would hold only what was read', async () => {

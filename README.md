@@ -259,16 +259,102 @@ handoff updated, so a handover loses nothing. Both are editable per agent in the
 
 ## Background tasks
 
-A task you type in a project does **not** hold the chat. Jev queues it, answers with the line
+A task you type in a project does **not** hold the chat.
+Jev queues it and answers with a start reply that says what runs, and you carry on: ask a question, start a task in another project, read the inspector.
+Every sentence of it is fixed wording filled in with what the router really picked (`plugins/jev-router/reply-words.js`); no model writes any of it.
 
-> Queued → Jev picks as **jev-3** (2nd in line for HarnessProjects: another task is running there). Keep chatting: the result posts here when done.
+```text
+OK, I'll run Claude Code with claude-opus-4-1 (effort high) in the background as jev-4 in HarnessProjects, and Codex reviews it before it's accepted. I'll report back here when it's done. Keep chatting.
 
-and you carry on: ask a question, start a task in another project, read the inspector.
-The task joins its folder's line as it is queued, so the brackets are read off the line itself (`tasks.get(jobId).waiting`), a foreground run in it counted as much as a task.
-They say where the task stands and why: `starting now in HarnessProjects`, `2nd in line for HarnessProjects: another task is running there`, `2nd in line for HarnessProjects: an earlier task there is waiting for a free slot`, or `next for a free slot to start in HarnessProjects: the resource budget caps how many tasks run at once` (`2nd for a free slot` when another folder's task takes the next one first).
-When a run started from the chat holds the folder (an `/auto`, `/<agent>`, `jev_route` or answer run, none of which has a row on the work board), the brackets say `2nd in line for HarnessProjects: a run started from the chat is using it`, and the task's row says `Waiting: a run started from the chat is using this workspace`.
+> Picked by Jev in 2.4 s: a code change, medium risk, so effort high.
+```
 
-When the task finishes, its result is posted into that chat **as its own message**, headed with the task name, its id, the agent, the model and the status - never merged into, and never in front of, whatever the assistant is saying. If an answer is streaming when the task lands, delivery waits for that answer to finish, so nothing interrupts it. A result counts as **unread** until your browser reports that it actually rendered the row, so the badge means "you have not seen this yet"; if the message could not be posted it stays on offer and is retried, and an appended result is never posted twice. Each result is a collapsed `Context injection · jev-router` row, which is the engine's own notice row rather than a bespoke card. That is deliberate: the slot the card needed is keyed, not chained, so taking it replaced the row for every other producer too and flattened five structured bodies. Open the row for the raw text, or the **Overview** tab in the right sidebar to read the same report rendered as Markdown, on a surface KzH owns outright.
+- **The plan, when it is known.**
+  The reply names the agent doing the work, its model (`its own default model` when none is set) and the effort its first attempt starts at, which is what the task's row in the Background tab then shows: the agent from the pick on, the effort once that attempt starts, and the model once it ends, since only its end records the model it ran.
+  It names the reviewer and the planner when the plan has them, and says `If the local model can't finish it, a stronger agent takes over.` when a local model works first and the agent the router picked takes over if it fails.
+  A forced agent (its own row in the model menu, or a Local effort) is known as it is queued, so it is named at once, with where it waits when it has to: `It waits 2nd in line (another task is running there).`
+  For any other task that starts at once, the reply waits for the router's pick, up to 15 s by default (Settings → Jev setup → **Chat replies** → **Wait for the pick before replying**, from `Reply at once (no wait)` to 60 s).
+- **The credit line** under it says who picked and how long it took: `Picked by Jev in 2.4 s`, `Picked by Laya on this PC in 1.9 s`, `Picked on this PC in 0.4 s, no Jev call` when nothing was asked before the pick (the local router, or the offline rule), or `Picked by the routing rules in 0.3 s, since Jev could not pick (...)`.
+  It names who the agent strip under the reply names, so when Jev was asked and answered no part of the routing, as when its routing calls fail, it reads `Picked by the routing rules in 0.3 s, since Jev could not pick (Error: 503 Service Unavailable)`, or `Picked on this PC in 0.4 s, since Jev could not pick (...)` when the local router picked, and never `no Jev call` once a call was made.
+  It goes on with what the decider made of the task and why that effort: `a code change, medium risk, so effort high` for Auto, which reads the larger of the task's complexity and risk, or `effort xhigh (your pick in the model menu)`, `(the default in Settings)` or `(set for this agent in Settings)`.
+  A forced agent's reads `You picked Claude Code; effort high (Auto in Settings).`, and `Your feedback moved it off Codex.` follows when your verdicts moved the pick.
+  A pick that gives the work to a tool names no effort, since the tool runs at none.
+- **A task that waits its turn** is answered at once: `OK, **jev-5** is queued: 2nd in line for HarnessProjects (another task is running there, about 4 min left). Jev picks the agent when it starts; I'll say which here, and report back when it's done. Keep chatting.`
+  The task joins its folder's line as it is queued, so where it stands is read off the line itself (`tasks.get(jobId).waiting`), a foreground run in it counted as much as a task, and the time left is there only when past runs give a figure for it (the wait estimate, below).
+  The other places read `2nd in line for HarnessProjects (an earlier task there is waiting for a free slot)` and `next for a free slot to start in HarnessProjects (the resource budget caps how many tasks run at once)` (`2nd for a free slot` when another folder's task takes the next one first), followed by the sentences on **Tasks at once** the task's row shows.
+  When a run started from the chat holds the folder (an `/auto`, `/<agent>`, `jev_route` or answer run, none of which has a row on the work board), it reads `2nd in line for HarnessProjects (a run started from the chat is using it)`, and the task's row says `Waiting: a run started from the chat is using this workspace`.
+- **A pick that takes longer than the wait**: `OK, **jev-4** is starting in HarnessProjects, and Jev is still choosing the agent (15 s so far). I'll say here which one it picks, and report back when it's done. Keep chatting.`
+- **A task that ends before its pick**: `**jev-4** ended before Jev picked its agent (Failed). Its result is posted here as its own message.`
+  A task Jev reads as needing a person (`human_required`, [below](#what-the-request-needs-capabilities)) is one of these: no agent starts on it, so its reply says `(Needs input)` and names none, and no started notice follows, not even for one that waited its turn.
+  The router's own line for it, in the reply's wait and wherever else the router's lines show, reads `Jev read this as needing a person: no agent runs`, and its result's head reads `Agent: Jev picks`, as for any task no agent was picked for.
+- **While the reply waits**, nothing shows for its first 600 ms, so a quick pick looks instant.
+  After that a reasoning block says `Queued as jev-4. Choosing the agent (I reply once it's picked, at most 15 s). Stop here ends this reply only; the task keeps going (stop it on the work board).`, followed by the router's own lines; a message that takes longer than that to sort into a task or a question says `Jev is reading your message (task or question)…` the same way.
+  Stop during the wait ends the reply only: the task runs on, and its started notice still comes, before the notice that its work moved to another agent when that happens first.
+  A message you type meanwhile is held by the engine until the reply is out, as for any answer.
+- **Hidden marks** ride at the end of the reply, as they do at the end of a report: the task by its key, the run once it has begun, and, once the agent is known, the agent strip under the reply (`Jev (jev-1.13.0) → claude (claude-opus-4-1, high)`: who picked, with the model its answers came from, then the worker by its id), so a Like or Dislike on the reply is about the agent it names.
+
+**Milestone notices** follow the reply in the chat as collapsed `jev-router` rows, the engine's own notice rows, which start no model turn:
+
+- `jev-5 started: Claude Code, claude-opus-4-1, effort medium` once the router picks for a task whose reply named no plan (a waiting task's, or one answered before the pick); its body adds how long it waited for the folder or for a free slot.
+- `jev-4 started again as work that writes` when a read pass handed the task back to its folder's line and it started again ([Read-only work](#read-only-work)).
+  Its body says why the pass went back: `**jev-4** needed to change files, so it started again as work that writes: ...` when its agent said so or its routing named work that may, and `**jev-4** could not run locked against writing (<the router's reason>), so ...` for any other hand-back, such as an agent that could not be locked.
+- `jev-2: effort max instead of high` when a forced agent starts at another effort than its reply named, as when its effort was set otherwise in Settings while it waited.
+  A reply names only a forced agent's plan, which routing never moves off its agent, or the pick it waited for, so no change of plan names another agent than the reply did (`jev-4: Codex instead of Claude Code`); a retry that later moves the work to another agent gets the moved notice below.
+- `jev-4 moved to Codex` when a retry moves the work to another agent, with the router's own lines for why.
+  Only what sent the work there is among them: the review that did, or the usage limit of the agent it was on, with that agent's credit falling under its floor when that was the limit; a credit that only runs low, or a limit of Jev's own key, keeps the work where it is, so neither is.
+  A move later in the same routing posts no second notice; the task's row in the Background tab names the agent the work is on then.
+
+A task gets each kind at most once per routing, remembered in its record (`progressPosted`), so a restart never posts one again.
+No notice goes into a streaming answer, none is posted for a task that has ended (its result says the rest), and a notice's summary never holds `·`, so the browser never takes it for a result and it never marks a result read.
+**Progress in chat: Start and result only** (Settings → Jev setup → Chat replies) posts none, and the replies then promise only the result.
+Both settings are kept in `~/.kzh/jev-router/chat-replies.json`.
+
+**How Jev replies** (Settings → Jev setup, under Chat replies) shows what learns in the background to make the start reply sooner.
+The guess at the agent changes no reply yet: a reply still waits for the router's pick to name it.
+Task or question changes one only once it is read on this PC, and then only for a message it is sure is a task: Jev is not asked about that message, so it gets no read-only verdict ([Read-only work](#read-only-work)) and runs as work that writes.
+Where no task can run, in the **No project** space and the KzH scratch workspace, it is never read on this PC: Jev reads every message there, so a question is answered, never refused as a task.
+
+- `Start replies: after routing (median 4.2 s this week)`: how long the replies that waited for the pick took this week, until it came or the wait for it ran out (**Wait for the pick before replying** in Chat replies).
+  When some ran out first, the line says how many, `...; 3 of 10 went out when the wait ran out, before the pick`.
+  A reply for a task that waits its turn, for an agent you picked, or after a read pass handed its task back does not wait the pick out and is not timed; with none timed this week the line says `none timed this week`.
+  With the wait set to **Reply at once**, the line reads `Start replies: at once, without waiting for the pick (Reply at once, in Chat replies)`.
+- `Task or question: learning, 212 of 750 checked examples (task 190, question 22 of 100 needed); 95% right of the last 100 checked (needs 94%).`: how far the message intent has come toward being read on this PC rather than by Jev ([It learns](#it-learns-adaptive-routing)).
+  Each message on a Jev row is recorded as an example, with Jev's answer as the teacher's, and Jev is still asked once per message.
+  What the message's run did checks its example: a task when the run was accepted with files changed or was routed as project work, a question when it answered and changed no file.
+  It is read on this PC once it has earned the rung that lets it (with the shipped gates, 750 checked examples, 100 of each kind, and the accuracy that rung asks); the line then reads `Task or question: read on this PC when it is sure a message is a task, and by Jev otherwise (812 checked examples); 95% right of the last 225 checked.`, with no bar beside the accuracy, since the one it needed to get there is not what keeps it there.
+  The accuracy is cut down, never rounded up, as the rung's bar holds the share itself: 211 right of the last 225 (93.8%) reads `93% right of the last 225 checked (needs 94%)`, and a bar set between two whole percents, such as 94.5%, is given as set, with the accuracy to the same tenth.
+  Until Like and Dislike can check a question answered directly, only a run routed as an answer that changed no file checks a question, so that takes a long while.
+  A question answered directly ends with a hidden mark, `[jev-intent]`, naming its example, so that a verdict on the answer can check it, which Like and Dislike do not do yet.
+  **Offline · Local only**, a dead network and Laya Auto record no example, and with adaptive routing or its learning off nothing is recorded.
+- `Agent and effort prediction: right 41 of the last 50 (quick replies need 45; "likely" needs 16 of the last 20).`: a guess at the agent and effort routing will pick, made as each task is queued and checked once routing picks.
+  It is trained on this PC, in the background, once 60 tasks that routing picked for are on record, and again after every 25 more; until then the line says how many there are.
+  While that first training runs the line says `it is training now`, and a training that failed is tried again after 25 more tasks, which the line says too.
+  A start with 60 or more on record and no predictor saved, as with `reply-model.json` deleted, trains one as it first reads the record, not once the next task is routed.
+  Laya Auto's picks are guessed and scored apart, on a line of their own once any is scored.
+  A predictor with none of Jev's guesses checked yet says `no guess under Jev Auto has been checked yet` while Laya's have a record, and `no guess has been checked yet` only while neither has.
+- **Recent replies**, a table of the newest ten: the job, what its start reply named, what then ran, and how the reply came to name it (`after routing`; `wait ran out` for one that went out when its wait for the pick ran out; `at once` for one that went out at once beside a task that starts at once, with Reply at once in Chat replies or as the work asked for beside a question answered directly; `your pick` for an agent picked in the model menu; `waited` for any other that named none, whose task waited its turn or which waited for a pick that did not come).
+  A pick that gave the work to a tool is the tool in both columns, `the lint tool`, as its reply named it.
+  A task that ended before routing picked anything ran nothing and never will, so what ran reads `nothing ran` with how it ended, `nothing ran (Stopped)` for one removed while it waited and `nothing ran (Needs input)` for one routing read as needing a person; `not routed yet` is only for a task still to run.
+
+With learning off (`routing.learn: false`) nothing here learns, and the card says so: start replies are not timed, the prediction is off, neither trained nor checked, whatever it learned before, and no start reply is recorded or trained from.
+With adaptive routing off (`routing.enabled: false`) and its learning on, the card opens by saying only the guess at the agent learns: task or question is not learned, and Jev reads every message.
+
+A question answered directly while tasks run is told what they are doing now (`Right now in this chat: jev-4 is running on Claude Code (6 min, last: running claude (primary)…); jev-5 waits 2nd in line.`), so asking how a task is going gets a true answer.
+A task still starting is said to start on the agent you picked for it, or, when you picked none, to be starting while Jev or Laya chooses its agent.
+The milestone notices are left out of what that chat model is sent, since the sentence says what runs now; results stay.
+
+When the task finishes, its result is posted into that chat **as its own message**, headed with the task name, its id, the agent (named as the start reply named it) with its model, its effort and how long the task ran (`Agent: Claude Code · claude-opus-4-1 · effort high · took 7 min`), and the status - never merged into, and never in front of, whatever the assistant is saying.
+The effort is the one its working attempt started at, so a task that ends before its first attempt names none, whatever level it was queued at, one sent to an agent picked in the model menu included.
+A tool that did the work is named as its reply named it, `Agent: the lint tool · took 3 s`, and so is a local model the plan put to work first, before the agent behind it takes over.
+If an answer is streaming when the task lands, delivery waits for that answer to finish, so nothing interrupts it.
+A result counts as **unread** until your browser reports that it actually rendered the row, so the badge means "you have not seen this yet"; if the message could not be posted it stays on offer and is retried, and an appended result is never posted twice.
+The browser names each result row it rendered by the chat it is in and by the task's id and name, as the row's summary shows them (`jev-3 · Fix sidebar width · Completed`), and names each row once, even when two rows read the same.
+A result is marked read only once its message has been posted, and only by a row in its own chat, so a task still waiting or running, or one whose result is still waiting to be posted, is never marked read.
+That matters after a restart: the engine counts task ids from 1 again, in every chat, so a chat can hold an older task's result under the id a new task now has, with the same name too when you send the same words again, and that older row cannot mark the new task's result read before it has posted, nor at all from another chat.
+A result the app never posted, because the app was closed while its task waited or ran, or before its finished result went out, is not posted after the restart either: it stays an `Unread result` in the Background tab, counted on the top bar's Background button, until you clear it, and its row there gives the reason a task did not complete, and the report when there is one.
+Each result is a collapsed `Context injection · jev-router` row, which is the engine's own notice row rather than a bespoke card.
+That is deliberate: the slot the card needed is keyed, not chained, so taking it replaced the row for every other producer too and flattened five structured bodies.
+Open the row for the raw text, or the **Overview** tab in the right sidebar to read the same report rendered as Markdown, on a surface KzH owns outright.
 
 - **One task that writes at a time per project folder.** Two agents never edit the same folder at once; a second task for the same folder waits its turn.
   A task the decider judged only reads the project ([Read-only work](#read-only-work) below) takes a slot of its own and runs beside the task writing there, on an agent locked against writing; it still counts under **Tasks at once**.
@@ -282,6 +368,9 @@ When the task finishes, its result is posted into that chat **as its own message
 - **Interrupted work is reconciled.** If the app quits mid-task, that row comes back as stopped with the reason and the last progress line it had, instead of showing work that can never finish.
   A task that was still in line comes back as stopped with `the app restarted while this task waited in line, so it never started`.
 - **The task list** is the Jev inspector's **Background** tab (Ctrl+Alt+B). It shows the row's phase, agent, model, effort, elapsed time, the last router line, and the full report once you open a finished row.
+  Its agent, model and effort are the work's own, and a finished task's result names the same ones: the effort the working attempt started at (none for a local model or a tool, whatever level the task was queued at) and the model that attempt ran, never a planner's, a reviewer's or a parallel opinion's.
+  A waiting row shows the level the task was queued at, a routed one none until its working attempt starts, and a task that ends before then none, whether it was removed from the line, refused before it was routed or stopped by a restart.
+  A row names the model only once the working attempt has ended, since only the attempt's end records the model it ran: none while that attempt works, and none for a task stopped before its first working attempt ended.
   A waiting row's meta says its place instead of a time (`2nd in line`, `next for a free slot`, `2nd for a free slot`), and its line says why it waits, kept current as the line moves (a foreground run's live lines are told again when the reason changes), then, where past runs allow, an estimate with its basis: `Waiting: another task is running in this workspace. Starts in about 4 to 8 min, estimated from 5 past runs of claude at medium effort with no planned review.`
   That line is in the row itself, not only behind the disclosure.
   Between the reason and the estimate it says, in sentences with no figure, what else decides the start, each where it applies: `Tasks at once: 2 of 2 in use (1 background task and 1 capability benchmark task).` (or `Tasks at once: 2 in use, over the 1 now set, so the next to end frees no slot (...).`), `1 task waiting in another workspace takes a free slot before this one.`, and `1 run from the chat waits ahead of it in this line.`
@@ -293,7 +382,16 @@ When the task finishes, its result is posted into that chat **as its own message
 - Questions, `/auto`, `/claude` and the other forced-agent commands still answer in the chat rather than as a background task; only routed project work is queued.
   A foreground `/auto`, `/<agent>` or `jev_route` run in a folder where a task is running waits its turn in that folder's line (`Waiting: another task is running in this workspace`) and then runs.
   The one call still refused is `jev_route` from an agent the router started, a child of a chat whose route is running now: `a routed agent must do its task directly, not call jev_route: it would wait for its own run to end`.
-- Task records are kept in `~/.kzh/jev-router/tasks.jsonl` (the last 100). If the engine has no job service, tasks run in the chat exactly as they did before.
+- **Up to 32 background tasks per chat**, waiting ones included.
+  Each task is one of the engine's background jobs from the moment it is queued until it ends, and the engine allows 10 per chat unless told otherwise, so `config/cordis.patch.yml` sets 32 (its `jobs` row).
+  How many run at once is still **Tasks at once**.
+  One task more is refused, and the chat answers `jev-router: Too many background tasks in this chat (32). Wait for one to finish or remove a waiting one, then send it again.`
+  An install made before this row existed keeps the engine's 10 until the `jobs` block is copied into `~/.kzh/profiles/web/cordis.patch.yml`; `scripts/Update-Harness.ps1` lists it among the settings missing there.
+  Copy it while no task is running: taking the new limit can restart the engine's job service, which stops every task it holds.
+- Task records are kept in `~/.kzh/jev-router/tasks.jsonl` (the last 100).
+  Each has a `key` of its own, which no restart gives to another task the way the engine hands its task ids out again, and a `plan`: what the router picked when it last routed the task, which is the agent doing the work with its model and effort, and the planner and the reviewer when the plan has them.
+  The history row of each run a task makes names the task by that key (`taskKey`).
+  If the engine has no job service, tasks run in the chat exactly as they did before.
 
 **The wait estimate** is drawn only from history rows that recorded their wall-clock time (`startedAt` and `wallMs`, from the moment a run took its folder's lane to its end), within the provider that decided the running task (Jev or Laya), at the first of these levels with at least 5 runs: the same agent at the same effort with a planned review or without one, as the running task has; the agent at that effort; the agent; the workspace.
 Each level keeps its 50 newest runs.
@@ -331,7 +429,7 @@ A flat answer, an unsure one (Laya could not sort the message), an offline run (
   Once the agent has started, KzH reads again what it can call, and stops it before it works if it can see anything else.
 - **Codex** cannot be locked through its provider, so its read-only work waits its turn in the folder's line.
 
-**How a read pass runs.** A task judged read only runs as a read pass when at least one agent this run could pick can be locked now (switched on, allowed in this mode, the one asked for when one was, signed in and not at its usage limit as last read, unless the time it resets has passed); otherwise it waits in the line, and its queued line says why, naming each agent with its reason (`claude: not signed in`, `claude: at its usage limit`, or for a local model `qwen: not ready on this PC (this PC cannot run ...)`).
+**How a read pass runs.** A task judged read only runs as a read pass when at least one agent this run could pick can be locked now (switched on, allowed in this mode, the one asked for when one was, signed in and not at its usage limit as last read, unless the time it resets has passed); otherwise it waits in the line, and its start reply says why, naming each agent with its reason (`claude: not signed in`, `claude: at its usage limit`, or for a local model `qwen: not ready on this PC (this PC cannot run ...)`).
 The read pass is routed as an answer over the whole pool of agents, with no tools, no checks, no review and no handoff note: it neither reads nor writes `.kz-harness/handoff.md`.
 The agent is told it is locked to reading, that another agent may be changing files while it reads, and to write `NEEDS-WRITE-ACCESS` on a line of its own if the task cannot be done without changing a file or running a command.
 The task goes to its folder's line, and runs once more as work that writes, decided again when it starts, when:
@@ -381,16 +479,18 @@ With that setting `git diff --name-only` also lists files that were only touched
 The installer writes a profile's patch file only once, so an existing profile gets the row only by hand; `scripts/Update-Harness.ps1` lists the lines your copy is missing.
 Without the row, Jev setup says `Read-only work: no, the claude-code-readonly row (Claude Code in plan mode) is not in this profile; config/cordis.patch.yml has it and scripts/Update-Harness.ps1 lists the lines to copy`.
 Plan mode is Claude Code's own enforcement, and your own Claude settings (allow rules, hooks, MCP servers) still apply to it, so run the check once, in a test repository with nothing to lose and no other task running there, since another run beside it leaves the lock check unmeasured.
-Send a task that is judged read only (its queued line says `Read only: ...`) and whose words also ask Claude to create a file and run `git stash`.
+Send a task that is judged read only (its start reply says `Read only: ...`) and whose words also ask Claude to create a file and run `git stash`.
 Plan mode held when the lock check measured no change: either the report says `claude ran locked (Claude Code plan mode)` and `Lock check: nothing changed in this repository while it ran (measured ...)`, or Claude wrote `NEEDS-WRITE-ACCESS` (the live line says `Needs the folder after all: ...`), and the report of the pass that writes after it says `Its read pass's lock check: nothing changed in this repository while it ran (measured ...)`.
 In the second case that pass then runs as work that writes and really creates the file and stashes, which is why the check belongs in a test repository.
-If the queued line does not say `Read only`, the task runs as work that writes from the start.
+If the start reply does not say `Read only`, the task runs as work that writes from the start.
 
 **What you see.**
 
-- The chat's queued line adds `Read only: Jev judged it only reads the project (93%, its bar is 80%), so it runs on an agent locked against writing, beside any task changing HarnessProjects.`
+- The chat's start reply adds `Read only: Jev judged it only reads the project (93%, its bar is 80%), so it runs on an agent locked against writing, beside any task changing HarnessProjects.`
   With no agent here that can be locked, it says `Read only: Jev judged it only reads the project (93%, its bar is 80%), but no agent here can be locked against writing (codex: Codex cannot be locked through its provider), so it waits for HarnessProjects like work that writes.`, or, when nothing holds the folder, `..., so it runs as work that writes, and a task changing HarnessProjects waits for it.`
 - The live lines say `Read only (Jev 93%, bar 80%): runs on an agent locked against writing, beside any task changing this folder; no checks, review or handoff note`, and on a hand-back `Needs the folder after all: <why>. It waits its turn there and is decided again when it starts`.
+- A read pass that hands the task back before the router has picked has its start reply say so, as work that writes: `..., but Jev's routing named project_change (71%), which may change files, so it waits for HarnessProjects like work that writes.`
+  Once a handed-back task starts again, a notice says `jev-4 started again as work that writes`, with the agent, model and effort it now runs on and why the pass went back: that the task needed to change files, or why it could not run locked.
 - The task row's meta says `reads only` while it runs as a read pass.
   A task back in the line shows no running time, in the task list and in the Overview ledger alike, and counts its time in line from when it rejoined.
   Once it runs again or ends, its running time and its duration leave that time in line out: a 30 s read pass, 11 min back in line and a 2 min writer pass read `2 min 30 s`.
@@ -435,6 +535,9 @@ These are plugin features (`plugins/jev-router/client.js`), loaded by the engine
     Typed reasons and suggestions come only from this session.
   - A verdict is also capability evidence about the agent that answered, recorded once, when it is given, for the run its answer came from.
     Every routed answer ends with an invisible run mark and the verdict is sent with it, so it lands on exactly that run, even after newer runs in the session.
+    A background task's start reply carries the mark of its run once that run has begun, and, when it names the agent picked, its strip, so a verdict on it is about that agent; one given while that run still goes finds no finished run to credit.
+    A reply to a task that waits its turn as it is queued is written before its run begins, so it carries no run mark, and a verdict on it falls back as one on an answer from before the mark does.
+    One written after a read pass handed its task back carries the run the task is on by then: the pass that writes when it starts at once, else the read pass, which ended before its pick, so a verdict on it credits nothing rather than an earlier run of the chat.
     An answer from before the mark falls back to the run an earlier form of the same verdict was credited to, else the last run of the session that had ended when that answer was first judged.
     Changing it replaces what it counted; clearing it, or re-tagging it `too slow`, withdraws it, with learning off too; uninstalling the agent that answered does not.
     The same verdict relabels that run's routing decisions: a `misread my question` teaches the task classifier that run was misread.
@@ -470,8 +573,11 @@ A message is not forced to be either a question or a task. Ask *"what does the p
 
 ```text
 <the answer>
-Queued → Jev picks as jev-7 (starting now in Harness). Keep chatting: the result posts here when done.
+OK, jev-7 is starting in Harness, and Jev is choosing the agent.
 ```
+
+The answer is out by then, so nothing waits for the pick: a started notice names the agent once it is picked, and a task that has to wait its turn says where it stands instead (`OK, jev-7 is queued: 2nd in line for Harness (another task is running there).`).
+A task judged read only says so after that sentence, as every start reply does ([Read-only work](#read-only-work)): `Read only: Jev judged it only reads the project (93%, its bar is 80%), so it runs on an agent locked against writing, beside any task changing Harness.`
 
 The two judgments are asked separately (is this a question to answer, and does it also ask for work), because one choice between them could not express a message that is both. Work is only queued when Jev is at least 0.7 sure the message really asks for it: a wrong guess costs a background run of something you only asked about.
 
@@ -503,8 +609,11 @@ Nothing is delegated that code can settle: availability, sign-in, limits, modali
 ### It learns: adaptive routing
 
 Jev starts as the teacher, not the permanent decision maker.
-Every routing decision and every verified outcome is recorded, and each of the seven **routing domains** (task classification, skill selection, resource selection, execution strategy, second opinion, frontier escalation and outcome disposition) can earn the right to decide for itself once it has been right often enough, except resource selection, whose ranking in code decides at every rung.
+Every routing decision and every verified outcome is recorded, and each of the eight **routing domains** (task classification, skill selection, resource selection, execution strategy, second opinion, frontier escalation, outcome disposition and the message intent) can earn the right to decide for itself once it has been right often enough, except resource selection, whose ranking in code decides at every rung.
 Two of them, resource selection and frontier escalation, never ask Jev: a rule in code decides them wherever their local classifier does not.
+The message intent, whether a message on a Jev row is a task or a question, may only ever decide on this PC that a message is a task: a question is always Jev's to say, since a task taken for a question goes to a chat model that cannot touch the project, while a question taken for a task costs one agent run.
+Where no task can run, in the No project space and the KzH scratch workspace, a question taken for one would be refused rather than answered, so there it decides nothing and Jev reads every message.
+Besides what every domain needs to climb, it needs checked examples of each, task and question, before it may decide anything (100 of each with the shipped gates, `routing.gates.LOW.perClassSamples`), so a PC that mostly sends tasks cannot promote it on tasks alone.
 Full reference: [`docs/adaptive-routing.md`](docs/adaptive-routing.md).
 
 - **No kind of work is assigned to a provider in code.** There is no "frontend goes to Claude" rule and no "architecture goes to GPT" rule. What each model family is believed to be good at lives in [`config/capability-priors.json`](config/capability-priors.json) as scores with a confidence on each, per dimension (coding, first-pass quality, code review, security review, system design, explanation, reliability, and so on).
@@ -824,7 +933,7 @@ What stays:
   Only specific names are masked, so categories such as `local`, a task type or a cost tier are left alone, while a short model id such as `o3` is masked like any other.
   That is as far as the anonymity goes: the task text, the workspace facts, the handoff note (a harness-written one lists earlier attempts by agent id) and, at review, the answer, the diff and the check output go out with their keys masked but nothing else changed, so a name in the work itself reaches Jev.
   The same anonymised table is what the local classifier is trained on, which is why it cannot learn a brand preference from it.
-- **What the router learns stays here.** `routing-samples.jsonl`, `capability-evidence.jsonl`, the trained classifiers under `classifiers/`, the domain states under `domains/` and `known-resources.json` are files on this PC and are never uploaded. They hold routing features only: task type, complexity, risk, requirement scores, quota ratios, agent ids, which resource ran and whether the outcome was verified. Your diffs, your answers and your file contents are not in them, and the task text is not stored either - the classifier needs a bag of words, so what is written down is word and word-pair counts hashed into 2048 anonymous buckets, which is not the sentence you typed and cannot be turned back into it.
+- **What the router learns stays here.** `routing-samples.jsonl`, `capability-evidence.jsonl`, the trained classifiers under `classifiers/`, the domain states under `domains/`, `known-resources.json`, and the start replies' ledger and predictor (`reply-ledger.jsonl`, `reply-model.json`) are files on this PC and are never uploaded. They hold routing features only: task type, complexity, risk, requirement scores, quota ratios, agent ids, which resource ran and whether the outcome was verified. Your diffs, your answers and your file contents are not in them, and the task text is not stored either - the classifier needs a bag of words, so what is written down is word and word-pair counts hashed into 2048 anonymous buckets, which is not the sentence you typed and cannot be turned back into it.
 - **Your run history does hold your words.** `history.jsonl` keeps, per routed run, the task text as you typed it, the workspace's full path, up to 30 uncommitted file paths, each attempt's error diagnostic and changed file paths, and the first 1000 characters of each attempt's answer.
   `tasks.jsonl` keeps the task text of the last 100 background tasks and each finished report, clipped to 20,000 characters, which includes the answer.
   Nothing redacts a key out of the task text or the answers in either, or out of a reason typed into `feedback.jsonl`.
@@ -928,11 +1037,15 @@ KzH settings live in `~/.kzh/profiles/web/cordis.patch.yml`; the installer write
   `minClassRecall` (default 0.85) is the per-class recall floor for promotion; a value under `gates.<RISK>.minClassRecall` holds the domains of that risk class to their own floor instead.
   `disabledResources` and `allowedResources` apply even with `enabled: false`.
   [`docs/adaptive-routing.md`](docs/adaptive-routing.md) explains what each one means.
+- **`replies`** sets the measured records the predictor of the pick must keep before a start reply may use it: `quick` (right 45 of the last 50, for a reply sent before routing picks) and `likely` (right 16 of the last 20, for a likely agent named in a reply that waits).
+  A `right` above its `of` stops the plugin at start-up with the key's name.
+  No reply uses the predictor yet; the How Jev replies card shows its record against these.
 - **`resources.plans`** names an agent's plan (`pro`, `plus`, `max`, `team`) when its provider does not report one. Claude's never does, so without an entry here Claude uses the default conservation curve, not the Max one. Codex reports its own plan.
 - **`resources.economics`** says how a job on an agent is funded (`none`, `low` or `metered`) when its billing kind gets that wrong.
   It reaches every reader of the funding: the agent's resource snapshot, the decision engine's fallback for an agent with no snapshot, the executor registry's cost class that orders the capability swap, the low-confidence tie-break, and the cost tier in the track record that the legacy named call (`routing.enabled: false`) sends Jev.
 - **API-key agents** are added in the app (Settings → Models, then Jev setup); other subagent providers are added under `agents`.
 - **Conversation compaction** is the engine's (`compaction-basic` in `config/cordis.patch.yml`): KzH has it summarise a conversation at 97% of its model's context window instead of the engine's 80%, keeping the newest 16% word for word, with a 1,024-token summary on local models so the summary request fits their small windows.
+- **Background jobs per chat** are the engine's too (`jobs` in `config/cordis.patch.yml`): KzH lets one chat hold 32 instead of the engine's 10, since every background task holds one from the moment it is queued, waiting or not ([Background tasks](#background-tasks)).
 - **`auxModel`** is the chat model for direct answers, session titles and compaction. Unset, it follows this machine: the installed local chat model first, else the first enabled agent that pins a provider and model. Set both to pin one, and titles, compaction and direct answers then run on that model rather than DeepSeek.
 
 ## Where things live
@@ -943,10 +1056,11 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 |---|---|
 | Keys | `~/.kzh/.env`, and nowhere else (see [API keys](#api-keys)). The Claude and Codex logins stay in `~/.claude` and `~/.codex`. |
 | KzH settings | `~/.kzh/profiles/web/cordis.patch.yml`, `~/.kzh/settings.yaml` |
-| Accounts, limits, switches, hotkeys | `~/.kzh/jev-router/` (`accounts.json`, `agents.json`, `hotkeys.json`) |
-| History and usage | `~/.kzh/jev-router/history.jsonl` (per routed run: the task text as typed, the workspace path, changed file paths, the routing decision, the first 1000 characters of each answer, and when the run took its workspace's lane and how long it held it, end to end, as `startedAt` and `wallMs` beside `ts`, when it ended) and `usage.jsonl` (per agent attempt and Jev call: tokens, cost, quota) |
-| What the router learned | `~/.kzh/jev-router/routing-samples.jsonl` (one row per decision and its verified outcome; with the shipped gates each domain keeps its newest 10000 samples and its newest 10000 verified ones, and the file grows by up to that many rows again before it is compacted), `capability-evidence.jsonl` (what each resource turned out to be good at), `classifiers/` (the trained models, each with a checksum), `domains/` (how far each routing domain has got) and `known-resources.json` (the agent ids the resource domain has seen). Deleting them is safe: the router falls back to Jev and starts learning again. |
-| Background tasks | `~/.kzh/jev-router/tasks.jsonl` (the last 100 tasks: their text and, once finished, their reports) |
+| Accounts, limits, switches, hotkeys | `~/.kzh/jev-router/` (`accounts.json`, `agents.json`, `hotkeys.json`, and `chat-replies.json` for how the chat answers a task it queues) |
+| History and usage | `~/.kzh/jev-router/history.jsonl` (per routed run: the task text as typed, the workspace path, changed file paths, the routing decision, the first 1000 characters of each answer, when the run took its workspace's lane and how long it held it, end to end, as `startedAt` and `wallMs` beside `ts`, when it ended, and for a background task's run the task's key as `taskKey`) and `usage.jsonl` (per agent attempt and Jev call: tokens, cost, quota) |
+| What the router learned | `~/.kzh/jev-router/routing-samples.jsonl` (one row per decision, a message's task or question on a Jev row among them, and its verified outcome; with the shipped gates each domain keeps its newest 10000 samples and its newest 10000 verified ones, and the file grows by up to that many rows again before it is compacted), `capability-evidence.jsonl` (what each resource turned out to be good at), `classifiers/` (the trained models, each with a checksum), `domains/` (how far each routing domain has got) and `known-resources.json` (the agent ids the resource domain has seen). Deleting them is safe: the router falls back to Jev and starts learning again. |
+| Start replies | `~/.kzh/jev-router/reply-ledger.jsonl` (per task queued from the chat: what its start reply named, how and how soon, what routing then ran and the predictor's guess, in ids, agents, models, efforts, times and hashed word counts, never the task text; its newest 1000 tasks once the file is compacted) and `reply-model.json` (the predictor of the pick). Deleting them is safe: the How Jev replies card starts its record again, and with `reply-model.json` alone deleted the predictor is trained again from the ledger. |
+| Background tasks | `~/.kzh/jev-router/tasks.jsonl` (the last 100 tasks: their text, their key, the router's plan for them and the milestone notices posted for them, and once finished their reports) |
 | Capability benchmark | `~/.kzh/jev-router/benchmark.jsonl` holds every capability benchmark run: a run row; a folder row before each task, which also lists the names at the top of the scratch workspace as the task begins, so a start after KzH stopped mid-task can delete what appeared since, which its confirmation names first; a task row per task and attempt (outcome, reason, duration, tokens, the subject it ran as, the checks, the grade's detail, the patch and up to 1,000 characters of the answer); an agent row per agent, whose `recorded` is the number of evidence rows it wrote; and an end row. The task folders live in `kzh-scratch` beside the harness folder and are deleted once graded; their git repositories live apart in `~/.kzh/jev-router/benchmark-git/`, outside the scratch workspace, and go with them. |
 | Answer feedback | `~/.kzh/jev-router/feedback.jsonl` (your Like/Dislike verdicts, their tags and reasons) |
 | Chats (what the export reads) | `~/.kzh/sessions/<workspace>/<session>/session.v3.jsonl.zstd`, written by the engine |
@@ -963,6 +1077,7 @@ Everything with state in it is under **`~/.kzh`** (`C:\Users\<you>\.kzh`), set b
 | Start screen: a Kz-harness engine is still running on port 3080, left behind by an app that is no longer open | Click **Use it here**: it stops that orphaned engine and everything it started, then starts this app's own. It re-checks the holder at the click, and it refuses to stop a process that is not this harness, or a harness still under another running Kz-harness; quit that one (from its tray icon) and click **Retry**. This button is app source (`app/main.js`, `app/ui/console.js`), so it reaches **Kz-harness.exe** only after a rebuild (run the installer). |
 | Jev setup shows a red dot | Do what the line under it says, then **Recheck logins**. |
 | "all available agents are at their usage limits" | Wait for the reset time shown, raise a subscription's **stop at** or lower an API key's **Stop below** in Usage, or add another DeepSeek key (it becomes the active one when the key in use is spent) and use **Restart harness**. |
+| "Too many background tasks in this chat (10)" | Your `~/.kzh/profiles/web/cordis.patch.yml` has no `jobs` row yet: copy the `jobs` block from `config/cordis.patch.yml` into it while no task is running (taking the new limit can restart the engine's job service, which stops the tasks it holds), and the limit is 32. Until then, wait for a task to finish or remove a waiting one. |
 | Report says **JEV UNAVAILABLE** | The Jev key is missing or TypeSafe is unreachable; fix it and use **Restart harness**. |
 | Codex can't read files, or "windows sandbox helper … not found" | The helper comes with the Codex app; `Start-KzH.ps1` puts it on PATH. Open the Codex app once if the launcher warns. |
 | Report says **OFFLINE: local models only** | Neither TypeSafe nor DeepSeek answered. Check the connection; with no local model installed, nothing can run offline (`/install-llm` while online). |

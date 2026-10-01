@@ -579,48 +579,73 @@ window.__ModuleLoader__.load({
       return () => { mo.disconnect(); transcriptPass.cancel() }
     }
 
+    // ---- pure result helpers: no React, no state. The contract with the server's result notices
+    // (delivery.js), so nothing in it reaches outside it.
+
+    /** The label a finished task's notice summary ends with, one per terminal state, word for word adapter.js TASK_LABELS. */
+    const RESULT_LABELS = ['Completed', 'Failed', 'Stopped', 'Needs input', 'Paused by limit']
+    /**
+     * The job id and the task name a result notice's summary carries (`jev-3 · Fix sidebar width ·
+     * Completed`), or null when the row is not one of our results. The first field must be a job
+     * id and the last the label of a finished state; the name is everything between, since a
+     * task name may hold the separator itself. Requiring a finished state's label last keeps
+     * another plugin's notice, and any notice of ours about a task still at work, from being read
+     * as a result. Pure, so the contract with the server is testable.
+     */
+    const resultOf = (summary) => {
+      const parts = String(summary ?? '').split('·').map((s) => s.trim())
+      if (parts.length < 3 || !RESULT_LABELS.includes(parts[parts.length - 1]) || !/^[a-z][\w-]{0,40}$/.test(parts[0])) return null
+      return { id: parts[0], name: parts.slice(1, -1).join(' · ') }
+    }
+    /** The job id a result notice's summary starts with, or null when the row is not one of our results (resultOf). */
+    const resultIdOf = (summary) => resultOf(summary)?.id ?? null
+
+    // ---- end pure result helpers
+
     /**
      * Tell the server which background results this browser has actually rendered.
      *
      * A finished task stays "unread" until its message is in the conversation, and the engine
      * has no hook for "a person has now seen this", so the acknowledgement has to come from
      * here. Rows are matched by the job id the server puts at the front of the notice summary
-     * (`jev-3 · Fix sidebar width · Completed`); each id is acknowledged once, and an id whose
-     * request failed is forgotten so the next pass tries again. A renamed engine simply leaves
-     * the selector empty.
+     * and the task name after it (`jev-3 · Fix sidebar width · Completed`), and by the chat on
+     * screen, which every row in the document is in: the engine hands a job id out again after a
+     * restart, in every chat, and the server takes a result as read only under its own task's
+     * name and chat, once its own notice has been posted. Each rendered row is acknowledged
+     * once, remembered by the row itself rather than by what it says: the same words sent again
+     * after a restart give the new task's row the very summary an older row has, and the older
+     * row's refusal must not keep the new one from being acknowledged. A row mounted afresh, as
+     * after switching chats, is posted again, and the server refuses what it has already taken. A
+     * row whose request failed is forgotten so the next pass tries again. A renamed engine simply
+     * leaves the selector empty.
      */
-    const ackedResults = new Set()
-    /**
-     * The job id a notice summary starts with (`jev-3 · Fix sidebar width · Completed`), or
-     * null when the row is not one of ours. Pure, so the contract with the server is testable.
-     * Our summaries always carry three fields - id, task, status - and requiring all three is
-     * what keeps another plugin's two-field notice from being mistaken for one of ours.
-     */
-    const resultIdOf = (summary) => {
-      const parts = String(summary ?? '').split('·').map((s) => s.trim())
-      if (parts.length < 3) return null
-      return /^[a-z][\w-]{0,40}$/.test(parts[0]) ? parts[0] : null
-    }
-    function acknowledgeResults() {
+    const ackedRows = new WeakSet()
+    function acknowledgeResults(openChat) {
       // The engine renders the producer and the summary as TEXT inside marked spans, not as
       // attribute values: `data-context-source` and `data-context-summary` are boolean
       // attributes on those spans (dsh-client-ui-chat ContextInjectionRow). So read the text,
       // and check the producer by its text too - a selector on the attribute value never
       // matches, which is how an earlier version silently acknowledged nothing.
-      const ids = []
+      const results = []
+      const spans = []
       for (const span of document.querySelectorAll('[data-context-summary]')) {
         const row = span.closest('[data-disclosure-row]') ?? span.parentElement
         if ((row?.querySelector('[data-context-source]')?.textContent ?? '').trim() !== 'jev-router') continue
-        const id = resultIdOf(span.textContent)
-        if (!id || ackedResults.has(id)) continue
-        ackedResults.add(id)
-        ids.push(id)
+        const r = resultOf(span.textContent)
+        if (!r || ackedRows.has(span)) continue
+        ackedRows.add(span)
+        spans.push(span)
+        results.push({ jobId: r.id, name: r.name })
       }
-      if (!ids.length) return
-      post('/jev-router/tasks/seen', { jobIds: ids }).catch(() => { for (const id of ids) ackedResults.delete(id) })
+      if (!results.length) return
+      // The chat is unknown only for a moment, while the engine reads its list of chats again; the
+      // rows then go without it, as an older page sends them.
+      const sessionId = openChat()
+      post('/jev-router/tasks/seen', { ...(typeof sessionId === 'string' && sessionId ? { sessionId } : {}), results }).catch(() => { for (const span of spans) ackedRows.delete(span) })
     }
-    function startResultAcks() {
-      const pass = coalesce(acknowledgeResults)
+    /** `openChat` names the chat on screen, the engine's selected session; a test hands its own. */
+    function startResultAcks(openChat = () => sessionsApi?.list?.getSnapshot?.()?.current) {
+      const pass = coalesce(() => acknowledgeResults(openChat))
       const mo = new MutationObserver(pass.schedule)
       mo.observe(document.body, { childList: true, subtree: true })
       pass.schedule()
@@ -1706,7 +1731,13 @@ window.__ModuleLoader__.load({
      */
     const maturityWords = (d) => (d?.localDecides === false
       ? `${d?.teacher === 'code' ? 'a rule in code decides' : 'Jev decides'} at every rung; the local router is recorded beside it for comparison and never decides`
-      : (d?.teacher === 'code' ? CODE_MATURITY_WORDS : MATURITY_WORDS)[d?.maturity] ?? '')
+      : `${(d?.teacher === 'code' ? CODE_MATURITY_WORDS : MATURITY_WORDS)[d?.maturity] ?? ''}${onlyAnswers(d)}`)
+    // A domain whose local router may decide only some answers (`localLabels`, the message intent's
+    // case: only that a message is a task) is decided by its teacher on every other answer, at the
+    // rungs where the local router decides at all.
+    const onlyAnswers = (d) => (Array.isArray(d?.localLabels) && (d.maturity === 'GUARDED_LOCAL' || d.maturity === 'LOCAL_ONLY')
+      ? `, and only when it answers ${d.localLabels.join(' or ')}: ${d.teacher === 'code' ? 'a rule in code decides' : 'Jev decides'} every other answer`
+      : '')
 
     /**
      * The comparison of Jev and Laya over the last 7 days, for the current Laya identity (8.4):
@@ -3866,6 +3897,164 @@ window.__ModuleLoader__.load({
             e.codexSpeed === 'fast' ? '1.5x (uses more of your plan)' : 'Normal'))))
     }
 
+    // ---------- settings: Jev setup: chat replies ----------
+    // ---- pure chat replies helpers: no React, no state. The choices the rows offer for the settings
+    // POST /jev-router/chat-replies/settings takes (index.js validChatReplies).
+
+    /** How long the start reply may wait for the router's pick, in ms; 0 replies at once. */
+    const REPLY_WAITS = [0, 5000, 10_000, 15_000, 30_000, 60_000]
+    const replyWaitWords = (ms) => (ms > 0 ? `up to ${Math.round(ms / 100) / 10} s` : 'Reply at once (no wait)')
+    /** The wait's choices as [value, words], the saved wait among them even when it is not one of the usual ones. */
+    function replyWaitChoices(current) {
+      const values = [...new Set([...REPLY_WAITS, ...(Number.isInteger(current) && current >= 0 ? [current] : [])])].sort((a, b) => a - b)
+      return values.map((ms) => [String(ms), replyWaitWords(ms)])
+    }
+    /** What follows the start reply in the chat: the milestone notices, or only the result. */
+    const PROGRESS_CHOICES = [['milestones', 'Milestones'], ['off', 'Start and result only']]
+
+    // ---- end pure chat replies helpers
+
+    function ChatRepliesCard() {
+      const [s, setS] = useState(null)
+      const [err, setErr] = useState('')
+      useEffect(() => { api('/jev-router/chat-replies/settings').then(setS, (x) => setErr(x.message)) }, [])
+      const save = async (patch) => { setErr(''); try { setS(await api('/jev-router/chat-replies/settings', { method: 'POST', body: JSON.stringify(patch) })) } catch (x) { setErr(x.message) } }
+      if (!s) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Chat replies'), h('div', { className: err ? 'err' : 'muted' }, err || 'Loading…'))
+      const pick = (id, label, value, options, onChange) => [
+        h('dt', { key: `${id}t` }, h('label', { htmlFor: id }, label)),
+        h('dd', { key: `${id}d` }, h('select', { id, value, onChange: (ev) => onChange(ev.target.value) }, ...options.map(([v, n]) => h('option', { key: v, value: v }, n)))),
+      ]
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-replies-h' },
+        h('div', { className: 'label', id: 'jevi-replies-h' }, 'Chat replies'),
+        h('div', { className: 'why' }, 'A task you send starts in the background. Its reply names the agent, model and effort once Jev has picked them, waiting for the pick at most this long; a task that waits its turn is answered at once. Milestones add a short notice when a task starts on an agent its reply did not name, starts at another effort than its reply named, starts again as work that writes once its read pass hands it back, or moves to another agent on a retry.'),
+        err ? h('div', { className: 'err', role: 'alert' }, err) : null,
+        h('dl', null,
+          ...pick('jevi-rp-w', 'Wait for the pick before replying', String(s.waitMs), replyWaitChoices(s.waitMs), (v) => save({ waitMs: Number(v) })),
+          ...pick('jevi-rp-p', 'Progress in chat', s.progress, PROGRESS_CHOICES, (v) => save({ progress: v }))))
+    }
+
+    // ---------- settings: Jev setup: how Jev replies ----------
+    // ---- pure how-jev-replies helpers: no React, no state. What the How Jev replies card says, from
+    // one GET /jev-router/replies/summary answer (index.js repliesSummary): how start replies are made,
+    // how far task or question has come toward being read on this PC, and how often the predictor of
+    // the pick, still in shadow, has been right.
+
+    /** How a reply came to name what it named, in the Recent replies table's words. */
+    const REPLY_HOW_WORDS = { instant: 'instant', quick: 'quick', routed: 'after routing', bound: 'wait ran out', now: 'at once', forced: 'your pick', waited: 'waited' }
+    /**
+     * A share and the bar it is held to, as percentages to the decimals the bar is set to (none for 94%,
+     * one for 98.5%, at most two), the share cut down, never rounded up: domains.js holds the share
+     * itself to the bar, so 211 right of 225 (93.8%) reads 93% beside a bar of 94%, never the 94% it
+     * misses, and a share reads as the bar only once it is there.
+     */
+    function percentsAgainst(x, bar) {
+      const f = [1, 10].find((m) => Math.abs(bar * 100 * m - Math.round(bar * 100 * m)) < 1e-9) ?? 100
+      return [`${Math.floor(x * 100 * f + 1e-9) / f}%`, `${Math.round(bar * 100 * f) / f}%`]
+    }
+    const secondWords = (ms) => { const s = Math.max(0, ms ?? 0) / 1000; return `${s >= 10 ? Math.round(s) : Math.round(s * 10) / 10} s` }
+    const RECENT_REPLY_COLUMNS = [{ key: 'job', label: 'Job' }, { key: 'said', label: 'What it said' }, { key: 'ran', label: 'What ran' }, { key: 'how', label: 'How' }]
+
+    /**
+     * What the card says first: what learns, and that only task or question can change a reply yet,
+     * once it is read on this PC; with adaptive routing off, which sorts no message here (no `intent`
+     * in the summary), that only the guess at the agent learns; with learning off, that nothing here learns.
+     */
+    const howJevRepliesWhy = (s) => (s?.learning === false
+      ? 'A start reply names the agent once routing has picked it. Learning is switched off (routing.learn in the jev-router configuration), so nothing here learns, and no start reply is recorded.'
+      : !s?.intent
+        ? 'A start reply names the agent once routing has picked it. A guess at the agent and effort learns in the background to make that sooner, checked against what routing then picks, and changes no reply yet. Task or question is not learned while adaptive routing is off (routing.enabled in the jev-router configuration): Jev reads every message.'
+        : 'A start reply names the agent once routing has picked it. Two things learn in the background to make that sooner: whether a message is a task or a question, read on this PC once it has been right often enough, and a guess at the agent and effort, checked against what routing then picks. The guess changes no reply yet. Task or question changes one only once it is read on this PC, and then only for a message it is sure is a task: Jev is not asked about that message, so it gets no read-only verdict and runs as work that writes.')
+
+    /**
+     * The card's lines: how start replies are made, with how long the ones that waited for the pick
+     * took this week, until it came or the wait ran out, and how many ran out, or that they go out at
+     * once with the wait set to none; how far task or question has come toward reading a task on this
+     * PC (its checked examples against what GUARDED_LOCAL needs, of each class, and how often it was
+     * right of the last ones checked, against what GUARDED_LOCAL needs until it gets there); and the
+     * predictor's record against the two gates, Laya's apart when it has one, so a predictor with no
+     * guess of Jev's checked yet says that of Jev alone beside one of Laya's. With learning off
+     * nothing is recorded, so nothing is timed, guessed or trained, and the lines say so rather than
+     * count on records that no longer grow.
+     */
+    function howJevRepliesLines(s) {
+      const lines = []
+      const off = s?.learning === false
+      const sr = s?.startReplies ?? {}
+      const ranOut = sr.atBound ? `; ${sr.atBound} of ${sr.n} went out when the wait ran out, before the pick` : ''
+      lines.push(sr.waitMs === 0 ? 'Start replies: at once, without waiting for the pick (Reply at once, in Chat replies)'
+        : `Start replies: after routing (${off ? 'not timed while learning is off' : sr.n ? `median ${secondWords(sr.medianMs)} this week${ranOut}` : 'none timed this week'})`)
+      const i = s?.intent
+      if (!i) lines.push('Task or question: Jev reads every message, and nothing is learned from it while adaptive routing or its learning is off.')
+      else {
+        // The accuracy it needs is the bar for being read on this PC, which a local rung is past: what
+        // keeps it there is more than one figure (domains.js rollback), so there the line gives the
+        // accuracy alone. Either way it is cut down, never rounded up to a bar it misses.
+        const local = i.maturity === 'GUARDED_LOCAL' || i.maturity === 'LOCAL_ONLY'
+        const shown = i.recent?.n ? percentsAgainst(i.recent.accuracy, i.needs.recentAccuracy) : null
+        const right = shown ? `${shown[0]} right of the last ${i.recent.n} checked${local ? '' : ` (needs ${shown[1]})`}` : 'not scored yet'
+        lines.push(local
+          ? `Task or question: read on this PC when it is sure a message is a task, and by Jev otherwise (${i.verified} checked examples); ${right}.`
+          : `Task or question: learning, ${i.verified} of ${i.needs.samples} checked examples (task ${i.classes?.task ?? 0}, question ${i.classes?.question ?? 0} of ${i.needs.perClass} needed); ${right}.`)
+      }
+      const p = s?.prediction ?? {}
+      if (off) {
+        lines.push(p.trained
+          ? `Agent and effort prediction: off while learning is off; it was trained on ${p.trained.rows} routed tasks before, and no guess is made or checked now.`
+          : 'Agent and effort prediction: off while learning is off; nothing is recorded for it, so it does not train.')
+        return lines
+      }
+      const g = p.gates ?? { quick: { right: 45, of: 50 }, likely: { right: 16, of: 20 } }
+      const need = `quick replies need ${g.quick.right}; "likely" needs ${g.likely.right} of the last ${g.likely.of}`
+      const record = (r, who) => (r?.n ? `${who}: right ${r.right} of the last ${r.n} (${need}).` : null)
+      // Not trained yet: too few routed tasks on record, a first training under way (the ledger
+      // starts one as soon as it has enough, as it reads them too), or one that failed, which the
+      // ledger tries again only after more tasks, so that it does not fail again on every one.
+      const untrained = p.training ? 'it is training now, on the routed tasks on record'
+        : (p.labelled ?? 0) >= (p.minRows ?? 60) ? `its training failed, and it is tried again after ${p.retrainEvery ?? 25} more routed tasks`
+          : `it starts once ${p.minRows ?? 60} routed tasks are on record`
+      // A predictor trained with no guess of Jev's checked yet says so of Jev alone while Laya has a
+      // record of its own, which the Laya line under it gives: no guess at all is not what happened.
+      const unchecked = p.records?.laya?.quick?.n ? 'no guess under Jev Auto has been checked yet' : 'no guess has been checked yet'
+      if (!p.trained) lines.push(`Agent and effort prediction: not trained yet; ${untrained} (${p.labelled ?? 0} so far).`)
+      else lines.push(record(p.records?.jev?.quick, 'Agent and effort prediction') ?? `Agent and effort prediction: trained on ${p.trained.rows} routed tasks; ${unchecked} (${need}).`)
+      const laya = record(p.records?.laya?.quick, 'Under Laya Auto')
+      if (laya) lines.push(laya)
+      return lines
+    }
+
+    /**
+     * The Recent replies table's rows, newest first: the job, what its reply named, what then ran, and
+     * how the reply came to name it. A task that ended before routing picked anything (`ended`: its
+     * final state, or true once it has left the task list) ran nothing and never will, so it is said to
+     * have run nothing, with how it ended; only a task still to run is not routed yet.
+     */
+    function recentReplyRows(s) {
+      const name = (id) => (String(id ?? '').startsWith('tool:') ? `the ${String(id).slice('tool:'.length)} tool` : s?.names?.[id] ?? id)
+      const plan = (x) => [name(x.agent), x.model, x.effort ? `effort ${x.effort}` : ''].filter(Boolean).join(' · ')
+      const ended = (r) => (taskLabels[r.ended] ? `nothing ran (${taskLabels[r.ended]})` : 'nothing ran')
+      return (s?.recent ?? []).map((r) => [
+        { text: r.jobId ?? '' },
+        { text: r.said?.agent ? plan(r.said) : 'no agent named' },
+        { text: r.ran?.agent ? plan(r.ran) : r.ended ? ended(r) : 'not routed yet' },
+        { text: REPLY_HOW_WORDS[r.said?.how] ?? '' },
+      ])
+    }
+
+    // ---- end pure how-jev-replies helpers
+
+    function HowJevRepliesCard() {
+      const [s, setS] = useState(null)
+      const [err, setErr] = useState('')
+      useEffect(() => { api('/jev-router/replies/summary').then(setS, (x) => setErr(x.message)) }, [])
+      if (!s) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'How Jev replies'), h('div', { className: err ? 'err' : 'muted' }, err || 'Loading…'))
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-how-h' },
+        h('div', { className: 'label', id: 'jevi-how-h' }, 'How Jev replies'),
+        h('div', { className: 'why' }, howJevRepliesWhy(s)),
+        ...howJevRepliesLines(s).map((t, i) => h('div', { key: i }, t)),
+        h('div', { className: 'label', style: { margin: '10px 0 4px' } }, 'Recent replies'),
+        h(SortTable, { label: 'Recent replies', columns: RECENT_REPLY_COLUMNS, rows: recentReplyRows(s), empty: s.learning === false ? 'No start reply is recorded while learning is off.' : 'No start reply yet.' }))
+    }
+
     // ---------- settings: Jev setup: the Laya decision model ----------
     // ---- pure laya helpers: no React, no state. test/laya-card.test.js evaluates this block on its
     // own (the runner cannot import a classic script), so nothing in it may reach outside it.
@@ -4460,6 +4649,10 @@ window.__ModuleLoader__.load({
         h(LocalModelsCard, { ask: setConfirm }),
 
         h(EffortCard),
+
+        h(ChatRepliesCard),
+
+        h(HowJevRepliesCard),
 
         h('div', { className: 'card' },
           h('div', { className: 'label' }, 'Add an API-key agent'),
@@ -5981,8 +6174,8 @@ window.__ModuleLoader__.load({
       // adapter.js TASK_LABELS on the server. The two start* schedulers are exposed with stubbable
       // DOM globals so a test can prove a pass lands on a timer while no frame is ever delivered.
       // ResourceBudget and LocalModelsCard are rendered with stand-in Reacts in test/budgetpanel.test.js,
-      // SetupSection in test/laya-card.test.js and InspectorBody in test/routerview.test.js.
-      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, stopOneWords, stopAllWords, stopTask, WorkBoard, Tasks, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, sortRows, filterRows, SortTable, BenchmarkCard, benchmarkProgress, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, UsageCard, RestartLine, taskItems },
+      // SetupSection, ChatRepliesCard and HowJevRepliesCard in test/laya-card.test.js and InspectorBody in test/routerview.test.js.
+      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, stopOneWords, stopAllWords, stopTask, WorkBoard, Tasks, resultIdOf, resultOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, sortRows, filterRows, SortTable, BenchmarkCard, benchmarkProgress, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, UsageCard, RestartLine, taskItems, replyWaitChoices, progressChoices: PROGRESS_CHOICES, ChatRepliesCard, howJevRepliesWhy, howJevRepliesLines, recentReplyRows, HowJevRepliesCard },
       apply(ctx) {
         sessionsApi = ctx.sessions
         sidebarRight = ctx.sidebarRight
