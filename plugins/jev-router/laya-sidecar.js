@@ -20,6 +20,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, readlink, rename, rm, writeFile } from 'node:fs/promises'
 import { constants as osConstants, cpus, setPriority as osSetPriority } from 'node:os'
 import { resolve, sep } from 'node:path'
+import { colibriAddressProblem } from './colibri-laya.js'
 import { createRotatingLog, execText, isAlive as pidAlive, layaPaths, lockHeld, processName, sizeOf, verifyWeights, withoutSecrets } from './laya-install.js'
 import { ADAPTER_VERSION } from './laya-questions.js'
 import { defaultThreads, freePort, killTree as defaultKillTree, workingSetOf } from './local.js'
@@ -162,8 +163,10 @@ const SETTINGS = {
   idleMinutes: { ok: (v) => Number.isInteger(v) && v >= 1 && v <= 240, why: 'Unload after idle: whole minutes 1-240' },
   device: { ok: (v) => ['auto', 'gpu', 'cpu'].includes(v), why: "Device: 'auto', 'gpu' or 'cpu'" },
   shadow: { ok: (v) => typeof v === 'boolean', why: 'Answer beside Jev in Jev Auto: true or false' },
+  // colibri's Laya, asked beside laya.serve for comparison only (docs/laya-auto.md 13): empty is off.
+  colibriUrl: { ok: (v) => colibriAddressProblem(v) == null, why: (v) => colibriAddressProblem(v) },
 }
-const DEFAULT_SETTINGS = Object.freeze({ startWithKzh: false, keepLoaded: false, idleMinutes: 30, device: 'auto', shadow: true })
+const DEFAULT_SETTINGS = Object.freeze({ startWithKzh: false, keepLoaded: false, idleMinutes: 30, device: 'auto', shadow: true, colibriUrl: '' })
 const PHASES = ['intent', 'route', 'review']
 const emptyDevice = (vram) => ({ identity: null, msPerToken: { intent: null, route: null, review: null }, ramGB: null, ...(vram ? { vramGB: null } : {}), loadMs: [] })
 /** The EWMA weight of a new ms-per-token reading (4.5). */
@@ -230,6 +233,9 @@ export function createLayaSidecar({
   let lastSelfTest = stored.lastSelfTest ?? null
   let saving = Promise.resolve()
   function persist() {
+    // Disposed of, it saves no more: the plugin applied again has read laya.json and saves its own
+    // settings there, which a copy of what this supervisor holds would be written over.
+    if (disposed) return saving
     saving = saving.then(async () => {
       await mkdir(dataDir, { recursive: true })
       await writeFile(`${paths.settings}.tmp`, JSON.stringify({ ...settings, measured, lastSelfTest }, null, 2))
@@ -264,7 +270,8 @@ export function createLayaSidecar({
   let currentStart = null
   let suspended = null
   let install = null
-  // Set for good by dispose(): nothing starts or restarts Laya afterwards, however it was chained.
+  // Set for good by dispose(): nothing starts or restarts Laya afterwards, however it was chained,
+  // and laya.json is saved no more (persist).
   let disposed = false
   let priority = 'normal'
   let priorityWarned = false
@@ -1120,7 +1127,7 @@ export function createLayaSidecar({
 
   async function setSettings(patch = {}) {
     for (const k of Object.keys(patch)) if (!SETTINGS[k]) throw new Error(`${k} is not a Laya setting`)
-    for (const [k, rule] of Object.entries(SETTINGS)) if (patch[k] !== undefined && !rule.ok(patch[k])) throw new Error(rule.why)
+    for (const [k, rule] of Object.entries(SETTINGS)) if (patch[k] !== undefined && !rule.ok(patch[k])) throw new Error(typeof rule.why === 'function' ? rule.why(patch[k]) : rule.why)
     for (const k of Object.keys(SETTINGS)) if (patch[k] !== undefined) settings[k] = patch[k]
     if (settings.keepLoaded) holds.add('keepLoaded')
     else if (holds.delete('keepLoaded') && !holds.size) touchIdle()

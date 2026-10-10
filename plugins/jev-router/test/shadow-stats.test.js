@@ -157,6 +157,37 @@ test('a verdict is read back as feedback.js reads it: the newest per message, an
   assert.deepEqual(domainOf(await shadow.compare({ days: 'all' }), 'review_action').personSaid, { n: 1, jevRight: 1, layaRight: 1 })
 })
 
+test('a rating of a start reply\'s pick carries its run\'s id but is no person\'s word on the run\'s answer, read directly and through the worker', async () => {
+  let clock = NOW - 60 * 60_000
+  const at = () => new Date(clock += 1000).toISOString()
+  // As acceptVerdict stores them: a verdict about the pick is stamped with the run of the plan it judged.
+  const pick = (messageId, verdict, tag, runId = 'rev') => ({ ts: at(), sessionId: 'sess-1', messageId, about: 'plan', taskKey: '0f8fad5b-d9cb-469f-a165-70867728950e', verdict, reason: '', tag, ...(tag === 'wrong effort' ? { suggestedEffort: 'xhigh' } : {}), planAgent: 'claude', runId })
+  const answer = (messageId, verdict, runId = 'rev') => ({ ts: at(), sessionId: 'sess-1', messageId, verdict, reason: '', runId })
+  const both = (q) => ({ addressed: noul(q), complete: noul(q), unrelatedChanges: noul(0.1), regressionRisk: noul(0.1), needsPerson: noul(0.1) })
+  const review = (runId) => row({ runId, phase: 'review', attempt: 0, review: { risk: 0.5, blockAccept: false, reviewed: false }, jev: both(0.9), laya: Object.fromEntries(Object.entries(both(0.9)).map(([k, v]) => [k, laya(v)])) })
+  const history = [{ runId: 'rev', finalStatus: 'accepted', attempts: [{ agent: 'claude', role: 'primary', stopReason: 'completed' }] }]
+  const reviewActionOf = (feedback) => standingOf(standing({ shadowRows: [review('rev')], feedback, history, identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW }), 'review_action')
+  assert.deepEqual(reviewActionOf([pick('m-reply', 'dislike', 'wrong effort')]).jev.personSaid, { n: 0, right: 0 }, 'a dislike of the effort says nothing of the answer')
+  assert.deepEqual(reviewActionOf([pick('m-reply', 'dislike', 'wrong agent')]).jev.personSaid, { n: 0, right: 0 }, 'nor does a dislike of the agent')
+  assert.deepEqual(reviewActionOf([pick('m-reply', 'like', 'good pick')]).jev.personSaid, { n: 0, right: 0 }, 'nor a like of the pick')
+  assert.deepEqual(reviewActionOf([answer('m-answer', 'dislike'), pick('m-reply', 'like', 'good pick')]).jev.personSaid, { n: 1, right: 0 }, 'a later rating of the pick leaves the dislike of the answer as the person\'s word')
+
+  // Through the file and the worker, as index.js asks for the standing: what the figures read of a
+  // feedback row keeps what it is about.
+  const { createShadow } = await import('../shadow.js')
+  const dir = mkdtempSync(join(tmpdir(), 'kz-pick-rated-'))
+  const files = { feedback: join(dir, 'feedback.jsonl'), history: join(dir, 'history.jsonl'), standing: join(dir, 'laya-standing.jsonl') }
+  const shadowFile = join(dir, 'laya-shadow.jsonl')
+  const jl = (rows) => rows.map((x) => `${JSON.stringify(x)}\n`).join('')
+  writeFileSync(shadowFile, jl([review('rev'), review('rev2')]))
+  writeFileSync(files.history, jl([...history, { ...history[0], runId: 'rev2' }]))
+  writeFileSync(files.feedback, jl([pick('m-reply', 'dislike', 'wrong effort'), answer('m-answer-2', 'like', 'rev2'), pick('m-reply-2', 'dislike', 'wrong agent', 'rev2')]))
+  const shadow = createShadow({ file: shadowFile, laya: { identity: () => ID, offerShadow: () => ({ dropped: 'not_running' }), withdraw: () => false }, providers: { jev: JEV, laya: LAYA }, jevHost: HOST, files, now: () => NOW })
+  const rows = await shadow.recordStanding()
+  assert.deepEqual(standingOf(rows, 'review_action').jev.personSaid, { n: 1, right: 1 }, 'the like of rev2\'s answer only')
+  assert.deepEqual(domainOf(await shadow.compare({ days: 'all' }), 'review_action').personSaid, { n: 1, jevRight: 1, layaRight: 1 })
+})
+
 // ---------------------------------------------------------------- agreement
 
 test('agreement for choice, noul and score, over every answer and over Laya\'s informative ones', () => {
@@ -452,8 +483,11 @@ test('identity, thresholds and Jev host are kept apart', () => {
 /** The comparison of 8.4 as the design writes it: the shape to match, key for key. */
 const DESIGN_8_4 = {
   identity: 'x', thresholds: { jev: 'x', laya: 'x' }, jevHost: 'x', days: 7,
-  questions: [{ name: 'taskType', type: 'choice', options: 12, corrected: 40, compared: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, inTopTwo: 33, meanDifference: null, atBar: null, flat: 11, layaMedianMs: 950 }],
-  domains: [{ domain: 'task_classification', question: 'taskType', layaAnswered: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, personSaid: { n: 4, jevRight: 3, layaRight: 2 }, whereJevWasContradicted: { n: 3, layaRight: 1 }, layaAutoRuns: { runs: 12, failed: null }, fieldAgreement: { risk: 0.64 } }],
+  questions: [{ name: 'taskType', type: 'choice', options: 12, corrected: 40, compared: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, intervals: { all: { low: 0.387, high: 0.679 }, informative: { low: 0.455, high: 0.781 } }, inTopTwo: 33, meanDifference: null, atBar: null, flat: 11, layaMedianMs: 950 }],
+  domains: [{
+    domain: 'task_classification', question: 'taskType', layaAnswered: 41, agree: { all: { n: 41, agree: 22 }, informative: { n: 30, agree: 19 } }, personSaid: { n: 4, jevRight: 3, layaRight: 2 }, whereJevWasContradicted: { n: 3, layaRight: 1 }, layaAutoRuns: { runs: 12, failed: null }, fieldAgreement: { risk: 0.64 },
+    intervals: { agree: { low: 0.455, high: 0.781 }, jevRight: { low: 0.301, high: 0.954 }, layaRight: { low: 0.15, high: 0.85 }, contradicted: { low: 0.061, high: 0.792 }, failed: null },
+  }],
   actions: { wouldHaveActedSame: [{ what: 'review_action', n: 20, same: 11 }], review: { jev: { accept: 12, second_review: 3, human: 1, retry: 4, belowAcceptBar: 3 }, laya: { accept: 5, second_review: 10, human: 1, retry: 4, belowAcceptBar: 10 } } },
   skips: { answered: 120, partial: 2, failed: 1, skipped: { not_running: 3, starting: 1, queue_full: 0, too_old: 0, jev_failed: 1, yielded: 2 }, atContextLimit: 0 },
   latency: { jev: { intent: 110, route: 900, review: 800 }, laya: { intent: 300, route: 950, review: 600 } },
@@ -493,6 +527,46 @@ test('the comparison has exactly the shape of 8.4, and the standing that of 6.7'
   assert.equal(tcStanding.identity, ID)
   assert.equal(tcStanding.ts, new Date(NOW).toISOString())
   assert.equal(cmp.standing.length, GROUPS.length)
+})
+
+test('each share the comparison gives has its 95% interval beside it, the Wilson score interval, narrower as the record grows, so a share of a few rows reads as the range it is, and a source with no rows has none (docs/live-agent-view.md 6, slice 9)', async () => {
+  const { interval } = await import('../shadow-stats.js')
+  assert.equal(typeof interval, 'function', 'shadow-stats.js gives the interval of a share')
+  assert.deepEqual(interval(22, 41), { low: 0.387, high: 0.679 })
+  assert.deepEqual(interval(3, 3), { low: 0.438, high: 1 }, 'three of three is no certainty')
+  assert.deepEqual(interval(0, 3), { low: 0, high: 0.562 })
+  assert.deepEqual([interval(30, 40), interval(300, 400)], [{ low: 0.598, high: 0.858 }, { low: 0.705, high: 0.79 }], 'the same share, ten times the rows')
+  assert.equal(interval(0, 0), null, 'nothing counted, no range')
+  assert.equal(interval(5, 3), null)
+  assert.equal(interval(1.5, 3), null)
+  const r = row({ runId: 'iv', jev: { taskType: taskType('debugging', 0.7) }, laya: { taskType: laya(taskType('debugging', 0.6)) } })
+  const contradicted = row({ runId: 'iv2', jev: { taskType: taskType('refactor', 0.7) }, laya: { taskType: laya(taskType('debugging', 0.6)) } })
+  const jevSamples = [
+    sample('task_classification', 'iv', 'debugging', { labelSource: 'human', label: 'debugging' }),
+    sample('task_classification', 'iv2', 'refactor', { labelSource: 'verified_outcome', label: 'debugging', negativeLabel: 'refactor' }),
+  ]
+  const cmp = compare({ shadowRows: [r, contradicted], jevSamples, layaSamples: [], identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW })
+  const td = domainOf(cmp, 'task_classification')
+  assert.deepEqual(td.intervals, {
+    agree: interval(td.agree.informative.agree, td.agree.informative.n),
+    jevRight: interval(td.personSaid.jevRight, td.personSaid.n),
+    layaRight: interval(td.personSaid.layaRight, td.personSaid.n),
+    contradicted: interval(td.whereJevWasContradicted.layaRight, td.whereJevWasContradicted.n),
+    failed: null,
+  }, 'a task type is not judged by its runs, so it has no failure range')
+  assert.ok(td.intervals.agree && td.intervals.jevRight && td.intervals.contradicted, 'each counted share has one')
+  const q = cmp.questions.find((x) => x.name === 'taskType')
+  assert.deepEqual(q.intervals, { all: interval(q.agree.all.agree, q.agree.all.n), informative: interval(q.agree.informative.agree, q.agree.informative.n) })
+  const none = domainOf(cmp, 'intent')
+  assert.deepEqual(none.intervals, { agree: null, jevRight: null, layaRight: null, contradicted: null, failed: null }, 'no rows, no range')
+  // Laya Auto's runs of a strategy, which a run's outcome can prove wrong: one it did, and one it did not.
+  const failedOne = layaSample('execution_strategy', 'lv1', 'CHEAP_DIRECT', { labelSource: 'verified_negative', negativeLabel: 'CHEAP_DIRECT' })
+  const fine = layaSample('execution_strategy', 'lv2', 'STANDARD_DIRECT', null)
+  const judged = domainOf(compare({ layaSamples: [failedOne, fine], identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW }), 'execution_strategy')
+  assert.deepEqual(judged.layaAutoRuns, { runs: 2, failed: 1 }, 'the setting')
+  assert.deepEqual(judged.intervals.failed, { low: 0.095, high: 0.905 }, 'the failed runs, one of two, have their range too')
+  const unfailed = domainOf(compare({ layaSamples: [fine], identity: ID, thresholds: THRESHOLDS, jevHost: HOST, now: NOW }), 'execution_strategy')
+  assert.deepEqual([unfailed.layaAutoRuns, unfailed.intervals.failed], [{ runs: 1, failed: 0 }, { low: 0, high: 0.793 }], 'and none failed of one run is a range from none, not no range')
 })
 
 // ---------------------------------------------------------------- no text

@@ -1,0 +1,6 @@
+{
+  "name": "@deepseek-ai/schemastery",
+  "private": true,
+  "type": "module",
+  "exports": "./index.js"
+}

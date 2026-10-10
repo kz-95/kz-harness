@@ -2,15 +2,21 @@
 // writes at a time per workspace (a lane), while the chat stays free. A task judged read
 // only takes a slot of its own and runs beside it, on an agent locked against writing
 // (runAdmitted). The resource budget can also cap how many run at once across every
-// workspace, read-only runs included.
+// workspace, read-only runs included. A waiting task can be started at once (Send now), over
+// that cap but never past a run in its own folder, and given the person's words before it
+// starts (amend), or while it works (Steer, through index.js and steer.js; noteSteer keeps what
+// becomes of each piece).
 //
 // One task is one record. The task list and the chat both read that record, so the
 // row and the delivered message can never disagree, and a result stays unread until
 // the conversation has actually taken it.
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { line } from './adapter.js'
 import { NEEDS_LANE } from './capabilities.js'
+import { SESSION_ID } from './export.js'
+import { nextState, steerStateWords } from './steer.js'
 import { placeText, slotFacts, waitText } from './waits.js'
 import { commonGitDir, outerRepoRoot } from './workspace.js'
 
@@ -117,6 +123,10 @@ export const WAITING = {
  * a background task: each runs an agent's processes, which is what overloads the PC. None is
  * exempt, so each is told when it has to wait: acquire's `onWait` hears why ('workspace' or 'cap',
  * see WAITING) as the run joins the line, and not at all when it starts at once.
+ *
+ * Send now (admit) is the one way past the cap: the person starts a waiting task at once, and the
+ * runs then hold more slots than the cap allows until enough of them end. It never goes past a run
+ * holding the waiter's workspace.
  */
 export function createLanes({ max = null } = {}) {
   const lanes = new Map() // key -> { holder: id | null, who: object | null, waiting: [{ id, n, go, onWait, told, who }] }
@@ -160,6 +170,13 @@ export function createLanes({ max = null } = {}) {
     }
     return { count, here }
   }
+  // Let waiter `w` of lane `l` in: from now it holds the lane and a slot under the cap.
+  const grant = (l, w) => {
+    l.holder = w.id
+    l.who = w.who ?? null
+    holding++
+    w.go()
+  }
   // A waiter whose reason changed since it was last told is told again: its live lines, its task
   // row's last line and the benchmark card then follow the line rather than keep the reason it had
   // when it joined. A listener that throws here is past the point where it could refuse to join.
@@ -176,15 +193,17 @@ export function createLanes({ max = null } = {}) {
   // Hand out every slot the cap allows: a lane nobody holds, with somebody waiting, lets the head
   // of its line in. With no cap that is every such lane, which is what this did before there was one.
   const next = () => {
+    // A waiter sent in after the run holding its lane (admit's `after`) takes the lane the moment that
+    // run lets it go, whatever the cap: the person stopped that run for it.
+    for (const l of lanes.values()) {
+      const i = l.holder ? -1 : l.waiting.findIndex((w) => w.now)
+      if (i >= 0) grant(l, l.waiting.splice(i, 1)[0])
+    }
     while (holding < limit) {
       let pick = null
       for (const l of lanes.values()) if (!l.holder && l.waiting.length && (!pick || firstArrival(l) < firstArrival(pick))) pick = l
       if (!pick) break
-      const w = pick.waiting.shift()
-      pick.holder = w.id
-      pick.who = w.who ?? null
-      holding++
-      w.go()
+      grant(pick, pick.waiting.shift())
     }
     for (const [k, l] of lanes) if (!l.holder && !l.waiting.length) lanes.delete(k)
     retell()
@@ -220,6 +239,40 @@ export function createLanes({ max = null } = {}) {
       })
     },
     busy: (k) => !!lanes.get(k)?.holder,
+    /** The ids waiting in front of `id` in lane `k`, first first: those Send now goes past. Empty when it waits in no line there. */
+    ahead(k, id) {
+      const waiting = lanes.get(k)?.waiting ?? []
+      const i = waiting.findIndex((w) => w.id === id)
+      return i < 0 ? [] : waiting.slice(0, i).map((w) => w.id)
+    },
+    /** Who holds lane `k` now: the run's id and whether it is a task ('workspace') or a run from the chat ('chat'), or null. */
+    holder: (k) => (lanes.get(k)?.holder ? { id: lanes.get(k).holder, kind: heldReason(lanes.get(k)) } : null),
+    /**
+     * Start the waiter `id` of lane `k` now, ahead of its line and at or over the cap (Send now), which
+     * `overCap` and slotFacts then word. Synchronous, so no run can take the lane between the look and
+     * the grant. Nothing moves while another run holds the lane: 'busy', with that run's id and whether
+     * it is a task's ('workspace') or a run from the chat ('chat'). With `after` naming that run, the
+     * waiter goes first in its line instead and takes the lane the moment the run lets it go, whatever
+     * the cap ('next'), which is how "Stop it and start this" keeps its word. 'not-waiting' when `id`
+     * waits in no line here: it has started, or left.
+     */
+    admit(k, id, { after = null } = {}) {
+      const l = lanes.get(k)
+      const i = l ? l.waiting.findIndex((w) => w.id === id) : -1
+      if (i < 0) return { result: 'not-waiting' }
+      if (l.holder && (after == null || after !== l.holder)) return { result: 'busy', holder: l.holder, kind: heldReason(l) }
+      const [w] = l.waiting.splice(i, 1)
+      if (l.holder) {
+        w.now = true
+        l.waiting.unshift(w)
+        retell()
+        return { result: 'next' }
+      }
+      grant(l, w)
+      // Those it went past in its own line now wait for it, in their workspace: they are told so.
+      retell()
+      return { result: 'started' }
+    },
     /** Whether a task joining lane `k` now would wait: its workspace is taken, or the cap is. */
     waits: (k) => !!waitsFor(k),
     /** A new cap (null: none). Raising it lets waiting work in at once; lowering it stops nothing that runs. */
@@ -398,6 +451,112 @@ export function validJobIds(ids) {
 }
 export const validJobId = (id) => validJobIds([id])[0]
 
+/**
+ * A task's name as a result notice's summary carries it (delivery.js: `jev-3 · <name> · Completed`),
+ * with whitespace around `·` removed and any other run of it read as one space: the browser reads
+ * each field of the summary back trimmed, and a task name may hold the separator itself.
+ */
+const nameKey = (s) => String(s ?? '').replace(/\s+/g, ' ').replace(/ ?· ?/g, '·').trim()
+
+/**
+ * The results a browser says it rendered (POST /jev-router/tasks/seen), as `{ jobId, name, sessionId }`:
+ * `results`, each naming the task as its notice summary does, then the bare `jobIds` an older page
+ * sends, which carry no name to check. `sessionId` is the chat the rows are in, on every entry when
+ * the page says which, and a chat that is no session id marks nothing read. An entry that is
+ * neither is dropped.
+ */
+export function seenResults(body) {
+  const valid = (id) => { try { return validJobId(id) } catch { return null } }
+  const chat = body?.sessionId ?? null
+  if (chat !== null && !(typeof chat === 'string' && SESSION_ID.test(chat))) return []
+  const inChat = chat === null ? {} : { sessionId: chat }
+  const named = (Array.isArray(body?.results) ? body.results : [])
+    .filter((r) => valid(r?.jobId) && typeof r.name === 'string')
+    .map((r) => ({ jobId: r.jobId, name: r.name, ...inChat }))
+  const bare = (Array.isArray(body?.jobIds) ? body.jobIds : []).filter(valid).map((jobId) => ({ jobId, ...inChat }))
+  return [...named, ...bare]
+}
+
+/**
+ * The engine's refusal of one more background job in a chat (dsh-jobs-local: `background job limit
+ * reached for this owner (limit: 10); use job_kill ...`), in words a person can act on. Every task
+ * holds its job from the moment it is queued, so waiting ones count; the limit is read from the refusal.
+ */
+const jobLimitWords = (message) => {
+  const n = /limit:\s*(\d+)/.exec(message)?.[1]
+  return `Too many background tasks in this chat${n ? ` (${n})` : ''}. Wait for one to finish or remove a waiting one, then send it again.`
+}
+
+/**
+ * What a routed event says a task runs as (router.js routed): the agent that does the work with
+ * its model and the effort its first attempt starts at, the planner and the reviewer when the plan
+ * has them, the tool tried first when there is one, and `localFirst` when a local model works first
+ * and the routed resource takes over if it fails. Kept on the record, so what was said of a task can
+ * be set against what it ran.
+ */
+const planOf = (e) => ({
+  agent: e.primary?.agent ?? e.routing?.primaryAgent ?? null,
+  model: e.primary?.model ?? null,
+  effort: e.primary?.effort ?? null,
+  level: e.primary?.level ?? null,
+  speed: e.primary?.speed ?? null,
+  ...(e.planner ? { planner: { agent: e.planner.agent, model: e.planner.model ?? null } } : {}),
+  ...(e.reviewer ? { reviewer: { agent: e.reviewer.agent, model: e.reviewer.model ?? null } } : {}),
+  ...(e.tool ? { tool: e.tool } : {}),
+  ...(localFirstOf(e) ? { localFirst: true } : {}),
+})
+
+/**
+ * Whether a routed plan puts a local model to work first, with the routed resource taking over if
+ * it fails. The strategy's name is not enough: the router keeps LOCAL_FIRST's local step in front
+ * of the routed resource only while that local model could have taken the work itself, and gives
+ * the step to the routed resource when a swap moved the work off the local model (a capability it
+ * lacks, your feedback): a hand-over is promised only when the worker is not the routed resource
+ * (router.js promisedHandOver).
+ */
+const localFirstOf = (e) => e.plan?.strategy === 'LOCAL_FIRST' && !!e.primary?.agent && !!e.routing?.primaryAgent && e.primary.agent !== e.routing.primaryAgent
+
+/**
+ * Which milestone notice a task is owed now, if any (docs/live-agent-view.md Feature 2), from what
+ * its start reply named (noteAck: `ackGen`, the routing whose plan it named, 0 for none, and `said`,
+ * the agent and effort) against what the router planned (`plan`, `planGen`):
+ * - 'again' once a task a read pass handed back (`requeuedAt`) is routed again as work that writes,
+ *   whatever its reply named: that was the read pass's plan, or none. A read pass handed back while it
+ *   was being routed emits no routed event, so this keys off the hand-back, not off the routing count;
+ * - 'started' once the router picks for a task whose reply named no plan, or only the agent likely
+ *   to run it (`said` at `ackGen` 0, a waiting task's `likely` clause), which that agent then runs;
+ * - 'change' when the reply named another worker or effort than the plan it runs: a plan it named, as
+ *   a quick reply names the predicted one, or the likely agent of a reply that waited. A tool that
+ *   takes the work is its worker (`tool:<id>`, as a reply naming the tool notes it), at no effort;
+ * - null while the reply has said nothing yet, before the pick, once the task has ended, and once that
+ *   notice has been posted for this routing (`progressPosted`, one of each kind per plan generation).
+ * Pure, so the notice scheduler (index.js) and the tests read one rule.
+ */
+export function startedNoticeDue(t) {
+  if (!t || FINISHED.includes(t.state) || t.ackGen == null || !t.plan) return null
+  const gen = t.planGen ?? 0
+  const posted = (kind) => (t.progressPosted?.[kind] ?? -1) >= gen
+  if (t.requeuedAt) return posted('again') ? null : 'again'
+  if (!t.said?.agent) return posted('started') ? null : 'started'
+  const worker = t.plan.tool ? `tool:${t.plan.tool}` : t.plan.agent
+  const differs = t.said.agent !== worker || (t.said.effort ?? null) !== (t.plan.tool ? null : t.plan.effort ?? null)
+  // A likely agent that runs still owes the notice that the task started, which its reply promised.
+  if (!(t.ackGen >= 1) && !differs) return posted('started') ? null : 'started'
+  return differs && !posted('change') ? 'change' : null
+}
+
+/**
+ * Whether routing gave a task's work to another worker than the agent its start reply named: a guess
+ * named before the pick that routing did not pick (a quick reply's, or the likely agent of a reply that
+ * waited), since a reply names a forced agent's plan, which routing never moves off its agent, or the
+ * pick it waited for otherwise. Its change of plan is the one milestone notice Start and result only
+ * posts (decided by the owner, 9 Oct); a change of effort alone is not one. Pure, as startedNoticeDue.
+ */
+export function guessMissed(t) {
+  if (!t?.said?.agent || !t.plan) return false
+  return t.said.agent !== (t.plan.tool ? `tool:${t.plan.tool}` : t.plan.agent)
+}
+
 /** What a read pass's measured breach changed, in words: the files, a few at most. */
 const breachWords = (b) => {
   const files = b?.changed ?? []
@@ -405,6 +564,9 @@ const breachWords = (b) => {
 }
 
 const clip = (s, n) => (String(s).length > n ? `${String(s).slice(0, n - 1)}…` : String(s))
+
+/** A task's guidance as it ends: a piece still waiting for an agent was not used (steer.js nextState). */
+const endedSteers = (steers, at) => (steers ?? []).map((x) => (x?.state === 'pending' ? { ...x, state: nextState(x.state, 'ended'), endedAt: at } : x))
 
 /**
  * The fields that are written to disk, in one place: the record is the one source of truth.
@@ -427,6 +589,22 @@ const SAVED = [
   // Every pass's run id, so the history rows of a read pass and of the pass that writes after it
   // stay the task's own after a restart, when only those rows are left to match.
   'runIds',
+  // The task's own id, which no restart hands to another task as the engine does its job id; what
+  // the router planned for it when it was last routed; and the intent sample of the message that
+  // queued it, which its history row keeps.
+  'key', 'plan', 'intentSample',
+  // Whether a restart caught the result posted and not yet seen, so that its notice may be in the
+  // chat although it is on offer again (reconcile()): no other unread result has one (delivered()).
+  'postedBeforeRestart',
+  // The milestone notices posted in its chat, each kind by the routing it was posted for
+  // (claimNotice()), so a restart never posts one again.
+  'progressPosted',
+  // Whether its working attempt had started, so a restart that stops it keeps the effort only of
+  // one that ran at it (reconcile()).
+  'workStarted',
+  // What the person added to it, each piece once, its text clipped: while it waited (amend()), and
+  // while it worked (noteSteer()), with what became of each piece.
+  'steers',
 ]
 
 /** A record from disk (possibly written by an older version) with every field present. */
@@ -457,6 +635,19 @@ const hydrate = (raw) => ({
   readBreach: raw.readBreach ?? null,
   inLineMs: raw.inLineMs ?? 0,
   runIds: Array.isArray(raw.runIds) ? raw.runIds : raw.runId ? [raw.runId] : null,
+  // Every task before there were keys gets one as it loads, so every task has one.
+  key: typeof raw.key === 'string' && raw.key ? raw.key : randomUUID(),
+  plan: raw.plan ?? null,
+  intentSample: raw.intentSample ?? null,
+  // A build before this mark put a result a restart caught posted back on offer without one, so any
+  // row it wrote may have its notice in the chat.
+  postedBeforeRestart: typeof raw.postedBeforeRestart === 'boolean' ? raw.postedBeforeRestart : true,
+  progressPosted: raw.progressPosted && typeof raw.progressPosted === 'object' && !Array.isArray(raw.progressPosted) ? raw.progressPosted : {},
+  // A row a build before this mark wrote is not known to have run at its effort, so a restart that
+  // stops it names none, as that build's result named none.
+  workStarted: raw.workStarted === true,
+  // Nobody could add to a task before there was Steer.
+  steers: Array.isArray(raw.steers) ? raw.steers : [],
 })
 
 /**
@@ -468,15 +659,46 @@ const hydrate = (raw) => ({
  * @param {(w: {key: string, workspace: string} & object) => ({lowMs: number|null, highMs: number|null, text: string}|null)} [p.wait]
  *   the estimate of how long a waiting task still waits, handed where it stands (lanes waitOf()),
  *   from waits.js through index.js; none without it
+ * @param {(t: {key: string, runIds: string[]|null}) => object|null} [p.activity]
+ *   what a task's work is doing now (live.js activityOfRuns, through index.js), worked out each time
+ *   the task is read and never saved; none without it
+ * @param {(key: string) => void} [p.onDrop]  hears the key of each task that leaves the list (trim(),
+ *   clear(), or an older record under a job id the engine hands out again), so what is kept beside it
+ *   (its live transcript) goes with it
+ * @param {(t: {key: string, jobId: string, sessionId: string}) => void} [p.onRestartStopped]  hears
+ *   each task the restart stopped as the list loaded (reconcile()): no run of it ends in this process,
+ *   so what waits for its run to end (a rating of its pick, index.js noRun) is told it never will
+ * @param {(agentId: string) => boolean} [p.isLocal]  whether an agent runs a local model on this PC,
+ *   which Send now warns of (view().controls); none is without it
+ * @param {(t: {key: string, jobId: string, runIds: string[]|null}) => object|null} [p.steering]  what
+ *   Steer does now with words for a task at work (index.js, from the attempt at work), which its
+ *   dialog is worded from (view().controls.steer), read as the list is read and never saved
+ * @param {object[]} [p.takeOver]  the tasks the plugin that closed on this data folder just before
+ *   still had going (its store's handOff(), through handover.js): each is taken over as the list loads,
+ *   in place of its record on disk, so it stays at work or in line here, and its result is recorded,
+ *   saved and handed to `onSettled` here, once, as its run ends in that plugin
  */
-export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, now = Date.now, max = 100, log = () => {} }) {
+export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, activity, onDrop, onRestartStopped, isLocal = () => false, steering = () => null, takeOver = [], now = Date.now, max = 100, log = () => {} }) {
   const tasks = [] // oldest first
   // Records that came off disk. Only these can be leftovers from a previous process;
   // a task created after this call is this process's own and must not be reconciled.
   const restored = []
   let settledCount = 0
+  // Once the plugin closes or is applied again (dispose), the file is rewritten no more: the plugin
+  // that replaces this one reads it and writes its own records there, which this store does not hold.
+  let disposed = false
+  // The tasks of the plugin that closed before this one, by key, to take over as the list loads.
+  const handedIn = new Map((takeOver ?? []).filter((x) => typeof x?.task?.key === 'string').map((x) => [x.task.key, x]))
+  // This store's tasks still going as the plugin closed (handOff), by key: each waits on the shelf for
+  // the plugin applied after it ('shelved'), then is that one's ('adopted'), or is reported here as
+  // before once none took it within the bound ('expired').
+  const handedOut = new Map()
+  // The store that took this one's tasks over: what changes in them from then on is saved there, and
+  // its watchers hear it.
+  let heir = null
 
   const persist = () => {
+    if (disposed) return heir ? heir.persist() : writing
     const rows = tasks.map((t) => JSON.stringify({
       ...Object.fromEntries(SAVED.map((k) => [k, t[k] ?? null])),
       report: t.report ? clip(t.report, 20_000) : null,
@@ -501,39 +723,92 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
   // whole. Coalesce them; a state change writes immediately through persist().
   let soon = null
   const persistSoon = () => {
+    if (disposed) return heir?.persistSoon()
     if (soon) return
     soon = setTimeout(() => { soon = null; persist() }, 500)
     soon.unref?.()
   }
+  // Every write asked for so far, a coalesced progress write written now rather than later.
+  const flushed = () => {
+    if (soon) { clearTimeout(soon); soon = null; persist() }
+    return writing
+  }
 
-  const ready = readFile(file, 'utf8').then((raw) => {
+  const ready = readFile(file, 'utf8').then((raw) => raw, () => '').then((raw) => {
+    let keyed = false
+    // The tasks the plugin that closed before this one handed over are this store's from now on.
+    const adopted = adopt()
     for (const l of raw.split('\n').filter(Boolean)) {
-      try { const t = hydrate(JSON.parse(l)); tasks.push(t); restored.push(t) } catch {}
+      try {
+        const row = JSON.parse(l)
+        // One taken over is the task itself, at work or in line, in its record's place.
+        const live = adopted.get(row.key)
+        if (live) { if (!tasks.includes(live)) tasks.push(live); continue }
+        const t = hydrate(row)
+        tasks.push(t)
+        restored.push(t)
+        keyed ||= t.key !== row.key
+      } catch {}
     }
+    // One whose record the plugin that closed had not saved yet is taken over all the same.
+    for (const t of adopted.values()) if (!tasks.includes(t)) tasks.push(t)
     // trim() is the one rule for dropping rows. Cutting the oldest lines blindly would take
     // finished reports that were never posted, and the next persist() writes that loss back.
     trim()
-  }, () => {}).then(reconcile)
+    // What the tasks taken over are now is saved at once: the plugin that closed saved none of it.
+    return keyed || adopted.size > 0
+  }).then(reconcile)
+
+  /**
+   * Take over the tasks the plugin that closed before this one still had going (takeOver), by key:
+   * from now on what changes in each is saved here and heard by the watchers here, and once its run
+   * has ended in that plugin, its record is saved here and its result reported from here, once.
+   */
+  function adopt() {
+    const adopted = new Map()
+    const hooks = { persist: () => persist(), persistSoon: () => persistSoon(), tell: (t, e) => tell(t, e) }
+    const entries = [...handedIn.values()]
+    handedIn.clear()
+    for (const entry of entries) {
+      const t = entry.task
+      if (!entry.adopt?.(hooks)) continue
+      adopted.set(t.key, t)
+      Promise.resolve(entry.result).then(() => {
+        t.settledSeq = ++settledCount
+        watchers.delete(t.key)
+        persist()
+        passOn(t)
+      })
+    }
+    return adopted
+  }
 
   /**
    * A record on disk that is not terminal belongs to a process that is gone: DSH jobs do
    * not survive a restart, so that work can never finish. Leaving it "running" would show
    * a task that is silently dead, so it becomes stopped, keeps its last progress line, and
-   * stays unread so the person is told what happened to it.
+   * stays unread so the person is told what happened to it. No run of it ends in this process,
+   * so `onRestartStopped` hears each one.
    *
    * A state this build does not know is left alone: not recognising a value says nothing
    * about what happened, and rewriting it would replace a settled outcome with a false one.
+   *
+   * `keyed` says a record from before there were keys was given one as it loaded, which is saved
+   * now, so that record keeps the same key through the next restart as well.
    */
-  function reconcile() {
-    let touched = false
+  function reconcile(keyed = false) {
+    let touched = keyed
+    const stopped = []
     for (const t of restored) {
       if (!TASK_STATES.includes(t.state) || FINISHED.includes(t.state)) {
         // A result caught mid-delivery by the restart: no append is in flight any more, and
         // nothing says whether the message made it. Offering it again risks the report showing
         // twice; dropping it risks losing it for good, and the spec settles that in favour of
-        // retrying until the renderer acknowledges it.
+        // retrying until the renderer acknowledges it. It is marked as one whose notice may be in
+        // the chat, so the row the browser renders there can still acknowledge it (delivered()).
         if (t.deliveryState === 'delivering') {
           t.deliveryState = 'pending'
+          t.postedBeforeRestart = true
           t.seq = (t.seq ?? 1) + 1
           touched = true
         }
@@ -555,16 +830,57 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
             : 'the app restarted while this task waited in line, so it never started',
         progressText: started ? t.progressText ?? 'Stopped: the app was closed while this task was running' : 'Stopped: the app was closed while this task waited in line',
         ...(started ? {} : { phase: null }),
+        // One whose working attempt had not started never ran at the level it was queued at (settle).
+        ...(t.workStarted ? {} : { effort: null }),
+        // It never had a result, so no notice of it can be in the chat, and nothing posts one now.
         deliveryState: 'pending',
         deliveredAt: null,
+        postedBeforeRestart: false,
+        // Guidance no agent had read by the restart was not used.
+        steers: endedSteers(t.steers, finishedAt),
         seq: (t.seq ?? 1) + 1,
       })
       touched = true
+      stopped.push(t)
     }
     if (touched) persist()
+    // A store closed before its list loaded tells nobody: the plugin applied after it reads the list
+    // again, and the tasks this one was handed have gone on to that one (handOff).
+    if (disposed) return
+    // No run of these ended here, so whoever waits for one hears it never will. A hook that fails is
+    // only logged: the list is what matters.
+    for (const t of stopped) {
+      try { onRestartStopped?.({ key: t.key, jobId: t.jobId, sessionId: t.sessionId }) } catch (err) { log(`the restart's stop of ${t.jobId} not told: ${err.message}`) }
+    }
   }
 
   const find = (jobId) => tasks.find((t) => t.jobId === jobId)
+  // Who hears each task's router events as they happen (watch()), by task key: a set of listeners
+  // per task, let go of as the task settles.
+  const watchers = new Map()
+  const tell = (t, e) => {
+    // A task handed over as the plugin closed is heard by the watchers of the store that took it over.
+    if (heir && handedOut.get(t.key)?.state === 'adopted') heir.tell(t, e)
+    const heard = watchers.get(t.key)
+    if (!heard?.size) return
+    const seen = view(t)
+    for (const fn of [...heard]) {
+      // A listener that throws is its own: the task and the others it tells go on.
+      try { fn(e, seen) } catch (err) { log(`a watcher of ${t.jobId} failed: ${err.message}`) }
+    }
+  }
+  // A task that has settled is handed to whoever owns its conversation (onSettled), once. One handed
+  // over as the plugin closed (handOff) is the store's that took it over, which reports it as its
+  // result promise settles; the store that handed it over reports it as before only once none took it
+  // over within the bound, and then posts nothing, since it is disposed of.
+  const passOn = (t) => {
+    const out = handedOut.get(t.key)
+    if (out) { out.settled(); if (out.state !== 'expired') return }
+    try { onSettled?.(resultOf(t), t.owner) } catch (err) { log(`result ${t.jobId} not handed over: ${err.message}`) }
+  }
+  // A task that leaves the list takes what is kept beside it along (onDrop). Never throws: the list is
+  // what matters, and a hook that fails is only logged.
+  const dropped = (t) => { try { onDrop?.(t.key) } catch (err) { log(`what was kept beside ${t.jobId} not dropped: ${err.message}`) } }
   // Finished tasks are dropped oldest first. Live ones are never dropped - forgetting a running
   // task would lose its result - and neither is a finished one whose result has not been posted
   // yet: dropping that loses the only copy of the report. Bounded in practice by one such record
@@ -573,7 +889,7 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
     while (tasks.length > max) {
       const i = tasks.findIndex((t) => FINISHED.includes(t.state) && t.deliveryState === 'delivered')
       if (i < 0) break
-      tasks.splice(i, 1)
+      dropped(tasks.splice(i, 1)[0])
     }
   }
 
@@ -594,18 +910,23 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
   /** The phase a router event puts the task in, and the label the list shows. */
   const PHASE_OF = { queued: 'queued', loading: 'routing', start: 'routing', routed: 'running', attempt_start: 'running', checks: 'verifying', review: 'reviewing' }
   const STATE_OF_PHASE = { verifying: 'verifying', reviewing: 'reviewing' }
+  /** The roles of an attempt that does the task's work (router.js), as against a plan step, a review or a parallel opinion. */
+  const WORK_ROLES = new Set(['primary', 'retry', 'tool'])
 
   /**
-   * One router event for a task: the work agent, the model, the current phase and the
-   * latest progress line. Ignored once the task is terminal (see transition).
+   * One router event for a task: the work agent with its model and effort, the current phase and
+   * the latest progress line. Ignored once the task is terminal (see transition).
    */
   function applyEvent(jobId, e) {
     const t = find(jobId)
     if (!t || FINISHED.includes(t.state)) return false
     // A read pass handed the task to its workspace's line: it is waiting again, as work that writes,
-    // and the agent, model and effort the read pass took are not the ones it will run with.
+    // and the agent, model and effort the read pass took are not the ones it will run with, nor is
+    // the plan it was routed with. No working attempt of the pass that writes has started yet. An
+    // agent it was queued for (forced) is the one that pass runs on too, so it keeps it, as it keeps
+    // the level it was queued at: nobody picks it, and its row and a direct answer say so.
     if (e.type === 'access' && e.mode === 'write' && t.access === 'read') {
-      Object.assign(t, { access: 'write', accessWhy: e.why ?? null, readBreach: e.breach ?? null, agent: null, model: null, effort: t.askedEffort ?? null })
+      Object.assign(t, { access: 'write', accessWhy: e.why ?? null, readBreach: e.breach ?? null, agent: t.askedAgent ?? null, model: null, effort: t.askedEffort ?? null, workStarted: false, plan: null })
       transition(t, 'queued', { phase: 'queued', requeuedAt: now() })
     }
     if (e.type === 'final') {
@@ -615,16 +936,45 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
       t.statusReason = e.statusReason ?? null
     }
     if (e.type === 'routed') {
-      t.agent = e.tool ? `tool:${e.tool}` : e.routing?.primaryAgent ?? t.agent
+      // The agent that does the work, as the plan names it (planOf), with no effort until its working
+      // attempt starts at its own: the level the task was queued at is not the one any attempt starts
+      // at. That is the plan's worker, not the routing's pick: a LOCAL_FIRST plan keeps a local model
+      // in front of the routed resource, which works only if the local model fails, so the row, what a
+      // direct answer is told and the result name the local model the start reply named, from the
+      // pick on, and not only once its attempt starts after the baseline checks. A run the router
+      // stops for a person runs no agent (router.js stopsForPerson), so it takes none from the
+      // routing, whom the decider would have picked, and no model either: its result names nobody, as
+      // its reply did.
+      if (e.stopsForPerson) Object.assign(t, { agent: null, model: null })
+      else t.agent = e.tool ? `tool:${e.tool}` : e.primary?.agent ?? e.routing?.primaryAgent ?? t.agent
+      t.effort = null
       // What the request turned out to need, recorded on the one canonical record.
       if (e.routing?.capability) t.capability = e.routing.capability
+      // What it runs as, and which of the task's routings this is: a task a read pass hands back
+      // after it was routed (its agent said it needs to change files or could not be started
+      // locked, or no agent that can be locked was left to try) is routed again as work that
+      // writes, its second; one handed back while it was being routed (the routing named work that
+      // may write, or picked an agent that cannot be locked, or no agent could be locked at all)
+      // emits no routed event then, and is routed once. A run the router stops for a person runs
+      // nothing (router.js stopsForPerson), so it has no plan: no reply names one, and no notice
+      // says one started.
+      t.plan = e.stopsForPerson ? null : planOf(e)
+      if (t.plan) t.planGen = (t.planGen ?? 0) + 1
     }
     // Work roles only. This used to take every attempt, so a run that ended in a review
-    // reported the reviewer as the agent, and the list said "claude" for work deepseek did.
-    if (e.type === 'attempt_start' && (e.role === 'primary' || e.role === 'retry')) t.agent = e.agent
-    if (e.type === 'attempt_end') {
+    // reported the reviewer as the agent, and the list said "claude" for work deepseek did; the
+    // model and effort went on doing so, and named the worker with its reviewer's model and effort
+    // in the list and in the result's head. The effort is the one the work attempt starts at, none
+    // for an agent that takes none (a local model, a tool), whatever level the task was queued
+    // with; the model, which only the attempt's end records, is never another agent's.
+    if (e.type === 'attempt_start' && WORK_ROLES.has(e.role)) {
+      if (e.agent !== t.agent) t.model = null
+      Object.assign(t, { agent: e.agent, effort: e.effort ?? null, workStarted: true })
+    }
+    // An end that names no role is taken as the work's, as every end was before.
+    if (e.type === 'attempt_end' && (e.attempt?.role == null || WORK_ROLES.has(e.attempt.role))) {
       t.model = e.attempt?.model ?? t.model
-      t.effort = e.attempt?.effort ?? t.effort
+      Object.assign(t, { effort: e.attempt?.effort ?? null, workStarted: true })
     }
     const phase = PHASE_OF[e.type]
     if (phase) {
@@ -649,23 +999,33 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
    * Start `task` as a background job owned by `owner` (the session's live root agent).
    * Returns the task, or null when background jobs are unavailable (caller runs it blocking).
    */
-  function enqueue({ owner, sessionId, workspace, task, forceAgent, effort, mode, decider, capability, taskName, executor, agent, modalities, readVerdict, access, accessWhy }) {
+  function enqueue({ owner, sessionId, workspace, task, forceAgent, effort, mode, decider, capability, taskName, executor, agent, modalities, readVerdict, access, accessWhy, intentSample }) {
     const jobs = getJobs()
     if (!jobs) return null
     const ac = new AbortController()
     let finish
     const done = new Promise((r) => { finish = r })
     const t = {
+      // Minted here, never reused: the engine counts job ids from 1 again after a restart.
+      key: randomUUID(), plan: null, planGen: 0, intentSample: intentSample ?? null,
+      // What its start reply named, once it is out (noteAck()), and the milestone notices posted since.
+      ackGen: null, said: null, progressPosted: {},
       jobId: null, sessionId, workspace,
       taskName: taskName ?? clip(String(task).replace(/\s+/g, ' '), 80), taskText: task, task,
       capability: capability ?? null, executor: executor ?? null, modalities: modalities ?? ['text'],
       state: 'queued', phase: 'queued', agent: agent ?? forceAgent ?? null, model: null, mode: mode ?? 'auto', decider: decider ?? 'jev', effort: effort && effort !== 'auto' ? effort : null,
       // The effort it was queued with, kept for a writer pass after a read pass took another.
       askedEffort: effort && effort !== 'auto' ? effort : null,
+      // The agent it was queued for, when it was forced to one, kept the same way.
+      askedAgent: agent ?? forceAgent ?? null,
+      // Whether a working attempt has started at its own effort (applyEvent): until one has, the
+      // effort shown is the level it was queued at, which a task that ends first never ran at (settle).
+      workStarted: false,
       readVerdict: readVerdict ?? null, access: access === 'read' ? 'read' : 'write', accessWhy: accessWhy ?? null, requeuedAt: null, inLineMs: 0,
       queuedAt: now(), startedAt: null, finishedAt: null, terminalReason: null, finalStatus: null,
       progressText: 'Waiting', lastLine: 'Waiting', report: null, runId: null,
-      deliveryState: 'pending', deliveredAt: null, seq: 1, settledSeq: 0,
+      deliveryState: 'pending', deliveredAt: null, postedBeforeRestart: false, seq: 1, settledSeq: 0,
+      steers: [],
       owner, ac, out: '',
     }
     let cursor = 0
@@ -683,6 +1043,8 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
       })
     } catch (err) {
       if (/unavailable|job controller/i.test(err.message)) return null
+      // The engine's own words tell a model to use job_kill; a person is told what they can do.
+      if (/job limit reached/i.test(err.message)) throw new Error(jobLimitWords(err.message), { cause: err })
       throw err
     }
     t.jobId = id
@@ -690,14 +1052,16 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
     // waiters as already reported when it settles, which is what stops tool-jobs posting its
     // own notice - that notice would wake the model for a result this plugin delivers itself.
     try { jobs.wait?.(id, 86_400_000, owner)?.catch?.(() => {}) } catch {}
-    for (let i = tasks.length - 1; i >= 0; i--) if (tasks[i].jobId === id) tasks.splice(i, 1) // an id reused after a restart
+    for (let i = tasks.length - 1; i >= 0; i--) if (tasks[i].jobId === id) dropped(tasks.splice(i, 1)[0]) // an id reused after a restart
     tasks.push(t)
     persist()
     trim()
     const say = (text) => { t.progressText = text; t.out += `${text}\n` }
+    // Whoever watches the task hears each event once the record holds it.
     const emit = (e) => {
       applyEvent(t.jobId, e)
       say(e.text ?? line(e))
+      tell(t, e)
     }
     const settle = (state, report, detail) => {
       if (FINISHED.includes(t.state)) return // idempotent: a second settle cannot re-report
@@ -710,14 +1074,23 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
         // no Waiting phase: the row would read Stopped and Waiting at once.
         ...(t.startedAt && t.state !== 'queued' ? {} : { phase: null }),
         ...(t.startedAt && t.state === 'queued' && t.requeuedAt ? { inLineMs: (t.inLineMs ?? 0) + now() - t.requeuedAt } : {}),
+        // One that ends before its working attempt starts (removed from the line, refused before it
+        // was routed, a forced agent included) never ran at the level it was queued at, so its row
+        // and its result name no effort.
+        ...(t.workStarted ? {} : { effort: null }),
+        // Guidance still waiting for an agent as the task ends was not used, which its result says.
+        steers: endedSteers(t.steers, now()),
       })
       if (report) t.out += `\n${report}\n`
       say({ completed: 'Done', needs_human: 'Needs input', paused_limit: 'Paused: agents at their limits', failed: `Failed: ${detail ?? ''}`, stopped: 'Stopped' }[state] ?? state)
       persist()
       finish({ status: JOB_STATUS[state] ?? 'completed', ...(report ? { output: report } : {}), ...(detail ? { detail } : {}) })
+      // Its watchers hear that it ended, once, and are let go: nothing more is said of a settled task.
+      tell(t, { type: 'settled', state })
+      watchers.delete(t.key)
       // Hand the finished result to whoever owns the conversation. It is delivered outside the
       // job, and a failure there must never stop the task from settling.
-      try { onSettled?.(resultOf(t), t.owner) } catch (err) { log(`result ${t.jobId} not handed over: ${err.message}`) }
+      passOn(t)
     }
     // Started here, not a tick later: run() joins the task's line before it does anything else, so
     // by the time enqueue returns the task's place is read off the line (the chat's queued line
@@ -746,7 +1119,7 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
         // A task stopped before the lane let it in never ran, and its message says so: nothing in
         // the workspace can have changed, which a person deciding whether to look should know.
         (err) => (ac.signal.aborted
-          ? settle('stopped', null, !t.startedAt ? 'removed from the line before it started' : t.state === 'queued' ? (t.readBreach ? `removed from the line after its read pass, during which ${breachWords(t.readBreach)}` : 'removed from the line after its read pass, before it changed anything') : 'stopped by the user')
+          ? settle('stopped', null, !t.startedAt ? 'removed from the line before it started' : t.state === 'queued' ? (t.readBreach ? `removed from the line after its read pass, during which ${breachWords(t.readBreach)}` : 'removed from the line after its read pass, before it changed anything') : t.stopWhy ?? 'stopped by the user')
           : settle('failed', `jev-router: ${err?.message ?? err}`, err?.message ?? String(err))),
       )
     return t
@@ -778,32 +1151,91 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
     const { holder, aheadWho, held, ...seen } = w
     return { ...seen, since: t.requeuedAt ?? t.queuedAt, placeText: placeText(w), reason, facts, estimate, text: waitText(reason, estimate, facts) }
   }
+  // How long a task has run: none while it waits, a task back in line after its read pass included,
+  // since it is not running; its time back in line is left out once it runs again or ends.
+  const ranMs = (t) => (t.startedAt && t.state !== 'queued' ? (t.finishedAt ?? now()) - t.startedAt - (t.inLineMs ?? 0) : null)
+  /**
+   * What Send now does for a waiting task, and the facts its dialogs are worded from (client.js),
+   * read off the line as it is now. `sendNow` is 'slot' when it waits only for a free slot, or behind
+   * the first of its own line who does, as a read-only task always does, so it can start at once;
+   * 'workspace' or 'chat' when a task or a run from the chat holds its folder, which only Put first in
+   * line, or stopping that task, gets it past; null for a task in no line. `holder` is the task that
+   * holds its folder (`heldBy` says which kind of run does, a read-only task running beside it), `ahead`
+   * the tasks in front of it in its own line and `chatAhead` the runs from the chat there, `held` the
+   * runs that hold a slot now and `max` the cap, `local` a task running a local model on this PC now,
+   * and `forcedLocal` whether it was sent to a local model itself.
+   */
+  const controlsOf = (t) => {
+    const w = t.state === 'queued' ? lanes.waitOf(laneOf(t), t.jobId) : null
+    if (!w) {
+      // A task at work says what Steer does now with words for it.
+      const steer = t.state !== 'queued' && !FINISHED.includes(t.state) ? steerOf(t) : null
+      return { sendNow: null, ...(steer ? { steer } : {}) }
+    }
+    const ids = new Set(tasks.map((x) => x.jobId))
+    const folder = lanes.holder(laneKey(t.workspace))
+    const running = tasks.find((x) => x !== t && !FINISHED.includes(x.state) && x.state !== 'queued' && typeof x.agent === 'string' && isLocal(x.agent))
+    const { held, max } = lanes.slots()
+    return {
+      sendNow: t.access === 'read' || w.why === 'cap' || w.why === 'line' ? 'slot' : w.why,
+      holder: folder?.kind === 'workspace' && ids.has(folder.id) ? folder.id : null,
+      heldBy: folder ? (folder.kind === 'chat' ? 'chat' : 'task') : null,
+      ahead: lanes.ahead(laneOf(t), t.jobId).filter((id) => ids.has(id)),
+      chatAhead: w.chatAhead ?? 0,
+      held, max,
+      local: running?.jobId ?? null,
+      forcedLocal: typeof t.askedAgent === 'string' && isLocal(t.askedAgent),
+    }
+  }
+  /**
+   * What Steer does now with words for a task at work (index.js steering): the agent at work takes
+   * them, or why they wait for its next attempt, in the words its dialog shows. Worked out as it is
+   * read and never saved, and left out when it cannot be, as activity is.
+   */
+  const steerOf = (t) => {
+    try { return steering(t) ?? null } catch (err) { log(`no steer facts for ${t.jobId}: ${err.message}`); return null }
+  }
+  /**
+   * What the task's work is doing now (live.js, through index.js), worked out as it is read and never
+   * saved: each event would otherwise rewrite tasks.jsonl. Extra, as an estimate is: one that cannot be
+   * worked out is logged and left out, and never takes the task list down with it.
+   */
+  const activityOfTask = (t) => {
+    if (!activity || !t.runIds?.length) return null
+    try { return activity(t) ?? null } catch (err) { log(`no live activity for ${t.jobId}: ${err.message}`); return null }
+  }
   const view = (t) => ({
-    jobId: t.jobId, sessionId: t.sessionId, workspace: t.workspace,
+    key: t.key, jobId: t.jobId, sessionId: t.sessionId, workspace: t.workspace,
     task: t.taskText, taskName: t.taskName, taskText: t.taskText,
     capability: t.capability, executor: t.executor,
     state: t.state, status: t.state, phase: t.phase, position: position(t), queuePosition: position(t),
     mode: t.mode, decider: t.decider, agent: t.agent, model: t.model, effort: t.effort,
+    plan: t.plan ?? null, planGen: t.planGen ?? 0,
+    ackGen: t.ackGen ?? null, said: t.said ?? null, progressPosted: t.progressPosted ?? {},
     readVerdict: t.readVerdict, access: t.access, accessWhy: t.accessWhy, requeuedAt: t.requeuedAt, readBreach: t.readBreach ?? null, inLineMs: t.inLineMs ?? 0,
     queuedAt: t.queuedAt, startedAt: t.startedAt, finishedAt: t.finishedAt,
     terminalReason: t.terminalReason, finalStatus: t.finalStatus, statusReason: t.statusReason,
     progressText: t.progressText, lastLine: t.progressText,
     reportAvailable: !!t.report, runId: t.runId, runIds: t.runIds ?? (t.runId ? [t.runId] : []),
     deliveryState: t.deliveryState, deliveredAt: t.deliveredAt, seq: t.seq,
-    // None while it waits, a task back in line after its read pass included: it is not running. Its
-    // time back in line is left out once it runs again or ends.
-    durationMs: t.startedAt && t.state !== 'queued' ? (t.finishedAt ?? now()) - t.startedAt - (t.inLineMs ?? 0) : null,
+    durationMs: ranMs(t),
     waiting: waitingOf(t),
+    activity: activityOfTask(t),
+    controls: controlsOf(t),
+    // Each piece of the person's guidance with what became of it, in the words its row shows.
+    steers: (t.steers ?? []).map((x) => ({ ...x, words: steerStateWords(x) })),
   })
 
-  /** What the chat needs to render one finished task as its own message. */
+  /** What the chat needs to render one finished task as its own message, the effort and how long it ran included. */
   const resultOf = (t) => ({
     jobId: t.jobId, sessionId: t.sessionId, workspace: t.workspace,
     task: t.taskText, taskName: t.taskName, capability: t.capability,
-    agent: t.agent, model: t.model, decider: t.decider, state: t.state, status: t.state,
+    agent: t.agent, model: t.model, effort: t.effort ?? null, decider: t.decider, state: t.state, status: t.state,
     terminalReason: t.terminalReason, finalStatus: t.finalStatus,
     report: t.report,
-    finishedAt: t.finishedAt, queuedAt: t.queuedAt, deliveryState: t.deliveryState, seq: t.seq,
+    finishedAt: t.finishedAt, queuedAt: t.queuedAt, durationMs: ranMs(t), deliveryState: t.deliveryState, seq: t.seq,
+    // What became of the person's guidance, a line of its head each (delivery.js).
+    steers: t.steers ?? [],
   })
 
   /**
@@ -824,12 +1256,112 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
      * second). This is how to know the file holds the latest state: polling the file races the
      * writer, and on Windows a reader holding the file open is exactly what makes its rename fail.
      */
-    flushed() {
-      if (soon) { clearTimeout(soon); soon = null; persist() }
-      return writing
+    flushed,
+    /**
+     * The plugin is closing or applied again: every write asked for so far, a progress write still
+     * waiting to be coalesced included, goes to the file, and none after it. A task that settles
+     * later and every other change are kept in memory only, since a rewrite from them would put back
+     * what this store holds over the records the plugin that replaces it has written, and no result
+     * or notice is claimed after, since its claim could not be saved. Resolves once those writes have
+     * landed or failed and been logged.
+     */
+    dispose() {
+      const last = flushed()
+      disposed = true
+      return last
+    },
+    /**
+     * The plugin is closing: each task still going, in line or at work, for the plugin applied after
+     * it on this data folder to take over (handover.js), with the promise of its result, which settles
+     * once its run has ended and its record says how. Its run goes on here, in this plugin's closures;
+     * once taken over (`adopt`), what changes in it is saved by the store that took it, which reports
+     * its result. One no store takes over within the bound (`expire`) is reported here as before.
+     */
+    handOff() {
+      // What this store was handed and has not taken over yet, as one closed before its list loaded,
+      // goes on to the plugin applied after it as it came.
+      const out = [...handedIn.values()]
+      handedIn.clear()
+      for (const t of tasks) {
+        // A record from disk has no run in this process, and one handed off already waits on its shelf.
+        if (FINISHED.includes(t.state) || !t.ac || handedOut.has(t.key)) continue
+        let settled
+        const result = new Promise((r) => { settled = r })
+        const h = { state: 'shelved', settled }
+        handedOut.set(t.key, h)
+        out.push({
+          key: t.key, jobId: t.jobId, task: t, result,
+          adopt: (hooks) => {
+            if (h.state !== 'shelved') return false
+            h.state = 'adopted'
+            heir ??= hooks
+            return true
+          },
+          expire: () => {
+            if (h.state !== 'shelved') return
+            h.state = 'expired'
+            if (FINISHED.includes(t.state)) passOn(t)
+          },
+        })
+      }
+      return out
     },
     enqueue,
     applyEvent,
+    /**
+     * Hear the router events of the task with this key as they happen: `fn(event, task)`, with the
+     * task as the list shows it once the event is on its record. As the task settles `fn` hears
+     * `{ type: 'settled', state }` once more and is let go, so nothing is kept for a task that has
+     * ended. Returns the unsubscribe; a key naming no task still waiting or running hears nothing.
+     */
+    watch(key, fn) {
+      const t = tasks.find((x) => x.key === key)
+      if (!t || FINISHED.includes(t.state) || typeof fn !== 'function') return () => {}
+      if (!watchers.has(key)) watchers.set(key, new Set())
+      const heard = watchers.get(key)
+      // A listener of its own per call, so a function watching twice is let go by each call alone.
+      const listener = (e, seen) => fn(e, seen)
+      heard.add(listener)
+      return () => { heard.delete(listener); if (!heard.size && watchers.get(key) === heard) watchers.delete(key) }
+    },
+    /** How many listeners watch tasks now (watch()): none once every task watched has settled. */
+    get watching() {
+      let n = 0
+      for (const heard of watchers.values()) n += heard.size
+      return n
+    },
+    /**
+     * What the start reply named of the task with this key, once it is out: `gen`, the routing whose
+     * plan it named (1 for a forced agent's plan, a pick it waited for or the pick it predicted, 0 for
+     * none), and `said`, the agent and effort it named, at `gen` 0 the agent a waiting task's reply
+     * said was likely. Until this is noted no milestone notice is due (startedNoticeDue).
+     * False for a key that names no task still waiting or running.
+     */
+    noteAck(key, { gen = 0, said = null } = {}) {
+      const t = tasks.find((x) => x.key === key)
+      if (!t || FINISHED.includes(t.state)) return false
+      t.ackGen = Number.isInteger(gen) && gen >= 0 ? gen : 0
+      t.said = typeof said?.agent === 'string' && said.agent ? { agent: said.agent, effort: said.effort ?? null } : null
+      return true
+    },
+    /**
+     * Claim the milestone notice of `kind` for the task's current routing. Only the first caller gets
+     * true, so two triggers at once cannot post one notice twice, and the claim is saved
+     * (progressPosted), so a restart never posts it again. False for a key that names no task still
+     * waiting or running.
+     */
+    claimNotice(key, kind) {
+      const t = tasks.find((x) => x.key === key)
+      // A store disposed of could not save the claim, so it makes none.
+      if (disposed || !t || FINISHED.includes(t.state) || typeof kind !== 'string' || !kind) return false
+      const gen = t.planGen ?? 0
+      if ((t.progressPosted?.[kind] ?? -1) >= gen) return false
+      t.progressPosted = { ...(t.progressPosted ?? {}), [kind]: gen }
+      persist()
+      return true
+    },
+    /** The task with this key as the list shows it, or null: a key, unlike a job id, is never handed out twice. */
+    byKey: (key) => { const t = tasks.find((x) => x.key === key); return t ? view(t) : null },
     get: (jobId) => { const t = find(jobId); return t ? view(t) : null },
     list: () => tasks.map(view),
     report: (jobId) => find(jobId)?.report ?? null,
@@ -847,7 +1379,9 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
      */
     delivering(jobId) {
       const t = find(jobId)
-      if (!t || t.deliveryState !== 'pending') return false
+      // A store disposed of could not save the claim, and a result posted without it would read as
+      // never posted once the plugin starts again, so nothing is claimed: it stays unread on disk.
+      if (disposed || !t || t.deliveryState !== 'pending') return false
       t.deliveryState = 'delivering'
       persist()
       return true
@@ -856,11 +1390,24 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
      * The conversation has taken the result's message. This is the only thing that marks a
      * result read, so a duplicate notice can retry delivery without the report ever being
      * shown twice. Safe to call twice.
+     *
+     * Only a result whose notice can be in the chat is taken: one claimed for delivery (delivering()),
+     * or one a restart caught posted and not yet seen (postedBeforeRestart). A task still waiting or
+     * running has no result, and any other unread one has no notice: it waits to be posted, its post
+     * failed, or the app closed before it was posted (a task the restart stopped included), after
+     * which nothing posts it. All of them are refused: the engine hands a job id out again after a
+     * restart, and an old notice in the chat under that id, even one naming the same task, must never
+     * mark the new task's result read before it has posted. `name`, when given, must also be the
+     * task's own as its notice summary carries it (nameKey), and `sessionId`, when given, the chat the
+     * task is in, since another chat can hold such an old notice too.
      */
-    delivered(jobId) {
+    delivered(jobId, { name, sessionId } = {}) {
       const t = find(jobId)
-      if (!t) return false
+      if (!t || !FINISHED.includes(t.state)) return false
+      if (typeof name === 'string' && nameKey(name) !== nameKey(t.taskName)) return false
+      if (typeof sessionId === 'string' && sessionId !== t.sessionId) return false
       if (t.deliveryState === 'delivered') return false
+      if (t.deliveryState === 'pending' && !t.postedBeforeRestart) return false
       t.deliveryState = 'delivered'
       t.deliveredAt = now()
       persist()
@@ -877,13 +1424,15 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
     },
     /**
      * Stop a task. `onlyIfWaiting` is Remove: a task that left the line and started while the person
-     * was confirming is not stopped under words that said nothing had changed ('started').
+     * was confirming is not stopped under words that said nothing had changed ('started'). `why` is
+     * what a task at work says it stopped for, in its row and its result, instead of the plain words.
      */
-    stop(jobId, { onlyIfWaiting = false } = {}) {
+    stop(jobId, { onlyIfWaiting = false, why = null } = {}) {
       const t = find(jobId)
       if (!t) throw Object.assign(new Error('no task with that id'), { status: 404 })
       if (FINISHED.includes(t.state)) return 'already-finished'
       if (onlyIfWaiting && t.state !== 'queued') return 'started'
+      if (typeof why === 'string' && why) t.stopWhy = why
       try { getJobs()?.kill(jobId, t.owner, 'stopped by the user') } catch {}
       // A record restored from disk has no live controller: there is nothing running to abort.
       t.ac?.abort(new Error('stopped by the user'))
@@ -893,6 +1442,90 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
     stopRun(runId) {
       const t = tasks.find((x) => x.runId === runId && !FINISHED.includes(x.state))
       return t ? this.stop(t.jobId) : null
+    },
+    /**
+     * Send now: start the waiting task with this key at once, ahead of its line and over the cap on
+     * tasks at once if it must be (lanes admit()). 'started'; 'workspace-busy' or 'chat-busy' while a
+     * task or a run from the chat holds its folder, and nothing moves; 'not-waiting' when it is in no
+     * line, as when its lane has just let it in and its record does not say so yet; 'already-finished'.
+     *
+     * With `stop` naming the task that holds its folder (Stop it and start this), that task is stopped,
+     * saying `why` when given, and this one goes first in line and starts the moment the folder is
+     * free, whatever the cap: 'stopping'. A folder another run holds by then is 'workspace-busy' or
+     * 'chat-busy' as above, and nothing is stopped.
+     */
+    startNow(key, { stop: holder = null, why = null } = {}) {
+      const t = tasks.find((x) => x.key === key)
+      if (!t) throw Object.assign(new Error('no task with that key'), { status: 404 })
+      if (FINISHED.includes(t.state)) return 'already-finished'
+      if (t.state !== 'queued') return 'not-waiting'
+      // Only a task still going can be stopped for it; one that has ended may have freed the folder.
+      const other = holder ? find(holder) : null
+      const after = other && !FINISHED.includes(other.state) ? holder : null
+      const r = lanes.admit(laneOf(t), t.jobId, after ? { after } : {})
+      if (r.result === 'busy') return r.kind === 'chat' ? 'chat-busy' : 'workspace-busy'
+      if (r.result !== 'next') return r.result
+      this.stop(after, { why })
+      return 'stopping'
+    },
+    /**
+     * What the task with this key was queued with, for a task Steer queues after it or in its place:
+     * the agent its chat runs on (`owner`), its chat, folder, text, mode, decider and kinds of input,
+     * the agent it works on now (none for a tool's pick, or before it is picked) and the effort it was
+     * queued with. Null for a key that names no task, or a task from before the app restarted, which
+     * has no chat agent to queue for.
+     */
+    queuedWith(key) {
+      const t = tasks.find((x) => x.key === key)
+      if (!t?.owner) return null
+      const agent = typeof t.agent === 'string' && t.agent && !t.agent.startsWith('tool:') ? t.agent : null
+      return { owner: t.owner, sessionId: t.sessionId, workspace: t.workspace, task: t.task ?? t.taskText, mode: t.mode, decider: t.decider, modalities: t.modalities ?? ['text'], agent, effort: t.askedEffort ?? null }
+    },
+    /**
+     * Steer a task that has not started: the person's words go onto what its run is sent, after a blank
+     * line, as `Added while it waited: <text>`, so its agent is picked with them, and onto its steers,
+     * which are saved. It keeps its place in line. 'added'; 'started' once its lane has let it in, even
+     * before its record says so, since its run may have read its text by then; 'already-finished'.
+     * A task handed back by its read pass, on its way to its folder's line, takes them for the pass
+     * that writes.
+     */
+    amend(key, text) {
+      const t = tasks.find((x) => x.key === key)
+      if (!t) throw Object.assign(new Error('no task with that key'), { status: 404 })
+      const words = typeof text === 'string' ? text.trim() : ''
+      if (!words) throw Object.assign(new Error('text: the words to add to the task'), { status: 400 })
+      if (FINISHED.includes(t.state)) return 'already-finished'
+      if (t.state !== 'queued' || lanes.position(laneOf(t), t.jobId) === 0) return 'started'
+      const added = `\n\nAdded while it waited: ${words}`
+      Object.assign(t, {
+        task: `${t.task ?? t.taskText}${added}`,
+        taskText: `${t.taskText}${added}`,
+        steers: [...(t.steers ?? []), { id: randomUUID(), at: now(), text: clip(words, 2000), how: 'amend', state: 'added' }],
+        seq: t.seq + 1,
+      })
+      persist()
+      return 'added'
+    },
+    /**
+     * Note a piece of the person's guidance for the task with this key, given while it works: made
+     * from `patch` when the task has no piece of that id, else changed by it, as index.js moves it
+     * through steer.js's outcome machine, and saved, so its row and its result say what became of it
+     * after a restart too. Its text is clipped as amend() clips it. The piece as it is now, or null for
+     * a key that names no task, and for a new piece of a task that has ended, which takes no more
+     * words; a piece it holds still moves on.
+     */
+    noteSteer(key, id, patch = {}) {
+      const t = tasks.find((x) => x.key === key)
+      if (!t || typeof id !== 'string' || !id) return null
+      const list = t.steers ?? []
+      const i = list.findIndex((x) => x?.id === id)
+      if (i < 0 && FINISHED.includes(t.state)) return null
+      const piece = { ...(i >= 0 ? list[i] : { at: now() }), ...patch, id }
+      if (typeof patch.text === 'string') piece.text = clip(patch.text.trim(), 2000)
+      t.steers = i >= 0 ? list.map((x, j) => (j === i ? piece : x)) : [...list, piece]
+      t.seq += 1
+      persist()
+      return piece
     },
     reorder(workspace, order) {
       if (typeof workspace !== 'string' || !workspace) throw new Error('workspace: the task folder')
@@ -905,7 +1538,7 @@ export function createTasks({ file, lanes, jobs: getJobs, run, onSettled, wait, 
     clear(jobIds) {
       validJobIds(jobIds)
       const gone = new Set(jobIds.filter((id) => FINISHED.includes(find(id)?.state)))
-      for (let i = tasks.length - 1; i >= 0; i--) if (gone.has(tasks[i].jobId) && FINISHED.includes(tasks[i].state)) tasks.splice(i, 1)
+      for (let i = tasks.length - 1; i >= 0; i--) if (gone.has(tasks[i].jobId) && FINISHED.includes(tasks[i].state)) dropped(tasks.splice(i, 1)[0])
       persist()
       return [...gone]
     },

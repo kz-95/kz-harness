@@ -34,7 +34,7 @@ const helpers = (() => {
   assert.ok(start > 0 && end > start, 'the budget helper block is marked')
   // What the speed benchmark adds to the block is read only where it is there, so the whole file
   // still loads against a page without it, and the tests of it fail by their own assertions.
-  const added = ['SPEED_DEPTH', 'SPEED_PREDICT', 'speedLine', 'speedButtonTitle', 'speedRunText'].map((k) => `${k}: typeof ${k} === 'undefined' ? undefined : ${k}`).join(', ')
+  const added = ['SPEED_DEPTH', 'SPEED_PREDICT', 'speedLine', 'speedButtonTitle', 'speedRunText', 'outputLine', 'heldLine'].map((k) => `${k}: typeof ${k} === 'undefined' ? undefined : ${k}`).join(', ')
   return new Function(`${client.slice(start, end)}\nreturn { MIN_CTX, BUDGET_ROWS, gbText, ctxText, budgetCells, budgetPatch, budgetError, modelFit, budgetNotes, modelName, chatModelOptions, ${added} }`)()
 })()
 
@@ -60,17 +60,27 @@ const PC = {
 }
 
 /**
- * A stand-in for llama-server that prints `report` as its load report and answers /health at once.
+ * A stand-in for llama-server that prints `report` as its load report and answers /health at once,
+ * and /v1/models, with the start's key only, naming its --alias, as llama-server b10964 does.
  * Its pid is one no process can have, since the Windows stop path calls taskkill on it.
  */
 function fakeEngine(report) {
-  const spawn = () => {
+  let run = null
+  const spawn = (cmd, args, opts = {}) => {
     const child = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, pid: 2147483647 })
     child.kill = () => { child.exitCode = 0; child.emit('exit', 0) }
     setImmediate(() => { for (const l of report()) child.stderr.emit('data', `${l}\n`) })
+    run = { alias: args[args.indexOf('--alias') + 1], key: opts.env?.LLAMA_API_KEY }
     return child
   }
-  return { spawn, fetch: async () => { await new Promise((r) => setImmediate(r)); return { ok: true } } }
+  const fetch = async (url = '', init = {}) => {
+    await new Promise((r) => setImmediate(r))
+    if (String(url).endsWith('/v1/models')) {
+      return init.headers?.authorization === `Bearer ${run?.key}` ? Response.json({ object: 'list', data: [{ id: run.alias }] }) : Response.json({ error: { code: 401, message: 'Invalid API Key' } }, { status: 401 })
+    }
+    return String(url).endsWith('/health') ? Response.json({ status: 'ok' }) : { ok: true }
+  }
+  return { spawn, fetch }
 }
 
 /** The engine (unless `engine` is false) and the models in `models` (Big and Small unless said) installed, as a hand install leaves them. */
@@ -553,6 +563,11 @@ async function card(extra, opts) {
         // As index.js answers it: ok, or the refusal with its status.
         benchmarks.push('cancel')
         try { local.cancelBenchmark(); body = { ok: true } } catch (e) { code = e.status ?? 400; body = { error: e.message } }
+      } else if (method === 'POST' && path === '/jev-router/local/benchmark/accept-output') {
+        // As index.js answers it: ok, or the refusal with its status.
+        const b = JSON.parse(init.body)
+        benchmarks.push({ accept: b.id })
+        body = await local.acceptOutput(b.id).then(() => ({ ok: true }), (e) => { code = e.status ?? 400; return { error: e.message } })
       } else code = 404
       const held = holds[method].shift()
       if (held) { busy--; await held; busy++ }
@@ -1141,4 +1156,112 @@ test('the card benchmarks a model from its row or every one from its head, shows
   assert.deepEqual(page.alerts(), ['A local model is answering right now; a speed benchmark would unload it mid-answer. Try again when it is idle.'])
   conn.release()
   await page.close()
+})
+
+// ---------- a mixture-of-experts model on the card and in the install picker ----------
+
+// The ~30B candidate as config/local-models.json ships it: no size and no SHA-256 until scripts/pin-model.mjs pins it.
+const MOE = {
+  id: 'qwen3-30b-a3b', kind: 'model', name: 'Qwen3 30B A3B', source: 'https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf', hfRepo: 'Qwen/Qwen3-30B-A3B-GGUF', file: 'Qwen3-30B-A3B-Q4_K_M.gguf',
+  license: 'Apache-2.0', reliability: 'official-stable', verified: false, role: 'best-quality', rank: 0, moe: { totalParamsB: 30.5, activeParamsB: 3.3, expertShare: 0.95, layers: 48 }, kvGbPerToken: 0.000091552734375, contextSize: 16384,
+}
+const PIN_LINE = 'not checked yet: run node scripts\\pin-model.mjs qwen3-30b-a3b'
+
+test('the Local models card lists a mixture-of-experts model before it is installed: where it would run on this PC, or why it would not, and what pins one not checked yet', async () => {
+  const lines = async (extra) => {
+    const c = await card({ modules: [...MODULES, MOE], ...extra })
+    const list = c.all().find((n) => n.type === 'ul' && n.props['aria-label'] === 'Mixture-of-experts models not installed')
+    assert.ok(list, 'the card lists the models not installed yet that keep their experts in RAM')
+    return nodes(list).filter((n) => n.type === 'li').map((li) => li.children[0].children.map(textOf))
+  }
+  // This PC, the 4 GB laptop with 24 GB: every expert in RAM, the rest on the GPU.
+  assert.deepEqual(await lines(), [['Qwen3 30B A3Bnot installed', 'Fits this PC: experts in RAM (about 16.5 GB), the rest on the GPU (~16 words/s est.)', 'Not checked yet: run node scripts\\pin-model.mjs qwen3-30b-a3b']])
+  // With 16 GB it would not hold the experts beside Windows and KzH.
+  assert.deepEqual(await lines({ specs: async () => ({ ...PC, ramGB: 15.7 }) }), [['Qwen3 30B A3Bnot installed', "Won't fit: needs about 23 GB RAM, 16.5 GB for its experts and 6 GB for Windows and KzH, and this PC has 16 GB", 'Not checked yet: run node scripts\\pin-model.mjs qwen3-30b-a3b']])
+})
+
+test('the install picker shows a candidate row with its fit and what pins it, and does not let it be picked: Install sends the suggestions alone', async () => {
+  const { local } = await installed({ modules: [...MODULES, MOE] }, { models: [] })
+  const posts = []
+  const fetch = async (path, init = {}) => {
+    const method = init.method ?? 'GET'
+    let body = { error: 'not found' }
+    let code = 200
+    if (method === 'GET' && path === '/jev-router/local/catalog') body = await localJs.buildCatalog(local, PC)
+    else if (method === 'GET' && path === '/jev-router/local') body = await local.status()
+    else if (method === 'POST' && path === '/jev-router/local/install') { posts.push(JSON.parse(init.body)); body = { ids: [] } }
+    else code = 404
+    const text = JSON.stringify(body)
+    return { ok: code === 200, status: code, json: async () => JSON.parse(text) }
+  }
+  const { React, mount } = statefulReact()
+  const { InstallPicker } = loadPlugin(React, { fetch, document: { hidden: false }, setInterval: () => 1, clearInterval: () => {} }).__test
+  assert.equal(typeof InstallPicker, 'function', 'the install picker can be rendered on its own')
+  const view = mount(InstallPicker, { onClose: () => {} })
+  // Until the catalog has come back and been rendered, however long the PC takes to read it.
+  for (const until = Date.now() + 10_000; Date.now() < until && !nodes(view.tree).some((n) => n.type === 'input' && n.props.id === 'jevi-llm-qwen3-30b-a3b');) await new Promise((r) => setTimeout(r, 10))
+  const all = nodes(view.tree)
+  const box = all.find((n) => n.type === 'input' && n.props.id === 'jevi-llm-qwen3-30b-a3b')
+  assert.ok(box, 'the candidate is listed')
+  assert.deepEqual([box.props.disabled, box.props.checked], [true, false])
+  const row = all.find((n) => n.type === 'li' && nodes(n).includes(box))
+  const texts = nodes(row).filter((n) => n.type === 'div' && n.props.className?.includes?.('why')).map(textOf)
+  assert.ok(textOf(row).includes('Qwen3 30B A3Bsize not checked yet'), textOf(row))
+  assert.ok(texts.includes('Fits this PC: experts in RAM (about 16.5 GB), the rest on the GPU (~16 words/s est.)'), texts.join('\n'))
+  assert.ok(texts.includes(PIN_LINE), texts.join('\n'))
+  const install = all.find((n) => n.type === 'button' && /^Install/.test(textOf(n)))
+  await install.props.onClick()
+  assert.equal(posts.length, 1)
+  assert.ok(posts[0].ids.length > 0 && !posts[0].ids.includes('qwen3-30b-a3b'), JSON.stringify(posts))
+  await local.dispose()
+})
+
+test('a mixture-of-experts model\'s speed line says where its experts were and the peak RAM measured, and its estimate says it comes from the weights a token reads', () => {
+  assert.equal(typeof helpers.speedLine, 'function')
+  const at = new Date(new Date().getFullYear(), 9, 10, 12).toISOString()
+  const reading = { at, tokensPerSec: 24.6, promptTokensPerSec: 310.2, depth: 8192, nPredict: 128, threads: 6, layersOnGpu: { gpu: 49, total: 49 }, cpuMoe: { layers: 48, cpuLayers: 32 }, peakRamGB: 12.4, laya: null }
+  assert.equal(helpers.speedLine({ speed: { reading, stands: true, why: null } }), 'Speed: 24.6 tokens/s generating and 310 tokens/s reading, both 8,192 tokens into a conversation (measured 10 Oct; the experts of 32 of 48 layers in RAM, 6 threads, peak RAM 12.4 GB).')
+  assert.equal(helpers.speedLine({ speed: { reading: null, stands: false, why: null }, rating: { fit: 'moe', wordsPerSec: 21, moe: { ramGB: 11, gpuGB: 9, cpuLayers: 32, layers: 48 }, source: 'estimated' } }),
+    "Speed: not measured on this PC; about 21 words/s estimated from the weights it reads per token, its active experts and the rest, and this PC's memory bandwidth.")
+})
+
+test('a mixture-of-experts model measured with every expert on the GPU says so in its speed line, not "the experts of 0 of 48 layers in RAM"', () => {
+  assert.equal(typeof helpers.speedLine, 'function')
+  const at = new Date(new Date().getFullYear(), 9, 10, 12).toISOString()
+  const reading = { at, tokensPerSec: 80.4, promptTokensPerSec: 900, depth: 8192, nPredict: 128, threads: 6, layersOnGpu: { gpu: 49, total: 49 }, cpuMoe: { layers: 48, cpuLayers: 0 }, peakRamGB: 3.1, laya: null }
+  assert.equal(helpers.speedLine({ speed: { reading, stands: true, why: null } }), 'Speed: 80.4 tokens/s generating and 900 tokens/s reading, both 8,192 tokens into a conversation (measured 10 Oct; every expert on the GPU, 6 threads, peak RAM 3.1 GB).')
+})
+
+test('a figure kept aside because its output differed from its baseline shows on the model\'s row with both outputs and Accept new output, which takes it as the model\'s speed; the row says what the output check found', async () => {
+  assert.equal(typeof helpers.outputLine, 'function', 'the budget helpers word the output check')
+  // 64 words, those from `from` on spelt differently: the greedy answer of the output check.
+  const answer = (from = 64) => Array.from({ length: 64 }, (_, i) => `${i < from ? 'w' : 'x'}${i}`).join(' ')
+  let text = answer()
+  const server = fakeLlamaServer({ report: () => SPLIT, greedy: () => text })
+  const page = await card({ spawn: server.spawn, fetch: server.fetch })
+  const button = (label) => page.all().find((n) => n.type === 'button' && (n.props['aria-label'] === label || textOf(n) === label))
+  const why = (name) => nodes(page.row(name)).filter((n) => n.props.className === 'why').map(textOf)
+  const benchmarkBig = async () => { button('Benchmark Big').props.onClick(); await page.settle(); await speedEnded(page.local); await page.poll() }
+  await benchmarkBig()
+  assert.ok(why('Big').includes(`Output: kept on ${today()} as the baseline for this engine build and GPU split, which later runs are held to.`), why('Big').join('\n'))
+  assert.equal(button('Accept new output of Big'), undefined, 'nothing to accept')
+  // A run whose answer leaves the baseline after 12 tokens: its figure is kept aside, with both outputs to read.
+  text = answer(12)
+  await benchmarkBig()
+  const row = nodes(page.row('Big'))
+  assert.deepEqual(row.filter((n) => n.props.className === 'warnline').map(textOf), [`Benchmark of ${today()}: 20.0 tokens/s generating, but its output differs from the ${today()} baseline after 12 tokens (32 needed), so it is not taken as this model's speed. If the new output reads right, accept it: the figure becomes the model's speed and the output its baseline.`])
+  const both = row.find((n) => n.type === 'details')
+  assert.deepEqual(nodes(both).filter((n) => n.props?.className === 'answer-text').map(textOf), [answer(), answer(12)])
+  assert.ok(why('Big').includes(`Output: kept on ${today()} as the baseline for this engine build and GPU split, which later runs are held to.`), 'the speed line is still the first run\'s')
+  const accept = button('Accept new output of Big')
+  assert.equal(accept.props.disabled, false)
+  accept.props.onClick()
+  await page.settle()
+  await page.poll()
+  assert.deepEqual(page.benchmarks.at(-1), { accept: 'big' })
+  assert.equal(button('Accept new output of Big'), undefined, 'taken')
+  assert.ok(why('Big').includes(`Output: accepted as the new baseline on ${today()}; it had differed from the ${today()} one after 12 tokens.`), why('Big').join('\n'))
+  // The same answer again: the same as the accepted baseline.
+  await benchmarkBig()
+  assert.ok(why('Big').includes(`Output: the same as the ${today()} baseline, its first 64 of 64 tokens agreeing (32 needed).`), why('Big').join('\n'))
 })

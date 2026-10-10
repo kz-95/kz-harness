@@ -35,6 +35,9 @@ window.__ModuleLoader__.load({
     // The whole session as one chronological ledger: messages, routed runs, tasks, subagents.
     const OVERVIEW_ID = 'jev-router/overview'
     const OVERVIEW_KIND = 'kz-overview'
+    // What each agent is doing as it does it (docs/live-agent-view.md Feature 1), by task or run.
+    const LIVE_ID = 'jev-router/live'
+    const LIVE_KIND = 'jev-live'
     // Services captured in apply (ctx.sessions, ctx.sidebarRight, ctx.layout, ctx.uiWorkspace).
     let sessionsApi
     let sidebarRight
@@ -317,6 +320,8 @@ window.__ModuleLoader__.load({
 .kzh-wb-x{flex:none;border:1px solid var(--dsw-alias-border-l2);background:none;color:var(--dsw-alias-label-secondary);border-radius:6px;padding:0 6px;font:var(--dsw-font-xxxs-11);cursor:pointer}
 .kzh-wb-x:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .kzh-wb-x:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.jevi-modal .box.confirm textarea.kzh-steer-box{flex:none;width:100%;min-height:72px;max-height:200px;margin-top:10px;font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px;resize:vertical;box-sizing:border-box}
+.jevi-modal .box.confirm .kzh-steer-note{flex:none;margin-top:8px;color:var(--dsw-alias-state-warn-label)}
 .kzh-wb-mark{flex:none;width:16px;text-align:center;color:var(--dsw-alias-label-tertiary)}
 .kzh-wb-row.live .kzh-wb-mark{width:12px;height:12px;border:2px solid var(--dsw-alias-bg-layer-3);border-top-color:var(--dsw-alias-state-business-primary);border-radius:50%;animation:kzh-spin .8s linear infinite}
 .kzh-wb-title{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -368,6 +373,8 @@ window.__ModuleLoader__.load({
 .kzh-vd-tag:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .kzh-vd-tag[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-active);border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary)}
 .kzh-vd-btn:focus-visible,.kzh-vd-why:focus-visible,.kzh-vd-select:focus-visible,.kzh-vd-reason:focus-visible,.kzh-vd-tag:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.kzh-vd-learned{flex:1 1 100%;min-width:0;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+.kzh-vd-ask{flex:1 1 100%;display:flex;flex-wrap:wrap;align-items:center;gap:4px;min-width:0;color:var(--dsw-alias-label-secondary)}
 /* Overview: one chronological ledger. Quiet, token only, and text always says the state. */
 .kzh-ov-chips{display:flex;flex-wrap:wrap;gap:4px;margin:2px 0 10px}
 .kzh-ov-chip{flex:none;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:none;color:var(--dsw-alias-label-tertiary);font:var(--dsw-font-xxxs-11);line-height:20px;padding:0 8px;cursor:pointer}
@@ -399,6 +406,72 @@ window.__ModuleLoader__.load({
 .kzh-ov-detail{margin:6px 0 2px 116px}
 .kzh-ov-note{margin:0 0 10px;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary)}
 .kzh-ov-note.warn{color:var(--dsw-alias-state-warn-label)}
+/* The live view (docs/live-agent-view.md Feature 1): the work board's second line, the Live tab and the card under a start reply. */
+.kzh-wb-row.go{cursor:pointer}
+.kzh-wb-act{display:flex;align-items:center;gap:6px;width:100%;margin:0;padding:0 0 3px 24px;border:0;background:none;box-sizing:border-box;min-width:0;font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-secondary);text-align:left;cursor:pointer}
+.kzh-wb-act:hover{color:var(--dsw-alias-label-primary)}
+.kzh-wb-act:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px;border-radius:6px}
+.kzh-wb-act .t{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kzh-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-caption)}
+.kzh-dot.fresh{background:var(--dsw-alias-state-success-primary);animation:kzh-pulse 1.2s ease-in-out infinite}
+@keyframes kzh-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@media (prefers-reduced-motion:reduce){.kzh-dot.fresh{animation:none}}
+.jevi.kzh-live{display:flex;flex-direction:column}
+.kzh-live-hd{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary);margin:4px 0 6px;overflow-wrap:anywhere}
+.kzh-live-note{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary);margin:0 0 6px}
+.kzh-live-bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 8px}
+.jevi .kzh-live-bar button.btn[aria-pressed=true]{background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
+.kzh-live-tl{flex:1;min-height:0;overflow-y:auto;border-top:1px solid var(--dsw-alias-border-l1);padding-top:6px}
+.kzh-live-sec{margin:0 0 10px}
+.kzh-live-sec>h4{font:var(--dsw-font-xxs-strong-12);color:var(--dsw-alias-label-caption);margin:8px 0 4px}
+.kzh-live-ms{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary);margin:2px 0;overflow-wrap:anywhere}
+.kzh-live-ms.bad{color:var(--dsw-alias-state-error-primary)}
+.kzh-live-row{display:flex;align-items:baseline;gap:6px;margin:2px 0;min-width:0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary)}
+.kzh-live-row .g{flex:none;width:12px;text-align:center;color:var(--dsw-alias-label-tertiary)}
+.kzh-live-row.done .g{color:var(--dsw-alias-state-success-primary)}
+.kzh-live-row.failed .g{color:var(--dsw-alias-state-error-primary)}
+.kzh-live-row .t{min-width:0;overflow-wrap:anywhere}
+.kzh-live-think{margin:4px 0;padding:4px 8px;border-left:2px solid var(--dsw-alias-border-l2);font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary)}
+.kzh-live-think-t{white-space:pre-wrap;overflow-wrap:anywhere}
+/* The preview follows the stream: its newest lines stay in view and the older ones fade out above. */
+.kzh-live-think.clip .kzh-live-think-t{max-height:120px;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;-webkit-mask-image:linear-gradient(180deg,transparent 0,#000 32px);mask-image:linear-gradient(180deg,transparent 0,#000 32px)}
+.kzh-live-text{margin:4px 0;font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.kzh-live-text.answer-md> :first-child{margin-top:0}
+.kzh-live-text.answer-md> :last-child{margin-bottom:0}
+.kzh-live-step{margin:2px 0}
+.kzh-live-step>summary{cursor:pointer;list-style:none}
+.kzh-live-step>summary::-webkit-details-marker{display:none}
+.kzh-live-out{margin:4px 0 4px 18px;padding:6px 8px;border-radius:8px;background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);font-family:var(--ds-font-family-code);font-size:var(--dsw-font-xxs-12-font-size);color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
+.kzh-live-out .add{color:var(--dsw-alias-state-success-primary)}
+.kzh-live-out .del{color:var(--dsw-alias-state-error-primary)}
+.kzh-live-use{font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-caption);margin:4px 0 0}
+.kzh-live-end{font:var(--dsw-font-xxs-strong-12);color:var(--dsw-alias-label-secondary);margin:8px 0 0}
+.jevi button.linkish,.kzh-lrc button.linkish{background:none;border:0;padding:0;margin:2px 0;font:var(--dsw-font-xxs-strong-12);color:var(--dsw-alias-state-business-primary);cursor:pointer}
+.kzh-live-tail{margin:2px 0}
+/* The person's words to a task at work (Steer): a bubble in its timeline, a line in its row and card, the box under the Live tab. */
+.kzh-live-you{margin:4px 0 4px 24px;padding:4px 8px;border-radius:8px;background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l2);font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.kzh-live-you .why,.kzh-guidance .why{display:block;color:var(--dsw-alias-label-tertiary)}
+.kzh-live-you .acts,.kzh-guidance .acts{display:flex;gap:10px}
+.kzh-guidance{margin:4px 0;font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-secondary)}
+.kzh-lrc .kzh-guidance{margin-left:28px}
+.kzh-guidance-row{margin:2px 0;overflow-wrap:anywhere}
+.kzh-live-steer{margin-top:6px;border-top:1px solid var(--dsw-alias-border-l1);padding-top:6px}
+.kzh-live-steer textarea{width:100%;min-height:40px;max-height:160px;box-sizing:border-box;resize:vertical;font:var(--dsw-font-xs-13);color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:6px 8px}
+.kzh-live-steer .kzh-steer-note{font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-tertiary);margin-top:4px}
+/* The card under a start reply sits in the reply's actions row: on a line of its own, below the icons. */
+[data-turn-tail] :has(> .kzh-lrc){flex-wrap:wrap}
+.kzh-lrc{flex:1 0 100%;order:99;box-sizing:border-box;min-width:0;margin:6px 0 2px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1);font:var(--dsw-font-xxs-12);color:var(--dsw-alias-label-primary)}
+.kzh-lrc-hd{display:flex;align-items:center;gap:8px;min-width:0}
+.kzh-lrc-av{flex:none;width:20px;height:20px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;background:var(--dsw-alias-bg-layer-3);font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-secondary)}
+.kzh-lrc-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:var(--dsw-font-xxs-strong-12)}
+.kzh-lrc-who,.kzh-lrc-now{margin:2px 0 0 28px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+.kzh-lrc-now{color:var(--dsw-alias-label-secondary)}
+.kzh-lrc-rows{list-style:none;margin:4px 0 0 28px;padding:0}
+.kzh-lrc-acts{display:flex;gap:6px;margin:6px 0 0 28px}
+.kzh-lrc-acts button{border:1px solid var(--dsw-alias-border-l2);background:none;color:var(--dsw-alias-label-secondary);border-radius:8px;padding:2px 8px;font:var(--dsw-font-xxs-strong-12);cursor:pointer}
+.kzh-lrc-acts button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.kzh-lrc-acts button.danger{color:var(--dsw-alias-state-error-primary)}
+.kzh-lrc-acts button:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
 `
     function useStyle() {
       useEffect(() => {
@@ -579,48 +652,73 @@ window.__ModuleLoader__.load({
       return () => { mo.disconnect(); transcriptPass.cancel() }
     }
 
+    // ---- pure result helpers: no React, no state. The contract with the server's result notices
+    // (delivery.js), so nothing in it reaches outside it.
+
+    /** The label a finished task's notice summary ends with, one per terminal state, word for word adapter.js TASK_LABELS. */
+    const RESULT_LABELS = ['Completed', 'Failed', 'Stopped', 'Needs input', 'Paused by limit']
+    /**
+     * The job id and the task name a result notice's summary carries (`jev-3 · Fix sidebar width ·
+     * Completed`), or null when the row is not one of our results. The first field must be a job
+     * id and the last the label of a finished state; the name is everything between, since a
+     * task name may hold the separator itself. Requiring a finished state's label last keeps
+     * another plugin's notice, and any notice of ours about a task still at work, from being read
+     * as a result. Pure, so the contract with the server is testable.
+     */
+    const resultOf = (summary) => {
+      const parts = String(summary ?? '').split('·').map((s) => s.trim())
+      if (parts.length < 3 || !RESULT_LABELS.includes(parts[parts.length - 1]) || !/^[a-z][\w-]{0,40}$/.test(parts[0])) return null
+      return { id: parts[0], name: parts.slice(1, -1).join(' · ') }
+    }
+    /** The job id a result notice's summary starts with, or null when the row is not one of our results (resultOf). */
+    const resultIdOf = (summary) => resultOf(summary)?.id ?? null
+
+    // ---- end pure result helpers
+
     /**
      * Tell the server which background results this browser has actually rendered.
      *
      * A finished task stays "unread" until its message is in the conversation, and the engine
      * has no hook for "a person has now seen this", so the acknowledgement has to come from
      * here. Rows are matched by the job id the server puts at the front of the notice summary
-     * (`jev-3 · Fix sidebar width · Completed`); each id is acknowledged once, and an id whose
-     * request failed is forgotten so the next pass tries again. A renamed engine simply leaves
-     * the selector empty.
+     * and the task name after it (`jev-3 · Fix sidebar width · Completed`), and by the chat on
+     * screen, which every row in the document is in: the engine hands a job id out again after a
+     * restart, in every chat, and the server takes a result as read only under its own task's
+     * name and chat, once its own notice has been posted. Each rendered row is acknowledged
+     * once, remembered by the row itself rather than by what it says: the same words sent again
+     * after a restart give the new task's row the very summary an older row has, and the older
+     * row's refusal must not keep the new one from being acknowledged. A row mounted afresh, as
+     * after switching chats, is posted again, and the server refuses what it has already taken. A
+     * row whose request failed is forgotten so the next pass tries again. A renamed engine simply
+     * leaves the selector empty.
      */
-    const ackedResults = new Set()
-    /**
-     * The job id a notice summary starts with (`jev-3 · Fix sidebar width · Completed`), or
-     * null when the row is not one of ours. Pure, so the contract with the server is testable.
-     * Our summaries always carry three fields - id, task, status - and requiring all three is
-     * what keeps another plugin's two-field notice from being mistaken for one of ours.
-     */
-    const resultIdOf = (summary) => {
-      const parts = String(summary ?? '').split('·').map((s) => s.trim())
-      if (parts.length < 3) return null
-      return /^[a-z][\w-]{0,40}$/.test(parts[0]) ? parts[0] : null
-    }
-    function acknowledgeResults() {
+    const ackedRows = new WeakSet()
+    function acknowledgeResults(openChat) {
       // The engine renders the producer and the summary as TEXT inside marked spans, not as
       // attribute values: `data-context-source` and `data-context-summary` are boolean
       // attributes on those spans (dsh-client-ui-chat ContextInjectionRow). So read the text,
       // and check the producer by its text too - a selector on the attribute value never
       // matches, which is how an earlier version silently acknowledged nothing.
-      const ids = []
+      const results = []
+      const spans = []
       for (const span of document.querySelectorAll('[data-context-summary]')) {
         const row = span.closest('[data-disclosure-row]') ?? span.parentElement
         if ((row?.querySelector('[data-context-source]')?.textContent ?? '').trim() !== 'jev-router') continue
-        const id = resultIdOf(span.textContent)
-        if (!id || ackedResults.has(id)) continue
-        ackedResults.add(id)
-        ids.push(id)
+        const r = resultOf(span.textContent)
+        if (!r || ackedRows.has(span)) continue
+        ackedRows.add(span)
+        spans.push(span)
+        results.push({ jobId: r.id, name: r.name })
       }
-      if (!ids.length) return
-      post('/jev-router/tasks/seen', { jobIds: ids }).catch(() => { for (const id of ids) ackedResults.delete(id) })
+      if (!results.length) return
+      // The chat is unknown only for a moment, while the engine reads its list of chats again; the
+      // rows then go without it, as an older page sends them.
+      const sessionId = openChat()
+      post('/jev-router/tasks/seen', { ...(typeof sessionId === 'string' && sessionId ? { sessionId } : {}), results }).catch(() => { for (const span of spans) ackedRows.delete(span) })
     }
-    function startResultAcks() {
-      const pass = coalesce(acknowledgeResults)
+    /** `openChat` names the chat on screen, the engine's selected session; a test hands its own. */
+    function startResultAcks(openChat = () => sessionsApi?.list?.getSnapshot?.()?.current) {
+      const pass = coalesce(() => acknowledgeResults(openChat))
       const mo = new MutationObserver(pass.schedule)
       mo.observe(document.body, { childList: true, subtree: true })
       pass.schedule()
@@ -722,6 +820,7 @@ window.__ModuleLoader__.load({
         await post('/jev-router/open-terminal', { cwd })
       } },
       { id: 'background', label: 'Background tasks', keys: 'Ctrl+Alt+B', desc: 'Lists work already given to an agent in this session, running or finished, each with a timer, its output and a Stop button.', run: () => togglePanel(TASKS_KIND) },
+      { id: 'live', label: 'Open Live', keys: '', desc: 'Opens the Live tab, where you watch an agent work on a task: its text, tool calls and reasoning as they stream.', run: () => togglePanel(LIVE_KIND) },
       { id: 'subagents', label: 'Subagents', keys: '', desc: 'Lists the helper sessions this session started, and opens one so you can read it.', run: () => togglePanel(SUBAGENTS_KIND) },
       { id: 'export', label: 'Export chat as Markdown', keys: 'Ctrl+Alt+M', desc: 'Copies the whole conversation as Markdown text, or saves it as a file.', run: () => openExport() },
       { id: 'queue', label: 'Task queue', keys: 'Ctrl+Alt+Q', desc: 'Lines up prompts you have not sent yet: the agent takes the next one each time it finishes the last.', run: () => openQueue() },
@@ -1567,8 +1666,13 @@ window.__ModuleLoader__.load({
     }
 
     // ---- the Router tab's side-by-side card, from GET /jev-router/laya/compare (8.4)
-    /** A count and its rate, `{ n, agree }`; a source with no rows says so and never shows a rate. */
-    const cmpAgree = (x) => (x?.n ? `${x.agree} of ${x.n} (${wholePct(x.agree, x.n)})` : 'none yet')
+    /**
+     * A share's 95% interval as the comparison gives it beside the share (shadow-stats.js interval),
+     * `range 45 to 78%`, or '' when it gives none: a share of a few rows is a wide range, not a figure.
+     */
+    const rangeWords = (iv) => (Number.isFinite(iv?.low) && Number.isFinite(iv?.high) ? `range ${Math.round(iv.low * 100)} to ${Math.round(iv.high * 100)}%` : '')
+    /** A count and its rate, `{ n, agree }`, with its range when the comparison gives one; a source with no rows says so and never shows a rate. */
+    const cmpAgree = (x, iv) => (x?.n ? `${x.agree} of ${x.n} (${[wholePct(x.agree, x.n), rangeWords(iv)].filter(Boolean).join(', ')})` : 'none yet')
     const cmpWords = (id) => String(id).replace(/_/g, ' ')
     /** The subtitle's checkpoint, weights and adapter, read from the identity string (4.5). */
     const identityWords = (identity) => {
@@ -1706,7 +1810,13 @@ window.__ModuleLoader__.load({
      */
     const maturityWords = (d) => (d?.localDecides === false
       ? `${d?.teacher === 'code' ? 'a rule in code decides' : 'Jev decides'} at every rung; the local router is recorded beside it for comparison and never decides`
-      : (d?.teacher === 'code' ? CODE_MATURITY_WORDS : MATURITY_WORDS)[d?.maturity] ?? '')
+      : `${(d?.teacher === 'code' ? CODE_MATURITY_WORDS : MATURITY_WORDS)[d?.maturity] ?? ''}${onlyAnswers(d)}`)
+    // A domain whose local router may decide only some answers (`localLabels`, the message intent's
+    // case: only that a message is a task) is decided by its teacher on every other answer, at the
+    // rungs where the local router decides at all.
+    const onlyAnswers = (d) => (Array.isArray(d?.localLabels) && (d.maturity === 'GUARDED_LOCAL' || d.maturity === 'LOCAL_ONLY')
+      ? `, and only when it answers ${d.localLabels.join(' or ')}: ${d.teacher === 'code' ? 'a rule in code decides' : 'Jev decides'} every other answer`
+      : '')
 
     /**
      * The comparison of Jev and Laya over the last 7 days, for the current Laya identity (8.4):
@@ -1742,23 +1852,25 @@ window.__ModuleLoader__.load({
         h('thead', null, h('tr', null, ...heads.map((t) => h('th', { key: t, scope: 'col' }, t)))),
         h('tbody', null, ...rows))
       const cell = (x) => h('td', null, x)
-      const person = (p) => (p?.n ? `${p.jevRight} / ${p.layaRight} of ${p.n}` : 'none yet')
-      const contradicted = (c) => (c?.n ? `${c.layaRight} of ${c.n}` : 'none yet')
+      // A share's range follows its count, when the comparison gives one (`intervals`).
+      const ranged = (text, ...ivs) => { const r = ivs.map(rangeWords); return r.every(Boolean) ? `${text} (${r.join(' / ')})` : text }
+      const person = (p, iv) => (p?.n ? ranged(`${p.jevRight} / ${p.layaRight} of ${p.n}`, iv?.jevRight, iv?.layaRight) : 'none yet')
+      const contradicted = (c, iv) => (c?.n ? ranged(`${c.layaRight} of ${c.n}`, iv?.contradicted) : 'none yet')
       // A domain no outcome of a run can fault (the task type, the skill) says so, never 0 failed.
-      const failedRuns = (r) => (!r?.runs ? 'none yet' : r.failed == null ? `not measured (${r.runs} ${r.runs === 1 ? 'run' : 'runs'})` : `${r.failed} of ${r.runs}`)
+      const failedRuns = (r, iv) => (!r?.runs ? 'none yet' : r.failed == null ? `not measured (${r.runs} ${r.runs === 1 ? 'run' : 'runs'})` : ranged(`${r.failed} of ${r.runs}`, iv?.failed))
       const domains = (data.domains ?? []).map((d) => h('tr', { key: d.domain },
-        h('th', { scope: 'row' }, cmpWords(d.domain)), cell(String(d.layaAnswered ?? 0)), cell(cmpAgree(d.agree?.informative)),
-        cell(person(d.personSaid)), cell(contradicted(d.whereJevWasContradicted)), cell(failedRuns(d.layaAutoRuns))))
+        h('th', { scope: 'row' }, cmpWords(d.domain)), cell(String(d.layaAnswered ?? 0)), cell(cmpAgree(d.agree?.informative, d.intervals?.agree)),
+        cell(person(d.personSaid, d.intervals)), cell(contradicted(d.whereJevWasContradicted, d.intervals)), cell(failedRuns(d.layaAutoRuns, d.intervals))))
       const fields = (data.domains ?? []).filter((d) => d.fieldAgreement && Object.keys(d.fieldAgreement).length)
       const questions = (data.questions ?? []).map((q) => h('tr', { key: q.name },
         h('th', { scope: 'row' }, h('code', null, q.name), q.corrected ? h('span', { className: 'pill warn' }, `uncalibrated (${q.options} options)`) : null),
-        cell(String(q.compared ?? 0)), cell(cmpAgree(q.agree?.all)), cell(cmpAgree(q.agree?.informative)),
+        cell(String(q.compared ?? 0)), cell(cmpAgree(q.agree?.all, q.intervals?.all)), cell(cmpAgree(q.agree?.informative, q.intervals?.informative)),
         cell(typeof q.meanDifference === 'number' ? q.meanDifference.toFixed(2) : '-'), cell(typeof q.layaMedianMs === 'number' ? `${q.layaMedianMs} ms` : '-')))
       return h('section', { className: 'card', 'aria-labelledby': 'jevi-cmp-h' },
         h('div', { className: 'label', id: 'jevi-cmp-h' }, 'Jev and Laya, side by side'),
         h('div', { className: 'why', style: { margin: '0 0 8px' } }, `From the calls Laya answered in the background in Jev Auto, and the runs Laya decided in Laya Auto. ${identityWords(data.identity)} Agreement is not accuracy, and outcomes are counted only where they can judge: see each column.`),
         table(['Domain', 'Laya answered', 'Agrees with Jev (informative only)', 'A person said (Jev right / Laya right)', "Where Jev's pick was contradicted (Laya had it right)", 'Laya Auto runs that failed'], domains),
-        h('div', { className: 'why', style: { marginTop: 4 } }, "A person said: the rows a person labelled, the least biased. Where Jev's pick was contradicted: rows that exist only because Jev's pick went wrong, so they say how often Laya would have had it right there, never Laya's accuracy. Laya Auto runs that failed: a failure rate of the runs Laya decided, never an accuracy; a review counts as failed only when the person disliked what it accepted or another agent's review did not accept it, and a task type or a skill is judged only by what a person said, so it is not measured there."),
+        h('div', { className: 'why', style: { marginTop: 4 } }, "A person said: the rows a person labelled, the least biased. Where Jev's pick was contradicted: rows that exist only because Jev's pick went wrong, so they say how often Laya would have had it right there, never Laya's accuracy. Laya Auto runs that failed: a failure rate of the runs Laya decided, never an accuracy; a review counts as failed only when the person disliked what it accepted or another agent's review did not accept it, and a task type or a skill is judged only by what a person said, so it is not measured there. A range beside a share is its 95% interval: how far a longer record could still put it."),
         ...fields.map((d) => h('div', { className: 'why', key: `f${d.domain}` }, `${cmpWords(d.domain)}, profile fields that agree with Jev: ${Object.entries(d.fieldAgreement).map(([k, v]) => `${k} ${pct(v)}`).join(', ')}`)),
         table(['Question', 'Compared', 'Agree', 'Agree, informative only', 'Mean difference', 'Laya median ms'], questions),
         h('div', { className: 'label', style: { margin: '10px 0 4px' } }, 'Would it have acted the same'),
@@ -2387,6 +2499,296 @@ window.__ModuleLoader__.load({
         : `"${what}" went back to waiting in line while you were confirming, so nothing was stopped. Use Remove on its row to take it out of the line.`
     }
 
+    // ---- pure queue control helpers: no React, no state. Send now and Steer for a task's row
+    // (docs/live-agent-view.md Feature 5): which of them a row offers, and the words of their dialogs,
+    // from the facts the server reads off the line (tasks.js view().controls). test/workboard.test.js
+    // and test/tasklist.test.js pin them; test/observability.test.js renders the dialogs.
+
+    /** What a task's row offers beside Stop or Remove: Send now while it waits in a line, Steer until it ends. */
+    const queueActions = (t) => (!t || TERMINAL_TASK.includes(t.state) ? [] : t.state === 'queued' ? [...(t.controls?.sendNow ? ['send'] : []), 'steer'] : ['steer'])
+    /** A queue button's accessible name, which names its task: `Send jev-5 now`, `Steer jev-4`. */
+    const queueLabel = (action, t) => (action === 'send' ? `Send ${t.jobId} now` : `Steer ${t.jobId}`)
+    /** `jev-3 and jev-4`, `jev-2, jev-3 and jev-4`. */
+    const andList = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`)
+    const tasksWord = (n) => `${n} task${n === 1 ? '' : 's'}`
+
+    /**
+     * The Send now dialog of a waiting task, by what it waits for (controls.sendNow), or null for a task
+     * in no line. 'slot', where it can start at once, says what starting it does: over the cap on tasks
+     * at once, past those in front of it in its own line, locked against writing beside the task writing
+     * in its folder, beside a local model. 'workspace' and 'chat', where its folder is in use and it
+     * cannot start, say so and what can be done instead: Put first in line, or stop the task in the way.
+     */
+    function sendNowWords(t) {
+      const c = t?.controls
+      if (!c?.sendNow || t.state !== 'queued') return null
+      const id = t.jobId
+      const folder = folderOf(t.workspace)
+      if (c.sendNow === 'workspace') {
+        return {
+          kind: 'workspace', holder: c.holder ?? null, title: `${c.holder ?? 'Another task'} is changing ${folder}`,
+          body: c.holder ? `Only one task changes a folder at a time. You can put ${id} first in line, or stop ${c.holder} now (what it changed so far stays in the folder) and start ${id}.` : `Only one task changes a folder at a time. You can put ${id} first in line.`,
+        }
+      }
+      if (c.sendNow === 'chat') return { kind: 'chat', holder: null, title: `A run from the chat is using ${folder}`, body: `A run started from the chat is using ${folder}; ${id} can go first in line after it.` }
+      const ahead = [...(c.ahead ?? []), ...(c.chatAhead ? [c.chatAhead === 1 ? 'a run started from the chat' : `${c.chatAhead} runs started from the chat`] : [])]
+      const body = [
+        c.max != null && c.held >= c.max ? `It runs beside ${c.held} other ${c.held === 1 ? 'task' : 'tasks'}, over your limit of ${tasksWord(c.max)} at once (Settings, Resource budget), so the next task to end frees no slot.` : '',
+        ahead.length === 1 ? `${ahead[0]} was ahead of it in ${folder} and now waits for it.` : ahead.length ? `${andList(ahead)} were ahead of it in ${folder}; they wait for it now.` : '',
+        t.access !== 'read' ? '' : c.heldBy === 'task' ? `It runs locked against writing, beside the task changing ${folder}.` : c.heldBy === 'chat' ? `It runs locked against writing, beside the run from the chat using ${folder}.` : 'It runs locked against writing.',
+        c.local ? `${c.local} runs a local model on this PC; two at once can slow it down a lot.` : c.forcedLocal ? `${id} runs a local model on this PC; beside other work it can slow down a lot.` : '',
+      ].filter(Boolean)
+      return { kind: 'slot', holder: null, title: `Start ${id} now?`, body: body.length ? body : [`${id} starts now.`], confirmLabel: 'Start now' }
+    }
+    /** The second confirmation of Stop it and start this: the task in the folder's way stops, and this one starts once it has. */
+    const stopForWords = (t, holder) => ({ title: `Stop ${holder}?`, body: `Work it already did stays in ${folderOf(t.workspace)}. ${t.jobId} starts as soon as it has stopped.`, confirmLabel: `Stop ${holder}` })
+    /**
+     * The Steer dialog of a task, or null once it has ended. Before it starts, the words are added to it
+     * ('amend'); once it is at work, which `started` says the server found while its row still waits,
+     * they go to the agent at work now, where it takes them, or with its next attempt (`confirmLabel`,
+     * `live`), or stop the step it is on and go to it as what it does next (`now`, Send now), or as a
+     * follow-up task, or with a fresh start of it ('running'). What the agent at work does with them, or
+     * why it cannot take them, is the server's (controls.steer), and `live` is false only past an agent
+     * that cannot take them; `now.open` only where the agent at work can be stopped for them, the
+     * dialog saying why not otherwise. `typed` says the dialog was opened while the task waited, so one
+     * that started meanwhile says so, and the words typed stay in the box for the other choices.
+     */
+    function steerDialogWords(t, { typed = false, started = false } = {}) {
+      if (!t || TERMINAL_TASK.includes(t.state)) return null
+      const id = t.jobId
+      if (t.state === 'queued' && !started) return { mode: 'amend', title: `Steer ${id}`, body: 'Your words are added to the task before it starts. It keeps its place in line.', placeholder: 'What should it do differently?', confirmLabel: 'Add to task', note: '' }
+      const s = t.controls?.steer ?? null
+      const now = { open: !!s?.now?.path, words: s?.now?.words ?? '' }
+      return {
+        mode: 'running', title: `Steer ${id}`,
+        body: [s?.words || `Your words go to ${id} while it works, or with its next attempt.`, ...(!now.open && now.words ? [now.words] : []), `Or send them as a follow-up task that runs after it, or stop it and start again with them. What it changed so far stays in ${folderOf(t.workspace)}.`],
+        placeholder: 'What should it do differently?',
+        confirmLabel: 'Now, while it works',
+        live: s ? s.sendable !== false : true,
+        now,
+        note: typed ? `${id} started while you were typing, so your words were not added. Steer it again: they now go to the running agent.` : '',
+      }
+    }
+    /** The confirmation of Send now on a task at work: its agent's current step stops for the words. */
+    const sendNowRunningWords = (t) => ({ title: `Send now to ${t.jobId}?`, body: 'Stop the current step and give it this now? Work already done stays in the folder.', confirmLabel: 'Send now' })
+    /** A task's guidance as its row lists it, oldest first: each piece's words, what became of them, and whether its task ended without them. */
+    const guidanceRows = (t) => (Array.isArray(t?.steers) ? t.steers : [])
+      .filter((x) => x && typeof x.text === 'string' && x.text.trim())
+      .map((x) => ({ id: x.id, text: x.text, state: x.state, words: x.words ?? '', returned: x.state === 'returned' }))
+    /**
+     * The Live tab's box for Steer under a task's timeline: its placeholder, and whether it takes words
+     * now (`open`). Before the task starts they are added to it; once it is at work they go to the agent
+     * at work or with its next attempt, never past an agent that cannot take them (controls.steer),
+     * whose reason the box says instead. Null for a task that has ended.
+     */
+    function composerWords(t) {
+      if (!t?.key || TERMINAL_TASK.includes(t.state)) return null
+      if (t.state === 'queued') return { placeholder: `Add to ${t.jobId} before it starts`, open: true }
+      const s = t.controls?.steer ?? null
+      if (s && s.sendable === false) return { placeholder: s.words, open: false }
+      return { placeholder: `Steer ${t.jobId}: tell ${s?.name ?? t.activity?.agent ?? 'the agent'} something while it works`, open: true }
+    }
+    /** The confirmation of Stop it and start again with your message. */
+    const restartWords = (t) => ({ title: `Stop ${t.jobId} and start again?`, body: `Stop ${t.jobId} and start again with your message? What it changed so far stays in ${folderOf(t.workspace)}.`, confirmLabel: 'Stop and start again' })
+    /**
+     * Why a queue dialog closed on its own, or '' while it still fits, as confirmDrift says it of Stop.
+     * Send now's closes once its task has left the line, or what it waits for has changed, so a button
+     * never does what nobody read; Steer's once its task has ended, and a fresh start's or a running
+     * task's Send now's once its task has gone back to waiting. A task that starts while Steer is open
+     * only turns the dialog to the choices for a task at work, the words kept (steerDialogWords).
+     */
+    function queueDrift(ask, t) {
+      if (!ask) return ''
+      const id = t?.jobId ?? ask.jobId
+      const typing = ask.kind === 'steer' || ask.kind === 'restart' || ask.kind === 'now'
+      if (!t || TERMINAL_TASK.includes(t.state)) return typing ? `${id} ended while you were typing, so your words were not sent.` : `${id} ended while you were deciding, so nothing was done.`
+      if ((ask.kind === 'restart' || ask.kind === 'now') && t.state === 'queued') return `${id} went back to waiting in line while you were deciding, so nothing was stopped.`
+      if (typing) return ''
+      if (t.state !== 'queued') return `${id} has already started.`
+      if ((t.controls?.sendNow ?? null) !== ask.wait || (ask.wait === 'workspace' && (t.controls?.holder ?? null) !== ask.holder)) return `What ${id} waits for changed while you were deciding, so nothing was done. Send now says what it waits for now.`
+      return ''
+    }
+    // ---- end pure queue control helpers
+
+    /**
+     * The overlay of a Send now or Steer dialog: Confirm's, with as many buttons after Cancel as the
+     * choice has, and for Steer the box the words are typed in, which keeps them through a drift
+     * (`note`, said above the buttons). `onEnter`, when given, is what Enter in the box does (Shift+Enter
+     * starts a new line), and `onCtrlEnter` what Ctrl+Enter does.
+     */
+    function QueueDialog({ title, body, note, text, placeholder, onText, onEnter, onCtrlEnter, actions, onCancel }) {
+      useEffect(() => {
+        const k = (e) => { if (e.key === 'Escape') onCancel() }
+        window.addEventListener('keydown', k)
+        return () => window.removeEventListener('keydown', k)
+      }, [onCancel])
+      useEffect(() => { const back = typeof document === 'undefined' ? null : document.activeElement; return () => { try { back?.focus?.() } catch {} } }, [])
+      return h('div', { className: 'jevi jevi-modal', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'jevi-queue-t', 'aria-describedby': 'jevi-queue-b', onClick: onCancel },
+        h('div', { className: 'box confirm', onClick: (e) => e.stopPropagation() },
+          h('h3', { id: 'jevi-queue-t' }, title),
+          h('div', { className: 'body', id: 'jevi-queue-b' }, ...(Array.isArray(body) ? body : [body]).map((p, i) => h('p', { key: i }, p))),
+          onText ? h('textarea', {
+            className: 'kzh-steer-box', rows: 4, value: text, placeholder, 'aria-label': placeholder, autoFocus: true, onChange: (e) => onText(e.target.value),
+            ...(onEnter || onCtrlEnter ? {
+              onKeyDown: (e) => {
+                if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return
+                const run = e.ctrlKey || e.metaKey ? onCtrlEnter : onEnter
+                if (run) { e.preventDefault(); run() }
+              },
+            } : {}),
+          }) : null,
+          note ? h('div', { className: 'kzh-steer-note', role: 'alert' }, note) : null,
+          h('div', { className: 'actions' },
+            h('button', { className: 'btn', onClick: onCancel, autoFocus: !onText }, 'Cancel'),
+            ...actions.map((a) => h('button', { key: a.label, className: cx('btn', a.danger && 'danger'), disabled: !!a.disabled, ...(a.title ? { title: a.title } : {}), onClick: a.run }, a.label)))))
+    }
+
+    /**
+     * Send now and Steer for one view's rows (the work board, the Tasks tab, the Live tab and the card
+     * under a start reply): `open(action, t)` opens the dialog of `action` ('send' or 'steer') about
+     * task `t`, and `dialog` renders it, worded from the task as the list has it now. What came of it is
+     * a toast; what stopped it, or a dialog that closed on its own, goes to `say`, the view's own line
+     * for errors.
+     */
+    function useQueueControls(tasks, say) {
+      // null, or what the open dialog is about: `kind` 'send' (with what the task waited for as it
+      // opened, and who held its folder), 'stop' (Stop it and start this, to confirm), 'steer' (the
+      // words in `text`), 'restart' (Stop it and start again, to confirm) or 'now' (Send now on a task
+      // at work, to confirm).
+      const [ask, setAsk] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const t = ask ? (tasks ?? []).find((x) => x.key === ask.key) ?? null : null
+      const drift = queueDrift(ask, t)
+      useEffect(() => { if (drift) { setAsk(null); say(drift) } }, [drift])
+      const open = (action, x) => {
+        say('')
+        setAsk(action === 'send'
+          ? { kind: 'send', key: x.key, jobId: x.jobId, wait: x.controls?.sendNow ?? null, holder: x.controls?.holder ?? null }
+          : { kind: 'steer', key: x.key, jobId: x.jobId, text: '', typed: x.state === 'queued', started: false, error: '' })
+      }
+      const close = () => setAsk(null)
+      const request = (fn, onError) => { setBusy(true); Promise.resolve().then(fn).catch(onError).finally(() => setBusy(false)) }
+      // A refused Send now closes its dialog and says why; a refused Steer keeps the words in the box.
+      const failed = (e) => { setAsk(null); say(e.message) }
+      const steerFailed = (e) => setAsk((a) => (a ? { ...a, kind: 'steer', error: e.message } : a))
+      const startNow = (stop) => request(async () => {
+        const r = await post('/jev-router/tasks/start-now', { key: ask.key, ...(stop ? { stop } : {}) })
+        setAsk(null)
+        if (r?.result === 'started') toast(`${ask.jobId} started.`)
+        else if (r?.result === 'stopping') toast(r.words)
+        else say(r?.words ?? '')
+      }, failed)
+      const putFirst = () => request(async () => {
+        await post('/jev-router/tasks/reorder', { workspace: t.workspace, order: [t.jobId] })
+        setAsk(null)
+        toast(`${t.jobId} is first in line in ${folderOf(t.workspace)}.`)
+      }, failed)
+      const steer = (how) => request(async () => {
+        const r = await post('/jev-router/tasks/steer', { key: ask.key, text: ask.text, how })
+        // Started before the words got there: the dialog turns to the choices for a task at work.
+        if (r?.result === 'started') { setAsk((a) => (a ? { ...a, kind: 'steer', started: true } : a)); return }
+        // Nothing could be stopped for them after all: the words stay in the box for the other choices.
+        if (r?.result === 'not-now') { setAsk((a) => (a ? { ...a, kind: 'steer', error: r.words ?? '' } : a)); return }
+        setAsk(null)
+        if (['added', 'sent', 'replaced', 'pending', 'queued', 'restarting'].includes(r?.result)) toast(r.words)
+        else say(r?.words ?? '')
+      }, steerFailed)
+      let dialog = null
+      if (ask && t && !drift) {
+        if (ask.kind === 'send') {
+          const w = sendNowWords(t)
+          if (w) {
+            dialog = h(QueueDialog, {
+              title: w.title, body: w.body, onCancel: close,
+              actions: w.kind === 'slot' ? [{ label: w.confirmLabel, disabled: busy, run: () => startNow(null) }]
+                : [{ label: 'Put first in line', disabled: busy, run: putFirst }, ...(w.holder ? [{ label: `Stop ${w.holder} and start this`, danger: true, disabled: busy, run: () => setAsk({ ...ask, kind: 'stop' }) }] : [])],
+            })
+          }
+        } else if (ask.kind === 'stop') {
+          const w = stopForWords(t, ask.holder)
+          dialog = h(QueueDialog, { title: w.title, body: w.body, onCancel: close, actions: [{ label: w.confirmLabel, danger: true, disabled: busy, run: () => startNow(ask.holder) }] })
+        } else if (ask.kind === 'restart') {
+          const w = restartWords(t)
+          dialog = h(QueueDialog, { title: w.title, body: w.body, onCancel: () => setAsk({ ...ask, kind: 'steer' }), actions: [{ label: w.confirmLabel, danger: true, disabled: busy, run: () => steer('restart') }] })
+        } else if (ask.kind === 'now') {
+          const w = sendNowRunningWords(t)
+          dialog = h(QueueDialog, { title: w.title, body: w.body, onCancel: () => setAsk({ ...ask, kind: 'steer' }), actions: [{ label: w.confirmLabel, danger: true, disabled: busy, run: () => steer('now') }] })
+        } else {
+          const w = steerDialogWords(t, { typed: ask.typed, started: ask.started })
+          const empty = !ask.text.trim()
+          if (w) {
+            // A task at work takes the words now (Enter), unless the agent at work cannot take them, and
+            // Send now (Ctrl+Enter) stops its current step for them where it can be stopped, once confirmed.
+            const now = w.mode === 'running' && w.live && !busy && !empty
+            const stop = w.mode === 'running' && w.now.open && !busy && !empty
+            const sendNow = () => { if (stop) setAsk({ ...ask, kind: 'now' }) }
+            dialog = h(QueueDialog, {
+              title: w.title, body: w.body, note: ask.error || w.note, text: ask.text, placeholder: w.placeholder, onCancel: close,
+              onText: (text) => setAsk((a) => (a ? { ...a, text, error: '' } : a)),
+              ...(w.mode === 'running' ? { onEnter: () => { if (now) steer('live') }, onCtrlEnter: sendNow } : {}),
+              actions: w.mode === 'amend' ? [{ label: w.confirmLabel, disabled: busy || empty, run: () => steer('amend') }]
+                : [
+                    { label: w.confirmLabel, disabled: !now, run: () => steer('live') },
+                    { label: 'Send now', disabled: !stop, title: w.now.words, run: sendNow },
+                    { label: 'Follow-up after it', disabled: busy || empty, run: () => steer('follow-up') },
+                    { label: 'Stop and start again', danger: true, disabled: busy || empty, run: () => setAsk({ ...ask, kind: 'restart' }) },
+                  ],
+            })
+          }
+        }
+      }
+      return { open, dialog }
+    }
+
+    /** Copy and Send as a follow-up, for a piece of guidance its task ended without (Steer, docs/live-agent-view.md Feature 5). */
+    function GuidanceActions({ t, text }) {
+      const copy = () => Promise.resolve().then(() => navigator.clipboard.writeText(text)).then(() => toast('Copied.'), (e) => toast(`Could not copy: ${e.message}`))
+      const followUp = () => Promise.resolve().then(() => post('/jev-router/tasks/steer', { key: t.key, text, how: 'follow-up' })).then((r) => toast(r?.words || 'Queued as a follow-up.'), (e) => toast(e.message))
+      return h('span', { className: 'acts' },
+        h('button', { type: 'button', className: 'linkish', onClick: copy }, 'Copy'),
+        h('button', { type: 'button', className: 'linkish', onClick: followUp }, 'Send as a follow-up'))
+    }
+
+    /** A task's guidance in its row and its card: each piece, what became of it, and for one not used, Copy and Send as a follow-up. */
+    function GuidanceList({ t }) {
+      const rows = guidanceRows(t)
+      if (!rows.length) return null
+      return h('div', { className: 'kzh-guidance', role: 'list', 'aria-label': `Your guidance for ${t.jobId}` },
+        ...rows.map((r) => h('div', { key: r.id, role: 'listitem', className: 'kzh-guidance-row' },
+          h('span', { className: 't' }, `You: ${r.text}`),
+          r.words ? h('span', { className: 'why' }, r.words) : null,
+          r.returned ? h(GuidanceActions, { t, text: r.text }) : null)))
+    }
+
+    /**
+     * The Live tab's box for Steer (composerWords): Enter gives the words to the task, the agent at work
+     * or, before it starts, its text, and Shift+Enter starts a new line; what came of them is said under
+     * it, and the words stay in the box when they could not go.
+     */
+    function LiveComposer({ t, say }) {
+      const [text, setText] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [said, setSaid] = useState('')
+      const w = composerWords(t)
+      if (!w) return null
+      const send = () => {
+        const words = text.trim()
+        if (!words || busy || !w.open) return
+        setBusy(true)
+        say('')
+        Promise.resolve().then(() => post('/jev-router/tasks/steer', { key: t.key, text: words, how: 'auto' }))
+          .then((r) => { if (r?.result !== 'started') setText(''); setSaid(r?.words ?? '') }, (e) => say(e.message))
+          .finally(() => setBusy(false))
+      }
+      return h('div', { className: 'kzh-live-steer' },
+        h('textarea', {
+          rows: 2, value: text, placeholder: w.placeholder, 'aria-label': w.placeholder, disabled: !w.open || busy,
+          onChange: (e) => { setText(e.target.value); setSaid('') },
+          onKeyDown: (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send() } },
+        }),
+        said ? h('div', { className: 'kzh-steer-note', role: 'status' }, said) : null)
+    }
+
     /** This session's queued, running and finished background tasks, polled while the tab is on screen. */
     function useTasks(sessionId, visible, every = 1000) {
       const [tasks, setTasks] = useState(EMPTY)
@@ -2441,13 +2843,16 @@ window.__ModuleLoader__.load({
       const fromTasks = tasks.map((t) => {
         const m = taskRowModel(t, now)
         const key = `t${t.jobId}`
+        // While it runs, its last live steps and the way to watch it (liveTail); once finished, its report;
+        // and below either, the person's guidance with what became of it.
+        const shown = open.has(key) && t.reportAvailable ? h(TaskReport, { jobId: t.jobId }) : liveTail(t) ?? h('div', { className: 'answer-text' }, m.detail)
         return {
           key, at: t.startedAt ?? t.queuedAt ?? 0, status: t.state, title: m.title, kind: t.jobId,
           position: t.position ?? 0, icon: m.icon, label: m.label, meta: m.meta,
           struck: m.struck, unread: m.unread, reason: m.reason, wait: m.wait,
-          body: open.has(key) && t.reportAvailable
-            ? h(TaskReport, { jobId: t.jobId })
-            : h('div', { className: 'answer-text' }, m.detail),
+          body: guidanceRows(t).length ? h('div', null, shown, h(GuidanceList, { t })) : shown,
+          // Send now and Steer, beside Run next and Clear (docs/live-agent-view.md Feature 5).
+          queue: queueActions(t).map((action) => ({ action, task: t })),
           // Only worth offering when something else is genuinely ahead of it.
           runNext: m.runNext && { workspace: t.workspace, jobId: t.jobId },
           stop: m.canStop && { what: m.title, jobId: t.jobId, word: m.stopWord },
@@ -2788,6 +3193,7 @@ window.__ModuleLoader__.load({
       const shown = confirm?.jobId ? confirmFor(tasks, confirm.jobId, now, confirm.word) : confirm
       const drift = confirmDrift(tasks, confirm, now)
       useEffect(() => { if (drift) { setConfirm(null); setErr(drift) } }, [drift])
+      const queue = useQueueControls(tasks, setErr)
       const act = (fn) => { setErr(''); Promise.resolve(fn()).catch((e) => setErr(e.message)) }
       const toggle = (key, isOpen) => setOpen((s) => { const n = new Set(s); if (isOpen) n.add(key); else n.delete(key); return n })
       if (!items.length) return h('div', { className: 'empty' }, 'Nothing queued, running or finished in this session yet.')
@@ -2828,6 +3234,7 @@ window.__ModuleLoader__.load({
                   // only behind the disclosure. Not a live region: its estimate moves every minute.
                   it.wait ? h('div', { className: 'why' }, it.wait) : null)),
               h('div', { style: { marginTop: 6 } }, it.body)),
+            ...(it.queue ?? []).map((q) => h('button', { key: q.action, className: 'btn', 'aria-label': queueLabel(q.action, q.task), onClick: () => queue.open(q.action, q.task) }, q.action === 'send' ? 'Send now' : 'Steer…')),
             it.runNext ? h('button', {
               className: 'btn', 'aria-label': `Run ${it.title} next`,
               onClick: () => act(() => post('/jev-router/tasks/reorder', { workspace: it.runNext.workspace, order: [it.runNext.jobId] })),
@@ -2853,7 +3260,8 @@ window.__ModuleLoader__.load({
           confirmLabel: shown.confirmLabel,
           onCancel: () => setConfirm(null),
           onConfirm: () => { setConfirm(null); act(shown.run) },
-        }) : null)
+        }) : null,
+        queue.dialog)
     }
 
     // ---------- work board: this session's background tasks, always on screen ----------
@@ -2878,6 +3286,7 @@ window.__ModuleLoader__.load({
       const [err, setErr] = useState('')
       const drift = confirmDrift(tasks, confirm, now)
       useEffect(() => { if (drift) { setConfirm(null); setErr(drift) } }, [drift])
+      const queue = useQueueControls(tasks, setErr)
       if (!tasks.length) return null
       // Only `completed` counts as done: a stopped or failed task is finished, not a success, so
       // the header names every terminal state that did not complete instead of folding it in.
@@ -2924,17 +3333,33 @@ window.__ModuleLoader__.load({
           // A waiting row's clock is its time in line, from when it was queued; it has no start
           // time, which is what used to leave it reading "starting" for as long as it waited.
           const time = !isLive ? null : t.state === 'queued' ? (m.waited ? `in line ${m.waited}` : null) : elapsed(t.startedAt + (t.inLineMs ?? 0), now) || null
+          // What its work is doing now, under a running row (a waiting row keeps its wait words); the
+          // row opens the Live tab on the task, and the line is that same way in from the keyboard.
+          const act = isLive && t.state !== 'queued' ? t.activity ?? null : null
+          const line = act ? activityLine(act, now, t.state) : ''
+          const watch = t.key ? () => openLive({ task: t.key }) : null
           return h('li', { key: m.jobId ?? `t${i}`, className: 'kzh-wb-item' },
-            h('div', { className: cx('kzh-wb-row', isLive && 'live') },
+            h('div', { className: cx('kzh-wb-row', isLive && 'live', watch && 'go'), onClick: watch ? (e) => { if (!e?.target?.closest?.('button')) watch() } : undefined },
               h('span', { className: 'kzh-wb-mark', 'aria-hidden': true }, isLive ? '' : m.icon),
               h('span', { className: cx('kzh-wb-title', m.struck && 'struck'), title: m.title || undefined }, m.title || 'Untitled task'),
               h('span', { className: 'kzh-wb-state' }, m.label),
               h('span', { className: 'kzh-wb-meta', title: m.meta }, m.meta),
               time ? h('span', { className: 'kzh-wb-time' }, time) : null,
+              // Send now while it waits in a line, Steer until it ends (docs/live-agent-view.md Feature 5).
+              ...queueActions(t).map((a) => h('button', {
+                key: a, type: 'button', className: 'kzh-wb-x', 'aria-label': queueLabel(a, t),
+                title: a === 'send' ? 'Start it now, ahead of its line' : 'Tell it something, before it starts or after', onClick: () => queue.open(a, t),
+              }, a === 'send' ? 'Send now' : 'Steer…')),
               isLive && m.canStop ? h('button', {
                 type: 'button', className: 'kzh-wb-x', 'aria-label': `${m.stopWord} ${m.title || 'this task'}`,
                 title: m.stopWord === 'Remove' ? 'Take this task out of the line' : 'Stop this task', onClick: () => setConfirm({ jobId: t.jobId, word: m.stopWord }),
               }, m.stopWord) : null),
+            line ? h('button', {
+              type: 'button', className: 'kzh-wb-act', title: line, onClick: watch ?? undefined,
+              'aria-label': `Watch ${m.title || 'this task'} live: ${line}`,
+            },
+              h('span', { className: cx('kzh-dot', freshNow(act, now) && 'fresh'), 'aria-hidden': true }),
+              h('span', { className: 't' }, line)) : null,
             // Why it waits, and how long it may, under the row: the reason is the part that decides
             // what to do about it, so it is never cut off with the meta line.
             m.wait ? h('div', { className: 'kzh-wb-why' }, m.wait) : null)
@@ -2948,7 +3373,8 @@ window.__ModuleLoader__.load({
           confirmLabel: words.confirmLabel,
           onCancel: () => setConfirm(null),
           onConfirm: () => { setConfirm(null); act(words.run) },
-        }) : null)
+        }) : null,
+        queue.dialog)
     }
 
     // ---------- work board seat: the top of the conversation, not the composer ----------
@@ -3002,6 +3428,584 @@ window.__ModuleLoader__.load({
       const RD = portaling()
       if (!RD || !host || !sessionId) return null
       return RD.createPortal(h(WorkBoard, { session: { sessionId } }), host)
+    }
+
+    // ---------- the live view: what each agent is doing as it does it ----------
+    // docs/live-agent-view.md Feature 1. The server keeps each run's steps as they stream (live.js) and
+    // serves them by task or run at GET /jev-router/live; the work board's second line and the Tasks
+    // tab's tail read the `activity` each /tasks row already carries, so they need no poller of their
+    // own. The words are worked out by pure helpers, which test/liveview.test.js pins without a DOM.
+
+    // ---- pure live helpers: no React, no state. What the live view says, from GET /jev-router/live
+    // answers and the `activity` of a /tasks row (live.js), and the clock.
+
+    // The live store's thresholds (live.js LIVE_TIMES), for the words the clock moves between two reads.
+    const LIVE_TIMES = { commandMs: 60_000, silenceMs: 90_000, quietMs: 10_000, freshMs: 5_000, rateMs: 2_000 }
+    // The mark a start reply carries for its task (reply-words.js JOB_MARK).
+    const JOB_MARK = /^\[jev-job\]:\s*kzh-job-1-([\w-]{1,80})\s*$/m
+    // How many lines of a command's output, and of a file's diff, a step shows before Show all.
+    const TERMINAL_LINES = 20
+    const DIFF_LINES = 400
+
+    /** A span of time as the live view says it: `45s`, `3m 05s`, `1h 02m` (live.js spanWords). */
+    function spanWords(n) {
+      const s = Math.max(0, Math.floor((n ?? 0) / 1000))
+      if (s < 60) return `${s}s`
+      const pad = (x) => String(x).padStart(2, '0')
+      if (s < 3600) return `${Math.floor(s / 60)}m ${pad(s % 60)}s`
+      return `${Math.floor(s / 3600)}h ${pad(Math.floor((s % 3600) / 60))}m`
+    }
+    /** Text on one line, its first `n` characters, with an ellipsis when there was more (live.js oneLine). */
+    const oneLine = (t, n) => { const x = String(t ?? '').replace(/\s+/g, ' ').trim(); return x.length > n ? `${x.slice(0, n)}…` : x }
+
+    /**
+     * Why a live run reads as stalled, or '': the browser's copy of live.js stallOf, so the counts in
+     * its words move with the clock between two reads. A call of any tool still running (`busy`)
+     * counts as open, as there: the agent waits on it. It never says stuck: a long command or a long
+     * think is not one. Its silence words say Stop is on the row, as the work board's row and the
+     * card have one; a line with no Stop beside it (`stopHere` false) leaves that out.
+     */
+    function stallWords({ open, lastAgentAt, agent, live, busy } = {}, now = Date.now(), { stopHere = true } = {}) {
+      if (open && now - open.since > LIVE_TIMES.commandMs) return `Waiting on a command for ${spanWords(now - open.since)}: ${oneLine(open.command, 60)}`
+      if (live && !open && !busy && Number.isFinite(lastAgentAt) && now - lastAgentAt > LIVE_TIMES.silenceMs) return `No news from ${agent ?? 'the agent'} for ${spanWords(now - lastAgentAt)}. It may still be thinking${stopHere ? '; Stop is on this row' : ''}.`
+      return ''
+    }
+
+    /** A token count as a person reads one: `950 tokens`, `18.2k tokens`, `41k tokens`, `1.2M tokens`. */
+    function tokenWords(n) {
+      const x = Math.max(0, Math.round(Number(n) || 0))
+      const short = (v, unit) => `${(Math.round(v * 10) / 10).toString()}${unit}`
+      if (x < 1000) return `${x} token${x === 1 ? '' : 's'}`
+      if (x < 100_000) return `${short(x / 1000, 'k')} tokens`
+      if (x < 999_500) return `${Math.round(x / 1000)}k tokens`
+      return `${short(x / 1_000_000, 'M')} tokens`
+    }
+    /** How long ago, in the activity line's words: `3 s ago`, then `2m 05s ago`. */
+    const agoWords = (n) => (n < 60_000 ? `${Math.floor(Math.max(0, n) / 1000)} s ago` : `${spanWords(n)} ago`)
+
+    /**
+     * The work board's second line for a live task, from its activity (live.js activityOf) and the clock:
+     * `Running a command: npm test · 14 tool calls · 18.2k tokens · 31 tokens/s · 1 s ago`. The rate is
+     * that of a stream this build reads; it falls to 0 once nothing has come for its window, and past
+     * 10 s of quiet the line says `quiet for N s` rather than how long ago. While an agent works whose
+     * steps this build cannot hear (live detail off, `heard` false), it says neither, which would read
+     * as that agent's silence. A stall's words take the phrase's place, worked out again with the
+     * clock. A line with no Stop beside it (`stopHere` false) words a silence by the clock alone, never
+     * by the phrase the store read it with, whose words say Stop is on the row. Pure.
+     */
+    function activityLine(a, now = Date.now(), state = null, { stopHere = true } = {}) {
+      if (!a) return ''
+      if (a.done) return doneLine(a, state)
+      const quiet = Number.isFinite(a.lastActivityAt) && a.heard !== false ? Math.max(0, now - a.lastActivityAt) : null
+      const phrase = stallWords({ open: a.open, lastAgentAt: a.lastAgentAt, agent: a.agent, live: a.live, busy: a.busy }, now, { stopHere }) || (stopHere || a.stall?.kind !== 'silence' ? a.phrase : '') || ''
+      const rate = typeof a.rate === 'number' ? (quiet != null && quiet >= LIVE_TIMES.rateMs ? 0 : Math.round(a.rate)) : null
+      return [
+        phrase,
+        a.tools ? `${a.tools} tool call${a.tools === 1 ? '' : 's'}` : '',
+        a.tokens ? tokenWords(a.tokens) : '',
+        rate != null ? `${rate} tokens/s` : '',
+        quiet == null ? '' : quiet >= LIVE_TIMES.quietMs ? `quiet for ${quiet < 60_000 ? `${Math.floor(quiet / 1000)} s` : spanWords(quiet)}` : agoWords(quiet),
+      ].filter(Boolean).join(' · ')
+    }
+    /**
+     * A finished task's line, from its activity and the state it ended in: `Done in 7m 12s · 23 tool
+     * calls · 41k tokens`, or `Stopped after 3m 05s · ...` for one that did not complete. Pure.
+     */
+    function doneLine(a, state = null) {
+      const took = spanWords(a?.done?.ms ?? a?.elapsedMs)
+      const head = state && state !== 'completed' && TERMINAL_TASK.includes(state) ? `${taskLabels[state]} after ${took}` : `Done in ${took}`
+      return [head, a?.tools ? `${a.tools} tool call${a.tools === 1 ? '' : 's'}` : '', a?.tokens ? tokenWords(a.tokens) : ''].filter(Boolean).join(' · ')
+    }
+    /** Whether the newest of the work is under 5 s old, which the work board's dot pulses for. */
+    const freshNow = (a, now = Date.now()) => !!a && !a.done && Number.isFinite(a.lastActivityAt) && now - a.lastActivityAt < LIVE_TIMES.freshMs
+
+    /**
+     * A GET /jev-router/live answer merged into what the view holds: each run's steps by id, a newer
+     * version over an older one, in the order the run made them, those older than the run keeps
+     * (`keptFrom`) let go but its `Older steps dropped` line; each run's attempts and summary as the
+     * answer has them; and `v`, the version the next read asks after. `at` is when it came, for the
+     * clock between reads. Pure.
+     */
+    function mergeLive(prev, body, at = Date.now()) {
+      const runs = new Map((prev?.runs ?? []).map((r) => [r.runId, r]))
+      for (const r of body?.runs ?? []) {
+        if (!r || typeof r.runId !== 'string') continue
+        const old = runs.get(r.runId)
+        const byId = new Map((old?.items ?? []).map((it) => [it.id, it]))
+        for (const it of r.items ?? []) { const was = byId.get(it.id); if (it && typeof it.id === 'string' && !(was?.v > it.v)) byId.set(it.id, it) }
+        const keptFrom = r.keptFrom ?? old?.keptFrom ?? 1
+        const items = [...byId.values()].filter((it) => it.id === 'dropped' || !(it.n < keptFrom)).sort((x, y) => (x.n ?? 0) - (y.n ?? 0))
+        runs.set(r.runId, { ...old, ...r, keptFrom, items })
+      }
+      // The answer names a task's runs in the order they ran; one it left out keeps its place first.
+      const named = (body?.runs ?? []).map((r) => r?.runId).filter((id) => runs.has(id))
+      const order = [...[...runs.keys()].filter((id) => !named.includes(id)), ...named]
+      return {
+        v: Number.isFinite(body?.v) ? body.v : prev?.v ?? 0,
+        runs: order.map((id) => runs.get(id)),
+        done: !!body?.done, saved: !!(body?.saved || prev?.saved),
+        patches: body?.patches ?? prev?.patches ?? {}, task: body?.task ?? prev?.task ?? null,
+        fetchedAt: at,
+      }
+    }
+
+    /**
+     * A reasoning block as its preview shows it: what it has thought so far, which the view clips to
+     * 120 px under a fade and keeps at its newest line as it streams, with Show all when there is more
+     * than the preview holds; where only a count came, `Thinking... (about 1.2k tokens)`. Pure.
+     */
+    function reasoningPreview(item, { full = false } = {}) {
+      const text = String(item?.text ?? '')
+      if (!text.trim()) {
+        const n = Number(item?.meta?.tokens)
+        return { text: n > 0 ? `Thinking... (about ${tokenWords(n)})` : 'Thinking...', more: false }
+      }
+      const lines = text.split('\n')
+      const before = item?.clippedBefore ? `… ${item.clippedBefore} characters before this are not shown here …\n` : ''
+      return { text: full ? `${before}${text}` : lines.slice(-8).join('\n'), more: !full && (lines.length > 8 || text.length > 600 || !!item?.clippedBefore) }
+    }
+
+    // The roles an attempt can have that are not the work itself (router.js attempt_start).
+    const SIDE_ROLES = { review: 'Review', opinion: 'Second opinion', plan: 'Plan' }
+    /** An attempt's heading in the timeline: `Attempt 1 · Claude Code · work`, `Review · Codex`. Pure. */
+    function attemptTitle(a, attempts = [a]) {
+      const name = a?.name ?? a?.agent ?? 'the agent'
+      if (SIDE_ROLES[a?.role]) return `${SIDE_ROLES[a.role]} · ${name}`
+      if (a?.role === 'tool') return `${name.charAt(0).toUpperCase()}${name.slice(1)}`
+      const work = (attempts ?? []).filter((x) => x && !SIDE_ROLES[x.role] && x.role !== 'tool')
+      const k = work.findIndex((x) => x === a || x.index === a?.index) + 1
+      return `Attempt ${k || 1} · ${name} · work`
+    }
+
+    // Terminal control sequences: CSI (colours, cursor moves), OSC (titles, links) and the two-byte ones.
+    const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g
+    /**
+     * A command's output as its step shows it: colour and cursor codes stripped, Windows line ends read
+     * as line ends, each carriage return applied as a terminal applies it (a progress bar keeps its last
+     * state), and the last `max` lines kept, with how many went before them. Pure.
+     */
+    function cleanTerminal(raw, max = TERMINAL_LINES) {
+      const lines = String(raw ?? '').replace(ANSI, '').replace(/\r\n/g, '\n').split('\n').map((l) => {
+        let out = ''
+        for (const part of l.split('\r')) out = part + out.slice(part.length)
+        return out.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+      })
+      while (lines.length && !lines.at(-1)) lines.pop()
+      return { text: lines.slice(-max).join('\n'), hidden: Math.max(0, lines.length - max) }
+    }
+
+    /**
+     * The Live tab's header line from the merged view and the clock: `jev-3 · Claude Code ·
+     * claude-opus-4-1 · effort high · 2m 14s · 18.2k tokens · last activity 2 s ago`. The time counts
+     * each pass's own work, its time in line left out, and moves on between reads while it runs; the
+     * last activity is left out while an agent works whose steps this build cannot hear. Pure.
+     */
+    function liveHeader(view, now = Date.now()) {
+      const runs = view?.runs ?? []
+      const last = runs.at(-1)
+      if (!last) return view?.task?.jobId ?? ''
+      const a = last.attempts?.at(-1)
+      const s = last.summary ?? {}
+      const done = !!view.done || !!s.done
+      const elapsed = runs.reduce((t, r) => t + (r.summary?.elapsedMs ?? 0), 0) + (done ? 0 : Math.max(0, now - (view.fetchedAt ?? now)))
+      const tokens = runs.reduce((t, r) => t + (r.summary?.tokens ?? 0), 0)
+      const quiet = Number.isFinite(s.lastActivityAt) && s.heard !== false ? Math.max(0, now - s.lastActivityAt) : null
+      const effort = a?.effort ?? s.effort
+      return [view.task?.jobId ?? last.runId, a?.name ?? s.agent, a?.model ?? s.model, effort ? `effort ${effort}` : '', spanWords(elapsed), tokens ? tokenWords(tokens) : '', !done && quiet != null ? `last activity ${agoWords(quiet)}` : '']
+        .filter(Boolean).join(' · ')
+    }
+
+    /**
+     * The notes under the header, each only where it applies: what Codex and Claude Code share of their
+     * thinking, detail that is off, a local model that does not think aloud, a saved transcript. Pure.
+     */
+    function liveNotes(view) {
+      const attempts = (view?.runs ?? []).flatMap((r) => r.attempts ?? [])
+      const off = new Map()
+      for (const a of attempts) if (a.detail === 'off' && !off.has(a.name ?? a.agent)) off.set(a.name ?? a.agent, a.why)
+      const heard = (provider) => attempts.some((a) => a.detail === 'live' && a.provider === provider)
+      return [
+        heard('codex') ? 'Codex shares its reasoning as short summaries.' : '',
+        heard('claude-code') ? 'Claude Code shows thinking only when Claude shares it; text and tool calls always show.' : '',
+        ...[...off].map(([name, why]) => `Live detail for ${name} is off${why ? `: ${why}` : ''}. You still see the router's steps, and the result posts as usual.`),
+        attempts.some((a) => a.thinking === false) ? 'This local model runs with thinking off, so there is no reasoning to show.' : '',
+        view?.saved ? 'Saved transcript (last 256 KB). The task\'s report is in the chat.' : '',
+      ].filter(Boolean)
+    }
+
+    /**
+     * A finished view's last line, `Finished: Completed in 4m 10s.`, in the words of how its task ended
+     * (one stopped as it waited after its read pass reads `Stopped`, never that the pass handed it
+     * back), or of how its run ended for a view of one run; '' while it runs. Pure.
+     */
+    function liveEndLine(view) {
+      if (!view?.done) return ''
+      const runs = view.runs ?? []
+      const ms = runs.reduce((t, r) => t + (r.summary?.done?.ms ?? r.summary?.elapsedMs ?? 0), 0)
+      const label = TERMINAL_TASK.includes(view.task?.state) ? taskLabels[view.task.state] : runs.at(-1)?.summary?.done?.label
+      return !label ? 'Finished.' : runs.length ? `Finished: ${label} in ${spanWords(ms)}.` : `Finished: ${label}.`
+    }
+
+    /** A run's steps in sections: the router's lines before its first attempt, then one section per attempt with its usage. */
+    function liveSections(run) {
+      const attempts = run.attempts ?? []
+      const sections = [{ key: 'routing', attempt: null, items: [] }, ...attempts.map((a) => ({ key: `a${a.index}`, attempt: a, items: [] }))]
+      const byIndex = new Map(sections.filter((x) => x.attempt).map((x) => [x.attempt.index, x]))
+      for (const it of run.items ?? []) {
+        if (it.meta?.hidden) continue
+        ;(byIndex.get(it.attempt) ?? sections[0]).items.push(it)
+      }
+      return sections.filter((x) => x.attempt || x.items.length)
+    }
+
+    /** What the Live tab is opened on: `{ task }` or `{ run }`, from its params; null for the picker. */
+    const liveTarget = (p) => (typeof p?.task === 'string' && p.task ? { task: p.task } : typeof p?.run === 'string' && p.run ? { run: p.run } : null)
+
+    // ---- end pure live helpers
+
+    /** Open the Live tab on a task or a run. Never throws: with no right sidebar a toast says why. */
+    const openLive = (target) => { try { openPanel(LIVE_KIND, target ?? undefined) } catch (e) { toast(e.message) } }
+
+    /**
+     * One task's or run's live view, read every 700 ms while `visible`, asking each time only for what
+     * changed since the last read and merging it in; it stops once the work has ended (or the read is
+     * refused as not there), and while the page is hidden it reads nothing until it is shown again.
+     */
+    function useLive(target, visible, every = 700) {
+      const q = target?.task ? `task=${encodeURIComponent(target.task)}` : target?.run ? `run=${encodeURIComponent(target.run)}` : ''
+      const [state, setState] = useState({ q: '', view: null, error: '' })
+      const held = useRef(state)
+      held.current = state.q === q ? state : { q, view: null, error: '' }
+      useEffect(() => {
+        if (!visible || !q) return
+        let stop = false
+        let timer = null
+        const wake = () => { if (!document.hidden && !stop && !timer) { document.removeEventListener?.('visibilitychange', wake); tick() } }
+        const tick = async () => {
+          timer = null
+          if (stop) return
+          // Hidden: nothing is read until the page is shown again.
+          if (document.hidden) { document.addEventListener?.('visibilitychange', wake); return }
+          const was = held.current.q === q ? held.current.view : null
+          try {
+            const body = await api(`/jev-router/live?${q}&after=${was?.v ?? 0}`)
+            if (stop) return
+            const view = mergeLive(was, body)
+            held.current = { q, view, error: '' }
+            setState(held.current)
+            if (body.done) return
+          } catch (e) {
+            if (stop) return
+            const gone = e.status === 404 ? `This ${target?.task ? 'task is no longer in the task list' : 'run is no longer kept'}, so there is nothing to show.` : e.message
+            held.current = { q, view: was, error: gone }
+            setState(held.current)
+            if (e.status === 400 || e.status === 404) return
+          }
+          timer = setTimeout(tick, every)
+        }
+        tick()
+        return () => { stop = true; clearTimeout(timer); document.removeEventListener?.('visibilitychange', wake) }
+      }, [q, visible, every])
+      return held.current
+    }
+
+    // One /tasks reader for every card under a start reply and the Live tab's picker, held while any
+    // of them needs it: a chat with many start replies still reads the list once a second, not once
+    // per card. `at` is when the list was read.
+    const tasksFeed = (() => {
+      const store = makeStore({ tasks: null, at: 0 })
+      let holders = 0
+      let running = false
+      let timer = null
+      const tick = async () => {
+        timer = null
+        if (!holders) { running = false; return }
+        if (!document.hidden) { try { const d = await api('/jev-router/tasks'); store.set({ tasks: d.tasks ?? [], at: Date.now() }) } catch {} }
+        if (!holders) { running = false; return }
+        timer = setTimeout(tick, 1000)
+      }
+      return {
+        store,
+        /** Hold the reader; the function returned lets it go, once. */
+        hold() {
+          holders++
+          if (!running) { running = true; tick() }
+          let held = true
+          return () => {
+            if (!held) return
+            held = false
+            if (--holders === 0 && timer) { clearTimeout(timer); timer = null; running = false }
+          }
+        },
+      }
+    })()
+    /** Every task as the shared reader last read them (null before its first read), held while `active`. */
+    function useTasksFeed(active) {
+      const { tasks, at } = tasksFeed.store.use()
+      useEffect(() => (active ? tasksFeed.hold() : undefined), [active])
+      return { tasks, at }
+    }
+
+    /** Whether an element is on screen, by an IntersectionObserver; true where there is none to ask. */
+    function useOnScreen(ref, key) {
+      const [on, setOn] = useState(true)
+      useEffect(() => {
+        const el = ref.current
+        if (!el || typeof IntersectionObserver !== 'function') return
+        const io = new IntersectionObserver((entries) => setOn(entries.some((e) => e.isIntersecting)))
+        io.observe(el)
+        return () => io.disconnect()
+      }, [key])
+      return on
+    }
+
+    const stepGlyph = (state) => (state === 'running' ? '…' : state === 'failed' ? '✕' : '✓')
+    /** One step as a row: its state's glyph, then its words. */
+    const stepRow = (key, state, title) => h('div', { key, className: cx('kzh-live-row', state) },
+      h('span', { className: 'g', 'aria-hidden': true }, stepGlyph(state)),
+      h('span', { className: 't' }, title))
+
+    /**
+     * A running task's last six live steps and the way to watch it, for its row in the Tasks tab; null
+     * for a task that is waiting, finished, or not followed live.
+     */
+    function liveTail(t) {
+      const a = t?.activity
+      if (!t?.key || !a || a.done || !LIVE_TASK.includes(t.state) || t.state === 'queued') return null
+      const recent = Array.isArray(a.recent) ? a.recent.slice(-6) : []
+      return h('div', { className: 'kzh-live-tail' },
+        recent.length ? h('div', { role: 'list', 'aria-label': 'Latest steps' }, ...recent.map((r, i) => h('div', { key: i, role: 'listitem' }, stepRow(`r${i}`, r.state, r.title))))
+          : h('div', { className: 'answer-text' }, a.phrase ?? ''),
+        h('a', { className: 'link', role: 'button', tabIndex: 0, onClick: () => openLive({ task: t.key }), onKeyDown: (k) => { if (k.key === 'Enter') openLive({ task: t.key }) } }, 'Open live view'))
+    }
+
+    /**
+     * A step of the timeline: the router's lines grey, thinking as a preview, text as Markdown, tools,
+     * commands and edits as rows, and the person's words (Steer) as a bubble saying what became of them,
+     * as task `t`'s row has it now, with Copy and Send as a follow-up for words it ended without.
+     */
+    function liveStep(it, { expanded, toggle, t = null }) {
+      const key = it.id
+      const all = expanded.has(key)
+      if (it.kind === 'steer') {
+        const piece = (t?.steers ?? []).find((x) => x?.id === it.meta?.steer) ?? null
+        const words = piece?.words || it.meta?.words || ''
+        return h('div', { key, className: 'kzh-live-you' },
+          h('div', { className: 't' }, it.title),
+          words ? h('div', { className: 'why' }, words) : null,
+          piece?.state === 'returned' && t ? h(GuidanceActions, { t, text: piece.text }) : null)
+      }
+      if (it.router || it.kind === 'status' || it.kind === 'error') {
+        return h('div', { key, className: cx('kzh-live-ms', it.kind === 'error' && 'bad') }, it.title, it.text ? h('div', { className: 'why' }, it.text) : null)
+      }
+      if (it.kind === 'reasoning') {
+        const p = reasoningPreview(it, { full: all })
+        return h('div', { key, className: cx('kzh-live-think', !all && 'clip') },
+          h('div', { className: 'kzh-live-think-t' }, p.text),
+          p.more || all ? h('button', { type: 'button', className: 'linkish', onClick: () => toggle(key) }, all ? 'Show less' : 'Show all') : null)
+      }
+      if (it.kind === 'text') return h('div', { key }, h(Markdown, { className: 'kzh-live-text', text: it.text ?? '' }))
+      if (it.kind === 'command') {
+        const out = cleanTerminal(it.text)
+        // Open while it runs, folded once it ends with its output's last lines inside. A spawn child's
+        // command has no output before then: its session commits nothing between a call and its result.
+        return h('details', { key, className: 'kzh-live-step', open: it.state === 'running' },
+          h('summary', null, stepRow('s', it.state, it.title)),
+          out.text ? h('pre', { className: 'kzh-live-out' }, out.hidden ? `… ${out.hidden} earlier lines …\n` : '', out.text) : null)
+      }
+      if (it.kind === 'file' || it.kind === 'plan') {
+        const lines = String(it.text ?? '').split('\n')
+        const shown = all ? lines : lines.slice(0, DIFF_LINES)
+        return h('details', { key, className: 'kzh-live-step' },
+          h('summary', null, stepRow('s', it.state, it.title)),
+          it.text ? h('pre', { className: 'kzh-live-out' }, ...shown.map((l, i) => h('span', { key: i, className: it.kind === 'file' && /^\+(?!\+\+)/.test(l) ? 'add' : it.kind === 'file' && /^-(?!--)/.test(l) ? 'del' : undefined }, `${l}\n`))) : null,
+          lines.length > DIFF_LINES ? h('button', { type: 'button', className: 'linkish', onClick: () => toggle(key) }, all ? 'Show less' : `Show all ${lines.length} lines`) : null)
+      }
+      return stepRow(key, it.state, it.title)
+    }
+
+    /**
+     * The Live tab: a task's or a run's work as it streams, one section per attempt, with Follow, Open
+     * full session and Stop; with neither, a picker of this chat's tasks, the live ones first.
+     */
+    function LivePane({ useTabInfo, sessionId }) {
+      useStyle()
+      const info = useTabInfo?.()
+      const visible = info?.tab?.visible ?? true
+      // Openers name the task or run: openTab(LIVE_KIND, { params: { task } }); revision steps on every re-open.
+      const nav = info?.tab?.navigation
+      const [target, setTarget] = useState(() => liveTarget(nav?.params))
+      useEffect(() => { const t = liveTarget(nav?.params); if (t) setTarget(t) }, [nav?.revision, nav?.params?.task, nav?.params?.run])
+      const { tasks } = useTasksFeed(visible)
+      const { view, error } = useLive(target, visible)
+      const mine = (tasks ?? []).filter((t) => t.sessionId === sessionId && t.key)
+      // The clock moves while what is shown can change: a view still being read, or a picker with a
+      // live task, whose line says how long it has been quiet.
+      const now = useNow(visible && (target ? !view?.done : mine.some((t) => LIVE_TASK.includes(t.state))))
+      const [follow, setFollow] = useState(true)
+      const [expanded, setExpanded] = useState(() => new Set())
+      // null, { jobId, word } of the task being stopped or removed, with the word its button said, or
+      // the words of a run's Stop as it was pressed.
+      const [confirm, setConfirm] = useState(null)
+      const [err, setErr] = useState('')
+      const scroller = useRef(null)
+      // Following: each read lands at the newest step.
+      useEffect(() => { const el = scroller.current; if (follow && el) el.scrollTop = el.scrollHeight }, [follow, view])
+      // A dialog never changes what its button does: one whose task started, ended or went back to
+      // waiting meanwhile closes and says so, as the work board's does.
+      const drift = confirmDrift(tasks, confirm, now)
+      useEffect(() => { if (drift) { setConfirm(null); setErr(drift) } }, [drift])
+      const queue = useQueueControls(tasks, setErr)
+      const toggle = (key) => setExpanded((s) => { const n = new Set(s); if (n.has(key)) n.delete(key); else n.add(key); return n })
+      const act = (fn) => { setErr(''); Promise.resolve().then(fn).catch((e) => setErr(e.message)) }
+      if (!target) {
+        const liveOnes = mine.filter((t) => LIVE_TASK.includes(t.state))
+        const finished = mine.filter((t) => TERMINAL_TASK.includes(t.state)).sort((x, y) => (y.finishedAt ?? 0) - (x.finishedAt ?? 0)).slice(0, 10)
+        // A waiting task says what it waits for, as its work board row does: a read pass that handed it
+        // back to its line has ended, but its work has not. A row here has no Stop, only Watch, so a
+        // stall's words do not say Stop is on it.
+        const why = (t) => (t.state === 'queued' ? taskRowModel(t, now).wait || taskLabels.queued
+          : [taskLabels[t.state] ?? t.state, t.activity ? activityLine(t.activity, now, t.state, { stopHere: false }) : ''].filter(Boolean).join(' · '))
+        const pick = (t) => h('li', { key: t.key },
+          h('div', { style: { minWidth: 0 } },
+            h('div', { className: 'title' }, taskRowModel(t, now).title || 'Untitled task'),
+            h('div', { className: 'why' }, why(t))),
+          h('button', { type: 'button', className: 'btn', 'aria-label': `Watch ${taskRowModel(t, now).title || 'this task'}`, onClick: () => setTarget({ task: t.key }) }, 'Watch'))
+        return h('div', { className: 'jevi kzh-live' },
+          h('h3', null, 'Live'),
+          liveOnes.length ? h('ul', { className: 'plain', 'aria-label': 'Live tasks' }, ...liveOnes.map(pick))
+            : h('div', { className: 'empty' }, 'Nothing is running in this chat. When a task starts you can watch it here.'),
+          finished.length ? h('div', { className: 'label', style: { marginTop: 12 } }, 'Recently finished') : null,
+          finished.length ? h('ul', { className: 'plain', 'aria-label': 'Recently finished tasks' }, ...finished.map(pick)) : null)
+      }
+      const t = target.task ? mine.find((x) => x.key === target.task) ?? (tasks ?? []).find((x) => x.key === target.task) : null
+      const runs = view?.runs ?? []
+      const child = runs.at(-1)?.child ?? null
+      const childOf = view?.task?.sessionId ?? t?.sessionId ?? sessionId
+      const canStop = target.task ? !!t && LIVE_TASK.includes(t.state) : !!view && !view.done
+      // A task's button says Remove while it waits in line, as its row does, and its dialog is worded
+      // from the row each time it renders (confirmFor); a run's is asked about as it was when pressed.
+      const stopWord = t ? taskRowModel(t, now).stopWord : 'Stop'
+      const ask = () => setConfirm(t ? { jobId: t.jobId, word: stopWord } : { ...stopOneWords({ title: 'this run', stopWord: 'Stop' }), run: () => post('/jev-router/runs/stop', { runId: target.run }) })
+      const shown = confirm?.jobId ? confirmFor(tasks, confirm.jobId, Date.now(), confirm.word) : confirm
+      const end = liveEndLine(view)
+      return h('div', { className: 'jevi kzh-live' },
+        h('div', { className: 'head' },
+          h('h3', null, t ? taskRowModel(t, now).title || 'Live' : 'Live'),
+          h('button', { type: 'button', className: 'linkish', onClick: () => setTarget(null) }, 'All tasks')),
+        h('div', { className: 'kzh-live-hd' }, liveHeader(view, now) || (t ? taskRowModel(t, now).detail : '')),
+        ...liveNotes(view).map((n, i) => h('div', { key: `n${i}`, className: 'kzh-live-note' }, n)),
+        h('div', { className: 'kzh-live-bar' },
+          h('button', { type: 'button', className: 'btn', 'aria-pressed': follow, onClick: () => setFollow(!follow) }, 'Follow'),
+          !follow ? h('button', { type: 'button', className: 'btn', onClick: () => setFollow(true) }, 'Jump to latest') : null,
+          child && sessionsApi?.openSubagent ? h('button', { type: 'button', className: 'btn', onClick: () => act(() => sessionsApi.openSubagent({ parentSessionId: childOf, childSessionId: child.id, mode: 'one-shot', ...(child.label ? { label: child.label } : {}) })) }, 'Open full session') : null,
+          ...queueActions(t).map((a) => h('button', { key: a, type: 'button', className: 'btn', 'aria-label': queueLabel(a, t), onClick: () => queue.open(a, t) }, a === 'send' ? 'Send now' : 'Steer…')),
+          canStop ? h('button', { type: 'button', className: 'btn danger', onClick: ask }, stopWord) : null),
+        error ? h('div', { className: 'err', role: 'alert' }, error) : null,
+        err ? h('div', { className: 'err', role: 'alert' }, err) : null,
+        h('div', {
+          className: 'kzh-live-tl', ref: scroller, 'aria-live': 'off',
+          // Scrolling up to read turns Follow off; Jump to latest turns it back on.
+          onScroll: (e) => { const el = e.currentTarget ?? e.target; if (el && el.scrollHeight - el.scrollTop - el.clientHeight > 40) setFollow(false) },
+        },
+          !view ? h('div', { className: 'empty' }, error ? '' : t?.state === 'queued' ? taskRowModel(t, now).detail : 'Loading…')
+            : !runs.length ? h('div', { className: 'empty' }, t?.state === 'queued' ? taskRowModel(t, now).detail : 'Nothing to show yet.')
+              : runs.map((run, ri) => h('div', { key: run.runId },
+                runs.length > 1 ? h('div', { className: 'label' }, `Pass ${ri + 1} of ${runs.length}${run.summary?.done?.status === 'needs_write' ? ': read only, handed back to write' : ''}`) : null,
+                ...liveSections(run).map((sec) => h('section', { key: sec.key, className: 'kzh-live-sec' },
+                  sec.attempt ? h('h4', null, attemptTitle(sec.attempt, run.attempts)) : null,
+                  ...sec.items.map((it) => liveStep(it, { expanded, toggle, t })),
+                  sec.attempt?.tokens?.total ? h('div', { className: 'kzh-live-use' }, `Usage: ${tokenWords(sec.attempt.tokens.input)} in, ${tokenWords(sec.attempt.tokens.output)} out`) : null)))),
+          end ? h('div', { className: 'kzh-live-end' }, end) : null),
+        // Steer from here: the words go to the task at work, or onto it before it starts. One box per
+        // task, so words typed for one never stay in it as the tab turns to another.
+        t ? h(LiveComposer, { key: t.key, t, say: setErr }) : null,
+        shown ? h(Confirm, {
+          title: shown.title, body: shown.body, confirmLabel: shown.confirmLabel,
+          onCancel: () => setConfirm(null),
+          onConfirm: () => { setConfirm(null); act(shown.run) },
+        }) : null,
+        queue.dialog)
+    }
+
+    /**
+     * The card under a start reply (a message with a `[jev-job]` mark): who works on the task, what it
+     * does now and its last tool calls, Open live view and Stop; once it ends, how it went. Here it only
+     * reads the message's text, as AgentStrip does, so a reply with no mark, as most are, renders nothing
+     * and is kept out of the shared task list's every read (LiveTaskCard reads that).
+     */
+    function LiveRunCard({ messageId, useChat }) {
+      const text = useChat((s) => messageText(s.legacy.nodes, messageId))
+      const key = JOB_MARK.exec(String(text ?? ''))?.[1] ?? null
+      return key ? h(LiveTaskCard, { taskKey: key }) : null
+    }
+
+    /**
+     * The card of the task a start reply names (LiveRunCard): it reads the shared task list while the
+     * task can still change, and the task's steps only while the task is live and the card is on screen.
+     */
+    function LiveTaskCard({ taskKey: key }) {
+      useStyle()
+      const root = useRef(null)
+      const since = useRef(Date.now())
+      // The list is read while the task can still change, and let go once it has ended or left the list.
+      const [settled, setSettled] = useState(false)
+      const { tasks, at } = useTasksFeed(!settled)
+      const t = (tasks ?? []).find((x) => x.key === key) ?? null
+      const live = !!t && LIVE_TASK.includes(t.state)
+      useEffect(() => { if (tasks && at > since.current && !live) setSettled(true) }, [tasks, at, live])
+      const onScreen = useOnScreen(root, t ? key : '')
+      // Its steps are read while it is live and on screen, and once more after it ends if they were
+      // being read, for the last of them.
+      const seen = useRef(null)
+      const { view } = useLive({ task: key }, onScreen && (live || (!!seen.current && !seen.current.done)))
+      seen.current = view
+      const now = useNow(live)
+      // null, or { jobId, word } of the task being stopped or removed, with the word its button said.
+      const [confirm, setConfirm] = useState(null)
+      const [err, setErr] = useState('')
+      // A dialog never changes what its button does: one whose task started, ended or went back to
+      // waiting meanwhile closes and says so, as the work board's does.
+      const drift = confirmDrift(tasks, confirm, now)
+      useEffect(() => { if (drift) { setConfirm(null); setErr(drift) } }, [drift])
+      const queue = useQueueControls(tasks, setErr)
+      if (!t) return null
+      const a = t.activity ?? null
+      const name = a?.agent ?? (t.agent ? agentLabel(t.agent) : '')
+      const steps = (view?.runs ?? []).flatMap((r) => r.items ?? []).filter((it) => !it.meta?.hidden && !it.router && ['tool', 'command', 'file', 'plan'].includes(it.kind)).slice(-8)
+      const m = taskRowModel(t, now)
+      // Waiting keeps the wait words; a run that has ended says how it went; one at work says what it
+      // does now and for how long, until which it is starting.
+      const doing = t.state === 'queued' ? m.wait || m.detail
+        : a?.done ? doneLine(a, t.state)
+          : !live ? m.reason || m.label
+            : a ? [stallWords({ open: a.open, lastAgentAt: a.lastAgentAt, agent: a.agent, live: a.live, busy: a.busy }, now) || a.phrase, spanWords(a.elapsedMs + Math.max(0, now - (at || now)))].filter(Boolean).join(' · ')
+              : `Starting ${name || 'the agent'}...`
+      const who = [name, a?.model ?? t.model, (a?.effort ?? t.effort) ? `effort ${a?.effort ?? t.effort}` : ''].filter(Boolean).join(' · ')
+      return h('div', { className: 'kzh-lrc', ref: root, role: 'group', 'aria-label': `Live: ${m.title || 'task'}` },
+        h('div', { className: 'kzh-lrc-hd' },
+          h('span', { className: 'kzh-lrc-av', 'aria-hidden': true }, (name || '?').charAt(0).toUpperCase()),
+          h('span', { className: 'kzh-lrc-name', title: m.title }, m.title || 'Task')),
+        who ? h('div', { className: 'kzh-lrc-who' }, `${who}${a?.tools ? ` (${a.tools} tool call${a.tools === 1 ? '' : 's'})` : ''}`) : null,
+        // Not a live region: its clock moves every second, and announcing each would bury what matters.
+        h('div', { className: 'kzh-lrc-now' }, doing),
+        steps.length ? h('div', { className: 'kzh-lrc-rows', role: 'list', 'aria-label': 'Latest tool calls' }, ...steps.map((it) => h('div', { key: it.id, role: 'listitem' }, stepRow('r', it.state, it.title)))) : null,
+        h(GuidanceList, { t }),
+        err ? h('div', { className: 'kzh-wb-err', role: 'alert' }, err) : null,
+        h('div', { className: 'kzh-lrc-acts' },
+          h('button', { type: 'button', onClick: () => openLive({ task: key }) }, 'Open live view'),
+          ...queueActions(t).map((q) => h('button', { key: q, type: 'button', 'aria-label': queueLabel(q, t), onClick: () => queue.open(q, t) }, q === 'send' ? 'Send now…' : 'Steer…')),
+          live ? h('button', { type: 'button', className: 'danger', onClick: () => setConfirm({ jobId: t.jobId, word: m.stopWord }) }, m.stopWord) : null),
+        confirm ? (() => {
+          const words = confirmFor(tasks, confirm.jobId, Date.now(), confirm.word)
+          if (!words) return null
+          return h(Confirm, {
+            title: words.title, body: words.body, confirmLabel: words.confirmLabel,
+            onCancel: () => setConfirm(null),
+            onConfirm: () => { setConfirm(null); setErr(''); Promise.resolve().then(words.run).catch((e) => setErr(e.message)) },
+          })
+        })() : null,
+        queue.dialog)
     }
 
     // ---------- accounts, usage, limits ----------
@@ -3522,11 +4526,12 @@ window.__ModuleLoader__.load({
       try { return face?.getSnapshot?.() ?? null } catch { return null }
     }
 
-    function TaskQueue() {
+    // `face` stands in for the chat's own in a test (test/observability.test.js).
+    function TaskQueue({ face: given = null } = {}) {
       useStyle()
       useUiTick()
       const { open } = queueOpen.use()
-      const face = currentFace()
+      const face = given ?? currentFace()
       const snap = useSnapshot(face)
       const [draft, setDraft] = useState('')
       const [editing, setEditing] = useState(null) // { id, text }
@@ -3581,6 +4586,15 @@ window.__ModuleLoader__.load({
                 })
                 : h('span', { className: 'tx' }, text || '(no text)'),
               q.placement === 'steering' ? h('span', { className: 'tag' }, 'steering') : null,
+              // Send now: the turn under way takes it at its next step rather than after it ends, which
+              // the engine allows only while a turn runs, and only for a prompt not already steering.
+              snap?.running && q.placement !== 'steering' && !isEditing
+                ? h('button', {
+                  disabled: busy, 'aria-label': `Send task ${i + 1} now`,
+                  title: 'Give this to the current turn at its next step instead of waiting for the turn to end',
+                  onClick: () => call(() => face.updateQueue(q.id, { kind: 'steer' })),
+                }, 'Send now')
+                : null,
               isEditing
                 ? h('button', { onClick: saveEdit, disabled: busy }, 'Save')
                 : h('button', { onClick: () => setEditing({ id: q.id, text }), disabled: busy, 'aria-label': `Edit task ${i + 1}` }, 'Edit'),
@@ -3839,11 +4853,23 @@ window.__ModuleLoader__.load({
       codex: [['low', 'Light'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra High'], ['max', 'Max'], ['ultra', 'Ultra']],
       deepseek: [['off', 'Off'], ['low', 'Low'], ['high', 'High'], ['max', 'Max']],
     }
+    /**
+     * What Settings, Effort says your ratings of the picks changed (GET /jev-router/effort `learned`, in
+     * the server's words), and what its toggle does now. Pure.
+     */
+    function ratedEffortLines(e) {
+      const lines = (e?.learned ?? []).map((b) => b.text).filter(Boolean)
+      if (lines.length && e.ratingsMove === false) lines.push('Auto effort does not follow these while Let my ratings move Auto effort is off.')
+      return lines
+    }
+
     function EffortCard() {
       const [e, setE] = useState(null)
       const [err, setErr] = useState('')
       useEffect(() => { api('/jev-router/effort').then(setE, (x) => setErr(x.message)) }, [])
-      const save = async (next) => { setErr(''); try { setE(await api('/jev-router/effort', { method: 'POST', body: JSON.stringify(next) })) } catch (x) { setErr(x.message) } }
+      // What your ratings moved is read with the settings and never sent back: the server works it out.
+      const save = async ({ learned, ...next }) => { setErr(''); try { setE({ ...(await api('/jev-router/effort', { method: 'POST', body: JSON.stringify(next) })), learned }) } catch (x) { setErr(x.message) } }
+      const reset = async () => { setErr(''); try { setE(await api('/jev-router/effort/ratings-reset', { method: 'POST', body: '{}' })) } catch (x) { setErr(x.message) } }
       if (!e) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Effort'), h('div', { className: err ? 'err' : 'muted' }, err || 'Loading…'))
       const pick = (id, label, value, options, onChange) => [
         h('dt', { key: `${id}t` }, h('label', { htmlFor: id }, label)),
@@ -3863,7 +4889,293 @@ window.__ModuleLoader__.load({
           h('dt', null, 'Codex speed'),
           h('dd', null, h('label', { className: 'toggle' },
             h('input', { type: 'checkbox', role: 'switch', checked: e.codexSpeed === 'fast', 'aria-label': 'Codex 1.5x speed', onChange: (ev) => save({ ...e, codexSpeed: ev.target.checked ? 'fast' : 'normal' }) }),
-            e.codexSpeed === 'fast' ? '1.5x (uses more of your plan)' : 'Normal'))))
+            e.codexSpeed === 'fast' ? '1.5x (uses more of your plan)' : 'Normal')),
+          // Claude Code's fast mode reaches a run only through the engine patch (scripts/patch-agent-live.mjs),
+          // and its cost is said whichever way the switch is set.
+          h('dt', null, 'Claude Code speed'),
+          h('dd', null, h('label', { className: 'toggle' },
+            h('input', { type: 'checkbox', role: 'switch', checked: e.claudeSpeed === 'fast', 'aria-label': 'Claude Code fast mode', onChange: (ev) => save({ ...e, claudeSpeed: ev.target.checked ? 'fast' : 'normal' }) }),
+            e.claudeSpeed === 'fast' ? 'Fast (costs more)' : 'Normal'),
+            h('div', { className: 'why' }, 'Fast mode costs more: Claude bills it to your usage credits. A run gets it only while the Live agent view card says the engine patch is on, and an account or model without fast mode runs at normal speed.')),
+          // Three of your last five `wrong effort` ratings of one agent on one kind of work move its Auto
+          // effort a step (docs/live-agent-view.md Feature 4); Reset makes the ones given so far count no more.
+          h('dt', null, 'Your ratings'),
+          h('dd', null, h('label', { className: 'toggle' },
+            h('input', { type: 'checkbox', role: 'switch', checked: e.ratingsMove !== false, 'aria-label': 'Let my ratings move Auto effort', onChange: (ev) => save({ ...e, ratingsMove: ev.target.checked }) }),
+            'Let my ratings move Auto effort'))),
+        ...ratedEffortLines(e).map((line, i) => h('div', { key: `r${i}`, className: 'muted' }, line)),
+        (e.learned ?? []).length ? h('button', { type: 'button', onClick: reset, title: 'Your ratings given so far move Auto effort no more. Nothing is deleted.' }, 'Reset') : null)
+    }
+
+    // ---------- settings: Jev setup: chat replies ----------
+    // ---- pure chat replies helpers: no React, no state. The choices the rows offer for the settings
+    // POST /jev-router/chat-replies/settings takes (index.js validChatReplies).
+
+    /** How long the start reply may wait for the router's pick, in ms; 0 replies at once. */
+    const REPLY_WAITS = [0, 5000, 10_000, 15_000, 30_000, 60_000]
+    const replyWaitWords = (ms) => (ms > 0 ? `up to ${Math.round(ms / 100) / 10} s` : 'Reply at once (no wait)')
+    /** The wait's choices as [value, words], the saved wait among them even when it is not one of the usual ones. */
+    function replyWaitChoices(current) {
+      const values = [...new Set([...REPLY_WAITS, ...(Number.isInteger(current) && current >= 0 ? [current] : [])])].sort((a, b) => a - b)
+      return values.map((ms) => [String(ms), replyWaitWords(ms)])
+    }
+    /** What follows the start reply in the chat: the milestone notices, or only the result and a guess's change of plan. */
+    const PROGRESS_CHOICES = [['milestones', 'Milestones'], ['off', 'Start and result only']]
+
+    // ---- end pure chat replies helpers
+
+    function ChatRepliesCard() {
+      const [s, setS] = useState(null)
+      const [err, setErr] = useState('')
+      useEffect(() => { api('/jev-router/chat-replies/settings').then(setS, (x) => setErr(x.message)) }, [])
+      const save = async (patch) => {
+        setErr('')
+        try {
+          const saved = await api('/jev-router/chat-replies/settings', { method: 'POST', body: JSON.stringify(patch) })
+          setS(saved)
+          // The ask under a start reply follows the switch at once, under the replies already shown too.
+          if ('askWhenWrong' in patch) askHolders.set({ asking: (saved?.askWhenWrong ?? patch.askWhenWrong) !== false })
+        } catch (x) { setErr(x.message) }
+      }
+      if (!s) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Chat replies'), h('div', { className: err ? 'err' : 'muted' }, err || 'Loading…'))
+      const pick = (id, label, value, options, onChange) => [
+        h('dt', { key: `${id}t` }, h('label', { htmlFor: id }, label)),
+        h('dd', { key: `${id}d` }, h('select', { id, value, onChange: (ev) => onChange(ev.target.value) }, ...options.map(([v, n]) => h('option', { key: v, value: v }, n)))),
+      ]
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-replies-h' },
+        h('div', { className: 'label', id: 'jevi-replies-h' }, 'Chat replies'),
+        h('div', { className: 'why' }, 'A task you send starts in the background. Its reply names the agent, model and effort once Jev has picked them, waiting for the pick at most this long, or the guessed ones before the pick once How Jev replies shows quick replies on; a task that waits its turn is answered at once. Milestones add a short notice when a task starts on an agent its reply did not name, starts at another effort than its reply named, starts again as work that writes once its read pass hands it back, or moves to another agent on a retry. Start and result only drops all of them but one: a task that starts on another agent than its reply guessed still gets that notice.'),
+        err ? h('div', { className: 'err', role: 'alert' }, err) : null,
+        h('dl', null,
+          ...pick('jevi-rp-w', 'Wait for the pick before replying', String(s.waitMs), replyWaitChoices(s.waitMs), (v) => save({ waitMs: Number(v) })),
+          ...pick('jevi-rp-p', 'Progress in chat', s.progress, PROGRESS_CHOICES, (v) => save({ progress: v })),
+          // The one ask under a start reply whose plan changed (docs/live-agent-view.md Feature 4), which
+          // Don't ask me this under it switches off.
+          h('dt', null, 'When the plan changes'),
+          h('dd', null, h('label', { className: 'toggle' },
+            h('input', { type: 'checkbox', role: 'switch', checked: s.askWhenWrong !== false, 'aria-label': 'Ask which was right when what ran is not what the reply said', onChange: (ev) => save({ askWhenWrong: ev.target.checked }) }),
+            'Ask which was right'))))
+    }
+
+    // ---------- settings: Jev setup: how Jev replies ----------
+    // ---- pure how-jev-replies helpers: no React, no state. What the How Jev replies card says, from
+    // one GET /jev-router/replies/summary answer (index.js repliesSummary): how start replies are made,
+    // how far task or question has come toward being read on this PC, how often the predictor of the
+    // pick has been right, and which replies its record has switched on.
+
+    /** How a reply came to name what it named, in the Recent replies table's words. */
+    const REPLY_HOW_WORDS = { instant: 'instant', quick: 'quick', likely: 'likely', routed: 'after routing', bound: 'wait ran out', now: 'at once', forced: 'your pick', waited: 'waited' }
+    /** The gates the summary gives, or the ones the plugin ships with (reply-ledger.js REPLY_GATES). */
+    const replyGatesOf = (s) => s?.prediction?.gates ?? { quick: { right: 45, of: 50 }, likely: { right: 16, of: 20 } }
+    /** What the guess at the pick changes once its record has earned it, with the gates it must keep. */
+    const guessWords = (g) => `Once the guess has been right ${g.quick.right} of the last ${g.quick.of} times, a task that starts at once is told the guessed agent before routing picks (a quick reply), and once right ${g.likely.right} of the last ${g.likely.of}, a task that waits its turn is told the agent likely to run it. Routing still picks, and a pick it makes otherwise is said in a notice, even with Progress in chat at Start and result only, and asked about under the reply while Ask which was right is on.`
+    /**
+     * A share and the bar it is held to, as percentages to the decimals the bar is set to (none for 94%,
+     * one for 98.5%, at most two), the share cut down, never rounded up: domains.js holds the share
+     * itself to the bar, so 211 right of 225 (93.8%) reads 93% beside a bar of 94%, never the 94% it
+     * misses, and a share reads as the bar only once it is there.
+     */
+    function percentsAgainst(x, bar) {
+      const f = [1, 10].find((m) => Math.abs(bar * 100 * m - Math.round(bar * 100 * m)) < 1e-9) ?? 100
+      return [`${Math.floor(x * 100 * f + 1e-9) / f}%`, `${Math.round(bar * 100 * f) / f}%`]
+    }
+    const secondWords = (ms) => { const s = Math.max(0, ms ?? 0) / 1000; return `${s >= 10 ? Math.round(s) : Math.round(s * 10) / 10} s` }
+    const RECENT_REPLY_COLUMNS = [{ key: 'job', label: 'Job' }, { key: 'said', label: 'What it said' }, { key: 'ran', label: 'What ran' }, { key: 'how', label: 'How' }, { key: 'rating', label: 'Rating' }]
+    /** How you rated a reply's pick, in the Recent replies table's words: `Disliked: wrong agent`, or '' for none. */
+    const ratingWords = (v) => (v?.verdict === 'like' || v?.verdict === 'dislike' ? `${v.verdict === 'like' ? 'Liked' : 'Disliked'}${v.tag ? `: ${v.tag}` : ''}` : '')
+    /** What your ratings of the replies' picks changed, newest first, as the card lists them under What it changed. */
+    const ratingChanges = (s) => (s?.ratings?.changed ?? []).map((c) => (c.jobId ? `${c.jobId}: ${c.line}` : c.line))
+
+    /**
+     * What the card says first: what learns, which replies the guess at the agent changes once its
+     * record has earned it (with the gates it keeps), and that task or question changes one only once
+     * it is read on this PC, when a quick reply asks Jev nothing at all; with adaptive routing off,
+     * which sorts no message here (no `intent` in the summary), that only the guess at the agent
+     * learns; with learning off, that nothing here learns.
+     */
+    const howJevRepliesWhy = (s) => (s?.learning === false
+      ? 'A start reply names the agent once routing has picked it. Learning is switched off (routing.learn in the jev-router configuration), so nothing here learns, and no start reply is recorded.'
+      : !s?.intent
+        ? `A start reply names the agent once routing has picked it. A guess at the agent and effort learns in the background to make that sooner, checked against what routing then picks. ${guessWords(replyGatesOf(s))} Task or question is not learned while adaptive routing is off (routing.enabled in the jev-router configuration): Jev reads every message.`
+        : `A start reply names the agent once routing has picked it. Two things learn in the background to make that sooner: whether a message is a task or a question, read on this PC once it has been right often enough, and a guess at the agent and effort, checked against what routing then picks. ${guessWords(replyGatesOf(s))} Task or question changes a reply only once it is read on this PC, and then only for a message it is sure is a task: Jev is not asked about that message, so it gets no read-only verdict and runs as work that writes, and a quick reply to it is instant, with no Jev call at all.`)
+
+    /**
+     * Where the guess's replies stand for one decider, from its record and the gates' states
+     * (reply-ledger.js gateState): quick replies and the likely agent each `on` while the record keeps
+     * its gate, and `paused` once it has fallen below one it kept, when replies wait for routing again;
+     * nothing while one has never switched on, which the record line before them says it needs. Beside
+     * quick replies under Jev Auto, whether instant ones are on: only while task or question is read on
+     * this PC (`intent` 'local', else 'learning', or 'off' with adaptive routing off), and never under
+     * Laya Auto, where Laya reads every message itself.
+     */
+    function guessStageLines(state, record, g, { laya = false, intent = 'learning' } = {}) {
+      const lines = []
+      const quick = laya ? 'Under Laya Auto, quick replies' : 'Quick replies'
+      const likely = laya ? 'Under Laya Auto, "likely"' : '"Likely"'
+      const q = record?.quick
+      const l = record?.likely
+      if (state?.quick === 'on' && q) {
+        lines.push(`${quick} on: right ${q.right} of the last ${q.n}, so a task that starts at once is told the guessed agent before routing picks.`)
+        if (!laya) {
+          lines.push(intent === 'local' ? 'Instant replies on: a message read on this PC as a task gets its reply with no Jev call.'
+            : intent === 'off' ? 'Instant replies: none while adaptive routing is off, since Jev reads every message.'
+              : 'Instant replies: not until task or question is read on this PC.')
+        }
+      }
+      if (state?.quick === 'paused' && q) lines.push(`${quick} paused: right ${q.right} of the last ${q.n} (they need ${g.quick.right}), so replies wait for routing again.`)
+      if (state?.likely === 'on' && l) lines.push(`${likely} on: right ${l.right} of the last ${l.n}, so a task that waits its turn is told the agent likely to run it.`)
+      if (state?.likely === 'paused' && l) lines.push(`${likely} paused: right ${l.right} of the last ${l.n} (it needs ${g.likely.right}), so a reply that waits names no agent again.`)
+      return lines
+    }
+
+    /**
+     * The card's lines: how start replies are made, with how long the ones that waited for the pick
+     * took this week, until it came or the wait ran out, and how many ran out, or that they go out at
+     * once with the wait set to none; how far task or question has come toward reading a task on this
+     * PC (its checked examples against what GUARDED_LOCAL needs, of each class, and how often it was
+     * right of the last ones checked, against what GUARDED_LOCAL needs until it gets there); the
+     * predictor's record against the two gates, Laya's apart when it has one, so a predictor with no
+     * guess of Jev's checked yet says that of Jev alone beside one of Laya's; and, under each record,
+     * the replies it has switched on or paused (guessStageLines), with which the first line says start
+     * replies can go out before routing. With learning off
+     * nothing is recorded, so nothing is timed, guessed or trained, and the lines say so rather than
+     * count on records that no longer grow.
+     */
+    function howJevRepliesLines(s) {
+      const lines = []
+      const off = s?.learning === false
+      const sr = s?.startReplies ?? {}
+      const ranOut = sr.atBound ? `; ${sr.atBound} of ${sr.n} went out when the wait ran out, before the pick` : ''
+      const states = off ? {} : s?.prediction?.states ?? {}
+      // Quick replies on for either decider go out before routing; the rest are timed as before.
+      const quickOn = states.jev?.quick === 'on' || states.laya?.quick === 'on'
+      lines.push(sr.waitMs === 0 ? 'Start replies: at once, without waiting for the pick (Reply at once, in Chat replies)'
+        : `Start replies: ${quickOn ? 'before routing when the guess has earned it, else after routing' : 'after routing'} (${off ? 'not timed while learning is off' : sr.n ? `median ${secondWords(sr.medianMs)} this week${ranOut}` : 'none timed this week'})`)
+      const i = s?.intent
+      if (!i) lines.push('Task or question: Jev reads every message, and nothing is learned from it while adaptive routing or its learning is off.')
+      else {
+        // The accuracy it needs is the bar for being read on this PC, which a local rung is past: what
+        // keeps it there is more than one figure (domains.js rollback), so there the line gives the
+        // accuracy alone. Either way it is cut down, never rounded up to a bar it misses.
+        const local = i.maturity === 'GUARDED_LOCAL' || i.maturity === 'LOCAL_ONLY'
+        const shown = i.recent?.n ? percentsAgainst(i.recent.accuracy, i.needs.recentAccuracy) : null
+        const right = shown ? `${shown[0]} right of the last ${i.recent.n} checked${local ? '' : ` (needs ${shown[1]})`}` : 'not scored yet'
+        lines.push(local
+          ? `Task or question: read on this PC when it is sure a message is a task, and by Jev otherwise (${i.verified} checked examples); ${right}.`
+          : `Task or question: learning, ${i.verified} of ${i.needs.samples} checked examples (task ${i.classes?.task ?? 0}, question ${i.classes?.question ?? 0} of ${i.needs.perClass} needed); ${right}.`)
+      }
+      const p = s?.prediction ?? {}
+      if (off) {
+        lines.push(p.trained
+          ? `Agent and effort prediction: off while learning is off; it was trained on ${p.trained.rows} routed tasks before, and no guess is made or checked now.`
+          : 'Agent and effort prediction: off while learning is off; nothing is recorded for it, so it does not train.')
+        return lines
+      }
+      const g = p.gates ?? { quick: { right: 45, of: 50 }, likely: { right: 16, of: 20 } }
+      const need = `quick replies need ${g.quick.right}; "likely" needs ${g.likely.right} of the last ${g.likely.of}`
+      const record = (r, who) => (r?.n ? `${who}: right ${r.right} of the last ${r.n} (${need}).` : null)
+      // Not trained yet: too few routed tasks on record, a first training under way (the ledger
+      // starts one as soon as it has enough, as it reads them too), or one that failed, which the
+      // ledger tries again only after more tasks, so that it does not fail again on every one.
+      const untrained = p.training ? 'it is training now, on the routed tasks on record'
+        : (p.labelled ?? 0) >= (p.minRows ?? 60) ? `its training failed, and it is tried again after ${p.retrainEvery ?? 25} more routed tasks`
+          : `it starts once ${p.minRows ?? 60} routed tasks are on record`
+      // A predictor trained with no guess of Jev's checked yet says so of Jev alone while Laya has a
+      // record of its own, which the Laya line under it gives: no guess at all is not what happened.
+      const unchecked = p.records?.laya?.quick?.n ? 'no guess under Jev Auto has been checked yet' : 'no guess has been checked yet'
+      if (!p.trained) lines.push(`Agent and effort prediction: not trained yet; ${untrained} (${p.labelled ?? 0} so far).`)
+      else lines.push(record(p.records?.jev?.quick, 'Agent and effort prediction') ?? `Agent and effort prediction: trained on ${p.trained.rows} routed tasks; ${unchecked} (${need}).`)
+      // Which replies the guess has switched on, or paused, for each decider (docs/live-agent-view.md Feature 3).
+      const intent = !i ? 'off' : i.maturity === 'GUARDED_LOCAL' || i.maturity === 'LOCAL_ONLY' ? 'local' : 'learning'
+      lines.push(...guessStageLines(states.jev, p.records?.jev, g, { intent }))
+      const laya = record(p.records?.laya?.quick, 'Under Laya Auto')
+      if (laya) lines.push(laya)
+      lines.push(...guessStageLines(states.laya, p.records?.laya, g, { laya: true }))
+      // Your ratings of the replies' picks, once there is one (docs/live-agent-view.md Feature 4).
+      const r = s?.ratings
+      if (r?.liked || r?.disliked) lines.push(`Your ratings on replies: ${r.liked} liked, ${r.disliked} disliked`)
+      return lines
+    }
+
+    /**
+     * The Recent replies table's rows, newest first: the job, what its reply named, what then ran, and
+     * how the reply came to name it. A task that ended before routing picked anything (`ended`: its
+     * final state, or true once it has left the task list) ran nothing and never will, so it is said to
+     * have run nothing, with how it ended; only a task still to run is not routed yet.
+     */
+    function recentReplyRows(s) {
+      const name = (id) => (String(id ?? '').startsWith('tool:') ? `the ${String(id).slice('tool:'.length)} tool` : s?.names?.[id] ?? id)
+      const plan = (x) => [name(x.agent), x.model, x.effort ? `effort ${x.effort}` : ''].filter(Boolean).join(' · ')
+      const ended = (r) => (taskLabels[r.ended] ? `nothing ran (${taskLabels[r.ended]})` : 'nothing ran')
+      return (s?.recent ?? []).map((r) => [
+        { text: r.jobId ?? '' },
+        { text: r.said?.agent ? plan(r.said) : 'no agent named' },
+        { text: r.ran?.agent ? plan(r.ran) : r.ended ? ended(r) : 'not routed yet' },
+        { text: REPLY_HOW_WORDS[r.said?.how] ?? '' },
+        { text: ratingWords(r.verdict) },
+      ])
+    }
+
+    // ---- end pure how-jev-replies helpers
+
+    function HowJevRepliesCard() {
+      const [s, setS] = useState(null)
+      const [err, setErr] = useState('')
+      useEffect(() => { api('/jev-router/replies/summary').then(setS, (x) => setErr(x.message)) }, [])
+      if (!s) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'How Jev replies'), h('div', { className: err ? 'err' : 'muted' }, err || 'Loading…'))
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-how-h' },
+        h('div', { className: 'label', id: 'jevi-how-h' }, 'How Jev replies'),
+        h('div', { className: 'why' }, howJevRepliesWhy(s)),
+        ...howJevRepliesLines(s).map((t, i) => h('div', { key: i }, t)),
+        ...(ratingChanges(s).length ? [h('div', { key: 'changed', className: 'label', style: { margin: '10px 0 4px' } }, 'What it changed'), ...ratingChanges(s).map((t, i) => h('div', { key: `c${i}`, className: 'muted' }, t))] : []),
+        h('div', { className: 'label', style: { margin: '10px 0 4px' } }, 'Recent replies'),
+        h(SortTable, { label: 'Recent replies', columns: RECENT_REPLY_COLUMNS, rows: recentReplyRows(s), empty: s.learning === false ? 'No start reply is recorded while learning is off.' : 'No start reply yet.' }))
+    }
+
+    // ---------- settings: Jev setup: live agent view ----------
+    // ---- pure live agent view helpers: no React, no state. What the Live agent view card says of the
+    // engine patch (GET /jev-router/engine-patches), and the choices its rows offer for the settings
+    // POST /jev-router/live/settings takes (index.js validLiveSettings).
+
+    /** Whether each agent's own work shows live, as `[agent, words]`: Claude Code and Codex by the engine patch, the rest always. */
+    function livePatchLines(patches) {
+      const of = (name, p) => [name, p?.on ? 'live detail on' : `live detail off${p?.why ? ` (${p.why})` : ''}`]
+      return [of('Claude Code', patches?.['claude-code']), of('Codex', patches?.codex), ['DeepSeek, API and local models', 'always on (no patch needed)']]
+    }
+    /** How Claude Code shows its thinking in the Live tab. */
+    const THINKING_CHOICES = [['default', 'As Claude Code shows it'], ['summarized', 'Summarized']]
+    /** Whether each task's transcript is kept on disk after its run, for the Live tab after a restart: the newest 20 tasks' (as shipped), every task's the list keeps, or none. */
+    const TRANSCRIPT_CHOICES = [['last20', 'Last 20 tasks'], ['last100', 'Last 100 tasks'], ['off', 'Off']]
+
+    // ---- end pure live agent view helpers
+
+    function LiveAgentViewCard() {
+      const [s, setS] = useState(null)
+      const [patches, setPatches] = useState(null)
+      const [err, setErr] = useState('')
+      useEffect(() => {
+        api('/jev-router/live/settings').then(setS, (x) => setErr(x.message))
+        api('/jev-router/engine-patches').then(setPatches, () => setPatches({}))
+      }, [])
+      const save = async (patch) => { setErr(''); try { setS(await api('/jev-router/live/settings', { method: 'POST', body: JSON.stringify(patch) })) } catch (x) { setErr(x.message) } }
+      if (!s || !patches) return h('div', { className: 'card' }, h('div', { className: 'label' }, 'Live agent view'), h('div', { className: err ? 'err' : 'muted' }, err || 'Loading…'))
+      const pick = (id, label, value, options, onChange) => [
+        h('dt', { key: `${id}t` }, h('label', { htmlFor: id }, label)),
+        h('dd', { key: `${id}d` }, h('select', { id, value, onChange: (ev) => onChange(ev.target.value) }, ...options.map(([v, n]) => h('option', { key: v, value: v }, n)))),
+      ]
+      return h('section', { className: 'card', 'aria-labelledby': 'jevi-live-h' },
+        h('div', { className: 'label', id: 'jevi-live-h' }, 'Live agent view'),
+        h('div', { className: 'why' }, 'The Live tab and the card under a reply show each agent\'s text, tool calls and thinking as it works. Claude Code and Codex need the engine patch Start-KzH adds at each start: a connector installed again at the same version turns it off until the next start, and one an engine update brings at a new version until KzH is updated for that version. Their runs work as before meanwhile, and the lines below say why one is off.'),
+        err ? h('div', { className: 'err', role: 'alert' }, err) : null,
+        h('dl', null,
+          ...livePatchLines(patches).flatMap(([name, words], i) => [h('dt', { key: `p${i}t` }, name), h('dd', { key: `p${i}d` }, words)]),
+          h('dt', null, 'Let Steer reach a running Claude Code (experimental)'),
+          h('dd', null, h('label', { className: 'toggle' },
+            h('input', { type: 'checkbox', role: 'switch', checked: s.claudeSteer === true, 'aria-label': 'Let Steer reach a running Claude Code (experimental)', onChange: (ev) => save({ claudeSteer: ev.target.checked }) }),
+            s.claudeSteer ? 'On' : 'Off')),
+          ...pick('jevi-lv-t', 'Claude Code thinking', s.claudeThinking, THINKING_CHOICES, (v) => save({ claudeThinking: v })),
+          ...pick('jevi-lv-k', 'Keep transcripts', s.transcripts, TRANSCRIPT_CHOICES, (v) => save({ transcripts: v }))),
+        h('div', { className: 'muted' }, 'Steer and Send now reach a running DeepSeek, API, local-model or Codex task as it works. With Let Steer reach a running Claude Code on, they reach a Claude Code task started after it was turned on, through an input channel that is still experimental: Claude Code may take your words between tool calls, after its turn, or without saying whether it read them. Claude Code thinking: Summarized asks each Claude Code task started after it to share its thinking as summaries. Keep transcripts Off deletes the ones kept and keeps none.'))
     }
 
     // ---------- settings: Jev setup: the Laya decision model ----------
@@ -4173,6 +5485,7 @@ window.__ModuleLoader__.load({
             ? `${kept}about ${layaGB(vram)} GB of GPU memory, so local models get fewer GPU layers, or about ${layaGB(ram)} GB of RAM, ${counted}`
             : `${kept}its GPU memory, so local models get fewer GPU layers, or its RAM, ${counted}`,
         shadow: "Laya answers every Jev question too, on this PC, and both answers are recorded side by side. It never delays a Jev Auto run and never starts or keeps Laya loaded: when Laya is busy, starting or not running, or a local model is answering or needs Laya's memory, the comparison waits or is skipped and counted. Only Keep Laya loaded makes Laya hold memory beside a local model. Nothing is sent anywhere.",
+        colibri: 'Empty is off. The address of a colibri you run yourself on this PC with its Laya engine, such as http://127.0.0.1:8000: each request laya.serve answers in Laya Auto and the shadow is then asked of colibri too, after laya.serve and for comparison only. KzH installs nothing of colibri and sends it no key.',
         vramGB: typeof vram === 'number' ? vram : null,
       }
     }
@@ -4210,6 +5523,60 @@ window.__ModuleLoader__.load({
         body: `Stops Laya and deletes ${p.engine}${size(b?.engine)} and ${p.models}${size(b?.models)}. Your recorded comparisons and Laya samples are kept. Laya Auto leaves the model menu.`,
         confirmLabel: 'Remove Laya',
       }
+    }
+    /**
+     * colibri Laya, side by side (13): the card's section once the colibri Laya address is set, from
+     * the `colibri` figures of GET /jev-router/laya (GET /jev-router/laya/colibri has the same).
+     * Whether colibri answers, or why not; what was compared and how often it agreed with laya.serve,
+     * by question type; how long each took; colibri's three gaps, as the figures meet them; and that
+     * nothing it answers is used. Each line is `{ text, tone }`, and a share is never rounded up.
+     */
+    function colibriLines(c) {
+      if (!c?.on) return []
+      const out = []
+      const r = c.reachable ?? {}
+      const how = "KzH checks it with one test question, since colibri's /health lists no loaded model."
+      if (r.checking) out.push({ text: `Asking colibri its test question… ${how}`, tone: 'why' })
+      else if (r.ok === true) out.push({ text: `Reachable: colibri answered its test question${typeof r.ms === 'number' ? ` in ${layaSeconds(r.ms)} s` : ''}${r.model ? ` as ${r.model}` : ''}. ${how}`, tone: '' })
+      else if (r.ok === false) out.push({ text: `Not reachable: ${sentence(r.why)}. ${how}`, tone: 'warn' })
+      else out.push({ text: `Not checked yet. ${how}`, tone: 'why' })
+      if (r.ok === true && r.model && !/laya/i.test(r.model)) out.push({ text: `colibri says it serves ${r.model}, not Laya: start it with Laya's model, as its docs/laya.md says.`, tone: 'warn' })
+      const n = c.compared ?? {}
+      const d = c.dropped ?? {}
+      const f = c.failed ?? {}
+      // What the record holds (the rows kept), and apart from it what was dropped since KzH started.
+      const unanswered = [
+        f.timeout ? `${f.timeout} past ${f.timeout === 1 ? 'its' : 'their'} deadline` : '',
+        f.refused ? `${f.refused} refused by colibri` : '',
+        f.unreachable ? `${f.unreachable} cut off` : '',
+        f.bad_answer ? `${f.bad_answer} answered in a shape KzH could not read` : '',
+      ].filter(Boolean)
+      const notAsked = [
+        d.busy ? `${d.busy} while colibri was answering another` : '',
+        d.local_busy ? `${d.local_busy} while a local model was answering` : '',
+        d.laya_busy ? `${d.laya_busy} while laya.serve had more to answer on the CPU` : '',
+        d.not_reachable ? `${d.not_reachable} while colibri could not be reached` : '',
+      ].filter(Boolean)
+      const plural = (k, w) => `${k} ${w}${k === 1 ? '' : 's'}`
+      out.push({
+        text: `${n.questions ? `Compared ${plural(n.questions, 'question')} in ${plural(n.requests, 'request')}${n.since ? ` since ${String(n.since).slice(0, 10)}` : ''}.`
+          : 'Nothing compared yet: each request laya.serve answers in Laya Auto or the shadow is asked of colibri too, after laya.serve, one at a time.'}${unanswered.length ? ` Not answered: ${listed(unanswered)}.` : ''}${notAsked.length ? ` Not asked since KzH started: ${listed(notAsked)}.` : ''}`,
+        tone: 'why',
+      })
+      const a = c.agreement ?? {}
+      const share = (x) => `${x.agreed} of ${x.compared} (${Math.floor((100 * x.agreed) / x.compared)}%)`
+      const parts = [
+        a.choice?.compared ? `choice ${share(a.choice)}` : '',
+        a.score?.compared ? `score ${share(a.score)} within ${a.score.tolerance} of a level` : '',
+        a.noul?.compared ? `yes/no ${share(a.noul)}` : '',
+      ].filter(Boolean)
+      if (parts.length) out.push({ text: `Agreement with laya.serve: ${listed(parts)}.`, tone: '' })
+      const ms = c.medianMs ?? {}
+      if (typeof ms.laya === 'number' && typeof ms.colibri === 'number') out.push({ text: `Median time per request: laya.serve ${layaSeconds(ms.laya)} s, colibri ${layaSeconds(ms.colibri)} s.`, tone: 'why' })
+      out.push({ text: `Yes/no questions go to colibri as KzH sends them, labels and all; colibri ignores the labels, so it reads each in its raw false/true form, unlike laya.serve${c.rawNouls ? ` (${c.rawNouls} so far)` : ''}.`, tone: 'why' })
+      out.push({ text: `colibri gives a yes/no answer no confidence: each is recorded as unknown and left out of every figure that needs one${c.confidenceUnknown ? ` (${c.confidenceUnknown} so far)` : ''}.`, tone: 'why' })
+      out.push({ text: `Nothing colibri answers is used: it decides nothing, and nothing learns from it. Its answers are kept in ${c.file ?? 'colibri-laya.jsonl'} only.`, tone: 'note' })
+      return out
     }
     // ---- end pure laya helpers
 
@@ -4274,6 +5641,8 @@ window.__ModuleLoader__.load({
       // The idle time as typed, until it is saved: the field shows it over the saved value, so a
       // status poll never puts the saved one back mid-edit, and follows the saved one otherwise.
       const [idleEdit, setIdleEdit] = useState(null)
+      // The colibri Laya address as typed, kept over the saved one the same way until it is saved.
+      const [colibriEdit, setColibriEdit] = useState(null)
       const installed = !!st?.installed
       useEffect(() => {
         if (!installed) return
@@ -4304,6 +5673,13 @@ window.__ModuleLoader__.load({
         if (typed == null) return
         if (Number(typed) !== st.settings?.idleMinutes) await save({ idleMinutes: Number(typed) })
         setIdleEdit((v) => (v === typed ? null : v))
+      }
+      // Saved as typed less the spaces around it, and saved again unchanged, which asks colibri its test question again.
+      const saveColibri = async () => {
+        const typed = colibriEdit
+        if (typed == null) return
+        await save({ colibriUrl: typed.trim() })
+        setColibriEdit((v) => (v === typed ? null : v))
       }
       const press = {
         install: () => setInstalling(device),
@@ -4366,8 +5742,15 @@ window.__ModuleLoader__.load({
           ...toggle('jevi-laya-keep', 'Keep Laya loaded', 'keepLoaded', help.keepLoaded),
           h('dt', null, h('label', { htmlFor: 'jevi-laya-idle' }, 'Unload after idle (minutes)')),
           h('dd', null, h('input', { id: 'jevi-laya-idle', type: 'number', min: 1, max: 240, value: idleEdit ?? String(s.idleMinutes ?? ''), disabled: !!s.keepLoaded, style: { width: 64 }, onChange: (e) => setIdleEdit(e.target.value), onBlur: saveIdle })),
-          ...toggle('jevi-laya-shadow', 'Answer beside Jev in Jev Auto', 'shadow', help.shadow)) : null,
+          ...toggle('jevi-laya-shadow', 'Answer beside Jev in Jev Auto', 'shadow', help.shadow),
+          h('dt', null, h('label', { htmlFor: 'jevi-laya-colibri' }, 'colibri Laya address')),
+          h('dd', null,
+            h('input', { id: 'jevi-laya-colibri', type: 'text', placeholder: 'http://127.0.0.1:8000', spellCheck: false, value: colibriEdit ?? String(s.colibriUrl ?? ''), disabled: busy === 'settings', style: { width: 220 }, onChange: (e) => setColibriEdit(e.target.value), onBlur: saveColibri }),
+            h('div', { className: 'why' }, help.colibri))) : null,
         switchable && st.installed.cuda ? h('div', { className: 'why' }, layaHeldNote(help.vramGB)) : null,
+        switchable && s.colibriUrl ? h('section', { 'aria-labelledby': 'jevi-laya-colibri-h', style: { marginTop: 8 } },
+          h('div', { className: 'label', id: 'jevi-laya-colibri-h' }, 'colibri Laya, side by side'),
+          ...colibriLines(st.colibri).map((l, i) => h('div', { key: `c${i}`, className: tone(l.tone) }, l.text))) : null,
         ...layaNotes(st, compare).map((n, i) => h('div', { key: `n${i}`, className: tone(n.tone), style: { marginTop: 6 } }, n.text)),
         ...layaVersions(st).map((v, i) => h('div', { key: `v${i}`, style: { marginTop: 8 } },
           h('div', { className: 'why' }, v.text),
@@ -4460,6 +5843,12 @@ window.__ModuleLoader__.load({
         h(LocalModelsCard, { ask: setConfirm }),
 
         h(EffortCard),
+
+        h(ChatRepliesCard),
+
+        h(HowJevRepliesCard),
+
+        h(LiveAgentViewCard),
 
         h('div', { className: 'card' },
           h('div', { className: 'label' }, 'Add an API-key agent'),
@@ -4570,14 +5959,16 @@ window.__ModuleLoader__.load({
             h('ul', { className: 'plain', 'aria-label': 'Local models' }, ...cat.modules.map((x) => {
               const inst = installedNow(x)
               const job = jobOf(x.id)
-              const blocked = x.rating.fit === 'no'
+              // A row not pinned yet cannot be picked: nothing downloads a file it has no SHA-256 for
+              // (local.js isPinned), and its line under the badges says what pins it.
+              const blocked = x.rating.fit === 'no' || !!x.unpinned
               const id = `jevi-llm-${x.id}`
               return h('li', { key: x.id, style: { alignItems: 'flex-start' } },
                 h('label', { htmlFor: id, style: { display: 'flex', gap: 8, minWidth: 0, cursor: inst || blocked ? 'default' : 'pointer' } },
-                  h('input', { id, type: 'checkbox', checked: !inst && !!picked?.has(x.id), disabled: inst || blocked || ACTIVE_JOB.includes(job?.state), onChange: () => toggle(x.id), style: { marginTop: 3 } }),
+                  h('input', { id, type: 'checkbox', checked: !inst && !blocked && !!picked?.has(x.id), disabled: inst || blocked || ACTIVE_JOB.includes(job?.state), onChange: () => toggle(x.id), style: { marginTop: 3 } }),
                   h('div', { style: { minWidth: 0 } },
-                    h('div', null, h('b', null, x.name), h('span', { className: 'pill' }, bytes(x.size)), inst ? h('span', { className: 'pill ok' }, 'installed') : null, x.suggested && !inst ? h('span', { className: 'pill ok' }, 'suggested') : null),
-                    h('div', { className: cx('why', blocked && 'err') }, blocked ? `Won't fit: ${x.rating.reason}` : x.rating.label),
+                    h('div', null, h('b', null, x.name), h('span', { className: 'pill' }, x.unpinned ? 'size not checked yet' : bytes(x.size)), inst ? h('span', { className: 'pill ok' }, 'installed') : null, x.suggested && !inst ? h('span', { className: 'pill ok' }, 'suggested') : null),
+                    h('div', { className: cx('why', x.rating.fit === 'no' && 'err') }, x.rating.fit === 'no' ? `Won't fit: ${x.rating.reason}` : x.rating.label),
                     h(Badges, { list: x.badges }),
                     h('div', { className: 'why' }, [x.agent ? `Agent: ${x.agent}` : x.for ? `Add-on for ${x.for}` : null, `Source: ${x.repo}`, x.license].filter(Boolean).join(' · ')),
                     x.notes ? h('div', { className: 'why' }, x.notes) : null,
@@ -4698,7 +6089,8 @@ window.__ModuleLoader__.load({
       const estimate = () => {
         const guess = rating.wordsPerSecRange ? `about ${rating.wordsPerSecRange[0]} to ${rating.wordsPerSecRange[1]} words/s` : `about ${rating.wordsPerSec} words/s`
         const unknown = rating.wordsPerSecRange ? ", a range because this GPU's memory is unknown" : ''
-        return `${guess} estimated from its size and this PC's memory bandwidth${unknown}`
+        const from = rating.moe ? 'the weights it reads per token, its active experts and the rest,' : 'its size'
+        return `${guess} estimated from ${from} and this PC's memory bandwidth${unknown}`
       }
       if (!r) {
         if (!rating) return 'Speed: not measured on this PC.'
@@ -4712,13 +6104,44 @@ window.__ModuleLoader__.load({
         if (rating.fit === 'no') return `${stale} This PC cannot run it now: ${rating.reason}.`
         return `${stale} Until then, ${estimate()}.`
       }
-      const layers = r.layersOnGpu ? `${r.layersOnGpu.gpu} of ${r.layersOnGpu.total} layers on the GPU` : 'the engine did not report its GPU split'
+      const layers = r.cpuMoe?.cpuLayers ? `the experts of ${r.cpuMoe.cpuLayers} of ${r.cpuMoe.layers} layers in RAM` : r.cpuMoe ? 'every expert on the GPU' : r.layersOnGpu ? `${r.layersOnGpu.gpu} of ${r.layersOnGpu.total} layers on the GPU` : 'the engine did not report its GPU split'
       const beside = r.laya ? `, Laya on ${layaText(r.laya)} beside it` : ''
-      const how = `(measured ${dayText(r.at)}; ${layers}, ${threadsText(r.threads)}${beside})`
+      const peak = Number.isFinite(r.peakRamGB) ? `, peak RAM ${r.peakRamGB.toFixed(1)} GB` : ''
+      const how = `(measured ${dayText(r.at)}; ${layers}, ${threadsText(r.threads)}${beside}${peak})`
       const depth = `${Number(r.depth).toLocaleString('en-US')} tokens into a conversation`
       return r.promptTokensPerSec == null
         ? `Speed: ${tps} tokens/s generating, ${depth} ${how}. Its reading speed was not measured, because llama-server reused its prompt cache.`
         : `Speed: ${tps} tokens/s generating and ${Math.round(r.promptTokensPerSec)} tokens/s reading, both ${depth} ${how}.`
+    }
+
+    /**
+     * What the speed run's output check found for the reading a model's speed line gives, when that
+     * reading stands (docs/benchmark.md 2.15): the same as the baseline, kept as the first one,
+     * accepted, or not checked. Null for a reading from before there was a check.
+     */
+    const outputLine = (m) => {
+      const r = m?.speed?.reading
+      const o = r?.output
+      if (!o || !m.speed.stands) return null
+      if (o.state === 'same') return `Output: the same as the ${dayText(o.baselineAt)} baseline, its first ${o.agreed} of ${o.of} ${o.unit} agreeing (${o.need} needed).`
+      if (o.state === 'baseline') {
+        const also = o.also ? ` It agrees with the ${dayText(o.also.baselineAt)} baseline of ${o.also.other} for its first ${o.also.agreed} of ${o.also.of} ${o.also.unit}.` : ''
+        return `Output: kept on ${dayText(r.at)} as the baseline for this engine build and GPU split, which later runs are held to.${also}`
+      }
+      if (o.state === 'accepted') return `Output: accepted as the new baseline on ${dayText(o.acceptedAt)}; it had differed from the ${dayText(o.baselineAt)} one after ${o.agreed} ${o.unit}.`
+      if (o.state === 'unchecked') return `Output: not checked (${o.why}).`
+      return null
+    }
+
+    /**
+     * A figure held apart because its output differed from the baseline (2.15), for the line its
+     * Accept new output button sits on: what it is, and why it is not the model's speed. Null with none.
+     */
+    const heldLine = (m) => {
+      const r = m?.speed?.held
+      const o = r?.output
+      if (!o) return null
+      return `Benchmark of ${dayText(r.at)}: ${Number(r.tokensPerSec).toFixed(1)} tokens/s generating, but its output differs from the ${dayText(o.baselineAt)} baseline after ${o.agreed} ${o.unit} (${o.need} needed), so it is not taken as this model's speed. If the new output reads right, accept it: the figure becomes the model's speed and the output its baseline.`
     }
 
     /**
@@ -4755,6 +6178,7 @@ window.__ModuleLoader__.load({
             warming: 'a first short request, not timed',
             reading: `reading an ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt`,
             measuring: `timing ${SPEED_PREDICT} generated tokens, ${c.run} of 3`,
+            checking: 'checking its output against the one kept from its first run',
           }[c.phase] ?? c.phase
           const k = run.done.length + 1
           const then = run.queue.length ? ` Then ${run.queue.map(name).join(', ')}.` : ''
@@ -5076,6 +6500,9 @@ window.__ModuleLoader__.load({
       const models = data.modules.filter((m) => m.kind === 'model' && m.state === 'installed')
       const pick = startModel || data.settings.chatModel || models[0]?.id || ''
       const rows = removableRows(data)
+      // Mixture-of-experts models not installed yet: where they would run on this PC, or why they
+      // would not, and what pins one that is not checked yet, before anyone opens Install….
+      const moeRows = data.modules.filter((m) => m.kind === 'model' && m.moe && m.state !== 'installed')
       const busyJobs = data.modules.filter((m) => ACTIVE_JOB.includes(m.job?.state) || m.state === 'verifying')
       // The speed benchmark (docs/benchmark.md 2.9). It is free and changes nothing but which model is
       // loaded, so it asks for no confirmation; a refusal shows under the head with the card's others.
@@ -5129,11 +6556,26 @@ window.__ModuleLoader__.load({
               fit?.over ? h('div', { className: cx('why', 'err') }, fit.over) : null,
               fit?.floor ? h('div', { className: 'warnline' }, fit.floor) : null,
               chat ? h('div', { className: 'why' }, speedLine(m)) : null,
+              chat && outputLine(m) ? h('div', { className: 'why' }, outputLine(m)) : null,
+              // A figure whose output differed from its baseline, with both outputs to read and the button that takes it (2.15).
+              chat && heldLine(m) ? h('div', { className: 'warnline' }, heldLine(m)) : null,
+              chat && heldLine(m) ? h('details', { className: 'answer' },
+                h('summary', null, 'Both outputs'),
+                h('div', { className: 'why' }, `The baseline, of ${dayText(m.speed.held.output.baselineAt)}:`),
+                h('div', { className: 'answer-text' }, m.speed.held.output.baselineText),
+                h('div', { className: 'why' }, `This run, of ${dayText(m.speed.held.at)}:`),
+                h('div', { className: 'answer-text' }, m.speed.held.output.text)) : null,
+              chat && heldLine(m) ? h('button', { className: 'btn', style: { marginTop: 4 }, disabled: speed.running, 'aria-label': `Accept new output of ${r.name}`, title: 'Take this figure as the model\'s speed, and keep this output as the baseline its later runs are held to.', onClick: () => run(() => post('/jev-router/local/benchmark/accept-output', { id: m.id })) }, 'Accept new output') : null,
               m?.badges ? h(Badges, { list: m.badges }) : null),
             h('div', { style: { display: 'flex', gap: 8, flexShrink: 0 } },
               chat ? h('button', { className: 'btn', disabled: !canBenchmark, 'aria-label': `Benchmark ${r.name}`, title: speedButtonTitle(m), onClick: () => benchmark([m.id]) }, 'Benchmark') : null,
               h('button', { className: 'btn danger', 'aria-label': `Remove ${r.name}`, onClick: () => ask(removeConfirm([r], () => post('/jev-router/local/remove', { ids: r.ids }))) }, 'Remove')))
         })) : h('div', { className: 'muted', style: { marginTop: 8 } }, 'Nothing installed yet. Install… suggests models that fit this PC.'),
+        moeRows.length ? h('ul', { className: 'plain', 'aria-label': 'Mixture-of-experts models not installed', style: { marginTop: 8 } }, ...moeRows.map((m) => h('li', { key: m.id },
+          h('div', { style: { minWidth: 0 } },
+            h('div', null, h('b', null, m.name), h('span', { className: 'pill' }, 'not installed')),
+            m.rating ? h('div', { className: cx('why', m.rating.fit === 'no' && 'err') }, m.rating.fit === 'no' ? `Won't fit: ${m.rating.reason}` : m.rating.label) : null,
+            m.unpinned ? h('div', { className: 'warnline' }, `${m.unpinned[0].toUpperCase()}${m.unpinned.slice(1)}`) : null)))) : null,
         h(ResourceBudget, { data, edits: budget, errors: budgetMsg, onEdit: (k, v) => setBudget((b) => ({ ...b, [k]: v })), onSave: saveBudget }))
     }
 
@@ -5690,9 +7132,90 @@ window.__ModuleLoader__.load({
       like: ['good pick', 'good answer'],
       dislike: ['wrong agent', 'misread my question', 'wrong scope', 'not enough detail', 'too slow'],
     }
-    const tagsFor = (verdict) => TAGS_FOR[verdict] ?? []
+    // Under a start reply the verdict judges the pick the reply named, not an answer (feedback.js
+    // PLAN_TAGS): the agent, the effort, the reading of the message and whether it was a task at all.
+    // A question answered directly may say it should have been a task instead.
+    const PLAN_TAGS_FOR = {
+      like: ['good pick'],
+      dislike: ['wrong agent', 'wrong effort', 'misread my question', 'wrong scope', 'should have been a question'],
+    }
+    const TASK_TAG = 'should have been a task'
+    /** The tags offered for a verdict about an answer (`mode` 'answer') or the pick (`plan`); a direct answer (`direct`) adds TASK_TAG to a dislike. */
+    const tagsFor = (verdict, mode = 'answer', { direct = false } = {}) => (mode === 'plan' ? PLAN_TAGS_FOR[verdict] ?? []
+      : verdict === 'dislike' && direct ? [...TAGS_FOR.dislike, TASK_TAG] : TAGS_FOR[verdict] ?? [])
     /** A tag is optional: clicking the selected chip removes it. Pure, so it unit-tests. */
     const toggledTag = (current, clicked) => (current === clicked ? '' : clicked)
+
+    // ---- pure plan verdict helpers: no React, no state. The Like and Dislike under a start reply
+    // judge its pick (docs/live-agent-view.md Feature 4): what they offer, what they post, the line
+    // that says what a verdict changed, and the one ask under a reply whose plan changed.
+
+    // The example a question answered directly was recorded as (reply-words.js INTENT_MARK).
+    const INTENT_MARK = /^\[jev-intent\]:\s*kzh-intent-1-([\w-]{1,80})\s*$/m
+    /** What the verdicts under this message judge: the pick of a start reply (its `[jev-job]` mark), or an answer. */
+    const verdictMode = (text) => (JOB_MARK.test(String(text ?? '')) ? 'plan' : 'answer')
+    /** The task a start reply is about, by its key, '' for a message that names none. */
+    const messageJobKey = (text) => JOB_MARK.exec(String(text ?? ''))?.[1] ?? ''
+    /** The example a direct answer's message was recorded as, '' for any other message. */
+    const messageIntentSample = (text) => INTENT_MARK.exec(String(text ?? ''))?.[1] ?? ''
+    /** The efforts the pick should have run at, as the effort select offers them (feedback.js SUGGESTED_EFFORTS). */
+    const PLAN_EFFORTS = [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max']]
+    /**
+     * Which "should have been" selects a verdict shows: under an answer, the agent one with any dislike,
+     * as always; under a start reply, the agent one with `wrong agent` or a dislike with no tag, and the
+     * effort one only with `wrong effort`.
+     */
+    const verdictSelects = (mode, verdict, tag) => (verdict !== 'dislike' ? { agent: false, effort: false }
+      : mode !== 'plan' ? { agent: true, effort: false }
+        : { agent: !tag || tag === 'wrong agent', effort: tag === 'wrong effort' })
+    /** A verdict's state with what its selects no longer show dropped, so a leftover choice cannot ride along. */
+    const shownOnly = (mode, s) => {
+      const show = verdictSelects(mode, s.verdict, s.tag)
+      return { ...s, suggestedAgent: show.agent ? s.suggestedAgent ?? '' : '', suggestedEffort: show.effort ? s.suggestedEffort ?? '' : '' }
+    }
+    /** The line under a saved verdict: the server's own words for what it changed (index.js verdictEffects), '' for none. */
+    const learnedLine = (effects) => (Array.isArray(effects) ? effects.filter((x) => typeof x === 'string' && x).join(' ') : '')
+    /** How many messages the person has typed since an assistant message. */
+    function typedAfter(nodes, messageId) {
+      const list = Array.isArray(nodes) ? nodes : []
+      let at = -1
+      list.forEach((n, i) => { if (n?.kind === 'assistant' && n.messageId === messageId) at = i })
+      return at < 0 ? 0 : list.slice(at + 1).filter((n) => n?.kind === 'user').length
+    }
+    /**
+     * The ask under a start reply whose plan changed, or null: only when what ran is another agent than
+     * the reply named (`row`, GET /jev-router/replies?key=), nothing was rated, it was never answered,
+     * asking is on (`askWhenWrong`), fewer than two messages have been typed since, and no other reply
+     * of the chat holds the chat's one ask (`holder`, the message that does, or null). Its choices are
+     * the agent the reply named (`said`), the one that ran (`ran`), and `either`.
+     */
+    function askFor({ row, rated = false, typedSince = 0, messageId, holder = null, names = {} }) {
+      const said = row?.said?.agent
+      const ran = row?.ran?.agent
+      if (!said || !ran || said === ran || rated || row.verdict || row.ask || row.askWhenWrong === false || typedSince >= 2) return null
+      if (holder && holder !== messageId) return null
+      const name = (id) => (String(id).startsWith('tool:') ? `the ${String(id).slice('tool:'.length)} tool` : names[id] ?? id)
+      return { text: `It ran on ${name(ran)}, not ${name(said)} as I said. Which was right?`, choices: [['said', name(said)], ['ran', name(ran)], ['either', 'Doesn\'t matter']], said, ran }
+    }
+    /** Take the chat's one ask for this reply: the holders with it, unchanged when another reply holds it. */
+    const claimAsk = (holders, sessionId, messageId) => (holders?.[sessionId] && holders[sessionId] !== messageId ? holders : { ...holders, [sessionId]: messageId })
+    /** Let the chat's ask go, when this reply holds it. */
+    const releaseAsk = (holders, sessionId, messageId) => {
+      if (holders?.[sessionId] !== messageId) return holders
+      const { [sessionId]: _gone, ...rest } = holders
+      return rest
+    }
+    /**
+     * The verdict an answer to the ask posts: the agent that ran was right (`good pick`), or the one the
+     * reply named should have had it. A tool is no agent a verdict can name (feedback.js takes an agent
+     * or provider id), so a tool on either side is left out, and the verdict still says the pick was
+     * right or wrong.
+     */
+    const agentOf = (id) => (String(id ?? '').startsWith('tool:') ? '' : id)
+    const askVerdict = (answer, ask) => (answer === 'ran' ? { verdict: 'like', tag: 'good pick', suggestedAgent: '', provider: agentOf(ask.ran) }
+      : answer === 'said' ? { verdict: 'dislike', tag: 'wrong agent', suggestedAgent: agentOf(ask.said), provider: agentOf(ask.ran) } : null)
+
+    // ---- end pure plan verdict helpers
 
     /** A chain writes "model, effort"; the feedback route wants the model id alone. */
     const modelId = (s) => String(s ?? '').split(',')[0].trim()
@@ -5777,6 +7300,12 @@ window.__ModuleLoader__.load({
       ...(f.model ? { model: f.model } : {}),
       // Sent with every verdict and every edit of one, like the attribution; a clear needs no run.
       ...(f.verdict && f.runId ? { runId: f.runId } : {}),
+      // A verdict about the pick says so and names its task, and may name the effort it should have
+      // run at; one about an answer leaves all three off, as it always has, and names the example a
+      // direct answer's message was recorded as.
+      ...(f.verdict && f.about === 'plan' && f.taskKey ? { about: 'plan', taskKey: f.taskKey } : {}),
+      ...(f.verdict && f.about === 'plan' && f.taskKey && f.suggestedEffort ? { suggestedEffort: f.suggestedEffort } : {}),
+      ...(f.verdict && f.intentSample ? { intentSample: f.intentSample } : {}),
     })
 
     // The "should have been" picker is the same enabled-agent list the setup page and the model
@@ -5796,23 +7325,45 @@ window.__ModuleLoader__.load({
       return enabledAgentsPending
     }
 
+    // The chat's one ask under a start reply whose plan changed: the message that holds it, by chat,
+    // and whether asking is on as this page last saved it (`Don't ask me this`, or the switch in
+    // Settings, Chat replies), which a reply's row read before the save does not know; null until then.
+    const askHolders = makeStore({ holders: {}, asking: null })
+
     /**
      * Like/Dislike with an optional one-line reason, under every assistant answer. The seat gives
      * `messageId` plus the standard `sessionId` and `useChat`; with no way to name the message there
-     * is nothing to attach a verdict to, so it renders nothing.
+     * is nothing to attach a verdict to, so it renders nothing. Under a start reply (its `[jev-job]`
+     * mark) the verdict rates the pick the reply named (docs/live-agent-view.md Feature 4): its tags are
+     * about the agent, the effort and the reading of the message, a dislike may name the effort it
+     * should have run at, and a reply whose plan changed may ask, once, which was right. Once a verdict
+     * is saved, one muted line gives the server's own words for what it changed.
      */
     function AnswerVerdict({ messageId, sessionId, useChat }) {
       useStyle()
       const nameMap = names.use()
       // The message text carries both provenance shapes: the chain marker and the direct credit line.
       const text = useChat ? useChat((s) => messageText(s.legacy.nodes, messageId)) : ''
-      const [state, setState] = useState({ verdict: null, reason: '', tag: '', suggestedAgent: '' })
+      const typedSince = useChat ? useChat((s) => typedAfter(s.legacy.nodes, messageId)) : 0
+      const mode = verdictMode(text)
+      const plan = mode === 'plan'
+      const taskKey = plan ? messageJobKey(text) : ''
+      const intentSample = plan ? '' : messageIntentSample(text)
+      // `provider` is set only by an answer to the ask, which is about the agent that ran.
+      const [state, setState] = useState({ verdict: null, reason: '', tag: '', suggestedAgent: '', suggestedEffort: '', provider: '' })
       const [editing, setEditing] = useState(false)
       const [draft, setDraft] = useState('')
       const [agents, setAgents] = useState(null)
+      const [learned, setLearned] = useState('')
+      // The reply's row in the reply ledger: what it named and what then ran, for the ask.
+      const [row, setRow] = useState(null)
+      const [confirm, setConfirm] = useState(false)
       // A click made before the stored verdict lands wins: the person's action is newer than the read.
       const touched = useRef(false)
       const prov = messageProvenance(text) ?? { agent: '', model: '', provider: '' }
+      const asks = askHolders.use()
+      // The task, read while its reply says it should have been a question, so it can be stopped.
+      const { tasks } = useTasksFeed(plan && state.tag === 'should have been a question')
 
       useEffect(() => { loadNames() }, [])
       // Enabled agents, once: the "should have been" suggestion list. Attribution does not wait on
@@ -5830,37 +7381,81 @@ window.__ModuleLoader__.load({
           .then((d) => {
             if (stop || touched.current) return
             const r = storedVerdict(d.feedback, messageId)
-            if (r) setState({ verdict: r.verdict, reason: r.reason ?? '', tag: r.tag ?? '', suggestedAgent: r.suggestedAgent ?? '' })
+            // A rating of the pick keeps the agent it was given about, which the ask may have named.
+            if (r) setState({ verdict: r.verdict, reason: r.reason ?? '', tag: r.tag ?? '', suggestedAgent: r.suggestedAgent ?? '', suggestedEffort: r.suggestedEffort ?? '', provider: r.about === 'plan' ? r.provider ?? '' : '' })
           })
           .catch(() => {})
         return () => { stop = true }
       }, [sessionId, messageId])
+      // The row is read again while what the ask needs can still land. A reply that names its guess
+      // (a quick or instant reply, a likely agent) goes out before routing picks, so what ran comes
+      // later, or never if its task ends first. What the reply named is noted just after it is out, so
+      // a read may find no row yet, or one without it: such misses are read again three times running,
+      // then given up, as a row that never comes (the reply ledger off, or a reply of another chat).
+      useEffect(() => {
+        if (!taskKey || !sessionId) return
+        let stop = false
+        let timer
+        let misses = 0
+        const read = async () => {
+          let again = true
+          if (!document.hidden) {
+            try {
+              const d = await api(`/jev-router/replies?key=${encodeURIComponent(taskKey)}&session=${encodeURIComponent(sessionId)}`)
+              if (stop) return
+              setRow(d)
+              // What the reply named and what ran are each noted once, so a row with both is final, as
+              // is one whose reply named no agent, which has nothing to ask about.
+              misses = d.said ? 0 : misses + 1
+              again = d.said ? !!d.said.agent && !d.ran && !d.ended : misses < 4
+            } catch { again = ++misses < 4 }
+          }
+          if (!stop && again) timer = setTimeout(read, 3000)
+        }
+        read()
+        return () => { stop = true; clearTimeout(timer) }
+      }, [taskKey, sessionId])
+      // Asking as this page last saved it, where it did, over the setting the row was read with.
+      const seen = row && asks.asking !== null ? { ...row, askWhenWrong: asks.asking } : row
+      const ask = plan ? askFor({ row: seen, rated: !!state.verdict, typedSince, messageId, holder: asks.holders[sessionId] ?? null, names: nameMap.agents ?? {} }) : null
+      // The chat's one ask: taken while this reply's is due, let go once it is not.
+      useEffect(() => {
+        if (!ask || !sessionId) return undefined
+        askHolders.set({ holders: claimAsk(askHolders.get().holders, sessionId, messageId) })
+        return () => askHolders.set({ holders: releaseAsk(askHolders.get().holders, sessionId, messageId) })
+      }, [!!ask, sessionId, messageId])
 
       if (!messageId || !sessionId) return null
       const provider = verdictProvider(prov)
 
-      /** Optimistic: show the new verdict, then POST; a failure puts the old one back and says so. */
+      /** Optimistic: show the new verdict, then POST; a failure puts the old one back and says so. Answers whether it was saved. */
       const commit = async (next) => {
         const prev = state
         touched.current = true
         setEditing(false)
         setState(next)
         try {
-          await post('/jev-router/feedback', feedbackBody({
+          const res = await post('/jev-router/feedback', feedbackBody({
             sessionId, messageId, verdict: next.verdict, reason: next.reason, tag: next.tag,
-            suggestedAgent: next.suggestedAgent, provider, model: prov.model, runId: messageRunId(text),
+            suggestedAgent: next.suggestedAgent, provider: next.provider || provider, model: next.provider && next.provider !== provider ? '' : prov.model, runId: messageRunId(text),
+            about: mode, taskKey, suggestedEffort: next.suggestedEffort, intentSample,
           }))
+          // Under an answer the line is shown only when something was learned from the verdict.
+          const line = learnedLine(res?.effects)
+          setLearned(plan || line.startsWith('Learned:') ? line : '')
+          return true
         } catch (e) {
           setState(prev)
           toast(`Feedback not saved: ${e.message}`)
+          return false
         }
       }
       const pick = (v) => {
         const next = toggledVerdict(state.verdict, v)
-        if (!next) return commit({ verdict: null, reason: '', tag: '', suggestedAgent: '' })
+        if (!next) return commit({ verdict: null, reason: '', tag: '', suggestedAgent: '', suggestedEffort: '', provider: '' })
         // A tag the new verdict does not offer is dropped, so a leftover chip cannot ride along.
-        const tag = tagsFor(next).includes(state.tag) ? state.tag : ''
-        return commit({ verdict: next, reason: state.reason, tag, suggestedAgent: next === 'dislike' ? state.suggestedAgent : '' })
+        const tag = tagsFor(next, mode, { direct: !!intentSample }).includes(state.tag) ? state.tag : ''
+        return commit(shownOnly(mode, { ...state, verdict: next, tag }))
       }
       const saveReason = () => {
         if (!state.verdict) return
@@ -5870,19 +7465,36 @@ window.__ModuleLoader__.load({
       }
       const editReason = () => { setDraft(state.reason); setEditing(true) }
       const setSuggested = (id) => commit({ ...state, suggestedAgent: id })
-      const setTag = (tag) => commit({ ...state, tag: toggledTag(state.tag, tag) })
+      const setEffort = (level) => commit({ ...state, suggestedEffort: level })
+      const setTag = (tag) => commit(shownOnly(mode, { ...state, tag: toggledTag(state.tag, tag) }))
+      // The ask's answer: a verdict about the agent that ran, unless either was right, and the answer
+      // kept on the reply's row, so it is never asked again. A verdict that was not saved leaves the
+      // ask open, to be answered again.
+      const answerAsk = async (answer) => {
+        const said = askVerdict(answer, ask)
+        if (said && !(await commit({ ...state, ...said, suggestedEffort: '' }))) return
+        try { const d = await post('/jev-router/replies/ask', { key: taskKey, answer, sessionId }); setRow((r) => ({ ...r, ask: d.ask })) } catch (e) { toast(`Answer not saved: ${e.message}`) }
+      }
+      const stopAsking = async () => {
+        try { await post('/jev-router/chat-replies/settings', { askWhenWrong: false }); askHolders.set({ asking: false }) } catch (e) { toast(`Not saved: ${e.message}`) }
+      }
+      const show = verdictSelects(mode, state.verdict, state.tag)
+      const t = plan && taskKey ? (tasks ?? []).find((x) => x.key === taskKey) ?? null : null
+      const stopping = plan && state.tag === 'should have been a question' && !!t && LIVE_TASK.includes(t.state) ? taskRowModel(t) : null
+      const words = confirm && t ? confirmFor(tasks, t.jobId, Date.now(), stopping?.stopWord) : null
+      const asking = !!ask && asks.holders[sessionId] === messageId
 
-      return h('div', { className: 'kzh-vd', role: 'group', 'aria-label': 'Rate this answer' },
+      return h('div', { className: 'kzh-vd', role: 'group', 'aria-label': plan ? 'Rate this pick' : 'Rate this answer' },
         h('button', {
           type: 'button', className: cx('kzh-vd-btn', state.verdict === 'like' && 'on'),
           'aria-pressed': state.verdict === 'like',
-          title: state.verdict === 'like' ? 'Liked. Click to clear.' : 'This answer was right',
+          title: state.verdict === 'like' ? 'Liked. Click to clear.' : plan ? 'The right agent and effort' : 'This answer was right',
           onClick: () => pick('like'),
         }, state.verdict === 'like' ? 'Liked' : 'Like'),
         h('button', {
           type: 'button', className: cx('kzh-vd-btn', state.verdict === 'dislike' && 'on'),
           'aria-pressed': state.verdict === 'dislike',
-          title: state.verdict === 'dislike' ? 'Disliked. Click to clear.' : 'This answer was wrong',
+          title: state.verdict === 'dislike' ? 'Disliked. Click to clear.' : plan ? 'The pick was wrong' : 'This answer was wrong',
           onClick: () => pick('dislike'),
         }, state.verdict === 'dislike' ? 'Disliked' : 'Dislike'),
         // The optional tag, one chip per category, offered after the verdict so the person can say
@@ -5891,16 +7503,16 @@ window.__ModuleLoader__.load({
         state.verdict ? h('div', {
           className: 'kzh-vd-tags', role: 'group',
           'aria-label': state.verdict === 'dislike' ? 'What was wrong (optional)' : 'What was good (optional)',
-        }, ...tagsFor(state.verdict).map((t) => h('button', {
-          key: t, type: 'button', className: 'kzh-vd-tag',
-          'aria-pressed': state.tag === t,
-          title: state.tag === t ? `${t}. Click to remove this tag.` : `Tag this verdict: ${t}`,
-          onClick: () => setTag(t),
-        }, t))) : null,
+        }, ...tagsFor(state.verdict, mode, { direct: !!intentSample }).map((tg) => h('button', {
+          key: tg, type: 'button', className: 'kzh-vd-tag',
+          'aria-pressed': state.tag === tg,
+          title: state.tag === tg ? `${tg}. Click to remove this tag.` : `Tag this verdict: ${tg}`,
+          onClick: () => setTag(tg),
+        }, tg))) : null,
         state.verdict ? (editing
           ? h('input', {
               className: 'kzh-vd-reason', type: 'text', value: draft, autoFocus: true,
-              placeholder: 'Why?', 'aria-label': 'Why: the reason for this verdict',
+              placeholder: plan ? 'What was not accurate?' : 'Why?', 'aria-label': 'Why: the reason for this verdict',
               onChange: (e) => setDraft(e.target.value),
               onKeyDown: (e) => {
                 if (e.key === 'Enter') { e.preventDefault(); saveReason() }
@@ -5913,14 +7525,33 @@ window.__ModuleLoader__.load({
               'aria-label': state.reason ? `Why: ${state.reason}. Activate to edit.` : 'Add a reason',
               onClick: editReason,
             }, state.reason ? 'Why? (saved)' : 'Why?')) : null,
-        state.verdict === 'dislike' ? h('label', { className: 'kzh-vd-sug' },
+        show.agent ? h('label', { className: 'kzh-vd-sug' },
           h('span', { className: 'kzh-vd-suglab' }, 'should have been'),
           h('select', {
             className: 'kzh-vd-select', value: state.suggestedAgent,
-            'aria-label': 'should have been: the agent that should have answered',
+            'aria-label': plan ? 'should have been: the agent that should have run it' : 'should have been: the agent that should have answered',
             onChange: (e) => setSuggested(e.target.value),
           }, h('option', { value: '' }, 'no suggestion'),
-            ...(agents ?? []).filter(canSuggest).map((a) => h('option', { key: a.id, value: a.id }, nameMap.agents?.[a.id] ?? a.id)))) : null)
+            ...(agents ?? []).filter(canSuggest).map((a) => h('option', { key: a.id, value: a.id }, nameMap.agents?.[a.id] ?? a.id)))) : null,
+        show.effort ? h('label', { className: 'kzh-vd-sug' },
+          h('span', { className: 'kzh-vd-suglab' }, 'effort should have been'),
+          h('select', {
+            className: 'kzh-vd-select', value: state.suggestedEffort,
+            'aria-label': 'effort should have been: the effort it should have run at',
+            onChange: (e) => setEffort(e.target.value),
+          }, h('option', { value: '' }, 'no suggestion'), ...PLAN_EFFORTS.map(([v, n]) => h('option', { key: v, value: v }, n)))) : null,
+        // Said to have been a question while it still runs: it can be stopped from here.
+        stopping ? h('button', { type: 'button', className: 'kzh-vd-why', onClick: () => setConfirm(true) }, `${stopping.stopWord} ${t.jobId}`) : null,
+        words ? h(Confirm, {
+          title: words.title, body: words.body, confirmLabel: words.confirmLabel,
+          onCancel: () => setConfirm(false),
+          onConfirm: () => { setConfirm(false); Promise.resolve().then(words.run).catch((e) => toast(e.message)) },
+        }) : null,
+        learned ? h('div', { className: 'kzh-vd-learned', role: 'status' }, learned) : null,
+        asking ? h('div', { className: 'kzh-vd-ask', role: 'group', 'aria-label': ask.text },
+          h('span', null, ask.text),
+          ...ask.choices.map(([answer, label]) => h('button', { key: answer, type: 'button', className: 'kzh-vd-tag', onClick: () => answerAsk(answer) }, label)),
+          h('button', { type: 'button', className: 'kzh-vd-why', title: 'Never ask which was right when a plan changes (Settings, Chat replies)', onClick: stopAsking }, 'Don\'t ask me this')) : null)
     }
 
     /**
@@ -5981,8 +7612,10 @@ window.__ModuleLoader__.load({
       // adapter.js TASK_LABELS on the server. The two start* schedulers are exposed with stubbable
       // DOM globals so a test can prove a pass lands on a timer while no frame is ever delivered.
       // ResourceBudget and LocalModelsCard are rendered with stand-in Reacts in test/budgetpanel.test.js,
-      // SetupSection in test/laya-card.test.js and InspectorBody in test/routerview.test.js.
-      __test: { Markdown, ResourceBudget, LocalModelsCard, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, stopOneWords, stopAllWords, stopTask, WorkBoard, Tasks, resultIdOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, sortRows, filterRows, SortTable, BenchmarkCard, benchmarkProgress, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, UsageCard, RestartLine, taskItems },
+      // SetupSection, ChatRepliesCard and HowJevRepliesCard in test/laya-card.test.js and InspectorBody in test/routerview.test.js.
+      // The live view's pane, card and helpers are in test/liveview.test.js. Send now and Steer's helpers are
+      // in test/workboard.test.js and test/tasklist.test.js, their dialogs and TaskQueue in test/observability.test.js.
+      __test: { Markdown, ResourceBudget, LocalModelsCard, InstallPicker, transcriptButton, transcriptClicks, actions: ACTIONS, taskRowModel, taskLabels, liveTasks, liveSummary, workBoardHeader, stopOneWords, stopAllWords, stopTask, WorkBoard, Tasks, resultIdOf, resultOf, awaitingDelivery, resultAnnouncement, toggleActionOf, coalesce, startTranscripts, startResultAcks, userInputs, historyStep, arrowIntent, fileTreeRows: treeRows, orderTreeEntries, treeChildPath, fileAddressFor, treeFailureLine, fileTreeSearchLabels: FILE_TREE_SEARCH_LABELS, messageProvenance, messageRunId, verdictProvider, storedVerdict, toggledVerdict, feedbackBody, canSuggest, modelId, tagsFor, toggledTag, verdictMode, messageJobKey, messageIntentSample, planEfforts: PLAN_EFFORTS, verdictSelects, shownOnly, learnedLine, typedAfter, askFor, claimAsk, releaseAsk, askVerdict, AnswerVerdict, overviewGroups: OVERVIEW_GROUPS, overviewText, conversationLedger, turnWindows, bucketFor, pairRuns, runLedgerRows, taskLedgerRows, jobLedgerRows, subagentLedgerRows, buildLedger, recordState, recordDurationMs, maturityWords, summarize, Stats, WhatHappened, RoutingDecision, Questions, Decisions, HistoryRunDetail, RouterView, sortRows, filterRows, SortTable, BenchmarkCard, benchmarkProgress, LayaCompare, LayaCard, SetupSection, InspectorBody, SavingsCard, UsageCard, RestartLine, taskItems, ratedEffortLines, EffortCard, replyWaitChoices, progressChoices: PROGRESS_CHOICES, ChatRepliesCard, howJevRepliesWhy, howJevRepliesLines, recentReplyRows, ratingChanges, HowJevRepliesCard, livePatchLines, thinkingChoices: THINKING_CHOICES, transcriptChoices: TRANSCRIPT_CHOICES, LiveAgentViewCard, LivePane, LiveRunCard, mergeLive, activityLine, doneLine, stallWords, reasoningPreview, attemptTitle, cleanTerminal, liveHeader, liveNotes, liveEndLine, liveTail, tokenWords, spanWords, queueActions, queueLabel, sendNowWords, stopForWords, steerDialogWords, sendNowRunningWords, restartWords, queueDrift, TaskQueue, guidanceRows, composerWords, GuidanceList, LiveComposer },
       apply(ctx) {
         sessionsApi = ctx.sessions
         sidebarRight = ctx.sidebarRight
@@ -6062,6 +7695,14 @@ window.__ModuleLoader__.load({
           guide: [{ order: 49, title: () => 'Session overview', description: () => 'Every step in this session: messages, routed runs, background tasks, subagents' }],
         }))
         ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: OVERVIEW_ID }, OverviewPane))
+        ctx.effect(() => ctx.sidebarRightTabs.register({
+          id: LIVE_ID,
+          kind: LIVE_KIND,
+          priority: 'extension',
+          title: () => 'Live',
+          guide: [{ order: 51, title: () => 'Live', description: () => 'Watch agents work: text, tool calls and reasoning as they stream' }],
+        }))
+        ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: LIVE_ID }, LivePane))
         if (IN_APP) {
           document.documentElement.classList.add('kzh-in-app')
           ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'kz-titlebar' }, TitleBar))
@@ -6070,6 +7711,9 @@ window.__ModuleLoader__.load({
         }
         ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'kz-shortcuts', order: 16, label: () => 'Shortcuts' }, ShortcutsSection))
         ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({ name: 'conversation.chat.assistant-actions', id: 'jev-agents', order: 100 }, AgentStrip))
+        // The card under a start reply, between the strip and the verdict: it renders only for a
+        // message with a `[jev-job]` mark, so every other answer is left as it was.
+        ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({ name: 'conversation.chat.assistant-actions', id: 'jev-live', order: 105 }, LiveRunCard))
         // The verdict control, under every answer. A separate id and order, so the strip above is
         // untouched and neither can displace the other.
         ctx.slots.inject('conversation.chat.assistant-actions', () => ctx.slots.register({ name: 'conversation.chat.assistant-actions', id: 'jev-feedback', order: 110 }, AnswerVerdict))

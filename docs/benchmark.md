@@ -386,6 +386,7 @@ Running Benchmark all is how every installed model's figure there becomes measur
 - `POST /jev-router/local/benchmark` with `{ ids?: string[] }` (none means Benchmark all): 200 with `{ queued }`, the ids in the order they will be measured, 400 with a refusal of 2.7, 409 while a speed run is going.
   The run goes on in the background after the answer.
 - `POST /jev-router/local/benchmark/cancel`: 200 with `{ ok: true }`, also when nothing runs or the run is already cancelled, and 409 with the refusal of 2.8 while the run puts the engine back as it was.
+- `POST /jev-router/local/benchmark/accept-output` with `{ id }` (as built, 2.15): 200 with `{ ok: true }` once the model's figure kept aside for output that differed is its speed and that output its baseline, 400 when it has none kept aside, 409 while a speed run is going.
 
 ### 2.11 What B1 does not measure
 
@@ -409,12 +410,17 @@ Speed-Run.bat --context 24576          the context KzH starts local models with,
                                        profile sets one this cannot read
 Speed-Run.bat --no-pause               no key press at the end (Task Scheduler)
 Speed-Run.bat --verbose                the engine log as it runs
+Speed-Run.bat --accept-output          accept the new output a run kept aside, for the
+                                       models named with --models or every one waiting;
+                                       it measures nothing
 ```
 
 - `--models <id>,<id>` measures only those models, each id refused as Benchmark's `ids` are (2.7).
   It also takes the words that follow it, up to the next `--` argument, since PowerShell hands `--models a,b` to a .bat as `--models a b`.
 - `--context <tokens>`, a whole number of 2048 or more, says outright the context KzH starts local models with, and always wins over the profile's (below).
 - `--verbose` prints the engine log as it runs, and `--no-pause` leaves out the key press at the end.
+- `--accept-output` accepts the new output a run kept aside because it differs from its baseline (2.15), for each model named with `--models` or every one that has one waiting, as the card's **Accept new output** does, and measures nothing.
+  It takes the speed run lock and refuses while KzH runs, as a run does.
   The .bat reads `--no-pause` word by word with a `for` loop, so an `&` or a `|` in the arguments breaks no pipe.
 - `--harness <dir>` and `--data <dir>` point elsewhere; they default to the harness the script sits in and `<DSH_HOME>/jev-router`, with `DSH_HOME` `~/.kzh` when it is not set, as `Start-KzH.ps1` sets it.
 
@@ -481,12 +487,16 @@ This ran for real on 26 Sep in the cloud: SIGHUP mid-run gave exit code 129 and 
 
 Exit codes, for a scheduled run:
 
-- 0: every model was measured;
+- 0: every model was measured, and no output differs from its baseline;
 - 1: a model was not measured, and its line says why, a model whose file does not match the manifest's SHA256 included;
 - 2: it could not run: no engine, no model, an unknown model, a bad argument, a manifest that did not load, a context it cannot tell, a lock it cannot take, or Node.js not on the `PATH`, where the .bat says `Install Node.js 22.19 or newer` (the plugin's `engines`); a missing install also names `scripts\Install-Harness.ps1 -LocalModels <id,id|all>`;
 - 3: KzH, a llama-server, a Laya left behind or another Speed-Run is running, or a program on KzH's port cannot be told from KzH;
+- 4: every model was measured, and a model's output differs from its baseline, so its figure is kept aside until it is accepted (2.15);
 - 130: cancelled with Ctrl+C;
 - 128 plus the signal's number, 129 for SIGHUP: its console was closed, or it was ended.
+
+`--accept-output` exits 0 once every output asked for is accepted (or none was waiting), 2 when a model named has none waiting, and 3 as a run does.
+The .bat's own header lists the same codes and `--accept-output`, and `speed-run.test.js` "Speed-Run.bat's header, what a person setting up a scheduled run reads, ..." holds it to the script's `EXIT`.
 
 `test/speed-run.test.js` drives the script over the fake llama-server (5.1), and on 26 Sep `node scripts/speed-run.mjs` ran against the real llama-server b10964 on Linux (the status at the top).
 `Speed-Run.bat` itself has only been read by its test (plain ASCII, CRLF line ends, cmd.exe's `nul` rather than any Unix redirect, the `for` loop, the line that runs the script and the exit code it passes on) and has never run on Windows.
@@ -503,7 +513,8 @@ Who started a run is `local.js` `benchmark()`'s `by`, up to 60 characters: `Sett
 ```
 <UTC minute>, <who started it>: <k> of <n> measured[, stopped]
   PC: <the PC>; engine: <variant> build <12 hex digits>; budget: <limits set>, GPU layers <setting>; <Laya held on the GPU | no Laya held>
-  <model>  <x> tokens/s generating, <y> tokens/s reading, <context>, <g>/<n> layers on the GPU, <v> GB VRAM + <r> GB RAM, loaded in <s> s, <t> threads
+  <model>  <x> tokens/s generating, <y> tokens/s reading, <context>, <g>/<n> layers on the GPU, <v> GB VRAM + <r> GB RAM, loaded in <s> s, <t> threads, peak RAM <p> GB
+           <the output check's verdict>
   <model>  not measured: <why>
   <the restore line>
   Details: speed-run-<time>.log
@@ -511,7 +522,8 @@ Who started a run is `local.js` `benchmark()`'s `by`, up to 60 characters: `Sett
 
 - The first line says when the run started, to the minute in UTC, who started it, how many of its models were measured, and `, stopped` when it was cancelled.
 - The second gives the PC as `specsLine()` does, with commas for its middle dots so the line stays ASCII; the engine build, its variant and the first 12 hex digits of its SHA-256; the budget, that is the VRAM, RAM and cores limits when set and the GPU layers setting; and whether Laya was held, and on which device.
-- Then comes a row per model, in the run's order, from `speedFigures()`: generation speed, reading speed or `reading speed not measured (prompt cache)`, context, the layers on the GPU or `layers on the GPU not reported`, VRAM and RAM from the load's memory reading or `memory not reported`, load seconds or `load time not reported`, and threads or `threads not reported`.
+- Then comes a row per model, in the run's order, from `speedFigures()`: generation speed, reading speed or `reading speed not measured (prompt cache)`, context, the layers on the GPU or `layers on the GPU not reported`, VRAM and RAM from the load's memory reading or `memory not reported`, load seconds or `load time not reported`, threads or `threads not reported`, and the peak RAM or `peak RAM not read` (2.14).
+  Under each measured model's row, on a line of its own, is its output check's verdict, as `outputWords()` says it (2.15); an entry written before the check was built has none.
   A model not measured has `not measured: <why>`, and one a Cancel dropped from the queue has `not measured: cancelled before its turn`.
 - Then the restore line of 2.6, or 2.8's `Stopped. ...` line, and `Details: ` with the name of the run's detail log, followed by ` (incomplete: <what failed>)` when it could not all be written.
 
@@ -567,6 +579,44 @@ After the fix of 2.3:
 
 They show that the machinery works against the real server.
 They say nothing about the owner's RTX 3080 or the real models, whose runs belong in the owner's own `speed-runs.log`.
+
+### 2.14 As built, 10 Oct: peak RAM, and a mixture-of-experts model
+
+Each measured model now has its engine's peak working set, the reading the RAM watchdog takes (`readWorkingSet`: tasklist on Windows, ps elsewhere), taken as the model is measured and every `watchEveryMs` (5 s) until its last timed request.
+It is kept in `local.json` beside the speed as `peakRamGB` (null when no reading could be taken), and shown on the card's line (`, peak RAM 21.2 GB`, left out when not read), in the model's `speed-runs.log` row (`peak RAM 21.2 GB` or `peak RAM not read`), on the card's speed line, and in Speed-Run.bat's table as Peak RAM GB.
+A model's weights are mapped from its file, so the figure counts the pages of that file Windows holds in RAM for the engine.
+A mixture-of-experts model's reading also keeps `cpuMoe`, `{ layers, cpuLayers }`, the layers whose experts stayed in RAM (`--n-cpu-moe`), and it stands only for a load that keeps the same ones there (2.4): `it was measured with the experts of 32 of 48 layers in RAM and the next load has the experts of 38 of 48 layers in RAM`.
+Its rating, once a reading stands, is `Fits this PC: experts in RAM, the rest on the GPU: <speed> measured on this PC ...`, since every layer is on the GPU with its experts in RAM and the `offloaded N/M layers` count says nothing of where it runs.
+A GPU with room for every expert as well (about 21 GB or more at 16k, by the estimate) keeps none in RAM (`cpuLayers` 0, so neither flag), and the words follow the layout: the rating and the suggestion say `Fits this PC: all on the GPU, experts included (~60 words/s est.)` and `(all on the GPU, experts included, ~60 words/s)`, and the start's log line, the card's speed line and a reading that does not stand say `every expert on the GPU`, never `experts in RAM (about 0.0 GB)` or `the experts of 0 of 48 layers in RAM` (review of 10 Oct).
+It is tested by `moe.test.js` "a GPU that holds every expert too runs all of it there, ..." and `budgetpanel.test.js` "a mixture-of-experts model measured with every expert on the GPU says so in its speed line, ...", on a 24 GB GPU; no PC with such a GPU has run it.
+The fit and the estimate are local.js `moeLayout` (README, "Local models & offline"); nothing of it has run against a real llama-server or the real model.
+Changed on purpose: `local.test.js` "a speed run sends a warm-up, ..." (the stored reading has `peakRamGB: null`), "every speed run is logged: ..." and "a model's row in the speed run history says a figure its reading lacks is missing, never a zero" (the row ends with the peak RAM), and `speed-run.test.js` "a speed run measures every installed chat model ..." (the history row) and the table test, renamed for its new column.
+
+### 2.15 As built, 10 Oct: the output check
+
+The owner chose it from the colibri study (action 5), so that output a faster engine got wrong is not taken for an improvement.
+After its three timed requests, each model gets one more request, not timed: `CHECK_PROMPT` (a fixed start of a JavaScript function) to `/completion` with `n_predict` 64, `ignore_eos`, `cache_prompt: false`, `temperature: 0`, `top_k: 1` and `seed: 1`, streamed.
+It takes the path the speed requests take, text with no chat template, so a change in the answer is the engine's or the weights', never a template's.
+The answer kept is the streamed text, and the token ids llama-server sends with each piece; a piece without ids makes it compare in characters.
+b10964 sets one id on each streamed piece (`server-context.cpp` `send_partial_response`), and a token whose text ends inside a character comes with the next piece, its id not sent; the JSON writer (`server-task.cpp`) is not in the scratchpad, so whether the ids reach the stream has not been seen.
+
+- The key is the model id, the SHA-256 of its weights, the engine build (`e.build`, as in 2.4) and the GPU split of the load: the engine's own `offloaded N/M` count (the GPU layers setting when it printed none) and, for a mixture-of-experts model, the layers whose experts stayed in RAM (`local.js` `outputKey`).
+  The split is the load's, not the setting's, since with `auto` the fit decides it.
+- The first output of a key is its baseline, kept in `speed-baselines.json` beside `local.json` (`{ [key]: { id, at, weights, engine, split, text, tokens } }`), written through a queue of its own, as `mutate()` writes `local.json`; a file that cannot be read is never written over.
+  Another build or split is another key, so its first run keeps a baseline of its own rather than differing, and its verdict says how far it agrees with the newest baseline of the same weights under another build or split.
+- A later output is `same` when its longest common start with the baseline covers at least the plugin config's `local.outputCheckShare` of the baseline (0 to 1, `OUTPUT_SHARE` 0.5 as shipped: the first 32 of 64 tokens), and `differs` otherwise; Speed-Run.bat reads the share from the profile as it reads `local.contextSize`.
+- The verdict is kept on the reading as `output`: `{ state: 'baseline', also? }`, `{ state: 'same', agreed, of, need, unit, baselineAt }`, `differs` (with both texts and the new ids), `accepted` (with `acceptedAt`), or `{ state: 'unchecked', why }` when the request failed, gave no text, or the baselines file could not be read or written; an unchecked figure is taken as before.
+- A reading whose output differs goes to `local.json` `speedHeld` (one per model, keyed as `speed`), not to `speed`, so `speedFor()` never gives it as the reading: the rating, the picker and the card keep the reading the model had, and `speedFor()` gives the held one beside it as `held`, only when there is one.
+  Any later run of the model that is not kept aside itself drops it, since the newest run describes the machine as it is now.
+- **Accept new output** on the model's row (with **Both outputs** to read first), `POST /jev-router/local/benchmark/accept-output` `{ id }` and `Speed-Run.bat --accept-output [--models <id>]` all call `acceptOutput()`: the held output becomes its key's baseline first, then the held reading the model's `speed` reading, marked `accepted`, and `speed-runs.log` gets a line saying who accepted it.
+  It is refused with 409 while a speed run goes and 400 when the model has nothing held; the shell form takes the speed run lock, refuses while KzH runs as a run does, and measures nothing.
+- Each model's row in `speed-runs.log` has the verdict on a line of its own under its figures, the detail log has the request as the phase `output check, decoded greedily, not timed`, the answer itself (`output check answered 64 token ids: "..."`) and the verdict after it, the card's line of the run adds a sentence only when the output differs or was not checked, and the model's row in Settings says it under the speed line.
+  Speed-Run.bat exits 4 when every model was measured and an output differs, and says how to accept it.
+- Tested since the review of 10 Oct: the plugin config's share reaches the card's Benchmark (`speed-routes.test.js` "the plugin config's local.outputCheckShare is the share Benchmark in the card holds a model's output to: ..."), and a later run that is not kept aside drops the held figure, whether its output is the same or unchecked (`output-check.test.js` "a later run of the model that is not kept aside itself drops the figure kept aside before it, ...").
+
+What it does not do: it does not catch a broken build on its first run, since a new build sets a new baseline; that run's verdict says how far it agrees with the build before it, which is what the owner reads.
+The share is provisional: CUDA output is not bit-identical across builds or splits, and how far it drifts on the owner's PC has not been measured (docs/handoff.md, "Built but NOT observed").
+Changed on purpose: `local.test.js` "a speed run sends a warm-up, ..." (a seventh request, the check, and the reading's `output`) and "every speed run is logged: ..." (the history's output line), and `speed-run.test.js` "a speed run measures every installed chat model ..." and "Ctrl+C cancels as the card's Cancel does: ..." (the history's output line).
 
 ---
 

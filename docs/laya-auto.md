@@ -372,6 +372,8 @@ Cut-offs that stay shared or Jev-only, on purpose:
 | --- | --- | --- | --- | --- |
 | `jev-auto` | Jev Auto | auto | jev | always |
 | `laya-auto` | Laya Auto | auto | laya | Laya is installed, `laya.enabled` is not false, no `layaError`, and `routing.enabled` is not false |
+| `laya-online` | Laya Auto · Online | online | laya | as `laya-auto`, and a local agent exists (added later, see the as-built note below) |
+| `laya-local` | Laya Auto · Local | local | laya | as `laya-online` |
 | `jev-online` | Jev Auto · Online | online | jev | a local agent exists (unchanged) |
 | `jev-local` | Jev Auto · Local | local | jev | as today |
 | `jev-offline` | Offline · Local only | offline | jev (never called) | as today |
@@ -396,9 +398,20 @@ The measured sentence is read from the device Laya runs on, or would start on, w
 - `modeOf(model)` becomes `rowOf(model) -> { mode, decider }`; an unknown id still maps to Jev Auto, but `laya-auto` is always a known id and `resolveModel` always resolves it, so a saved selection never silently becomes Jev.
 - The group heading (`providerInfo` name, `adapter.js:327`) changes from `Jev` to `Kz-harness`, because the group holds Laya Auto and the plain agent rows too; the route id stays `jev`, so `settings.yaml`, the installer's `agent-default-model: jev / jev-auto` and every saved bookmark are untouched.
 - No second Laya row is added: offline, Laya Auto narrows the pool to local agents itself (3.5), and a `local-low` or `local-high` effort forces the agent exactly as it does under Jev Auto.
+  Superseded by the owner's request of 9 Oct 2026: `laya-online` and `laya-local` now follow `laya-auto`, see the as-built note below.
 - Under a local effort, `stream()` sets `forceAgent` and skips `classify` (`adapter.js:370-379, 436`), and the router takes the manual branch (`router.js:711`), so Laya routes nothing and still reviews; the heading reads `**Laya router** · MANUAL /<agent>`, and the `decider` stays `laya` because the effort override changes only `mode`.
 - `deepNote` reads "Laya judged this worth the stronger model, so " under Laya.
 - `queuedLine` says "Laya picks" instead of "Jev picks" for a Laya task, and appends the `why` that `classify` returned.
+
+As built (9 Oct 2026, the owner's request): Laya Auto · Online and Laya Auto · Local, the two variants Jev Auto has, with Laya deciding.
+They are rows of `JEV_MODELS` right after `laya-auto` (`mode: 'online'` and `'local'`, `decider: 'laya'`), offered only while both rules hold: Laya Auto's (`layaRow()` answers) and Jev's narrowed rows' (a local agent is installed).
+Each takes Laya Auto's description sentence by Laya's state, its efforts (`LAYA_REASONING`), its refusals (`layaUnavailable`, in `stream()` and `route()`), no shadow (the shadow note needs a Jev client), Laya's store (`routing.decider` is `laya`), and is never switched to Jev.
+`route()` narrows the pool by the row's mode exactly as for Jev's rows (`localOnly` for Local, `remoteOnly` for Online), so offline, or under a `local-*` effort, Online gives way to the local models as Jev Auto · Online does.
+Local records `routing.mode: 'local'`, its line reads `Routed to qwen-local (laya, local)` and its heading ends `LOCAL MODELS ONLY`, as an offline Laya Auto run's did.
+Online records `routing.mode: 'jev'` with `routing.online: true` beside it, so no reader of `mode` changes: its line reads `Routed to claude (laya, online)` and its heading `AUTO (Laya and routing rules decided), CLOUD AND SUBSCRIPTION AGENTS ONLY`; a Jev Auto · Online record is as it was, with no `online` field.
+There is no Laya twin of Offline · Local only: Laya needs no network, so Laya Auto · Local is that row with Laya deciding.
+A question under either row is answered by the chat model as in Jev Auto, as Laya Auto's is (`chatModels`, by the row's mode).
+`test/layaauto.test.js` and `test/laya-integration.test.js` cover the rows; `test/layaauto.test.js`'s menu test of Laya Auto was changed on purpose to list them.
 
 ### 3.2 `routing.mode` and `routing.decider`
 
@@ -484,6 +497,10 @@ It never contacts TypeSafe, and neither does anything else in a Laya Auto sessio
 While Laya is not ready, the message waits for the start with the `Starting Laya` line, bounded as a routing call is, and is then asked: a message treated as a task without asking would wait for the same start inside `route()` anyway, and would send a question to agents as a full run.
 Only a refusal, a failed start or a timeout makes it a task without an answer, with the line `Laya could not sort this message (<reason>); treating it as a task`, because unsure means task (`adapter.js:49-56`) and a word rule would send "why does this test fail?" to a chat model that cannot touch files.
 In the No project space, where no agent can run, that unsure result is answered as a question instead of refused (2.4).
+Under Jev Auto the message intent is a routing domain of its own since slice 3 of [`live-agent-view.md`](live-agent-view.md) (`intent`, [`adaptive-routing.md`](adaptive-routing.md)), which records each message as a sample with Jev's answer as the teacher's.
+Laya Auto keeps its intent exactly as above and records no intent sample in either store (`index.js` `classify`): Laya is no teacher, so its answer must not reach Jev's store, and a row in Laya's store would have nothing to label it, since a Laya Auto message carries no sample to its run.
+So a rating of a Laya Auto start reply's pick (`should have been a question`, slice 6 of [`live-agent-view.md`](live-agent-view.md)) has no intent example to label.
+Its other labels are the owner-given labels Laya's samples ask for: a rating of the pick is applied, as its run ends, in the store of whoever decided the run (`index.js` `onVerdict`), so the samples a Laya-decided run left in `laya-samples.jsonl` take the person's label in the domains a rating reads (`task_classification`, `skill_selection`, `resource_selection`), and no Jev sample does.
 
 ### 3.5 When Laya is missing, loading, failed, too slow, or offline
 
@@ -842,6 +859,7 @@ Task type, capability, strategy and second opinion are compared only where Laya'
 For the review it also counts, per provider, how many actions were `second_review` or `human` because the quality stayed under that provider's accept bar, so the cost of Laya's higher bars (2.6 rows 13-15) is a number, not a guess.
 
 Per domain, through the question that teaches it: `taskType` for `task_classification`, `skill` for `skill_selection`, `strategy` for `execution_strategy`, `secondOpinion` in the judgments group for `second_opinion`, `disposition` for `outcome_disposition`; plus two groups that are no routing domain, `review_action` and `intent` (agreement only, since intent has no verified label).
+As built in slice 3 of [`live-agent-view.md`](live-agent-view.md), `intent` is a routing domain of Jev's, with labels in `routing-samples.jsonl`, but Laya's standing still reads it for agreement only: a shadow intent row carries no run and no sample id (`runId: null`), so no label reaches it.
 
 The outcome judge, `judge(answer, outcome, domain)`, decides for each answer on each row with an outcome whether it was right, wrong or undetermined.
 A yes/no domain is one whose labels are exactly `{ yes, no }`, whatever its `kind` in `routing-policy.js` (`second_opinion` is declared `multiclass` there).
@@ -857,7 +875,8 @@ A yes/no domain is one whose labels are exactly `{ yes, no }`, whatever its `kin
 A confirmation is undetermined for everyone, because it is the acting router agreeing with itself: the accept that confirmed the pick came from that router's own review.
 `outcome_disposition` and `review_action` go further: every `verified_outcome` row of theirs is undetermined too, because `labelDisposition` derives the needed disposition from what followed the acting review (`training.js:571-588`), and what followed is that review's own action (accept ends the run, retry starts the next attempt, human sets `needs_human`).
 For those two groups only evidence independent of the acting review decides: the person's like or dislike of the run's answer (a dislike makes an accept wrong, a like makes it right), and a later review by another agent in the same run that did not accept what the acting review accepted.
-Both are read with `history.jsonl`, reduced to each run's id, final status and each attempt's agent, role, stop reason and limit hit, which `standing()` and `compare()` take as `history`: a like or dislike, joined by the feedback's run id, judges only the review of the run's last work attempt, and a later review is a completed review by another agent followed by more work or by `needs_human`; of feedback only the verdict, tag and run id are read, with the time and keys `feedback.js` reads it back by, never its words.
+Both are read with `history.jsonl`, reduced to each run's id, final status and each attempt's agent, role, stop reason and limit hit, which `standing()` and `compare()` take as `history`: a like or dislike, joined by the feedback's run id, judges only the review of the run's last work attempt, and a later review is a completed review by another agent followed by more work or by `needs_human`; of feedback only the verdict, tag, run id and what it is about (`about`) are read, with the time and keys `feedback.js` reads it back by, never its words.
+A rating of a start reply's pick (`about: 'plan'`, slice 6 of [`live-agent-view.md`](live-agent-view.md)) carries its run's id but judges the choice, not the answer, so it never counts as the person's like or dislike of the run's answer, nor replaces one given of that answer.
 `labelDisposition` never yields `SECOND_OPINION` or `FRONTIER_REVIEW`, so `second_review` and `human` are reported as rates per provider and never counted against a truth that cannot contain them.
 The inspector keeps the decisive sources apart and says why: `A person said` rows are the least biased; `Where Jev's pick was contradicted` rows exist only because Jev's pick went wrong, so they measure how often Laya would have had it right there, never Laya's accuracy.
 Paired accuracy is reported only on rows where both answers are determined, and only from `A person said` rows.
@@ -1125,6 +1144,7 @@ The steps, each shown on the card with its progress, each resumable:
 
 1. `Checking the downloads and disk`: free disk (8 GB while installing for the GPU, 3 GB for the CPU, both estimates until the desktop install measures its peak, which then goes into `config/laya.json`); HEAD probes of 5 s each to `github.com` (uv and Python come from GitHub releases), `pypi.org`, `files.pythonhosted.org`, `huggingface.co`, and for the GPU `download.pytorch.org`; an unreachable host is named in the error.
 2. `Getting uv`: `engine\uv\uv.exe --version` must print 0.12.18; when the installer was not re-run, `downloadVerified` (`local.js:102`) fetches it with the pins above.
+   As built (9 Oct 2026, the local model robustness fixes): `downloadVerified` tries a download that drops, stalls for 60 s or answers 408, 429 or 5xx again after waits of 2 to 30 s, resuming from where it stopped and checking the server's Content-Range, and gives up only after five waits in a row with no try getting further into the file, or at once when a start over stops at the byte the server would not resume at; it hashes the bytes as they arrive, and the install's lines say each new try (`uv download: terminated (other side closed); trying again in 2 s`).
 3. `Getting Python 3.12`: `uv python install 3.12`, then `uv venv --relocatable --python 3.12 --python-preference only-managed <harness>\engine\laya\venv.new`.
 4. `Installing PyTorch 2.14.0 for the GPU (CUDA <x>)` or `Installing PyTorch 2.14.0 for the CPU`: `uv pip install --python venv.new torch==2.14.0 --index-url https://download.pytorch.org/whl/<tag>`, or from PyPI for the CPU; progress is the cache folder's size against the wheel size; the SHA-256 of torch's installed `RECORD` file, which lists a hash for every file the wheel installed, goes to `installed.json` as `torchWheels`, so a later change is detectable, because the CUDA wheel cannot be hash-locked from the cloud and uv keeps no wheel file to hash.
    When the index has no matching wheel for a tag (HTTP 404, or uv's `no matching distribution` / `no solution`), the step tries the next tag of the list, and the card names each tag tried: `PyTorch 2.14.0 has no Windows wheel for cu130; trying cu128.` (naming `Linux` there on Linux); only when every listed tag fails does the step fail, offering `Install for the CPU instead`.
@@ -1171,6 +1191,7 @@ The card has no Reinstall button: a reinstall is `Remove` and then `Install Laya
 `local.js` is not given a second slot.
 `createLocalModels` holds one `engine` (`local.js:756`) and `acquire()` stops it to start another (`local.js:1155-1170`), with llama-specific arguments, memory reading and planning throughout, so a Python process inside it would touch every one of those paths and could evict the chat model; a separate supervisor cannot, by construction, and `acquire()` can never stop Laya.
 It imports from `local.js` only the pure helpers `freePort`, `workingSetOf`, `defaultThreads`, `sha256File` and `downloadVerified`, and a new exported `killTree(pid)`.
+As built (9 Oct 2026): `createRotatingLog` moved from `laya-install.js` to `local.js`, with a `keep` count of older files (two for Laya's logs, as before; one for llama-server's own `llama-server.log`), and `laya-install.js` exports it as it did.
 
 ```js
 export function createLayaSidecar({ harnessDir, dataDir, config /* providers.layaSettings */, pins, specs, residency,
@@ -1283,13 +1304,14 @@ A start that is stopped, or whose interpreter exits, while the warm-up takes its
 `~/.kzh/jev-router/laya.json`, written only by `setSettings` with per-field checks:
 
 ```json
-{ "startWithKzh": false, "keepLoaded": false, "idleMinutes": 30, "device": "auto", "shadow": true,
+{ "startWithKzh": false, "keepLoaded": false, "idleMinutes": 30, "device": "auto", "shadow": true, "colibriUrl": "",
   "measured": { "cpu": { "identity": null, "msPerToken": { "intent": null, "route": null, "review": null }, "ramGB": null, "loadMs": [] },
                 "cuda": { "identity": null, "msPerToken": { "intent": null, "route": null, "review": null }, "ramGB": null, "vramGB": null, "loadMs": [] } },
   "lastSelfTest": null }
 ```
 
 `measured.<device>.identity` names the Laya version, weights commit and adapter the figures were taken with, so "the first start per device and identity" (7.5) can tell when they belong to another identity and measure again.
+`colibriUrl` is the address of a colibri the owner runs with its Laya engine, empty (the default) for off, which KzH asks beside `laya.serve` for comparison only (13.1).
 
 - `startWithKzh`: `apply()` calls `warm()` after the plugin is up, never awaited and never blocking start-up.
 - **Held.** The sidecar is held while any hold is open: `route()` holds it for every open Laya-decided run, from its start to its return (2.4), Test Laya and the install check hold it while they run, and `keepLoaded` holds it permanently.
@@ -1426,6 +1448,7 @@ Rows under the status line:
 - `Answer beside Jev in Jev Auto` (switch), help `Laya answers every Jev question too, on this PC, and both answers are recorded side by side. It never delays a Jev Auto run and never starts or keeps Laya loaded: when Laya is busy, starting or not running, or a local model is answering or needs Laya's memory, the comparison waits or is skipped and counted. Only Keep Laya loaded makes Laya hold memory beside a local model. Nothing is sent anywhere.`
 - `Stop` while a Laya Auto run is open is refused with `Laya is deciding for an open Laya Auto run; stop that run first.` (7.4).
 - `Stop` and `Cancel` stay pressable while another button's request waits on the server (a Start or a Test Laya on a stopped Laya waits for the model to load), the status is read every 1.5 s while one does, and the action a Stop ended says nothing of its own.
+- `colibri Laya address` (a text field under the switches, saved when it loses focus), help `Empty is off. The address of a colibri you run yourself on this PC with its Laya engine, such as http://127.0.0.1:8000: each request laya.serve answers in Laya Auto and the shadow is then asked of colibri too, after laya.serve and for comparison only. KzH installs nothing of colibri and sends it no key.`; once it is set, the section `colibri Laya, side by side` of 13.5.
 - A comparison that could not be read is said under the switches: `The comparisons could not be read: <message>.`
 - Right after an install finishes: `To test Jev and Laya together, turn on Start Laya when KzH starts and Keep Laya loaded.`
 - When the shadow is on and Laya is not running: `Laya is not running, so Jev Auto records no comparisons now. Press Start, or turn on Start Laya when KzH starts and Keep Laya loaded.`
@@ -1464,6 +1487,9 @@ Buttons `Remove Laya` and `Cancel`.
 | `GET /jev-router/laya/log?lines=200` | `{ lines }` |
 | `GET /jev-router/laya/shadow?runId=<id>` | `{ rows }`, the rows of 5.3 for that run id, which is also the inspector's live `entry.id` (2.4), from the in-memory index |
 | `GET /jev-router/laya/compare?days=7\|all&identity=current\|all` | the comparison below, computed in the worker of 5.3; 404 while Laya cannot be asked and nothing was compared |
+| `GET /jev-router/laya/colibri` | the figures of colibri's Laya beside `laya.serve` (13), which `GET /jev-router/laya` also carries as `colibri` |
+
+As built (9 Oct), these routes and every other route of the plugin are listed for a coding agent on the owner's PC in [AI_SETUP.md](AI_SETUP.md) section 7, with the Laya command line in its section 5, and `test/ai-setup.test.js` fails when a route of `index.js` is missing there.
 
 ```json
 { "state": "not_installed | installing | install_failed | stopped | starting | ready | restarting | failed | stopping | disabled",
@@ -1485,15 +1511,24 @@ Buttons `Remove Laya` and `Cancel`.
   "lastRestart": null,
   "stoppedBecause": null,
   "orphanStopped": null,
-  "settings": { "startWithKzh": false, "keepLoaded": false, "idleMinutes": 30, "device": "auto", "shadow": true },
+  "settings": { "startWithKzh": false, "keepLoaded": false, "idleMinutes": 30, "device": "auto", "shadow": true, "colibriUrl": "" },
   "shadow": { "answered": 0, "partial": 0, "skipped": { "not_running": 0, "starting": 0, "queue_full": 0, "too_old": 0, "jev_failed": 0, "yielded": 0 }, "failed": 0 },
+  "colibri": { "provider": { "id": "colibri", "name": "colibri Laya", "teacher": false, "local": true, "decides": false }, "used": false,
+               "address": "", "on": false, "file": "colibri-laya.jsonl",
+               "reachable": { "ok": null, "why": null, "checkedAt": null, "ms": null, "model": null, "checking": false, "how": "one test question, since colibri's /health lists no loaded model" },
+               "compared": { "requests": 0, "partial": 0, "questions": 0, "since": null },
+               "failed": { "timeout": 0, "unreachable": 0, "refused": 0, "bad_answer": 0 }, "dropped": { "busy": 0, "local_busy": 0, "laya_busy": 0, "not_reachable": 0 },
+               "agreement": { "choice": { "compared": 0, "agreed": 0 }, "score": { "compared": 0, "agreed": 0, "tolerance": 0.5 }, "noul": { "compared": 0, "agreed": 0 } },
+               "gap": { "choice": null, "score": null, "noul": null }, "medianMs": { "laya": null, "colibri": null },
+               "confidence": { "choice": { "laya": null, "colibri": null }, "score": { "laya": null, "colibri": null }, "noul": { "laya": null, "colibri": null } },
+               "rawNouls": 0, "confidenceUnknown": 0 },
   "selfTest": null, "warnings": [], "logTail": [], "configError": null, "pinsError": null,
   "recovered": null, "weights": null,
   "paths": { "engine": "C:\\Harness\\engine\\laya", "models": "C:\\Harness\\models\\laya" },
   "need": { "device": "cuda", "cpu": { "ramGB": 3.3 }, "cuda": { "ramGB": 1.5, "vramGB": 2.5 } } }
 ```
 
-The sidecar's `status()` answers most of it, and `GET /jev-router/laya` adds what the card reads beside it: `shadow`, the shadow's counters (the sidecar leaves it null); `running.routeMs` and `reviewMs`, what a task costs Laya on its device (3.1); `recovered`, what `recover()` did at start (7.2); `weights`, the last `Check for a newer model` as `{ current, latest, changed }`; `paths`, where Laya lives; `need`, the device of the next start and what it would take there, measured or else the estimates of `config/laya.json`; and `offer`.
+The sidecar's `status()` answers most of it, and `GET /jev-router/laya` adds what the card reads beside it: `shadow`, the shadow's counters (the sidecar leaves it null); `colibri`, the figures of colibri's Laya beside `laya.serve` that `GET /jev-router/laya/colibri` also serves (13.5); `running.routeMs` and `reviewMs`, what a task costs Laya on its device (3.1); `recovered`, what `recover()` did at start (7.2); `weights`, the last `Check for a newer model` as `{ current, latest, changed }`; `paths`, where Laya lives; `need`, the device of the next start and what it would take there, measured or else the estimates of `config/laya.json`; and `offer`.
 `offer` is there only while Laya is not installed.
 `configError` is an error in the `laya` block of cordis.patch.yml and `pinsError` the reason `config/laya.json` could not be read, each with its own remedy on the card; either turns Laya off, and the state reads `disabled` for either, as for `laya.enabled` false, so these two fields tell the three apart.
 `restart` is `{ attempt, of, code, signal }` while `restarting`, and `lastRestart` is `{ kind: 'exit' | 'hung' | 'health' | '500' | 'unauthorized', why, at }`, with an exit's `code` and `signal`, for the last restart the supervisor made on its own, until the person starts or stops Laya.
@@ -1508,13 +1543,16 @@ The comparison, every figure a count so the client can show `n` beside each rate
   "thresholds": { "jev": "<12 hex>", "laya": "<12 hex>" }, "jevHost": "api.typesafe.ai", "days": 7,
   "questions": [ { "name": "taskType", "type": "choice", "options": 12, "corrected": 40,
                    "compared": 41, "agree": { "all": { "n": 41, "agree": 22 }, "informative": { "n": 30, "agree": 19 } },
+                   "intervals": { "all": { "low": 0.387, "high": 0.679 }, "informative": { "low": 0.455, "high": 0.781 } },
                    "inTopTwo": 33, "meanDifference": null, "atBar": null, "flat": 11, "layaMedianMs": 950 } ],
   "domains": [ { "domain": "task_classification", "question": "taskType", "layaAnswered": 41,
                  "agree": { "all": { "n": 41, "agree": 22 }, "informative": { "n": 30, "agree": 19 } },
                  "personSaid": { "n": 4, "jevRight": 3, "layaRight": 2 },
                  "whereJevWasContradicted": { "n": 3, "layaRight": 1 },
                  "layaAutoRuns": { "runs": 12, "failed": null },
-                 "fieldAgreement": { "risk": 0.64 } } ],
+                 "fieldAgreement": { "risk": 0.64 },
+                 "intervals": { "agree": { "low": 0.455, "high": 0.781 }, "jevRight": { "low": 0.301, "high": 0.954 }, "layaRight": { "low": 0.15, "high": 0.85 },
+                                "contradicted": { "low": 0.061, "high": 0.792 }, "failed": null } } ],
   "actions": { "wouldHaveActedSame": [ { "what": "review_action", "n": 20, "same": 11 } ],
                "review": { "jev": { "accept": 12, "second_review": 3, "human": 1, "retry": 4, "belowAcceptBar": 3 },
                            "laya": { "accept": 5, "second_review": 10, "human": 1, "retry": 4, "belowAcceptBar": 10 } } },
@@ -1529,6 +1567,7 @@ The comparison, every figure a count so the client can show `n` beside each rate
 `layaAutoRuns.failed` counts runs, not samples; `fieldAgreement` is a share per field for `task_classification` and null for every other domain, and the `review_action` group's `question` is null.
 `standing` is computed afresh from the same files as the rest, so it is the newest reading, rather than read back from `laya-standing.jsonl`.
 `layaAutoRuns.failed` (and the standing's `layaAutoFailed.failed`) is `null` where no outcome of a run can fault the pick, `task_classification` and `skill_selection` (6.7), and the card shows `not measured (<n> runs)` there.
+`intervals` gives each share its 95% interval (`shadow-stats.js` `interval`, the Wilson score interval), `{ low, high }` to three decimals, or `null` where nothing is counted: a question's agreement over every answer and over the informative ones, and a domain's informative agreement, the person's rows for Jev and for Laya, the contradicted rows and the failed runs; the card shows each as `range 46 to 78%` beside its share, so a share of a few rows reads as the range it is ([`live-agent-view.md`](live-agent-view.md) 6, slice 9).
 
 Every string avoids em and en dashes.
 
@@ -1818,6 +1857,96 @@ This design starts from the correctness-first design and grafts the judges' reco
 | Test Laya: protocol, timings and paired probes | correctness-first, operations | The first real evidence on #156, visible before trusting Laya Auto. |
 | `scripts/red-check.mjs` | operations | It makes "every test fails against the old code" mechanical. |
 | The event type stays `'jev'`, with `trace.provider` | this design | It lives only in memory, and renaming it touches the inspector for no behaviour. |
+
+---
+
+## 13. colibri's Laya beside `laya.serve`: a comparison, never a decider
+
+Built on 10 Oct 2026, from action 7 of the colibri study: the owner asked for colibri's C Laya as a side-by-side test, not a replacement.
+colibri 2.0.0 serves a native C port of Laya on its own `POST /v1/systemone`, with the request and reply of TypeSafe's Jev API.
+It needs no PyTorch, and its own docs give it about 1.7 GB of RAM, against the estimated 3.3 GB `laya.serve` takes on the CPU (7.7).
+Whether it could ever stand in for `laya.serve` is a question for KzH's real questions on the owner's PC, and this records the evidence for it and decides nothing.
+The code is `plugins/jev-router/colibri-laya.js`, with one hook in `laya-client.js`, one setting in `laya-sidecar.js`, the wiring and a route in `index.js`, and a section of the Laya card in `client.js`.
+
+### 13.1 The setting
+
+- One Laya setting, `colibriUrl` in `laya.json`, the card's "colibri Laya address"; empty, the default, is off.
+- It is checked by `colibriAddressProblem`: plain `http`, a host on this PC (a `127.` address, `localhost` or `[::1]`), its port written out, and nothing more: no user name or password, path, query or spaces around it.
+- Anything else is refused with why (`POST /jev-router/laya/settings` answers 400, as for the other settings), and an address `laya.json` holds that would be refused is read back as empty, so nothing is ever sent off this PC.
+- KzH installs and starts nothing of colibri: the owner runs it with its Laya engine as colibri's README and `docs/laya.md` say, on 127.0.0.1 and without `COLI_API_KEY`, which colibri allows on this PC.
+- KzH sends colibri no key at all, never `laya.serve`'s per-start key and never the TypeSafe key: its requests go out through `node:http` with only a content type, so neither `TYPESAFE_API_KEY` nor `TYPESAFE_BASE_URL` can reach them, and a redirect is not followed.
+- Saving an address asks colibri its test question at once, and KzH asks it once at start while an address is set.
+- Emptying the address, or changing it, stops the comparison: nothing more is asked of the old address, and what comes back afterwards for a request already on its way to it, a test question or a comparison, is not written and moves no figure.
+- It is a measurement, not learning, so `routing.learn` does not switch it; the address alone does.
+
+### 13.2 When a question is asked of colibri
+
+- The Laya client hands every request `laya.serve` answered to its `onAnswered` the moment the answer is in, synchronously, and never awaits what comes of it; a throw is logged and the call goes on.
+- `offer()` takes a request of a Laya Auto run (an acting call with a run id; the intent's is `intent`) or of the shadow in Jev Auto (5).
+- Test Laya's fixed calls are not compared: an acting call with no run id is not KzH's real questions.
+- The request goes to colibri exactly as `laya.serve` was sent it: its `model`, `state` and `questions`, every noul with its labels.
+- One request to colibri at a time: one offered while another is on its way, or while a local model is answering (`local.isBusy()`), is dropped and counted (`busy`, `local_busy`), never queued.
+- With `laya.serve` on the CPU, a request is compared only once `laya.serve` has nothing more to answer at once: one the Laya client hands over with `more` (another request of the same call follows, or another call waits for `laya.serve`) is dropped and counted (`laya_busy`).
+  colibri's engine runs on the CPU with a thread for each physical core by default (colibri `docs/laya.md`), and KzH does not start it, so it cannot lower its priority as it lowers `laya.serve`'s outside acting requests (4.5); compared beside `laya.serve`'s next request it would take the cores that request is answered on, slow the run, and raise the measured ms per token that every deadline is drawn from.
+  So on the CPU a call's last request is offered, when no other call waits for `laya.serve`, and so is the last chunk of the shadow's work; on the GPU `laya.serve` does not answer on those cores, and every request is offered.
+  colibri's answer can still overlap the run's next call to `laya.serve`, which nothing on KzH's side can foresee; both timings of such a request then include the other's load.
+- Its deadline is twice what `laya.serve` took for the same request, at least 10 s and at most 60 s; past it the request is abandoned and recorded as `timeout`.
+- Nothing a run waits on waits for colibri: the acting call resolves at `laya.serve`'s pace, the shadow's next chunk goes as before, and a colibri that never answers holds only its own slot.
+
+### 13.3 colibri's three gaps, met on KzH's side
+
+| Gap | What KzH does | Where it is said |
+| --- | --- | --- |
+| Its `/health` answers `{ status: 'ok' }` with no `loaded` list, which the sidecar's readiness check needs (7.5) | colibri counts as reachable once it has answered one tiny test question (one noul about a one-sentence state) in its own shape and naming `provider: 'colibri'`; `/health` is never asked | a `readiness` row whenever the finding changes, with `how`; the card's first line |
+| It ignores the `labels` KzH gives every noul for Laya issue #156 (4.2): its decision record names the sides false and true | each noul goes as KzH sends it, and its row says `colibriSaw: 'raw'` | the question's row; the card's line on yes/no questions |
+| Its noul answers carry no `confidence`, which Test Laya's protocol check requires (4.6) | recorded as `confidence: null` with `confidenceUnknown: true`, never made up from P(true), and left out of every figure that needs a confidence (the `confidence` medians) | the question's row; the card's line on confidence |
+
+- A colibri found unreachable is left alone for a minute: offers meanwhile are dropped as `not_reachable`, and the next one after it asks the test question first.
+- A 401 says to start colibri without `COLI_API_KEY`; a server on the address that answers in another shape, or that does not name colibri as its provider, is said as such.
+- What the server at the address says in its own words, a refusal's message or the model it names, is kept to one plain line of at most 200 or 80 characters: each run of line breaks, spaces or control codes becomes one space, so nothing it sends can add a line of its own to the server log.
+- An answer naming a model other than Laya is warned about on the card: colibri started with a chat model answers through its language-model path.
+
+### 13.4 The record: `colibri-laya.jsonl`
+
+One row per request compared, written by `colibri-laya.js` alone, under colibri's own provider record `COLIBRI` (`id: 'colibri'`, `teacher: false`, `decides: false`), which is not one of `DECIDER_IDS` (2.1):
+
+```js
+{
+  v: 1, id, ts, provider: 'colibri', kind: 'compare', used: false,
+  runId, role: 'act' | 'shadow', phase: 'intent' | 'route' | 'review', address,
+  status: 'answered' | 'partial' | 'failed', reason: null | 'timeout' | 'unreachable' | 'refused' | 'bad_answer', why,
+  laya:    { ms, device, model, tokens },
+  colibri: { ms, deadlineMs, status, model, tokens },
+  questions: { <name>: { type, laya: { answer, p, confidence }, colibri: { answer, p, confidence }, agree, gap,
+                         colibriSaw: 'raw' /* nouls */, confidenceUnknown: true /* no confidence served */ } },
+}
+```
+
+- A `readiness` row, `{ kind: 'readiness', ok, why, ms, model, how }`, is written whenever what was found changes.
+- `answer` and `p` are kept as `laya-shadow.jsonl` keeps them (5.3): a choice's key, a tool parameter's option index, a score's expected level or a noul's P(true), and the probabilities in option order, to 3 decimals; no state, task text, question text or tool option key.
+- Both sides are the answers as served, before KzH's normalisation (4.3): its temperature correction keeps a choice's pick and a noul's side, so agreement is the same either way, and the served figures are what the two engines give.
+- The two `confidence` medians are each engine's own figure and not one scale: `laya.serve`'s choice and score confidence is normalised entropy (4.3) and colibri's is (n * peak - 1) / (n - 1), so the same answer of 0.9 and 0.1 reads 0.531 from `laya.serve` and 0.8 from colibri; neither median says which engine is surer.
+- Agreement: a choice on the same key, a score within `SCORE_TOLERANCE` (0.5 of a level) of the other, a noul on the same side of 0.5.
+- `gap`: half the summed difference of a choice's probabilities, the difference of two scores, or of two P(true).
+- The newest 2,000 rows are kept, the file rewritten and renamed back to them once it is 200 past; it is read once at start, at most a few MB, on the main thread.
+- Nothing else reads or writes it, and nothing of colibri's goes anywhere else: no training store, no standing, no shadow row, no usage row, no inspector event.
+- Closing abandons a request on its way with its socket and writes nothing of it; `dispose()` resolves once the rows before it are on disk, and `index.js` waits for it with Laya's own (`closeWithin`).
+
+### 13.5 The card and the route
+
+- Settings → Jev setup → Laya decision model has the "colibri Laya address" field under the switches, saved when it loses focus as the idle time is.
+- Once it is set, a "colibri Laya, side by side" section of eight lines at most: reachable, with the time and the model colibri named, or why not, and a warning when that model is not Laya; what was compared since when, and what was not and why; agreement with `laya.serve` by question type; the median time per request of each; the two gaps on yes/no questions; and that nothing colibri answers is used.
+- A share is rounded down, never up.
+- What was compared and what went unanswered come from the rows kept; what was dropped (`busy`, `local_busy`, `laya_busy`, `not_reachable`) is counted since KzH started, and the card says so.
+- `GET /jev-router/laya/colibri` serves the same figures, with no address set too, and `GET /jev-router/laya` carries them as `colibri`.
+
+### 13.6 Tests, and what is not known
+
+- `test/colibri-laya.test.js` runs the module against `test/fixtures/fake-colibri-laya.mjs`, which answers `/v1/systemone` in colibri's shapes (a noul without confidence, colibri's 422 envelope, a slow answer, a hung one, a dead port, a 401 when given a key), and in a shape colibri never gives when a test asks for one.
+- `laya-client.test.js` proves the hand-over and its `more`, `laya-sidecar.test.js` the setting, `laya-card.test.js` the section and the field, and `laya-integration.test.js` a Laya Auto run and a Jev Auto run with the shadow through the whole plugin: colibri's answers reach no file but its own, as given or as KzH's stores would round them, an address saved is asked its test question at once, a hung colibri holds up no run, and closing writes nothing of it.
+- Nothing here has run against the real colibri: the fake is built from colibri 2.0.0's `c/openai_server.py` and docs as read, and its shapes are the ones checked there.
+- How often colibri agrees with `laya.serve` on KzH's questions with the nouls read raw, how its speed on the owner's RTX 3080 under Windows compares (colibri has no CUDA build of Laya, and its Vulkan speed there has never been measured), and how laya 0.3.20 and 0.3.24 differ, is what the comparison is for; the handoff's entry has the steps.
+- What would make colibri a decider later is not built: its own provider record with its own cut-offs (2.6), the three gaps closed in colibri or by a sidecar mode, and a measured standing (6.7).
 
 ---
 

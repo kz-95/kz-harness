@@ -566,3 +566,59 @@ test('the answer is relabelled with what answered, its meta is complete, and its
   assert.equal(langOf({ task: '修复解析器中失败的测试' }), 'non-latin')
   assert.equal(langOf({ task: 'Fix the parser: ça ne marche pas' }), 'latin')
 })
+
+// ---------------------------------------------------------------- the hand-over to colibri's Laya
+
+test('every request laya.serve answers is handed on once its answer is in, as it was sent, with its answer, time, phase, role and run id, and a hand-over that throws or never settles holds up nothing (13)', async (t) => {
+  const handed = []
+  const logs = []
+  const onAnswered = (a) => {
+    handed.push({ ...a, at: Date.now() })
+    if (handed.length === 1) throw new Error('a comparison that throws')
+    return new Promise(() => {}) // and the rest never settle
+  }
+  const { fake, client } = await rig(t, { onAnswered, log: (m) => logs.push(m) })
+  // A Laya Auto run's acting call carries its run id; Test Laya's carries none; a shadow job, its own.
+  const routed = await client.client('act', { runId: 'run-1' }).systemOne(ROUTE, { phase: 'route' })
+  assert.ok(routed.answers.taskType, 'the acting call was answered whatever its hand-overs did')
+  await client.client('act').systemOne(INTENT, { phase: 'intent' })
+  assert.equal((await shadowOf(client, INTENT, { phase: 'intent' }).done).status, 'answered')
+  assert.equal(handed.length, fake.requests.length, 'one hand-over for each request laya.serve answered')
+  assert.ok(logs.some((l) => l.includes('a comparison that throws')), 'a hand-over that threw is logged')
+  // The intent's four questions go in one request, as an acting call and as a shadow chunk alike.
+  const routeRequests = handed.length - 2
+  assert.ok(routeRequests >= 1, 'the route call went in requests of its own')
+  assert.deepEqual(handed.map((h) => [h.role, h.runId, h.phase]), [
+    ...Array.from({ length: routeRequests }, () => ['act', 'run-1', 'route']),
+    ['act', null, 'intent'],
+    ['shadow', 'r', 'intent'],
+  ])
+  for (const [i, h] of handed.entries()) {
+    const sent = fake.requests[i]
+    assert.deepEqual({ model: h.request.model, state: h.request.state, questions: h.request.questions }, { model: sent.model, state: sent.state, questions: sent.questions }, 'the request as laya.serve was sent it')
+    assert.ok(h.at >= sent.finishedAt, 'handed on only once laya.serve had answered it')
+    assert.deepEqual(Object.keys(h.response.answers), Object.keys(sent.questions), 'with laya.serve\'s own answer')
+    assert.equal(typeof h.ms, 'number')
+    assert.equal(h.device, 'cpu')
+  }
+  assert.ok(handed.some((h) => Object.values(h.request.questions).some((q) => q.type === 'noul' && q.labels)), 'each noul with the labels laya.serve was sent')
+})
+
+test('a hand-over says whether laya.serve has more to answer at once: every request of a call but its last, and the last too while another call waits (13.2)', async (t) => {
+  const handed = []
+  const { client } = await rig(t, { fake: { msPerRow: 5 }, onAnswered: (a) => { handed.push(a) } })
+  const act = client.client('act', { runId: 'run-1' })
+  await act.systemOne(ROUTE, { phase: 'route' })
+  assert.ok(handed.length >= 2, `the route call in requests of its own: ${handed.length} handed on`)
+  assert.deepEqual(handed.map((h) => h.more), handed.map((_, i) => i < handed.length - 1), 'each but the last has another of its call after it')
+  // Two acting calls at once: the second waits for the first, so the first's last request has more after it too.
+  handed.length = 0
+  await Promise.all([act.systemOne(ROUTE, { phase: 'route' }), act.systemOne(INTENT, { phase: 'intent' })])
+  assert.deepEqual(new Set(handed.map((h) => h.phase)), new Set(['route', 'intent']))
+  assert.deepEqual(handed.map((h) => h.more), handed.map((_, i) => i < handed.length - 1), 'laya.serve had more to answer after each but the very last')
+  // A shadow job's chunks: each but the last has another after it.
+  handed.length = 0
+  assert.equal((await shadowOf(client, ROUTE).done).status, 'answered')
+  assert.ok(handed.length >= 2, `the route's chunks: ${handed.length}`)
+  assert.deepEqual(handed.map((h) => h.more), handed.map((_, i) => i < handed.length - 1))
+})

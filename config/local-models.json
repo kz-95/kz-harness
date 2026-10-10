@@ -1,5 +1,5 @@
 {
-  "about": "Local-model modules for Kz-harness. Git keeps only this manifest; the files go to engine/llama and models/ (both gitignored). Nothing installs by default: /install-llm in the chat, Settings -> Jev setup -> Local models, or Install-Harness.ps1 -LocalModels <ids|all>. Every file comes from `source` and must match `size` and `sha256` (GitHub release digest / Hugging Face LFS oid). Curated by hand: never add a model from an uploader other than the model's own organization. Fields: README.md, 'Local models & offline'.",
+  "about": "Local-model modules for Kz-harness. Git keeps only this manifest; the files go to engine/llama and models/ (both gitignored). Nothing installs by default: /install-llm in the chat, Settings -> Jev setup -> Local models, or Install-Harness.ps1 -LocalModels <ids|all>. Every file comes from `source` and must match `size` and `sha256` (GitHub release digest / Hugging Face LFS oid); a row without them is a candidate, which nothing downloads until `node scripts/pin-model.mjs <id>` reads them from Hugging Face. Curated by hand: never add a model from an uploader other than the model's own organization. Fields: README.md, 'Local models & offline'.",
   "modules": [
     {
       "id": "llama-cpp-cuda12",
@@ -117,6 +117,35 @@
       "agent": {
         "id": "qwen-local",
         "description": "Qwen3 8B (Q4_K_M GGUF) running on this PC through llama.cpp: free, private, works offline."
+      }
+    },
+    {
+      "id": "qwen3-30b-a3b",
+      "kind": "model",
+      "name": "Qwen3 30B A3B",
+      "source": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf",
+      "hfRepo": "Qwen/Qwen3-30B-A3B-GGUF",
+      "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+      "license": "Apache-2.0",
+      "reliability": "official-stable",
+      "verified": false,
+      "role": "best-quality",
+      "rank": 0,
+      "moe": {
+        "totalParamsB": 30.5,
+        "activeParamsB": 3.3,
+        "expertShare": 0.95,
+        "layers": 48
+      },
+      "kvGbPerToken": 0.000091552734375,
+      "notes": "Q4_K_M. A mixture of experts: 30.5B parameters, 3.3B of them active per token, so its experts stay in RAM and the rest runs on the GPU (llama-server --n-cpu-moe). Not tested on any PC yet.",
+      "chatTemplate": "embedded (--jinja); thinking off (--reasoning off)",
+      "contextSize": 16384,
+      "maxContext": 40960,
+      "gpuLayers": "auto",
+      "agent": {
+        "id": "qwen-moe-local",
+        "description": "Qwen3 30B A3B (Q4_K_M GGUF, a mixture of experts with 3.3B of its 30.5B parameters active per token) running on this PC through llama.cpp: free, private, works offline."
       }
     },
     {

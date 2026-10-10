@@ -11,6 +11,7 @@ import { createServer } from 'node:net'
 import { cpus, freemem, totalmem } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { localAgentFor, quickestLocal } from './effort.js'
+import { redactSecrets } from './export.js'
 import { createBudgetWatchdog, createResidency } from './residency.js'
 
 export const LOCAL_PROVIDER = 'local'
@@ -20,10 +21,29 @@ const ID = /^[a-z][a-z0-9._-]{0,47}$/
 const FILE = /^[\w.-]+\.(gguf|zip)$/
 // Official sources only: llama.cpp's own GitHub releases, and Hugging Face (the model's own organization; see README).
 const SOURCE = /^https:\/\/(github\.com\/ggml-org\/llama\.cpp\/releases\/download\/|huggingface\.co\/[\w.-]+\/[\w.-]+\/resolve\/)/
+/**
+ * The model makers whose own Hugging Face organization a candidate row may name, as the hub spells
+ * it; scripts/pin-model.mjs pins from these only. Add a maker's own organization, never an uploader
+ * who publishes copies of its models.
+ */
+export const VENDOR_ORGS = ['Qwen', 'google']
+
+/** Whether a module carries the size and SHA-256 its download is checked against; a candidate row (readManifest) carries neither. */
+export const isPinned = (m) => Number.isSafeInteger(m.size) && m.size > 0 && SHA.test(m.sha256 ?? '')
+/** What the picker, the card and /install-llm say of a candidate row, which nothing downloads. */
+export const notCheckedYet = (id) => `not checked yet: run node scripts\\pin-model.mjs ${id}`
+/** A mixture-of-experts row's `moe`: its parameters, the share of the file its experts are, and its layer count (moeLayout). */
+const validMoe = (x) => !!x && [x.totalParamsB, x.activeParamsB, x.expertShare].every(Number.isFinite) && x.activeParamsB > 0 && x.activeParamsB < x.totalParamsB
+  && x.expertShare > 0 && x.expertShare < 1 && x.activeParamsB / x.totalParamsB > 1 - x.expertShare && Number.isInteger(x.layers) && x.layers > 0
 
 /**
  * config/local-models.json: the modules (engine builds and GGUF models) that can
  * be installed. Checked strictly: download URLs and file names come only from here.
+ *
+ * A candidate row carries neither `size` nor `sha256`, since they cannot be read where it was
+ * written: scripts/pin-model.mjs reads them from Hugging Face on the owner's PC, and until then
+ * nothing downloads it. Only a mixture-of-experts model row (`moe`), from a maker's own organization
+ * (VENDOR_ORGS), whose `source` is its `hfRepo`'s own URL for its file, may be one.
  */
 export function readManifest(path) {
   const { modules } = JSON.parse(readFileSync(path, 'utf8'))
@@ -36,8 +56,14 @@ export function readManifest(path) {
     if (m.kind === 'engine' && !['cuda12', 'cuda13', 'vulkan', 'cpu'].includes(m.variant)) bad('variant: cuda12, cuda13, vulkan or cpu')
     if (!SOURCE.test(m.source ?? '')) bad('source: an official GitHub release or Hugging Face URL')
     if (!FILE.test(m.file ?? '') || !(m.kind === 'engine' ? /\.zip$/ : /\.gguf$/).test(m.file)) bad('file: a .zip (engine) or .gguf (model, vision) name')
-    if (!(Number.isSafeInteger(m.size) && m.size > 0)) bad('size: bytes')
-    if (!SHA.test(m.sha256 ?? '')) bad('sha256: 64 hex characters')
+    if (m.size === undefined && m.sha256 === undefined) {
+      if (m.kind !== 'model' || m.moe === undefined) bad('size and sha256: only a mixture-of-experts model row (moe) may leave both out, until pin-model.mjs pins it')
+      if (!VENDOR_ORGS.includes(String(m.hfRepo).split('/')[0]) || m.source !== `https://huggingface.co/${m.hfRepo}/resolve/main/${m.file}`) bad(`hfRepo: a row not pinned yet names a repo of a maker's own organization (${VENDOR_ORGS.join(', ')}), and its source is that repo's resolve/main URL of its file`)
+    } else {
+      if (!(Number.isSafeInteger(m.size) && m.size > 0)) bad('size: bytes')
+      if (!SHA.test(m.sha256 ?? '')) bad('sha256: 64 hex characters')
+    }
+    if (m.moe !== undefined && (m.kind !== 'model' || !validMoe(m.moe))) bad('moe: on a model row, { totalParamsB, activeParamsB, expertShare, layers }, with the active share above the share outside the experts')
     if (m.kind === 'model' && m.agent && !/^[a-z][a-z0-9_-]*$/.test(m.agent.id ?? '')) bad('agent.id')
   }
   for (const v of modules.filter((m) => m.kind === 'vision')) {
@@ -57,8 +83,12 @@ export const FIT_TARGET_MIB = 256
  * it. One slot, so the whole context serves the one request. Log level 4 so
  * the "offloaded N/M layers to GPU" line can be read. `threads` becomes -t;
  * start() always sets it, from the core budget or defaultThreads().
+ *
+ * `cpuMoe` (moeLayout) keeps a mixture-of-experts model's experts in RAM: --cpu-moe for every layer's,
+ * --n-cpu-moe N for the first N layers'. Both set tensor overrides, and b10964's --fit adjusts only the
+ * arguments left unset, so it leaves them as given; the layers themselves all still go to the GPU.
  */
-export function llamaArgs({ modelPath, alias, port, ctx, gpuLayers = 'auto', fitTargetMiB = FIT_TARGET_MIB, thinking = false, threads }) {
+export function llamaArgs({ modelPath, alias, port, ctx, gpuLayers = 'auto', fitTargetMiB = FIT_TARGET_MIB, thinking = false, threads, cpuMoe = null }) {
   return [
     '-m', modelPath,
     '--alias', alias,
@@ -67,6 +97,7 @@ export function llamaArgs({ modelPath, alias, port, ctx, gpuLayers = 'auto', fit
     '-c', String(ctx),
     '-np', '1',
     '-ngl', String(gpuLayers),
+    ...(!cpuMoe?.cpuLayers ? [] : cpuMoe.cpuLayers >= cpuMoe.layers ? ['--cpu-moe'] : ['--n-cpu-moe', String(cpuMoe.cpuLayers)]),
     '--fit-target', String(fitTargetMiB),
     '--jinja',
     // Thinking is slow on a 4 GB GPU; off unless the manifest entry sets "thinking": true.
@@ -89,37 +120,159 @@ export async function freePort(from, tries = 10) {
   throw new Error(`no free port in ${from}-${from + tries - 1}`)
 }
 
+/** llama-server's own words when the port it was given is not free (b10964, server-http.cpp). */
+const BIND_FAILED = /couldn't bind HTTP server socket/i
+
+/**
+ * What answers on the port a llama-server was started on, asked while start() waits for it.
+ * `ready` once /health says {"status":"ok"} and /v1/models, asked with this start's key, names
+ * `alias`: the build KzH pins (b10964) answers /v1/models only with that key, so neither a
+ * leftover llama-server nor any other program passes for the model. `other`, with why, when a
+ * program that is not this start's llama-server answers there; neither while nothing answers yet
+ * or the model still loads, which llama-server answers with a 503 of its own on every route.
+ */
+export async function probeLlama({ port, key, alias, fetch = globalThis.fetch, timeoutMs = 2000 }) {
+  const base = `http://127.0.0.1:${port}`
+  // Each answer's body is read whole, so its connection is let go before the next look 500 ms later.
+  const ask = async (path, headers = {}) => {
+    const r = await fetch(`${base}${path}`, { headers, signal: AbortSignal.timeout(timeoutMs) }).catch(() => null)
+    return r && { status: r.status, ok: r.ok, body: await r.json().catch(() => null) }
+  }
+  // What b10964 answers while it loads: a 503 with {"error":{"message":"Loading model","code":503,...}}.
+  const loading = (r) => r.status === 503 && r.body?.error != null
+  const health = await ask('/health')
+  if (!health || loading(health)) return {}
+  if (!health.ok) return { other: `its /health answered HTTP ${health.status}` }
+  if (health.body?.status !== 'ok') return { other: 'its /health does not answer as llama-server does' }
+  const models = await ask('/v1/models', { authorization: `Bearer ${key}` })
+  if (!models || models.status >= 500) return {}
+  if (models.status === 401 || models.status === 403) return { other: 'it refused this start\'s key' }
+  if (!models.ok) return { other: `it answered /v1/models with HTTP ${models.status}` }
+  const list = models.body?.data
+  const names = Array.isArray(list) ? list.flatMap((x) => [x?.id, ...(Array.isArray(x?.aliases) ? x.aliases : [])]) : []
+  return names.includes(alias) ? { ready: true } : { other: `its /v1/models does not name ${alias}` }
+}
+
 export async function sha256File(path) {
   const h = createHash('sha256')
   for await (const c of createReadStream(path)) h.update(c)
   return h.digest('hex')
 }
 
+/** The waits before each new try of a download whose connection dropped, in ms: five tries in a row that get no further into the file, about a minute in all. */
+export const DOWNLOAD_RETRY_MS = [2000, 4000, 8000, 16_000, 30_000]
+
+/** Where a 206 answer's bytes start, read from its Content-Range (`bytes 100-199/200`), or null without one. */
+const rangeStart = (r) => {
+  const m = /^bytes\s+(\d+)-\d+\/(?:\d+|\*)$/i.exec(r.headers?.get?.('content-range') ?? '')
+  return m ? Number(m[1]) : null
+}
+
+/** A wait of `ms` that the abort of `signal` ends at once, rejecting with its reason. */
+const pause = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) return reject(signal.reason)
+  const stop = () => { clearTimeout(timer); reject(signal.reason) }
+  const timer = setTimeout(() => { signal?.removeEventListener('abort', stop); resolve() }, ms)
+  signal?.addEventListener('abort', stop, { once: true })
+})
+
+/** An error a download is not tried again for: a refusal, a file of the wrong size, the disk. */
+const lasting = (err) => Object.assign(err, { lasting: true })
+/** An error's message, with its cause's where fetch wraps one: `terminated (other side closed)`. */
+const whyOf = (err) => (err.cause?.message ? `${err.message} (${err.cause.message})` : err.message)
+
 /**
- * Resumable, verified download: bytes go to `<dest>.part` (resumed with a Range
- * request), the finished file must match `size` and `sha256`, and only then is
- * it renamed to `dest`. A mismatch deletes the partial file.
+ * Resumable, verified download: bytes go to `<dest>.part` and into the SHA-256 as they arrive, the
+ * finished file must match `size` and `sha256`, and only then is it renamed to `dest`; a mismatch
+ * deletes the partial file. A .part an earlier try left is resumed with a Range request and read
+ * once to seed the hash, so no file is read whole again after its download. A connection that
+ * drops, goes `stallMs` without a byte or answers 408, 429 or 5xx is tried again from where it
+ * stopped, after the waits of `retryMs` in turn; a try that gets further into the file than any
+ * before starts the waits again from the first, so only tries in a row that get no further use them
+ * up, a start over that gets no further than an earlier try among them. A resume the server
+ * does not honour (no 206 whose Content-Range starts at the byte asked for) starts over from the
+ * first byte, and a start over that stops at that same byte again ends the download as incomplete
+ * at once and deletes the .part, since the server sends no more. `onNote` hears each new try and
+ * each start over, in a sentence. Without a size and a SHA-256 to check against (a candidate row
+ * not pinned yet) it fetches nothing at all.
  */
-export async function downloadVerified({ url, dest, size, sha256, fetch = globalThis.fetch, onProgress = () => {}, signal }) {
+export async function downloadVerified({ url, dest, size, sha256, fetch = globalThis.fetch, onProgress = () => {}, onNote = () => {}, signal, retryMs = DOWNLOAD_RETRY_MS, stallMs = 60_000 }) {
+  if (!isPinned({ size, sha256 })) throw lasting(new Error(`download refused: ${basename(dest)} has no size and SHA-256 to check it against`))
   const part = `${dest}.part`
   let have = (await stat(part).catch(() => null))?.size ?? 0
   if (have > size) { await unlink(part); have = 0 }
-  if (have < size) {
-    const r = await fetch(url, { headers: have ? { range: `bytes=${have}-` } : {}, redirect: 'follow', signal })
-    if (!r.ok) throw new Error(`download failed: HTTP ${r.status}`)
-    if (have && r.status !== 206) have = 0 // server ignored the range: start over
-    const fh = await open(part, have ? 'a' : 'w')
+  let hash = createHash('sha256')
+  if (have) for await (const c of createReadStream(part, { end: have - 1 })) hash.update(c)
+  // Every try made; the furthest byte a try reached, and the waits used since a try last went past
+  // it; and the byte the server last would not resume at.
+  let tries = 0
+  let furthest = have
+  let waits = 0
+  let refused = null
+  const startOver = (why) => { onNote(`${why}; downloading it again from the first byte`); refused = have; have = 0; hash = createHash('sha256') }
+  while (have < size) {
+    signal?.throwIfAborted()
+    tries++
+    // Each try has a stop of its own, so a connection that goes quiet is given up and tried again.
+    const quiet = new AbortController()
+    let timer = null
+    const awake = () => { clearTimeout(timer); timer = setTimeout(() => quiet.abort(new Error(`no data for ${stallMs / 1000} s`)), stallMs) }
+    let fh = null
+    let wait = null
     try {
+      awake()
+      const from = have
+      const r = await fetch(url, { headers: from ? { range: `bytes=${from}-` } : {}, redirect: 'follow', signal: signal ? AbortSignal.any([signal, quiet.signal]) : quiet.signal })
+      if (from && r.status === 416) { await r.body?.cancel().catch(() => {}); startOver(`the server would not resume at byte ${from}`); continue }
+      if (!r.ok) {
+        await r.body?.cancel().catch(() => {})
+        if (r.status === 408 || r.status === 429 || r.status >= 500) throw new Error(`HTTP ${r.status}`)
+        throw lasting(new Error(`download failed: HTTP ${r.status}`))
+      }
+      // A 200, or a 206 from byte 0, is the file from its first byte; a 206 from any other byte but the one asked for cannot be used.
+      const at = r.status === 206 ? rangeStart(r) : 0
+      if (at !== from) {
+        if (at !== 0) await r.body?.cancel().catch(() => {})
+        // Asked for the whole file, a server that sends a part of it would do so again: nothing to try.
+        if (!from) throw lasting(new Error('download failed: the server sent part of the file when asked for all of it'))
+        startOver(`the server did not resume at byte ${from}`)
+        if (at !== 0) continue
+      }
+      fh = await open(part, have ? 'a' : 'w').catch((err) => { throw lasting(err) })
       for await (const chunk of r.body) {
-        await fh.write(chunk)
+        awake()
+        await fh.write(chunk).catch((err) => { throw lasting(err) })
+        hash.update(chunk)
         have += chunk.length
-        if (have > size) throw new Error(`download larger than expected (${size} bytes)`)
+        if (have > size) throw lasting(new Error(`download larger than expected (${size} bytes)`))
         onProgress(have, size)
       }
-    } finally { await fh.close() }
+      if (have < size) throw new Error(`the connection closed at byte ${have} of ${size}`)
+    } catch (err) {
+      if (signal?.aborted) throw signal.reason
+      if (err.lasting) throw err
+      const made = tries === 1 ? '1 try' : `${tries} tries`
+      // Started over from where the server would not resume, the file stopped there again: the server sends no more, and
+      // what it sent (a Wi-Fi sign-in page, say) is not kept for a later Download to resume onto.
+      if (have === refused) {
+        await fh?.close().catch(() => {})
+        fh = null
+        await unlink(part).catch(() => {})
+        throw new Error(`download incomplete: ${have} of ${size} bytes after ${made} (the server sends only the first ${have} bytes and would not resume after them; press Download again to start over)`)
+      }
+      // Only bytes past the furthest a try reached are new: a start over that gets no further brought none.
+      if (have > furthest) { furthest = have; waits = 0 }
+      if (waits >= retryMs.length) throw new Error(`download incomplete: ${have} of ${size} bytes after ${made} (${whyOf(err)}; press Download again to resume)`)
+      wait = retryMs[waits++]
+      onNote(`${whyOf(err)}; trying again in ${wait / 1000} s`)
+    } finally {
+      clearTimeout(timer)
+      await fh?.close().catch(() => {})
+    }
+    // Waited out with the .part closed and no stop armed.
+    if (wait != null) await pause(wait, signal)
   }
-  if (have !== size) throw new Error(`download incomplete: ${have} of ${size} bytes (press Download again to resume)`)
-  const got = await sha256File(part)
+  const got = hash.digest('hex')
   if (got !== sha256) {
     await unlink(part).catch(() => {})
     throw new Error(`SHA256 mismatch (expected ${sha256}, got ${got}); the file was deleted`)
@@ -127,6 +280,65 @@ export async function downloadVerified({ url, dest, size, sha256, fetch = global
   // Retried: on Windows a scan of the file just written keeps a handle on it for a moment.
   await renameRetry(part, dest)
   return { bytes: size, sha256: got }
+}
+
+/**
+ * A log file appended in order and rotated once it passes `maxBytes`, keeping `keep` older files
+ * (.1 the newest of them): two for Laya's laya-serve.log and install.log, one for llama-server.log.
+ * A write that fails is dropped, never thrown.
+ */
+export function createRotatingLog(file, { maxBytes = 5 * 1024 * 1024, keep = 2 } = {}) {
+  let bytes = null
+  let queue = Promise.resolve()
+  return {
+    append(text) {
+      queue = queue.then(async () => {
+        await mkdir(dirname(file), { recursive: true })
+        bytes ??= (await stat(file).catch(() => null))?.size ?? 0
+        if (bytes > maxBytes) {
+          for (let n = keep - 1; n >= 1; n--) await rename(`${file}.${n}`, `${file}.${n + 1}`).catch(() => {})
+          await rename(file, `${file}.1`).catch(() => {})
+          bytes = 0
+        }
+        await appendFile(file, text)
+        bytes += Buffer.byteLength(text)
+      }).catch(() => {})
+      return queue
+    },
+    flushed: () => queue,
+  }
+}
+
+/**
+ * The last `n` lines of a log createRotatingLog keeps, the newest of its older files first when the
+ * log itself holds fewer. Each file is read from its end, `maxBytes` of it at most, never whole.
+ */
+export async function readLogTail(file, n, { maxBytes = 256 * 1024 } = {}) {
+  let lines = []
+  for (const f of [file, `${file}.1`]) {
+    if (lines.length >= n) break
+    const fh = await open(f, 'r').catch(() => null)
+    if (!fh) continue
+    try {
+      const { size } = await fh.stat()
+      const len = Math.min(size, maxBytes)
+      const { buffer, bytesRead } = await fh.read(Buffer.alloc(len), 0, len, size - len)
+      const got = buffer.toString('utf8', 0, bytesRead).split(/\r?\n/)
+      // Read from the middle of a file, the first piece is the end of a line, not a line.
+      if (len < size) got.shift()
+      lines = [...got.filter((l) => l.trim()), ...lines]
+    } finally { await fh.close() }
+  }
+  return lines.slice(-n)
+}
+
+/**
+ * A line for llama-server's log: the start's key and any other key-shaped string taken out, and
+ * the key's last characters too, which llama-server echoes as `api_keys: ****abcd`.
+ */
+export function withoutKey(line, key) {
+  const out = key ? String(line).replaceAll(key, '[key]') : String(line)
+  return redactSecrets(out).replace(/(api_keys?:\s*)\*+\S*/gi, '$1[key]')
 }
 
 /**
@@ -195,12 +407,22 @@ function userContent(blocks, images) {
   return parts.every((p) => p.type === 'text') ? parts.map((p) => p.text).join('') : parts
 }
 
-/** DSH GenerateOptions -> llama-server /v1/chat/completions body. */
+/**
+ * DSH GenerateOptions -> llama-server /v1/chat/completions body. A step's tool results come before
+ * the person's words that step took in (a Steer, docs/live-agent-view.md Feature 5), as the chat
+ * format has them answer the calls right after the assistant made them, so the model reads its
+ * results first and the words after. A system message after the conversation has begun becomes a
+ * user message, which a model's chat template takes anywhere; the system prompts it begins with stay.
+ */
 export function toWire(options, images) {
   const messages = []
   if (options.system) messages.push({ role: 'system', content: options.system })
   for (const m of options.messages) {
-    if (m.role === 'system') { const t = textOf(m.content); if (t) messages.push({ role: 'system', content: t }); continue }
+    if (m.role === 'system') {
+      const t = textOf(m.content)
+      if (t) messages.push({ role: messages.some((x) => x.role !== 'system') ? 'user' : 'system', content: t })
+      continue
+    }
     if (m.role === 'assistant') {
       const calls = m.content.filter((b) => b.type === 'tool-call').map((b) => ({ id: b.id, type: 'function', function: { name: b.name, arguments: b.arguments } }))
       messages.push({ role: 'assistant', content: textOf(m.content), ...(calls.length ? { tool_calls: calls } : {}) })
@@ -208,8 +430,8 @@ export function toWire(options, images) {
     }
     const results = m.content.filter((b) => b.type === 'tool-result')
     const content = userContent(m.content.filter((b) => b.type !== 'tool-result'), images)
-    if (content.length || !results.length) messages.push({ role: 'user', content })
     for (const r of results) messages.push({ role: 'tool', tool_call_id: r.toolCallId, content: flatten(r.content) || '(no output)' })
+    if (content.length || !results.length) messages.push({ role: 'user', content })
   }
   return {
     model: options.model,
@@ -240,42 +462,65 @@ export async function* sseData(body) {
 const FINISH = { stop: { kind: 'stop' }, tool_calls: { kind: 'tool-calls' }, length: { kind: 'max-tokens' } }
 const failure = (code, message) => ({ type: 'finish', reason: { kind: 'error', failure: { code, message } } })
 
-/** OpenAI chat-completion chunks -> DSH StreamChunks (block-end, usage and finish at the end). */
-export async function* translate(payloads) {
+/**
+ * OpenAI chat-completion chunks -> DSH StreamChunks (block-end, usage and finish at the end). A stream
+ * that stops before it says why (a finish_reason) or that it is done ([DONE]) ends early, as an error:
+ * one llama-server closed, and one broken off, as its connection is when it dies mid-answer, which the
+ * error says why of. An abort of `signal` is the caller's own, and still throws.
+ */
+export async function* translate(payloads, { signal } = {}) {
   const order = []
   let text, reasoning
   const tools = new Map()
   let finish, usage
+  let done = false
+  // Why the stream broke off, where reading it failed rather than ended: fetch's body fails
+  // (`terminated`, the other side closed) once the server's socket goes.
+  let broke = null
   const open = (kind) => { const b = { index: order.length, kind, text: '' }; order.push(b); return b }
-  for await (const p of payloads) {
-    if (p === '[DONE]') break
-    let c
-    try { c = JSON.parse(p) } catch { yield failure('MALFORMED_RESPONSE', `bad SSE payload: ${p.slice(0, 120)}`); return }
-    if (c.error) { yield failure('PROVIDER_ERROR', String(c.error.message ?? c.error).slice(0, 300)); return }
-    for (const ch of c.choices ?? []) {
-      const d = ch.delta ?? {}
-      if (d.reasoning_content) {
-        if (!reasoning) { reasoning = open('reasoning'); yield { type: 'block-start', index: reasoning.index, blockType: 'reasoning' } }
-        reasoning.text += d.reasoning_content
-        yield { type: 'reasoning-delta', index: reasoning.index, text: d.reasoning_content }
+  try {
+    for await (const p of payloads) {
+      if (p === '[DONE]') { done = true; break }
+      let c
+      try { c = JSON.parse(p) } catch { yield failure('MALFORMED_RESPONSE', `bad SSE payload: ${p.slice(0, 120)}`); return }
+      if (c.error) { yield failure('PROVIDER_ERROR', String(c.error.message ?? c.error).slice(0, 300)); return }
+      for (const ch of c.choices ?? []) {
+        const d = ch.delta ?? {}
+        if (d.reasoning_content) {
+          if (!reasoning) { reasoning = open('reasoning'); yield { type: 'block-start', index: reasoning.index, blockType: 'reasoning' } }
+          reasoning.text += d.reasoning_content
+          yield { type: 'reasoning-delta', index: reasoning.index, text: d.reasoning_content }
+        }
+        if (d.content) {
+          if (!text) { text = open('text'); yield { type: 'block-start', index: text.index, blockType: 'text' } }
+          text.text += d.content
+          yield { type: 'text-delta', index: text.index, text: d.content }
+        }
+        for (const call of d.tool_calls ?? []) {
+          let b = tools.get(call.index ?? 0)
+          if (!b) { b = open('tool-call'); tools.set(call.index ?? 0, b); yield { type: 'block-start', index: b.index, blockType: 'tool-call' } }
+          if (call.id) b.id = call.id
+          if (call.function?.name) b.name = call.function.name
+          const frag = call.function?.arguments ?? ''
+          b.text += frag
+          yield { type: 'tool-call-delta', index: b.index, id: b.id ?? '', ...(b.name ? { name: b.name } : {}), argumentsDelta: frag }
+        }
+        if (ch.finish_reason) finish = FINISH[ch.finish_reason] ?? { kind: 'error', failure: { code: String(ch.finish_reason).toUpperCase(), message: `model stopped: ${ch.finish_reason}` } }
       }
-      if (d.content) {
-        if (!text) { text = open('text'); yield { type: 'block-start', index: text.index, blockType: 'text' } }
-        text.text += d.content
-        yield { type: 'text-delta', index: text.index, text: d.content }
-      }
-      for (const call of d.tool_calls ?? []) {
-        let b = tools.get(call.index ?? 0)
-        if (!b) { b = open('tool-call'); tools.set(call.index ?? 0, b); yield { type: 'block-start', index: b.index, blockType: 'tool-call' } }
-        if (call.id) b.id = call.id
-        if (call.function?.name) b.name = call.function.name
-        const frag = call.function?.arguments ?? ''
-        b.text += frag
-        yield { type: 'tool-call-delta', index: b.index, id: b.id ?? '', ...(b.name ? { name: b.name } : {}), argumentsDelta: frag }
-      }
-      if (ch.finish_reason) finish = FINISH[ch.finish_reason] ?? { kind: 'error', failure: { code: String(ch.finish_reason).toUpperCase(), message: `model stopped: ${ch.finish_reason}` } }
+      if (c.usage) usage = { inputTokens: c.usage.prompt_tokens ?? 0, outputTokens: c.usage.completion_tokens ?? 0 }
     }
-    if (c.usage) usage = { inputTokens: c.usage.prompt_tokens ?? 0, outputTokens: c.usage.completion_tokens ?? 0 }
+  } catch (err) {
+    // The caller's own abort still throws, as before; any other failure to read on is the stream's end.
+    if (signal?.aborted) throw err
+    broke = err
+  }
+  // Cut off mid-answer (a server that died, a connection that closed or broke off): what came is not
+  // the whole answer, and passing it on as one would hide that.
+  if (!done && !finish) {
+    if (usage) yield { type: 'usage', usage }
+    const why = broke ? ` (${[broke.message, broke.cause?.message].filter(Boolean).join(': ').slice(0, 200)})` : ''
+    yield failure('ENDED_EARLY', `llama-server closed the stream before the answer was finished${why}`)
+    return
   }
   for (const b of order) {
     const block = b.kind === 'tool-call' ? { type: 'tool-call', id: b.id ?? `call_${b.index}`, name: b.name ?? '', arguments: b.text || '{}' } : { type: b.kind, text: b.text }
@@ -395,9 +640,10 @@ export const usableVramGB = (specs, variant) => Math.max(0, ...gpusFor(specs, va
  * where it runs is the engine's own count of the layers it put on the GPU. Every other model rating
  * is `estimated`, and keeps `est.` in its label, so a measured figure and a guessed one never look alike.
  * The caller passes a reading only for an installed model, since nothing else can have been measured.
+ * `partBytes` is what a download stopped part way left in its .part, which the disk need not hold again.
  */
-export function rateModule(m, specs, variant, { installed = false, speed = null } = {}) {
-  const rating = estimateRating(m, specs, variant, { installed })
+export function rateModule(m, specs, variant, { installed = false, speed = null, partBytes = 0 } = {}) {
+  const rating = estimateRating(m, specs, variant, { installed, partBytes })
   if (m.kind !== 'model') return rating
   return speed && rating.fit !== 'no' ? measuredRating(rating, speed) : { ...rating, source: 'estimated' }
 }
@@ -411,8 +657,9 @@ export function rateModule(m, specs, variant, { installed = false, speed = null 
  * known: it is rated 'unknown', with no single speed (`wordsPerSec` null) but the two ends it lies
  * between (`wordsPerSecRange`): split as on a card of the ceiling's size, and fully on the GPU.
  */
-function estimateRating(m, specs, variant, { installed = false } = {}) {
-  const need = m.size * 1.1
+function estimateRating(m, specs, variant, { installed = false, partBytes = 0 } = {}) {
+  if (m.moe) return moeRating(m, specs, variant, { installed, partBytes })
+  const need = m.size * 1.1 - partBytes
   if (!installed && specs.diskFreeBytes != null && specs.diskFreeBytes < need) return { fit: 'no', label: "Won't fit", reason: `needs ${gb(need)} free disk, ${gb(specs.diskFreeBytes)} free` }
   if (m.minRamGB && specs.ramGB + 0.5 < m.minRamGB) return { fit: 'no', label: "Won't fit", reason: `needs ${m.minRamGB} GB RAM, this PC has ${Math.round(specs.ramGB)} GB` }
   if (m.kind === 'vision') return { fit: 'ok', label: 'Runs on the CPU next to its model' }
@@ -447,6 +694,9 @@ function estimateRating(m, specs, variant, { installed = false } = {}) {
 function measuredRating(estimate, r) {
   const words = Math.max(1, Math.round(r.tokensPerSec * 0.75))
   const figure = `${speedFigure(r.tokensPerSec)} tokens/s measured on this PC on ${dayText(r.at)}, ${r.depth.toLocaleString('en-US')} tokens into a conversation (about ${words} words/s)`
+  // Every layer of a mixture-of-experts model is on the GPU, with the experts its layout keeps in RAM
+  // held there, so its layer count says nothing of where it runs.
+  if (estimate.fit === 'moe') return { fit: 'moe', label: `Fits this PC: ${moeWhere(estimate.moe)}: ${figure}`, wordsPerSec: words, source: 'measured', moe: estimate.moe }
   const l = r.layersOnGpu
   if (!l) return { fit: estimate.fit, label: `${figure}; the engine did not report its GPU split, so where it runs is estimated`, wordsPerSec: words, source: 'measured' }
   const fit = l.gpu >= l.total ? 'gpu' : l.gpu > 0 ? 'split' : 'cpu'
@@ -502,13 +752,20 @@ export function kvGbPerToken(m) {
  * @param {number} p.ctx     context size the model will run with
  * @param {number} [p.vramGB] GPU memory the engine may use; 0 for a CPU-only run
  * @param {object} [p.measured] a previous run's reading: { vramGB, ramGB }
+ * @param {object} [p.cpuMoe] for a mixture-of-experts model laid out by moeLayout, the layers whose experts stay in RAM: { layers, cpuLayers }
  * @returns {{ vramGB: number, ramGB: number, totalGB: number, gpuFraction: number, source: 'measured'|'estimated' }}
  */
-export function estimateMemory(m, { ctx, vramGB = 0, measured = null } = {}) {
+export function estimateMemory(m, { ctx, vramGB = 0, measured = null, cpuMoe = null } = {}) {
   if (measured && Number.isFinite(measured.vramGB) && Number.isFinite(measured.ramGB)) {
     return { ...measured, totalGB: measured.vramGB + measured.ramGB, gpuFraction: measured.gpuFraction ?? null, source: 'measured' }
   }
-  const weights = m.size / GB
+  // Its experts in RAM as the layout keeps them there, and the rest on the GPU; laid out by layers
+  // like any other model when it has no such layout (a CPU run, or GPU layers pinned by hand).
+  if (m.moe && cpuMoe) {
+    const lay = moeLayout(m, { vramGB, ctx, cpuLayers: cpuMoe.cpuLayers })
+    return { vramGB: r1(lay.gpuGB), ramGB: r1(lay.ramGB), totalGB: r1(lay.gpuGB + lay.ramGB), gpuFraction: r1(lay.gpuGB / (lay.gpuGB + lay.ramGB)), source: 'estimated' }
+  }
+  const weights = m.moe ? moeLayout(m, { ctx }).sizeGB : m.size / GB
   const kv = Math.max(0, ctx) * kvGbPerToken(m)
   const live = weights + kv + COMPUTE_GB
   // The same reading of the GPU's room rateModule uses, so the picker's speed and its memory can
@@ -526,6 +783,89 @@ export function estimateMemory(m, { ctx, vramGB = 0, measured = null } = {}) {
 }
 
 const r1 = (x) => Math.round(x * 10) / 10
+
+// ---------- mixture of experts ----------
+
+/**
+ * The bits a parameter a row not pinned yet is sized at, until pin-model.mjs reads its file's size:
+ * llama.cpp's Q4_K_M mix, which every candidate row is, as Qwen3 8B's pinned file has it
+ * (5,027,783,488 bytes for 8.2 B parameters, 4.9 bits each).
+ */
+const UNPINNED_BITS = 4.9
+/**
+ * The RAM a model leaves to Windows, the app, its browser view and the agents' processes, in GB:
+ * what the dense rows' minRamGB keeps, Qwen3 8B's 12 GB being its CPU-only figure at 16k
+ * (estimateMemory, 5.7 GB) and about 6 GB more.
+ */
+export const RAM_HEADROOM_GB = 6
+/** GPU memory kept free beyond the figure once layers of experts go to the GPU: the scratch they add, and the estimate's own error. */
+const MOE_GPU_MARGIN_GB = 1
+
+/**
+ * Where a mixture-of-experts model goes on this PC, and how fast it runs there, by estimate. A token
+ * reads only its active experts, so the experts (`moe.expertShare` of the file) stay in RAM and the
+ * rest goes to the GPU: attention and the shared weights, the KV cache at `ctx`, the compute buffers
+ * and the desktop's reserve (`gpuNeedGB`). What the GPU has beyond that and MOE_GPU_MARGIN_GB takes
+ * whole layers of experts, the last layers first, since --n-cpu-moe N keeps the first N layers'
+ * experts in RAM: `cpuLayers` is that N, and may be given, for a load with every expert in RAM.
+ *
+ * The speed comes from the weights a token reads, over the bandwidth of the memory that holds them:
+ * every weight outside the experts, which over-counts the embedding table (read a row at a time),
+ * and the active share of each layer's experts. A row not pinned yet is sized from its parameters
+ * (UNPINNED_BITS), and `sizeEstimated` says so.
+ */
+export function moeLayout(m, { vramGB = 0, ctx, cpuLayers = null } = {}) {
+  const { totalParamsB, activeParamsB, expertShare, layers } = m.moe
+  const sizeEstimated = !isPinned(m)
+  const sizeGB = sizeEstimated ? (totalParamsB * 1e9 * UNPINNED_BITS) / 8 / GB : m.size / GB
+  const expertsGB = sizeGB * expertShare
+  const restGB = sizeGB - expertsGB
+  const gpuNeedGB = RESERVE_GB + restGB + Math.max(0, ctx) * kvGbPerToken(m) + COMPUTE_GB
+  const layerGB = expertsGB / layers
+  const spare = vramGB - gpuNeedGB - MOE_GPU_MARGIN_GB
+  const cpu = cpuLayers ?? layers - Math.min(layers, spare > 0 ? Math.floor(spare / layerGB) : 0)
+  const activeGB = (sizeGB * activeParamsB) / totalParamsB
+  const fromRam = (activeGB - restGB) * (cpu / layers)
+  return {
+    sizeGB, sizeEstimated, expertsGB, gpuNeedGB, layers, cpuLayers: cpu,
+    ramGB: layerGB * cpu, gpuGB: gpuNeedGB + layerGB * (layers - cpu),
+    tokensPerSec: 1 / (fromRam / CPU_GBPS + (activeGB - fromRam) / GPU_GBPS),
+  }
+}
+
+/**
+ * A mixture-of-experts row's rating, at the context it starts with here (moeLayout). It fits when the
+ * GPU holds all but its experts, and RAM holds the experts it keeps there with RAM_HEADROOM_GB beside
+ * them, give or take the half GB the dense rule allows for a total Windows rounds down. Otherwise it
+ * says which does not, and with no GPU the engine build can use, the rest has nowhere to go. Never
+ * 'unknown': a GPU sized from AdapterRAM's ceiling is taken at the ceiling, the least it has.
+ */
+function moeRating(m, specs, variant, { installed, partBytes }) {
+  const vram = usableVramGB(specs, variant)
+  const lay = moeLayout(m, { vramGB: vram, ctx: defaultsFor(m, specs, variant).ctx })
+  const no = (reason) => ({ fit: 'no', label: "Won't fit", reason })
+  const need = lay.sizeGB * GB * 1.1 - partBytes
+  if (!installed && specs.diskFreeBytes != null && specs.diskFreeBytes < need) return no(`needs ${lay.sizeEstimated ? 'about ' : ''}${gb(need)} free disk, ${gb(specs.diskFreeBytes)} free`)
+  const rest = `about ${lay.gpuNeedGB.toFixed(1)} GB of GPU memory for all but its experts`
+  if (!(vram > 0)) return no(`needs ${rest}, and ${variant === 'cpu' ? 'the CPU build of the engine uses no GPU' : 'this PC has no GPU the engine can use'}`)
+  const capped = gpusFor(specs, variant).some((g) => g.sizeCapped)
+  if (vram < lay.gpuNeedGB) return no(`needs ${rest}, and ${capped ? `this GPU's memory is unknown, ${CAPPED_GB} GB or more` : `this GPU has ${Math.round(vram)} GB`}`)
+  const ram = lay.ramGB + RAM_HEADROOM_GB
+  if (specs.ramGB + 0.5 < ram) return no(`needs about ${Math.ceil(ram)} GB RAM, ${lay.ramGB.toFixed(1)} GB for its experts and ${RAM_HEADROOM_GB} GB for Windows and KzH, and this PC has ${Math.round(specs.ramGB)} GB`)
+  const words = Math.max(1, Math.round(lay.tokensPerSec * 0.75))
+  return {
+    fit: 'moe', label: `Fits this PC: ${moeWhere(lay, lay.ramGB)} (~${words} words/s est.)`, wordsPerSec: words,
+    moe: { ramGB: r1(lay.ramGB), gpuGB: r1(lay.gpuGB), cpuLayers: lay.cpuLayers, layers: lay.layers, sizeEstimated: lay.sizeEstimated },
+  }
+}
+
+/**
+ * Where a mixture-of-experts layout (moeLayout) puts the model, in the words of its rating and its suggestion:
+ * its experts in RAM, `ramGB` of them when given, and the rest on the GPU, or all of it on a GPU that holds every expert.
+ */
+const moeWhere = ({ cpuLayers }, ramGB = null) => (cpuLayers > 0
+  ? `experts in RAM${ramGB == null ? '' : ` (about ${ramGB.toFixed(1)} GB)`}, the rest on the GPU`
+  : 'all on the GPU, experts included')
 
 /**
  * What the engine says it actually took, read from its own load report. llama.cpp prints one
@@ -603,6 +943,77 @@ export const SPEED_TEXT = (() => {
   return parts.join('\n')
 })()
 
+// ---------- the output check of a speed run (docs/benchmark.md 2.15) ----------
+
+/**
+ * What a speed run sends once a model's timed requests are done: a fixed prompt, decoded greedily,
+ * whose answer is kept as the model's baseline the first time and held to it after. It goes to
+ * /completion as text, the path the speed requests take, so no chat template comes between and a
+ * change in the answer is the engine's or the weights', never a template's.
+ */
+export const CHECK_PROMPT = 'Here is a JavaScript function that tells whether a whole number is prime, with a short comment on each step:\n\nfunction isPrime(n) {\n'
+/** Tokens the check generates: enough for a broken engine to show, few enough to add a second or two. */
+export const CHECK_PREDICT = 64
+/**
+ * How much of its baseline a later output must repeat from its first token to count as the same,
+ * unless the plugin config's `local.outputCheckShare` says otherwise: half, the first 32 of 64
+ * tokens. Provisional: CUDA output is not bit-identical across runs, builds or splits, and how far
+ * it drifts on the owner's PC has not been measured (docs/handoff.md).
+ */
+export const OUTPUT_SHARE = 0.5
+/** The output baselines, beside local.json in the data folder: each key's first output, kept until a person accepts another. */
+export const OUTPUT_BASELINES = 'speed-baselines.json'
+/** The model id of a `<model>@<context>` key of local.json. */
+const modelOfKey = (key) => key.slice(0, key.lastIndexOf('@'))
+
+/** How a load split the model, in words: the engine's own count of the layers on the GPU (the setting when it gave none) and the experts held in RAM. */
+const splitWords = (r) => [
+  r.layersOnGpu ? `${r.layersOnGpu.gpu}/${r.layersOnGpu.total} layers on the GPU` : `GPU layers ${r.gpuLayers ?? 'not set'}`,
+  ...(r.cpuMoe?.cpuLayers ? [`the experts of ${r.cpuMoe.cpuLayers} of ${r.cpuMoe.layers} layers in RAM`] : []),
+].join(', ')
+
+/**
+ * The baseline a reading's output is held to: the model, the SHA-256 of its weights, the engine
+ * build and the GPU split of its load. CUDA output is not bit-identical across builds or splits,
+ * so another of either is another key, whose first output becomes a baseline of its own.
+ */
+export function outputKey(id, r) {
+  return `${id}; weights ${r.weights?.sha256 ?? 'not named'}; ${r.engine ? `${r.engine.variant} build ${r.engine.sha256}` : 'no engine build named'}; ${splitWords(r)}`
+}
+
+/** How many of their first items two sequences, of tokens or of characters, have in common. */
+function sharedStart(a, b) {
+  let n = 0
+  while (n < a.length && n < b.length && a[n] === b[n]) n++
+  return n
+}
+
+/**
+ * An output against its baseline: `same` when the two agree from their start for at least `share`
+ * of the baseline, else `differs`. `agreed` is how far they agree, of the baseline's `of`, in
+ * tokens when both carry llama-server's token ids and in characters when either does not.
+ */
+export function compareOutput(baseline, output, share = OUTPUT_SHARE) {
+  const tokens = [baseline.tokens, output.tokens].every((t) => Array.isArray(t) && t.length > 0)
+  const [a, b] = tokens ? [baseline.tokens, output.tokens] : [baseline.text ?? '', output.text ?? '']
+  const agreed = sharedStart(a, b)
+  const need = Math.ceil(share * a.length)
+  return { state: agreed >= need ? 'same' : 'differs', agreed, of: a.length, need, unit: tokens ? 'tokens' : 'characters', baselineAt: baseline.at }
+}
+
+/** What an output check found, as the speed run logs say it; null for a reading from before there was one. */
+export function outputWords(o) {
+  if (!o) return null
+  if (o.state === 'same') return `output the same as the ${dayText(o.baselineAt)} baseline (its first ${o.agreed} of ${o.of} ${o.unit} agree, ${o.need} needed)`
+  if (o.state === 'differs') return `output differs from the ${dayText(o.baselineAt)} baseline after ${o.agreed} ${o.unit} (${o.need} needed), so this figure is not taken as its speed until the new output is accepted`
+  if (o.state === 'accepted') return `output accepted on ${dayText(o.acceptedAt)} as the new baseline; it had differed from the ${dayText(o.baselineAt)} one after ${o.agreed} ${o.unit}`
+  if (o.state === 'baseline') {
+    const also = o.also ? `; it agrees with the ${dayText(o.also.baselineAt)} baseline of ${o.also.other} for its first ${o.also.agreed} of ${o.also.of} ${o.also.unit}` : ''
+    return `output kept as the first baseline for this engine build and GPU split${also}`
+  }
+  return `output was not checked: ${o.why}`
+}
+
 /**
  * llama-server's own timings of one `/completion` answer. Both speeds are worked out from the counts
  * and the milliseconds rather than read from its rate fields, so a build that drops or renames a
@@ -634,14 +1045,15 @@ const layaWords = (d) => (d === 'cuda' ? 'the GPU' : 'the CPU')
 const threadWords = (n) => `${n} thread${n === 1 ? '' : 's'}`
 const sameBuild = (a, b) => !!a && !!b && a.variant === b.variant && a.sha256 === b.sha256
 const sameWeights = (a, b) => !!a && !!b && a.sha256 === b.sha256
+const expertWords = (c) => (c?.cpuLayers ? `the experts of ${c.cpuLayers} of ${c.layers} layers in RAM` : c ? 'every expert on the GPU' : 'no experts held in RAM')
 
 /**
  * Why a speed reading does not stand for the next load, in the words the Local models card prints,
  * or null when it does. Each condition decides how fast the model runs: other weights under the
  * same model id (a manifest update that ships another quantisation) are another model; the context
- * is its key; the GPU layers setting, the GPU room and a Laya on the GPU split it between the GPU
- * and the CPU; the threads set the CPU half's speed; another engine build is another program; and a
- * deeper prompt generates more slowly.
+ * is its key; the GPU layers setting, the GPU room, a mixture-of-experts model's experts held in RAM
+ * (`cpuMoe`) and a Laya on the GPU split it between the GPU and the CPU; the threads set the CPU
+ * half's speed; another engine build is another program; and a deeper prompt generates more slowly.
  */
 function speedDiffers(r, next) {
   if (!r.weights) return 'it does not say which weights of this model it was measured on'
@@ -653,6 +1065,7 @@ function speedDiffers(r, next) {
   }
   if (r.gpuLayers !== next.gpuLayers) return `it was measured with GPU layers ${layersWords(r.gpuLayers)} and they are now ${layersWords(next.gpuLayers)}`
   if (r.roomGB !== next.roomGB) return `it was measured with ${r.roomGB} GB of GPU room and the VRAM budget now leaves ${next.roomGB} GB`
+  if ((r.cpuMoe?.cpuLayers ?? null) !== (next.cpuMoe?.cpuLayers ?? null)) return `it was measured with ${expertWords(r.cpuMoe)} and the next load has ${expertWords(next.cpuMoe)}`
   if (r.threads !== next.threads) return `it was measured with ${threadWords(r.threads)} and the next load gets ${next.threads}`
   if (!sameBuild(r.engine, next.engine)) return 'it was measured on another engine build'
   const [was, now] = [r.laya ?? null, next.laya ?? null]
@@ -668,23 +1081,29 @@ function speedDiffers(r, next) {
 /**
  * The speed reading for a model's next load, from local.json's `speed` map (`s.speed`, keyed
  * `<model>@<context>` like the memory readings under `measured`), and whether it stands for that load.
- * `next` is what that load would get: `{ ctx, roomGB, gpuLayers, threads, engine, weights, depth,
- * laya }`, where `weights` is the manifest's `{ file, sha256 }` of the model and `laya` the device a
+ * `next` is what that load would get: `{ ctx, roomGB, gpuLayers, cpuMoe, threads, engine, weights,
+ * depth, laya }`, where `weights` is the manifest's `{ file, sha256 }` of the model and `laya` the device a
  * held Laya is resident on now, or null, since one nothing holds gives way when the model loads. A
  * reading's own `laya` is the Laya that was resident when it loaded, held or not. The reading under
  * the next load's key is the one; with none there, the newest reading of the model at any other
  * context is given, as one that does not stand, so the card can say why rather than say nothing
  * was measured.
  *
- * @returns {{ reading: object|null, stands: boolean, why: string|null }}
+ * A reading whose output differed from its baseline (2.15) is kept apart, in `s.speedHeld`, and is
+ * never the reading here, so the model's speed stays the one it had until the person accepts the
+ * new output; it is given as `held`, only when there is one, for the card to show with its mark.
+ *
+ * @returns {{ reading: object|null, stands: boolean, why: string|null, held?: object }}
  */
 export function speedFor(s, id, next) {
   const ctxOf = (key) => Number(key.slice(key.lastIndexOf('@') + 1))
+  const held = Object.entries(s?.speedHeld ?? {}).find(([key, r]) => modelOfKey(key) === id && r && typeof r === 'object')?.[1]
+  const withHeld = (found) => (held ? { ...found, held } : found)
   const mine = Object.entries(s?.speed ?? {}).filter(([key, r]) => key.slice(0, key.lastIndexOf('@')) === id && r && typeof r === 'object')
   const [key, reading] = mine.find(([k]) => ctxOf(k) === next.ctx) ?? mine.sort(([, a], [, b]) => String(b.at).localeCompare(String(a.at)))[0] ?? []
-  if (!reading) return { reading: null, stands: false, why: null }
+  if (!reading) return withHeld({ reading: null, stands: false, why: null })
   const why = speedDiffers({ ...reading, ctx: ctxOf(key) }, next)
-  return { reading, stands: !why, why }
+  return withHeld({ reading, stands: !why, why })
 }
 
 // ---------- the speed run logs (docs/benchmark.md 2.13) ----------
@@ -713,7 +1132,8 @@ export function speedFigures(line) {
   // A figure the reading does not carry is said to be missing, never shown as a zero.
   const load = Number.isFinite(r.loadMs) ? `loaded in ${(r.loadMs / 1000).toFixed(1)} s` : 'load time not reported'
   const threads = Number.isInteger(r.threads) ? threadWords(r.threads) : 'threads not reported'
-  return `${r.tokensPerSec.toFixed(1)} tokens/s generating, ${prompt}, ${ctx}, ${layers}, ${memory}, ${load}, ${threads}`
+  const peak = Number.isFinite(r.peakRamGB) ? `peak RAM ${r.peakRamGB.toFixed(1)} GB` : 'peak RAM not read'
+  return `${r.tokensPerSec.toFixed(1)} tokens/s generating, ${prompt}, ${ctx}, ${layers}, ${memory}, ${load}, ${threads}, ${peak}`
 }
 
 /** Default context and GPU layers for a model on this PC (manifest values unless the PC is small). */
@@ -743,7 +1163,7 @@ export const badgesOf = (m) => [
   m.verified ? `Verified${m.verifiedOn ? ` (${m.verifiedOn.split(',')[0]})` : ''}` : 'Not tested yet',
 ]
 
-const TIER = { gpu: 2, split: 2, unknown: 2, cpu: 1, ok: 0, no: -1 }
+const TIER = { gpu: 2, split: 2, unknown: 2, moe: 2, cpu: 1, ok: 0, no: -1 }
 /**
  * Suggest 1-2 models for this PC. Reliability first (official-stable and verified
  * only), then fit (runs at a usable speed), then quality (manifest rank), then
@@ -752,6 +1172,10 @@ const TIER = { gpu: 2, split: 2, unknown: 2, cpu: 1, ok: 0, no: -1 }
  * A model rated 'unknown' (a GPU sized from AdapterRAM's ceiling) is ranked down as slow only
  * if it is slow even fully on the GPU: that it would be slow on a card of the ceiling's size is a
  * guess at the size, and taking it would rank a bigger card as a 4 GB one.
+ *
+ * A row not pinned yet (readManifest) is never suggested, whatever it is rated: nothing can install
+ * it until pin-model.mjs has pinned it. A mixture-of-experts row ranks like a split one, and only the
+ * first pick of the best-quality role is called the best quality.
  * @param {{m: object, rating: object, installed: boolean, downloads?: number}[]} rows
  */
 export function suggest(rows, specs) {
@@ -759,28 +1183,30 @@ export function suggest(rows, specs) {
   const ok = []
   for (const r of rows.filter((x) => x.m.kind === 'model')) {
     if (r.installed) why[r.m.id] = 'already installed'
+    else if (!isPinned(r.m)) why[r.m.id] = notCheckedYet(r.m.id)
     else if (r.m.reliability !== 'official-stable') why[r.m.id] = `not suggested: ${r.m.reliability ?? 'unknown'} release`
     else if (!r.m.verified) why[r.m.id] = 'not suggested: not tested with this engine yet'
     else if (r.rating.fit === 'no') why[r.m.id] = r.rating.reason
     else ok.push(r)
   }
   const best = (rating) => rating.wordsPerSecRange?.[1] ?? rating.wordsPerSec
-  const usable = (r) => TIER[r.rating.fit] + ((r.rating.fit === 'split' || r.rating.fit === 'unknown') && best(r.rating) < 3 ? -1 : 0)
+  const usable = (r) => TIER[r.rating.fit] + (['split', 'unknown', 'moe'].includes(r.rating.fit) && best(r.rating) < 3 ? -1 : 0)
   ok.sort((a, b) => usable(b) - usable(a) || (a.m.rank ?? 99) - (b.m.rank ?? 99) || (b.downloads ?? 0) - (a.downloads ?? 0))
   const g = specs.gpus.find((x) => x.vramGB > 0)
   const pc = `${g ? (g.sizeCapped ? `GPU (${CAPPED_SIZE}) + ` : `${Math.round(g.vramGB)} GB GPU + `) : ''}${Math.round(specs.ramGB)} GB RAM`
   const speed = (rating) => (rating.wordsPerSecRange ? `~${rating.wordsPerSecRange[0]} to ~${rating.wordsPerSecRange[1]}` : `~${rating.wordsPerSec}`)
   const vision = (r) => rows.find((x) => x.m.kind === 'vision' && x.m.for === r.m.id && !x.installed)
+  const how = (rating) => (rating.fit === 'moe' ? moeWhere(rating.moe) : rating.label.replace(/ \(.*/, ''))
   const picks = ok.slice(0, 2).map((r, i) => ({
     id: r.m.id,
-    reason: (r.m.role === 'best-quality' || (i === 0 && r.m.rank === 1)
-      ? `${r.m.name}: best quality that still runs on your ${pc} (${r.rating.label.replace(/ \(.*/, '')}, ${speed(r.rating)} words/s)`
-      : `${r.m.name}: lighter and faster (${r.rating.label.replace(/ \(.*/, '')}, ${speed(r.rating)} words/s)`)
+    reason: ((r.m.role === 'best-quality' && !ok.slice(0, i).some((x) => x.m.role === 'best-quality')) || (i === 0 && r.m.rank === 1)
+      ? `${r.m.name}: best quality that still runs on your ${pc} (${how(r.rating)}, ${speed(r.rating)} words/s)`
+      : `${r.m.name}: lighter and faster (${how(r.rating)}, ${speed(r.rating)} words/s)`)
       + (vision(r) ? '; add the vision add-on to read images offline' : ''),
   }))
   for (const r of ok.slice(2)) why[r.m.id] = 'fits, but the suggested ones are better here'
   if (picks.length) return { picks, why }
-  const smallest = rows.filter((x) => x.m.kind === 'model' && !x.installed).sort((a, b) => a.m.size - b.m.size)[0]
+  const smallest = rows.filter((x) => x.m.kind === 'model' && !x.installed && isPinned(x.m)).sort((a, b) => a.m.size - b.m.size)[0]
   const allInstalled = rows.filter((x) => x.m.kind === 'model').every((x) => x.installed)
   return {
     picks: [],
@@ -982,7 +1408,7 @@ function unzip(zip, dir, spawn) {
  * @param {(m: object) => void} [p.onChange]  a module was installed, removed or verified
  * @param {(s: object) => void} [p.onSettings]  the settings were changed and saved; called with them
  * @param {(pid: number) => Promise<number|null>} [p.readWorkingSet]  the RAM watchdog's reading, in bytes (tests)
- * @param {() => number} [p.now]  the RAM watchdog's clock (tests)
+ * @param {() => number} [p.now]  the RAM watchdog's clock, and the capped wait's for a model (tests)
  * @param {number} [p.watchEveryMs]  how often the RAM watchdog reads, while a RAM budget is set
  * @param {object} [p.residency]  createResidency(): every local model process on this PC, llama-server
  *   and Laya's laya.serve, under one RAM budget. The loaded engine registers there as 'llama'; one of
@@ -994,11 +1420,32 @@ function unzip(zip, dir, spawn) {
  *   (docs/benchmark.md 2.7).
  * @param {string|null} [p.speedLogDir]  the folder of the speed run logs (docs/benchmark.md 2.13): each
  *   run's summary appended to speed-runs.log, and its detail log beside it; null keeps none.
+ * @param {number} [p.outputShare]  how much of its baseline a speed run's output must repeat from its
+ *   start to be the same (docs/benchmark.md 2.15): the plugin config's `local.outputCheckShare`, 0 to 1.
+ * @param {number} [p.modelWaitCapMinutes]  how long a local agent's attempt waits for its model before
+ *   no attempt joins the model held ahead of it (localAgentAttempt): the plugin config's
+ *   `local.modelWaitCapMinutes`, 1 to 60.
+ * @param {(fn: () => void, ms: number) => () => void} [p.setTimer]  runs `fn` after `ms`, answering a
+ *   function that cancels it; injectable so a test drives the capped wait on a fake clock.
+ * @param {string|null} [p.serverLog]  llama-server's log on disk (llama-server.log): every line it prints
+ *   and KzH's own on each start, rotated at 5 MB with one older file kept; null keeps none.
+ * @param {(from: number) => Promise<number>} [p.findPort]  the first free port from `from` (freePort; tests)
  */
-export function createLocalModels({ modules, engineDir, modelsDir, settingsFile, port: basePort = 8081, contextSize, specs: getSpecs = async () => null, spawn = nodeSpawn, fetch = globalThis.fetch, log: consoleLog = () => {}, onChange = () => {}, onSettings = () => {}, readWorkingSet = workingSetOf, now = Date.now, watchEveryMs = 5000, residency = createResidency({ log: consoleLog }), layaBusy = () => false, capabilityBusy = () => false, speedLogDir = null }) {
+export function createLocalModels({ modules, engineDir, modelsDir, settingsFile, port: basePort = 8081, contextSize, specs: getSpecs = async () => null, spawn = nodeSpawn, fetch = globalThis.fetch, log: consoleLog = () => {}, onChange = () => {}, onSettings = () => {}, readWorkingSet = workingSetOf, now = Date.now, watchEveryMs = 5000, residency = createResidency({ log: consoleLog }), layaBusy = () => false, capabilityBusy = () => false, speedLogDir = null, outputShare = OUTPUT_SHARE, modelWaitCapMinutes = 2, setTimer = (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return () => clearTimeout(t) }, serverLog = null, findPort = freePort }) {
   // Every line goes to the console, and while a speed run goes to its detail log too (docs/benchmark.md 2.13).
   let speedNote = null
   const log = (t) => { consoleLog(t); speedNote?.(t) }
+  // llama-server's log on disk (serverLog): every line it prints and KzH's own on each start (the
+  // command line, a port it could not have, ready, the exit), each stamped with the time and with the
+  // start's key and any other secret taken out. Two files of 5 MB at most, llama-server.log and .1;
+  // GET /jev-router/local/log serves its tail.
+  const engineLog = serverLog ? createRotatingLog(serverLog, { maxBytes: 5 * 1024 * 1024, keep: 1 }) : null
+  // A line, or the whole lines of one chunk of output, in a single append.
+  const toEngineLog = (lines, key) => {
+    if (!engineLog) return
+    const at = new Date().toISOString()
+    engineLog.append([lines].flat().map((l) => `${at} ${withoutKey(l, key)}\n`).join(''))
+  }
   const exe = join(engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server')
   const engines = modules.filter((m) => m.kind === 'engine')
   const models = modules.filter((m) => m.kind === 'model')
@@ -1020,6 +1467,10 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   // much of it lands in RAM changes, planFor sizes it below that context, and refuses it only when
   // there is no smaller one left (it was unloaded at the floor).
   const tripped = new Map()
+  // Mixture-of-experts models that did not load with layers of experts on the GPU and then loaded
+  // with every expert in RAM, by id, with the GPU room their plan had: until KzH starts again, a plan
+  // in that same room keeps every expert in RAM, rather than have each load fail once before it loads.
+  const moeFailed = new Map()
   const RAM_DECIDERS = ['maxRamGB', 'maxVramGB', 'gpuLayers']
   // The context each model was last planned with (planFor), for contextOf(), which has to answer at
   // once: the window DSH and the formatter fill must be the one llama-server is started with.
@@ -1032,8 +1483,10 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   const jobs = new Map() // module id -> { state: queued | downloading | extracting | done | failed, received, total, bytesPerSec, error }
 
   // `speed` holds the speed readings beside the memory readings under `measured`, keyed the same way
-  // (docs/benchmark.md 2.4). Nothing but a speed run writes it: setSettings copies only the keys it knows.
-  const DEFAULTS = { chatModel: null, idleMinutes: 10, gpuLayers: null, keepWarm: false, loadAtStart: null, measured: {}, speed: {}, ...Object.fromEntries(Object.keys(BUDGET).map((k) => [k, null])) }
+  // (docs/benchmark.md 2.4), and `speedHeld` a model's reading whose output differed from its baseline,
+  // until it is accepted (2.15). Nothing but a speed run and its Accept new output write them:
+  // setSettings copies only the keys it knows.
+  const DEFAULTS = { chatModel: null, idleMinutes: 10, gpuLayers: null, keepWarm: false, loadAtStart: null, measured: {}, speed: {}, speedHeld: {}, ...Object.fromEntries(Object.keys(BUDGET).map((k) => [k, null])) }
   const loadMs = new Map() // model id -> last load time, for the "~8 s" estimate
   const readSettings = async () => ({ ...DEFAULTS, ...JSON.parse(await readFile(settingsFile, 'utf8').catch(() => '{}')) })
 
@@ -1053,6 +1506,31 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     writes = next.catch(() => {})
     return next
   }
+
+  // The output baselines of the speed runs (docs/benchmark.md 2.15), in a file of their own beside
+  // local.json, keyed by outputKey: { id, at, weights, engine, split, text, tokens }.
+  const baselinesFile = join(dirname(settingsFile), OUTPUT_BASELINES)
+  /** The baselines on disk, none when the file is not there yet; a file that cannot be read throws, and is never written over. */
+  async function readBaselines() {
+    const text = await readFile(baselinesFile, 'utf8').catch((err) => { if (err.code === 'ENOENT') return '{}'; throw err })
+    const all = JSON.parse(text)
+    if (!all || typeof all !== 'object' || Array.isArray(all)) throw new Error('it is not a map of baselines')
+    return all
+  }
+  let baselineWrites = Promise.resolve()
+  /** Change the baselines through `fn`, one change after another, as mutate() changes local.json. */
+  function changeBaselines(fn) {
+    const next = baselineWrites.then(async () => {
+      const all = fn(await readBaselines())
+      await mkdir(dirname(baselinesFile), { recursive: true })
+      await writeFile(`${baselinesFile}.tmp`, JSON.stringify(all, null, 2))
+      await renameRetry(`${baselinesFile}.tmp`, baselinesFile)
+    })
+    baselineWrites = next.catch(() => {})
+    return next
+  }
+  /** A baseline as the file keeps it: the output of `r`, the model's reading it came with. */
+  const baselineOf = (id, r, { text, tokens }) => ({ id, at: r.at, weights: r.weights?.sha256 ?? null, engine: r.engine ?? null, split: splitWords(r), text, tokens })
 
   async function setSettings(patch) {
     let was
@@ -1126,23 +1604,31 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    * of it in RAM, and a run held to a tight VRAM budget overstates RAM once the budget is lifted;
    * taken as they are, the first lets an oversized model through and the second refuses a model
    * for good, since a refused model never runs again to be measured. Such a run stays on file and
-   * the estimate for this one stands in. A reading from before the room was recorded has none.
+   * the estimate for this one stands in. A reading from before the room was recorded has none. A
+   * mixture-of-experts model's run is like this one only with the same layers' experts held in RAM
+   * (`cpuMoe`, kept as `cpuMoeLayers`).
    */
-  const measuredFor = (s, modelId, ctx, { roomGB, gpuLayers }) => {
+  const measuredFor = (s, modelId, ctx, { roomGB, gpuLayers, cpuMoe = null }) => {
     const got = s.measured?.[`${modelId}@${ctx}`]
-    return got && got.roomGB === roomGB && got.gpuLayers === gpuLayers ? got : null
+    return got && got.roomGB === roomGB && got.gpuLayers === gpuLayers && (got.cpuMoeLayers ?? null) === (cpuMoe?.cpuLayers ?? null) ? got : null
   }
 
   // Install markers. Engine: <engineDir>/.installed/<id>.json once its zip was verified and unpacked.
   // Model/vision: <modelsDir>/.verified/<file>.json with the file's size, mtime and hash, so a 5 GB file is hashed once.
   const engineMarker = (m) => join(engineDir, '.installed', `${m.id}.json`)
   const fileMarker = (m) => join(modelsDir, '.verified', `${m.file}.json`)
+  /** What a module's download stopped part way left in its .part, in bytes: 0 without one, or with one too big to resume. */
+  const partBytes = async (m) => {
+    const n = (await stat(`${join(m.kind === 'engine' ? engineDir : modelsDir, m.file)}.part`).catch(() => null))?.size ?? 0
+    return n <= m.size ? n : 0
+  }
   const readJson = (p) => readFile(p, 'utf8').then(JSON.parse, () => null)
   const writeJson = async (p, v) => { await mkdir(dirname(p), { recursive: true }); await writeFile(p, JSON.stringify(v)) }
   const hashing = new Map() // module id -> Promise
 
-  /** installed | missing | verifying | corrupt (file present, SHA256 differs from the manifest). */
+  /** installed | missing | verifying | corrupt (file present, SHA256 differs from the manifest) | unpinned (a candidate row, which nothing installs or hashes). */
   async function stateOf(m) {
+    if (!isPinned(m)) return 'unpinned'
     if (['queued', 'downloading', 'extracting'].includes(jobs.get(m.id)?.state)) return 'missing'
     if (m.kind === 'engine') return (await stat(exe).catch(() => null))?.isFile() && (await readJson(engineMarker(m)))?.sha256 === m.sha256 ? 'installed' : 'missing'
     const path = join(modelsDir, m.file)
@@ -1295,6 +1781,14 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    * but only those a hold keeps loaded count against it here: one nothing holds is unloaded before
    * this model starts (start() yields it), so a context is never sized down for a Laya that would
    * be gone by the time the model loads. The plan only reads the residency; unloading is start()'s.
+   *
+   * A mixture-of-experts model with GPU layers on auto places its experts itself (moeLayout, the
+   * plan's `cpuMoe`), and --fit leaves that as given, so it is laid out in the room less what a held
+   * Laya keeps on the GPU, which --fit would have seen. With no room there for all but its experts,
+   * or GPU layers pinned by hand, it is placed by layers like any other model. `moeFallback` is the
+   * same load with every expert in RAM, which start() makes when a load with experts on the GPU
+   * fails, with the budget's refusal of it, if any; once such a load is ready, the plans in the same
+   * room keep every expert in RAM from the first (moeFailed).
    */
   async function planFor(m, s) {
     const specs = await getSpecs().catch(() => null)
@@ -1302,7 +1796,13 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const d = await runDefaults(m)
     const gpuLayers = s.gpuLayers ?? d.gpuLayers
     const room = !specs || gpuLayers === 0 ? 0 : Math.min(usableVramGB(specs, variant), s.maxVramGB ?? Infinity)
-    const figureAt = (ctx) => estimateMemory(m, { ctx, vramGB: room, measured: measuredFor(s, m.id, ctx, { roomGB: room, gpuLayers }) })
+    const moeRoom = m.moe && gpuLayers === 'auto' ? Math.max(0, room - residency.othersVramGB('llama', { heldOnly: true })) : 0
+    const cpuMoeAt = (ctx) => {
+      const lay = moeRoom > 0 ? moeLayout(m, { vramGB: moeRoom, ctx }) : null
+      if (!lay || moeRoom < lay.gpuNeedGB) return null
+      return { layers: lay.layers, cpuLayers: moeFailed.get(m.id) === moeRoom ? lay.layers : lay.cpuLayers }
+    }
+    const figureAt = (ctx, cpuMoe = cpuMoeAt(ctx)) => estimateMemory(m, { ctx, vramGB: cpuMoe ? moeRoom : room, cpuMoe, measured: measuredFor(s, m.id, ctx, { roomGB: room, gpuLayers, cpuMoe }) })
     const held = { gb: residency.othersRamGB('llama', { heldOnly: true }), by: residency.othersNames('llama', { heldOnly: true }) }
     const ramLeft = s.maxRamGB == null ? null : s.maxRamGB - held.gb
     const all = contextSteps(d.ctx)
@@ -1312,7 +1812,14 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const memory = figureAt(ctx)
     planned.set(m.id, ctx)
     const refusal = unloaded && !steps.length ? `the RAM watchdog unloaded ${m.name ?? m.id}: ${unloaded.why}. Raise the RAM budget to load it again.` : overBudget(memory, s, { name: m.name ?? m.id, ctx, held })
-    return { ctx, reducedFrom: ctx < d.ctx ? d.ctx : null, gpuLayers, room, specs, variant, memory, refusal }
+    const cpuMoe = cpuMoeAt(ctx)
+    let moeFallback = null
+    if (cpuMoe && cpuMoe.cpuLayers < cpuMoe.layers) {
+      const inRam = { layers: cpuMoe.layers, cpuLayers: cpuMoe.layers }
+      const figure = figureAt(ctx, inRam)
+      moeFallback = { cpuMoe: inRam, memory: figure, refusal: overBudget(figure, s, { name: m.name ?? m.id, ctx, held }) }
+    }
+    return { ctx, reducedFrom: ctx < d.ctx ? d.ctx : null, gpuLayers, room, moeRoom, specs, variant, memory, refusal, cpuMoe, moeFallback }
   }
 
   function kill(child) {
@@ -1329,7 +1836,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     clearTimeout(idleTimer)
     const e = engine
     engine = null
-    if (e) { residency.clear('llama', e.resident); kill(e.child); log(`local: engine stopped (${e.modelId})`) }
+    if (e) { e.stopped = true; residency.clear('llama', e.resident); toEngineLog(`KzH: stopping ${e.modelId}`); kill(e.child); log(`local: engine stopped (${e.modelId})`) }
   }
 
   /**
@@ -1385,110 +1892,182 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     // model the budget cannot hold is not started at all.
     const plan = await planFor(m, s)
     if (plan.refusal) throw new Error(plan.refusal)
-    const port = await freePort(basePort)
-    const key = randomBytes(24).toString('hex')
     const { ctx, gpuLayers } = plan
     const limits = limitsFor(s, plan.specs, plan.variant, gpuLayers)
     if (limits.unapplied) log(`local: VRAM budget of ${s.maxVramGB} GB not applied: ${limits.unapplied}`)
     if (plan.reducedFrom) log(`local: the resource budget reduced ${m.id}'s context from ${plan.reducedFrom} to ${ctx}, the largest that fits it`)
     const vision = await visionFor(m.id)
-    const args = [
-      ...llamaArgs({ modelPath: join(modelsDir, m.file), alias: m.id, port, ctx, gpuLayers, fitTargetMiB: limits.fitTargetMiB, threads: limits.threads, thinking: !!m.thinking }),
-      // The vision projector stays on the CPU so the GPU keeps the text model's layers.
-      ...(vision ? ['--mmproj', join(modelsDir, vision.file), '--no-mmproj-offload'] : ['--no-mmproj']),
-    ]
-    signal?.throwIfAborted()
-    // Read after every await above and right before the spawn, so a start that was already on its
-    // way when KzH closed (a speed run's restore, a chat title) loads nothing.
-    if (disposed) throw new Error(`KzH is closing, so ${m.name ?? m.id} was not loaded`)
-    // What shares the machine with this load, as it is spawned: --fit places the layers around the
-    // Laya resident now, held or not, so that is the Laya a speed reading of it was taken beside.
-    const beside = besideLlama()
-    const child = spawn(exe, args, { cwd: engineDir, env: { ...process.env, LLAMA_API_KEY: key }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    counters.loads++
-    // The conditions it runs under are kept on the engine, from the plan it was started with: a speed
-    // reading takes them from the engine that ran, never from a plan made after it (docs/benchmark.md 2.4).
-    const e = {
-      child, modelId: m.id, port, key, ctx, vision: !!vision, startedAt: Date.now(), gpuLayers: null, threads: limits.threads, fitTargetMiB: limits.fitTargetMiB, tail: [], memoryLines: [], memory: null,
-      roomGB: plan.room, gpuLayersSetting: gpuLayers, build: engineBuild(plan.variant), loadMs: null,
-      // The weights it loaded, by the manifest's SHA-256, which an installed file matches.
-      weights: { file: m.file, sha256: m.sha256 },
-      beside, laya: layaDevice(beside),
-    }
-    const onAbort = () => { if (engine === e && !e.loaded) { log(`local: loading ${m.id} cancelled`); stop() } }
-    signal?.addEventListener('abort', onAbort, { once: true })
-    const onLine = (chunk) => {
-      for (const l of String(chunk).split('\n')) {
-        const off = /offloaded (\d+)\/(\d+) layers to GPU/.exec(l)
-        if (off) e.gpuLayers = { gpu: Number(off[1]), total: Number(off[2]) }
-        // Kept apart from the tail, which is a short window for an error message and would have
-        // dropped these long before the engine finished reporting them.
-        if (/buffer size\s*=/i.test(l) && e.memoryLines.length < 60) e.memoryLines.push(l)
-        if (l.trim()) { e.tail.push(l.trim()); if (e.tail.length > 30) e.tail.shift() }
+    // A port found free can be taken before llama-server binds it, or be answered by a program the
+    // check on 127.0.0.1 missed: the start is then made once more, on the next free port.
+    const first = await findPort(basePort)
+    try { return await fitted(first) } catch (err) {
+      if (!err.portTaken) throw err
+      const next = await findPort(first + 1)
+      log(`local: port ${first} ${err.portTaken}; trying port ${next}`)
+      toEngineLog(`KzH: port ${first} ${err.portTaken}; trying port ${next}`)
+      try { return await fitted(next) } catch (again) {
+        throw again.portTaken ? new Error(`llama-server found no port of its own: ${first} ${err.portTaken}, and ${next} ${again.portTaken}`) : again
       }
     }
-    child.stdout.on('data', onLine)
-    child.stderr.on('data', onLine)
-    // While a speed run goes, llama-server's own lines go to its detail log too (2.13): the load
-    // report (the device, how the layers and buffers were fitted) and each request's timing lines.
-    // Whole lines only, since a chunk can end inside one; each stream keeps its own unfinished line.
-    const toDetail = () => {
-      let rest = ''
-      return (chunk) => {
-        if (!speedNote) { rest = ''; return }
-        const parts = (rest + String(chunk)).split('\n')
-        rest = parts.pop()
-        for (const l of parts) if (l.trim()) speedNote(`llama-server: ${l.trimEnd()}`)
+
+    /**
+     * The load on `port` as planned. A mixture-of-experts model whose llama-server exits as it loads
+     * with layers of experts on the GPU (--fit does not move them, so a GPU busier than the plan
+     * thought fails the load) is loaded once more with every expert in RAM, unless the budget refuses
+     * that. Only that load being ready shows the experts' place failed the first, so only then do its
+     * plans in the same room keep every expert in RAM from then on (moeFailed); one that exits too
+     * leaves the next start to try the plan's own layout again.
+     */
+    async function fitted(port) {
+      try { return await launch(port, plan.cpuMoe, plan.memory) } catch (err) {
+        const f = plan.moeFallback
+        if (!f || !err.exited || signal?.aborted || disposed) throw err
+        const onGpu = `the experts of ${plan.cpuMoe.layers - plan.cpuMoe.cpuLayers} layers on the GPU`
+        if (f.refusal) { log(`local: ${m.id} did not load with ${onGpu}, and the budget refuses it with every expert in RAM: ${f.refusal}`); throw err }
+        log(`local: ${m.id} did not load with ${onGpu} (${err.message}); loading it again with every expert in RAM`)
+        toEngineLog(`KzH: ${m.id} did not load with ${onGpu}; loading it again with every expert in RAM`)
+        const loaded = await launch(port, f.cpuMoe, f.memory)
+        moeFailed.set(m.id, plan.moeRoom)
+        return loaded
       }
     }
-    child.stdout.on('data', toDetail())
-    child.stderr.on('data', toDetail())
-    // An engine that exits on its own (a CUDA error, an access violation, a kill from Task Manager)
-    // leaves the shared residency with it, or the RAM and VRAM of a dead process would stay counted
-    // against the budget beside Laya until the next local model starts. Only its own entry: a late
-    // exit never clears one a newer engine registered, and one that never became ready has none.
-    const exited = new Promise((r) => child.once('exit', r)).then((code) => {
-      if (engine === e) engine = null
-      if (e.resident) residency.clear('llama', e.resident)
-      return code
-    })
-    child.once('error', (err) => { e.tail.push(err.message); if (engine === e) engine = null })
-    engine = e
-    log(`local: engine starting ${m.id} on 127.0.0.1:${port} (ctx ${ctx}, GPU layers ${gpuLayers}, ${threadWords(limits.threads)}${gpuLayers === 0 ? '' : `, ${limits.fitTargetMiB} MiB kept free on the GPU`}${vision ? ', vision' : ''})`)
-    e.ready = (async () => {
-      const deadline = Date.now() + 5 * 60_000
-      while (Date.now() < deadline) {
-        if (child.exitCode !== null || engine !== e) throw new Error(`llama-server exited: ${e.tail.slice(-3).join(' | ')}`)
-        const ok = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false)
-        if (ok) {
-          e.loaded = true
-          e.loadMs = Date.now() - e.startedAt
-          loadMs.set(m.id, e.loadMs)
-          // What it really took, at this context size, on this machine. Recorded against both, and
-          // with the GPU room and layers it ran with, so a reading is never shown for a context it
-          // was not measured at, nor taken for a run that splits the model another way.
-          e.memory = readMemoryUsage(e.memoryLines)
-          if (e.memory) { await recordMemory(m.id, ctx, { ...e.memory, roomGB: plan.room, gpuLayers }); log(`local: ${m.id} took ${e.memory.vramGB} GB VRAM + ${e.memory.ramGB} GB RAM at ctx ${ctx}`) }
-          log(`local: engine ready: ${m.id}, ${e.gpuLayers ? `${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : 'GPU layers unknown'}`)
-          // Resident, and watched, from here on, not while loading: the budget is about the model as
-          // it runs, and a model too big to load under it was refused before it started. Held,
-          // because the local model is what the person is using: nothing is ever unloaded for it
-          // to yield to, though the watchdog may still unload it for the budget as it always could.
-          if (engine === e) {
-            e.resident = residency.set('llama', {
-              pid: child.pid, startedAt: e.startedAt, device: gpuLayers === 0 || plan.variant === 'cpu' ? 'cpu' : 'gpu', name: m.id,
-              busy: () => busy > 0, held: () => true, unload: unloadFor(e),
-              ramGB: () => e.memory?.ramGB ?? plan.memory.ramGB, vramGB: () => e.memory?.vramGB ?? plan.memory.vramGB,
-            })
-          }
-          return
+
+    /**
+     * Spawn llama-server on `port` with a key of its own and wait until it is ready. A port that is not
+     * its own (it could not bind it, or another program answers there) fails with `portTaken` saying
+     * which, once this start's llama-server is gone from it. `cpuMoe` keeps a mixture-of-experts
+     * model's experts in RAM, and `planned` is the memory figure of that load.
+     */
+    async function launch(port, cpuMoe, planned) {
+      const key = randomBytes(24).toString('hex')
+      const args = [
+        ...llamaArgs({ modelPath: join(modelsDir, m.file), alias: m.id, port, ctx, gpuLayers, fitTargetMiB: limits.fitTargetMiB, threads: limits.threads, thinking: !!m.thinking, cpuMoe }),
+        // The vision projector stays on the CPU so the GPU keeps the text model's layers.
+        ...(vision ? ['--mmproj', join(modelsDir, vision.file), '--no-mmproj-offload'] : ['--no-mmproj']),
+      ]
+      signal?.throwIfAborted()
+      // Read after every await above and right before the spawn, so a start that was already on its
+      // way when KzH closed (a speed run's restore, a chat title) loads nothing.
+      if (disposed) throw new Error(`KzH is closing, so ${m.name ?? m.id} was not loaded`)
+      // What shares the machine with this load, as it is spawned: --fit places the layers around the
+      // Laya resident now, held or not, so that is the Laya a speed reading of it was taken beside.
+      const beside = besideLlama()
+      const child = spawn(exe, args, { cwd: engineDir, env: { ...process.env, LLAMA_API_KEY: key }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      counters.loads++
+      // The conditions it runs under are kept on the engine, from the plan it was started with: a speed
+      // reading takes them from the engine that ran, never from a plan made after it (docs/benchmark.md 2.4).
+      const e = {
+        child, modelId: m.id, port, key, ctx, vision: !!vision, startedAt: Date.now(), gpuLayers: null, threads: limits.threads, fitTargetMiB: limits.fitTargetMiB, tail: [], memoryLines: [], memory: null,
+        roomGB: plan.room, gpuLayersSetting: gpuLayers, cpuMoe: cpuMoe ?? null, build: engineBuild(plan.variant), loadMs: null,
+        // The weights it loaded, by the manifest's SHA-256, which an installed file matches.
+        weights: { file: m.file, sha256: m.sha256 },
+        beside, laya: layaDevice(beside),
+      }
+      const onAbort = () => { if (engine === e && !e.loaded) { log(`local: loading ${m.id} cancelled`); stop() } }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      const onLine = (chunk) => {
+        for (const l of String(chunk).split('\n')) {
+          const off = /offloaded (\d+)\/(\d+) layers to GPU/.exec(l)
+          if (off) e.gpuLayers = { gpu: Number(off[1]), total: Number(off[2]) }
+          // Kept apart from the tail, which is a short window for an error message and would have
+          // dropped these long before the engine finished reporting them.
+          if (/buffer size\s*=/i.test(l) && e.memoryLines.length < 60) e.memoryLines.push(l)
+          if (l.trim()) { e.tail.push(l.trim()); if (e.tail.length > 30) e.tail.shift() }
         }
-        await Promise.race([sleep(500), exited])
       }
-      throw new Error('llama-server did not become ready within 5 minutes')
-    })()
-    e.ready.catch(() => { if (engine === e) stop() }).finally(() => signal?.removeEventListener('abort', onAbort))
-    return e.ready
+      child.stdout.on('data', onLine)
+      child.stderr.on('data', onLine)
+      // While a speed run goes, llama-server's own lines go to its detail log too (2.13): the load
+      // report (the device, how the layers and buffers were fitted) and each request's timing lines.
+      // Whole lines only, since a chunk can end inside one; each stream keeps its own unfinished line.
+      const toDetail = () => {
+        let rest = ''
+        return (chunk) => {
+          if (!speedNote) { rest = ''; return }
+          const parts = (rest + String(chunk)).split('\n')
+          rest = parts.pop()
+          for (const l of parts) if (l.trim()) speedNote(`llama-server: ${l.trimEnd()}`)
+        }
+      }
+      child.stdout.on('data', toDetail())
+      child.stderr.on('data', toDetail())
+      // And every whole line to llama-server's log on disk, with this start's key taken out.
+      const toDisk = () => {
+        let rest = ''
+        return (chunk) => {
+          const parts = (rest + String(chunk)).split('\n')
+          rest = parts.pop()
+          const lines = parts.filter((l) => l.trim()).map((l) => l.trimEnd())
+          if (lines.length) toEngineLog(lines, key)
+        }
+      }
+      if (engineLog) { child.stdout.on('data', toDisk()); child.stderr.on('data', toDisk()) }
+      // Its last lines can come after its exit: a bind failure is read from them once its output has closed.
+      const closed = new Promise((r) => child.once('close', r))
+      // An engine that exits on its own (a CUDA error, an access violation, a kill from Task Manager)
+      // leaves the shared residency with it, or the RAM and VRAM of a dead process would stay counted
+      // against the budget beside Laya until the next local model starts. Only its own entry: a late
+      // exit never clears one a newer engine registered, and one that never became ready has none.
+      const exited = new Promise((r) => child.once('exit', r)).then((code) => {
+        if (engine === e) engine = null
+        if (e.resident) residency.clear('llama', e.resident)
+        toEngineLog(`KzH: llama-server exited${code == null ? '' : ` with code ${code}`}`)
+        return code
+      })
+      child.once('error', (err) => { e.tail.push(err.message); if (engine === e) engine = null })
+      engine = e
+      log(`local: engine starting ${m.id} on 127.0.0.1:${port} (ctx ${ctx}, GPU layers ${gpuLayers}, ${threadWords(limits.threads)}${gpuLayers === 0 ? '' : `, ${limits.fitTargetMiB} MiB kept free on the GPU`}${cpuMoe ? `, ${expertWords(cpuMoe)}` : ''}${vision ? ', vision' : ''})`)
+      toEngineLog(`KzH: starting ${m.id} on 127.0.0.1:${port}: ${[exe, ...args].map((a) => (/[\s"]/.test(a) ? `"${a}"` : a)).join(' ')}`, key)
+      e.ready = (async () => {
+        const deadline = Date.now() + 5 * 60_000
+        while (Date.now() < deadline) {
+          if (child.exitCode !== null || engine !== e) {
+            if (!e.stopped) await Promise.race([closed, sleep(500)])
+            if (!e.stopped && e.tail.some((l) => BIND_FAILED.test(l))) throw Object.assign(new Error(`llama-server could not bind 127.0.0.1:${port}`), { portTaken: 'was taken before llama-server could bind it' })
+            throw Object.assign(new Error(`llama-server exited: ${e.tail.slice(-3).join(' | ')}`), { exited: true })
+          }
+          const seen = await probeLlama({ port, key, alias: m.id, fetch })
+          if (seen.other && engine === e) {
+            // This start's llama-server may have bound the port beside that program, as Windows lets a
+            // socket with SO_REUSEADDR (llama-server's) do: it is stopped, and gone, before the next port is tried.
+            await stop()
+            let bound
+            await Promise.race([exited, new Promise((r) => { bound = setTimeout(r, 5000) })])
+            clearTimeout(bound)
+            throw Object.assign(new Error(`port ${port} is answered by another program (${seen.other})`), { portTaken: `is answered by another program (${seen.other})` })
+          }
+          if (seen.ready) {
+            e.loaded = true
+            e.loadMs = Date.now() - e.startedAt
+            loadMs.set(m.id, e.loadMs)
+            // What it really took, at this context size, on this machine. Recorded against both, and
+            // with the GPU room and layers it ran with, so a reading is never shown for a context it
+            // was not measured at, nor taken for a run that splits the model another way.
+            e.memory = readMemoryUsage(e.memoryLines)
+            if (e.memory) { await recordMemory(m.id, ctx, { ...e.memory, roomGB: plan.room, gpuLayers, ...(cpuMoe && { cpuMoeLayers: cpuMoe.cpuLayers }) }); log(`local: ${m.id} took ${e.memory.vramGB} GB VRAM + ${e.memory.ramGB} GB RAM at ctx ${ctx}`) }
+            const layers = e.gpuLayers ? `${e.gpuLayers.gpu}/${e.gpuLayers.total} layers on GPU` : 'GPU layers unknown'
+            log(`local: engine ready: ${m.id}, ${layers}`)
+            toEngineLog(`KzH: ready: ${m.id} on 127.0.0.1:${port} after ${(e.loadMs / 1000).toFixed(1)} s, ${layers}`)
+            // Resident, and watched, from here on, not while loading: the budget is about the model as
+            // it runs, and a model too big to load under it was refused before it started. Held,
+            // because the local model is what the person is using: nothing is ever unloaded for it
+            // to yield to, though the watchdog may still unload it for the budget as it always could.
+            if (engine === e) {
+              e.resident = residency.set('llama', {
+                pid: child.pid, startedAt: e.startedAt, device: gpuLayers === 0 || plan.variant === 'cpu' ? 'cpu' : 'gpu', name: m.id,
+                busy: () => busy > 0, held: () => true, unload: unloadFor(e),
+                ramGB: () => e.memory?.ramGB ?? planned.ramGB, vramGB: () => e.memory?.vramGB ?? planned.vramGB,
+              })
+            }
+            return
+          }
+          await Promise.race([sleep(500), exited])
+        }
+        throw new Error('llama-server did not become ready within 5 minutes')
+      })()
+      e.ready.catch(() => { if (engine === e) stop() }).finally(() => signal?.removeEventListener('abort', onAbort))
+      return e.ready
+    }
   }
 
   /** The installed engine build, as a speed reading names it: its variant and the manifest SHA-256 of the variant's first module, its llama-server zip. */
@@ -1509,13 +2088,23 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   /**
    * Hold the engine on `modelId` for one request. Starts it, or switches model
    * once no other request is using it. Returns the connection and a release().
+   * A `signal` that fires while the request waits its turn, or for another model's requests to end,
+   * rejects at once with its reason, and nothing is loaded for it: a run that has ended swaps no model
+   * in. It gives up its place only as its turn comes, so no request behind it goes first.
    */
-  function acquire(modelId) {
+  function acquire(modelId, { signal } = {}) {
     // ponytail: one model loaded at a time (4 GB VRAM); a request for the other model waits for in-flight ones.
+    // Set once it holds the engine. Before that a stop lets the caller go at once, and its turn, when it comes, only throws the stop.
+    let taken = false
     const got = lock.then(async () => {
-      while (busy > 0 && engine && engine.modelId !== modelId) await sleep(500)
+      signal?.throwIfAborted()
+      while (busy > 0 && engine && engine.modelId !== modelId) {
+        await sleep(500)
+        signal?.throwIfAborted()
+      }
       clearTimeout(idleTimer)
       busy++
+      taken = true
       // A request has reached the engine: a speed reading taken while this moved had company (2.3).
       served++
       try {
@@ -1524,7 +2113,13 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       return held(engine)
     })
     lock = got.catch(() => {})
-    return got
+    if (!signal) return got
+    return new Promise((resolve, reject) => {
+      const letGo = () => { if (!taken) reject(signal.reason) }
+      if (signal.aborted) letGo()
+      else signal.addEventListener('abort', letGo, { once: true })
+      got.then(resolve, reject).finally(() => signal.removeEventListener('abort', letGo))
+    })
   }
 
   /** A connection holding the engine `e` until its release(), which lets the idle stop run again. */
@@ -1578,7 +2173,13 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
    */
   async function* stream(options, { attachments } = {}) {
     let conn
-    try { conn = await acquire(options.model) } catch (err) { yield failure('LOCAL_ENGINE', err.message.slice(0, 300)); return }
+    // A call stopped while it waited for the engine throws its stop, as one stopped mid-answer does:
+    // it never reads as the engine failing.
+    try { conn = await acquire(options.model, { signal: options.signal }) } catch (err) {
+      if (options.signal?.aborted) throw err
+      yield failure('LOCAL_ENGINE', err.message.slice(0, 300))
+      return
+    }
     try {
       let images
       if (conn.vision && attachments) {
@@ -1593,7 +2194,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
         signal: options.signal,
       })
       if (!r.ok) { yield failure(`HTTP_${r.status}`, (await r.text().catch(() => '')).slice(0, 300) || `llama-server HTTP ${r.status}`); return }
-      yield* translate(sseData(r.body))
+      yield* translate(sseData(r.body), { signal: options.signal })
     } finally { conn.release() }
   }
 
@@ -1655,7 +2256,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   const refusal = (status, message) => Object.assign(new Error(message), { status })
   const nameOf = (id) => mod(id)?.name ?? id
   /** Each phase as the detail log says it (2.13). */
-  const SPEED_PHASE = { loading: 'loading at the context its runs get', warming: 'warm-up request, not timed', reading: `reading the ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt`, measuring: 'timed request', restoring: 'putting the engine back as it was' }
+  const SPEED_PHASE = { loading: 'loading at the context its runs get', warming: 'warm-up request, not timed', reading: `reading the ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt`, measuring: 'timed request', checking: 'output check, decoded greedily, not timed', restoring: 'putting the engine back as it was' }
   /** Why one model records nothing, carried up from wherever in its measurement it was found. */
   class NotMeasured extends Error {}
 
@@ -1733,6 +2334,38 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     return true
   }
 
+  /**
+   * Accept new output (2.15): the model's reading held because its output differed from its baseline
+   * becomes its speed reading, marked `accepted`, and that output the baseline later runs of its key
+   * are held to; the speed run history says who accepted it. `by` names them, as a run's own does.
+   * Answers the reading and the history's line. Refused with `status` 409 while a speed run goes,
+   * and 400 when the model has nothing held.
+   */
+  async function acceptOutput(id, { by = 'Settings, Local models' } = {}) {
+    if (speedRun) throw refusal(409, 'A speed benchmark is running; accept the new output once it has ended.')
+    if (!(typeof id === 'string' && id)) throw refusal(400, 'id: the local chat model whose new output to accept')
+    const at = new Date()
+    let accepted = null
+    await mutate(async (s) => {
+      const [key, reading] = Object.entries(s.speedHeld ?? {}).find(([k, r]) => modelOfKey(k) === id && r?.output?.state === 'differs') ?? []
+      if (!reading) throw refusal(400, `${nameOf(id)} has no new output waiting to be accepted.`)
+      // The baseline first: should local.json then fail to save, the reading stays held, and accepting it again writes the same baseline.
+      const { text, tokens, baselineText, ...verdict } = reading.output
+      await changeBaselines((all) => ({ ...all, [outputKey(id, reading)]: baselineOf(id, reading, { text, tokens }) }))
+      accepted = { ...reading, output: { ...verdict, state: 'accepted', acceptedAt: at.toISOString() } }
+      const { [key]: _taken, ...rest } = s.speedHeld
+      return { ...s, speed: { ...s.speed, [key]: accepted }, speedHeld: rest }
+    })
+    const line = `accepted the new output of ${nameOf(id)}: its figure of ${dayText(accepted.at)}, ${accepted.tokensPerSec.toFixed(1)} tokens/s generating, is its speed now, and that output the baseline its later runs are held to (it differed from the ${dayText(accepted.output.baselineAt)} baseline after ${accepted.output.agreed} ${accepted.output.unit})`
+    log(`local: ${line}`)
+    if (speedLogDir) {
+      try { mkdirSync(speedLogDir, { recursive: true }); appendFileSync(join(speedLogDir, SPEED_HISTORY), `${utcMinute(at)}, ${by}: ${line}.\n\n`) } catch (err) {
+        consoleLog(`local: the speed run history could not be written (${SPEED_HISTORY}: ${err.code ?? err.message})`)
+      }
+    }
+    return { reading: accepted, line }
+  }
+
   async function runSpeed(run) {
     try {
       while (run.queue.length && !run.cancelled) {
@@ -1785,6 +2418,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       `Laya: ${laya ? `held on ${laya === 'cuda' ? 'the GPU' : 'the CPU'}` : 'none held'}`,
       `Models, in this order: ${run.order.map((id) => `${nameOf(id)} (${id})`).join(', ')}`,
       `Each: a warm-up, the ${SPEED_DEPTH.toLocaleString('en-US')}-token prompt read once, then ${SPEED_PREDICT} tokens generated three times; the median is kept.`,
+      `Then its output check: ${CHECK_PREDICT} tokens of a fixed prompt decoded greedily, held to the first output kept for the same weights, engine build and GPU split, with which at least ${Math.round(outputShare * 100)}% of it must agree from its start (local.outputCheckShare ${outputShare}).`,
       '', '',
     ].join('\n'))
     speedNote = (t) => run.write(`${new Date().toISOString().slice(11, 23)}  ${String(t).replace(/^local: /, '')}\n`)
@@ -1801,7 +2435,9 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       const line = run.done.find((d) => d.id === id)
       const name = nameOf(id).padEnd(width)
       if (!line) return `  ${name}  not measured: cancelled before its turn`
-      return `  ${name}  ${line.ok ? speedFigures(line) : `not measured: ${line.why}`}`
+      // The output check's verdict on a line of its own under the figures (2.15).
+      const output = line.ok ? outputWords(line.reading.output) : null
+      return `  ${name}  ${line.ok ? speedFigures(line) : `not measured: ${line.why}`}${output ? `\n  ${' '.repeat(width)}  ${output}` : ''}`
     })
     const measured = run.done.filter((d) => d.ok).length
     const entry = [
@@ -1817,6 +2453,56 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       consoleLog(`local: the speed run history could not be written (${SPEED_HISTORY}: ${err.code ?? err.message})`)
     }
     speedLast.logError = run.logError
+  }
+
+  /**
+   * The highest working set the engine `e` reaches while a speed run measures it, in GB: the reading
+   * the RAM watchdog takes (readWorkingSet), taken at once, every `watchEveryMs` after and once more
+   * at stop(), which gives the peak, or null when no reading could be taken. A model's weights are
+   * mapped from its file, so this counts the pages of it Windows holds in RAM for the engine.
+   */
+  function ramPeak(e) {
+    let peak = null
+    let last = Promise.resolve()
+    const read = () => (last = last.then(() => readWorkingSet(e.child.pid)).then((b) => { if (Number.isFinite(b) && b > 0) peak = Math.max(peak ?? 0, b) }, () => {}))
+    read()
+    const timer = setInterval(read, watchEveryMs)
+    timer.unref?.()
+    let done = null
+    return { stop: () => (done ??= (clearInterval(timer), read().then(() => (peak == null ? null : r1(peak / GB))))) }
+  }
+
+  /**
+   * The output check's verdict on a reading (2.15), from the output its run got: the first output of
+   * its key (outputKey) is kept as that key's baseline, and with it how far it agrees with the newest
+   * baseline of the same weights under another build or split, for the logs; a later one is `same`
+   * when it repeats at least `outputShare` of the baseline from its start, and otherwise `differs`,
+   * carrying both outputs, so the person can read them before accepting the new one. A check that did
+   * not run, an empty output, or a baselines file that cannot be read or written leaves it `unchecked`
+   * with why; a file that cannot be read is never written over.
+   */
+  async function checkOutput(m, reading, got) {
+    if (got.why) return { state: 'unchecked', why: got.why }
+    if (!got.text) return { state: 'unchecked', why: 'llama-server gave no text' }
+    let all
+    try { all = await readBaselines() } catch (err) { return { state: 'unchecked', why: `${OUTPUT_BASELINES} could not be read (${err.code ?? err.message})` } }
+    const key = outputKey(m.id, reading)
+    const base = all[key]
+    if (base) {
+      const verdict = compareOutput(base, got, outputShare)
+      return verdict.state === 'same' ? verdict : { ...verdict, text: got.text, tokens: got.tokens, baselineText: base.text }
+    }
+    try { await changeBaselines((now) => ({ ...now, [key]: baselineOf(m.id, reading, got) })) } catch (err) {
+      return { state: 'unchecked', why: `its baseline could not be kept in ${OUTPUT_BASELINES} (${err.code ?? err.message})` }
+    }
+    const weights = reading.weights?.sha256 ?? null
+    const other = Object.entries(all).filter(([k, b]) => k !== key && b?.id === m.id && b.weights === weights).map(([, b]) => b).sort((a, b) => String(b.at).localeCompare(String(a.at)))[0]
+    if (!other) return { state: 'baseline' }
+    const v = compareOutput(other, got, outputShare)
+    const build = !sameBuild(other.engine, reading.engine)
+    const split = other.split !== splitWords(reading)
+    const what = build && split ? `another engine build and GPU split (${other.split})` : build ? 'another engine build' : `another GPU split (${other.split})`
+    return { state: 'baseline', also: { agreed: v.agreed, of: v.of, unit: v.unit, baselineAt: other.at, other: what } }
   }
 
   /** One model's measurement (2.1): its line for the card, `ok` when a reading was recorded. Never throws. */
@@ -1844,14 +2530,30 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       let conn
       try { conn = await reload(m.id, { signal }) } catch (err) { return no(signal.aborted ? 'cancelled' : `it did not load (${String(err.message).replace(/[\s.:|]+$/, '')})`) }
       const e = engine
+      const ram = ramPeak(e)
       try {
-        const reading = await measureLoaded(m, e, conn, { signal, at, note: (t) => speedNote?.(`${name}: ${t}`) })
-        await mutate((s) => ({ ...s, speed: { ...s.speed, [`${m.id}@${e.ctx}`]: reading } }))
+        const { output, ...timed } = await measureLoaded(m, e, conn, { signal, at, note: (t) => speedNote?.(`${name}: ${t}`) }).finally(() => ram.stop())
+        const reading = { ...timed, peakRamGB: await ram.stop() }
+        // The output check's verdict (2.15). A reading whose output differs from its baseline is kept
+        // apart, under speedHeld, and the model's speed stays the reading it had until the person
+        // accepts the new output (acceptOutput); any other is kept as before, and drops the reading
+        // held for the model before it, since the newest run describes the machine as it is now.
+        reading.output = await checkOutput(m, reading, output)
+        const held = reading.output.state === 'differs'
+        speedNote?.(`${name}: ${outputWords(reading.output)}`)
+        const key = `${m.id}@${e.ctx}`
+        await mutate((s) => {
+          const others = Object.fromEntries(Object.entries(s.speedHeld ?? {}).filter(([k]) => modelOfKey(k) !== m.id))
+          return held ? { ...s, speedHeld: { ...others, [key]: reading } } : { ...s, speed: { ...s.speed, [key]: reading }, speedHeld: others }
+        })
         const prompt = reading.promptTokensPerSec == null
           ? '; its reading speed was not measured, because llama-server reused its prompt cache'
           : ` and ${Math.round(reading.promptTokensPerSec)} tokens/s reading`
         const ctx = e.ctx % 1024 === 0 ? `${e.ctx / 1024}k` : `${e.ctx} tokens of`
-        return { id: m.id, ok: true, text: `${name}: ${reading.tokensPerSec.toFixed(1)} tokens/s generating${prompt}, ${SPEED_DEPTH.toLocaleString('en-US')} tokens into a conversation, at ${ctx} context.`, ctx: e.ctx, reading, memory: e.memory ?? null }
+        const peak = reading.peakRamGB == null ? '' : `, peak RAM ${reading.peakRamGB.toFixed(1)} GB`
+        // Output that differs, or that could not be checked, is said on the line too, since it decides what the figure counts for.
+        const checked = held || reading.output.state === 'unchecked' ? ` Its ${outputWords(reading.output)}.` : ''
+        return { id: m.id, ok: true, text: `${name}: ${reading.tokensPerSec.toFixed(1)} tokens/s generating${prompt}, ${SPEED_DEPTH.toLocaleString('en-US')} tokens into a conversation, at ${ctx} context${peak}.${checked}`, ctx: e.ctx, reading, memory: e.memory ?? null, ...(held && { held: true }) }
       } finally { conn.release() }
     } catch (err) {
       if (signal.aborted) return no('cancelled')
@@ -1883,7 +2585,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     // holds such a cut character back and ends with its timings all the same. Text with a broken
     // character inside it is refused either way, as an error event after HTTP 200, and records
     // nothing, in llama-server's own words.
-    const completion = async (path, body, minutes) => {
+    const completion = async (path, body, minutes, onEvent = () => {}) => {
       const limit = AbortSignal.timeout(minutes * 60_000)
       const streamed = body.stream === true
       try {
@@ -1917,6 +2619,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
             const said = typeof e === 'string' ? e : typeof e?.message === 'string' ? e.message : JSON.stringify(e)
             throw new NotMeasured(`llama-server stopped with an error: ${said.replace(/[\s.]+$/, '')}`)
           }
+          onEvent(event)
           last = event
         }
         if (engine !== e) throw gone()
@@ -1972,7 +2675,32 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     }
     const [low, median, high] = [...runs].sort((a, b) => a - b)
     if (high - low > SPEED_SPREAD * median) throw new NotMeasured('the three runs disagreed; something else was using the machine')
+
+    // The output check (2.15): the fixed prompt, decoded greedily, as text with no chat template and
+    // no prompt cache, and its answer as it streamed: the text, and the token ids llama-server sends
+    // with each piece (a token whose text ends inside a character comes with the next one's text, and
+    // its id is not sent), or none when a piece came without them. What stops it records the speed
+    // all the same, with why the output was not checked; only a cancel goes further.
+    at('checking')
+    let output
+    try {
+      const got = { text: '', tokens: [] }
+      let ids = true
+      await completion('/completion', { prompt: CHECK_PROMPT, n_predict: CHECK_PREDICT, ignore_eos: true, cache_prompt: false, temperature: 0, top_k: 1, seed: 1, stream: true }, REQUEST_MINUTES, (event) => {
+        const pieceIds = Array.isArray(event.tokens) && event.tokens.every(Number.isInteger) ? event.tokens : null
+        if (typeof event.content === 'string') got.text += event.content
+        if (pieceIds) got.tokens.push(...pieceIds)
+        if (event.content && !pieceIds?.length) ids = false
+      })
+      output = { text: got.text, tokens: ids && got.tokens.length ? got.tokens : null }
+      // The answer itself in the detail log, so two runs can be read side by side.
+      note(`output check answered ${output.tokens ? `${output.tokens.length} token ids` : 'without token ids'}: ${JSON.stringify(got.text)}`)
+    } catch (err) {
+      if (!(err instanceof NotMeasured) || signal.aborted) throw err
+      output = { why: err.message }
+    }
     return {
+      output,
       at: new Date().toISOString(),
       tokensPerSec: r1(median), promptTokensPerSec: promptTokensPerSec == null ? null : r1(promptTokensPerSec), depth: SPEED_DEPTH, nPredict: SPEED_PREDICT,
       runs: runs.map((x) => ({ tokensPerSec: r1(x) })),
@@ -1981,6 +2709,8 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       engine: e.build, weights: e.weights,
       layersOnGpu: e.gpuLayers ?? null,
       vision: e.vision, laya: e.laya,
+      // Where a mixture-of-experts model's experts were: the layers whose experts stayed in RAM.
+      ...(e.cpuMoe && { cpuMoe: e.cpuMoe }),
     }
   }
 
@@ -2019,34 +2749,124 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   /** What a local agent's attempt says while a speed run holds it back (2.6). */
   const speedWaitLine = (run) => `Waiting for the speed benchmark to finish (${nameOf(run.order[Math.max(0, run.index - 1)])}, ${Math.max(1, run.index)} of ${run.order.length}).`
 
+  // The model each local agent's attempt holds while it works (localAgentAttempt), with who holds it:
+  // an attempt for another model waits until no attempt holds one, rather than take turns with it
+  // call by call, each unloading the other's model between two calls and loading its own again with
+  // its whole context to read again (the Strata addendum: a model is held while an agent's run works).
+  const holds = new Map() // model id -> Set of { who }
+  // The attempts waiting for their model, in order of arrival, each { model, who, since, wake, cancel }.
+  // The wait is capped (the owner's decision of 9 Oct): once one has waited `modelWaitCapMinutes`, no
+  // attempt joins the model held ahead of it, so that model is let go once the attempts already on it
+  // end, and its own is loaded next. Before the cap an attempt on the model held starts at once.
+  let inLine = []
+  const waitCapMs = modelWaitCapMinutes * 60_000
+  /** The attempt that holds a model other than `modelId` now, as `{ model, who }`, or null. */
+  function holderBesides(modelId) {
+    for (const [m, set] of holds) if (m !== modelId) for (const h of set) return { model: m, who: h.who }
+    return null
+  }
+  /** Whether `w`, in line, has waited the cap for its model. */
+  const overdue = (w) => now() - w.since >= waitCapMs
+  /**
+   * The first attempt ahead of `me` in line (anywhere in it, for an attempt not in line yet) that has
+   * waited the cap for a model other than `modelId`, or undefined. One that has not waited the cap is
+   * never ahead of one that has, so those that have go in order of arrival.
+   */
+  const overdueAhead = (modelId, me) => inLine.slice(0, me ? inLine.indexOf(me) : inLine.length).find((w) => w.model !== modelId && overdue(w))
+  /** Every attempt in line looks again at what holds it back, and says so if that has changed. */
+  function moveLine() {
+    for (const w of inLine) { const wake = w.wake; w.wake = null; wake?.() }
+  }
+  /** Hold `modelId` for one attempt, by `who`: answers the function that lets it go, which tells the attempts waiting. */
+  function holdModel(modelId, who) {
+    const h = { who }
+    if (!holds.has(modelId)) holds.set(modelId, new Set())
+    holds.get(modelId).add(h)
+    return () => {
+      const set = holds.get(modelId)
+      if (!set?.delete(h)) return
+      if (!set.size) holds.delete(modelId)
+      moveLine()
+    }
+  }
+  /**
+   * What keeps an attempt on `modelId` from starting now, `me` its place in line if it has one:
+   * another model held, as `{ model, who }`, else an attempt ahead of it that has waited the cap for
+   * another model, as `{ model, who, turn: true }`; null when nothing does.
+   */
+  function heldBack(modelId, me) {
+    const h = holderBesides(modelId)
+    if (h) return h
+    const w = overdueAhead(modelId, me)
+    return w ? { model: w.model, who: w.who, turn: true } : null
+  }
+  /** What an attempt held back by `h` says: once it has waited the cap with none ahead of it, that it is next. */
+  function holdWaitLine(h, modelId, me) {
+    const who = h.who ?? 'another task'
+    if (h.turn) return `Waiting for ${who}, which has waited longer, to finish with ${nameOf(h.model)}: one local model works at a time.`
+    if (overdue(me) && !overdueAhead(modelId, me)) return `Waiting for ${who} to finish with ${nameOf(h.model)}; it is next once that ends.`
+    return `Waiting for ${who} to finish with ${nameOf(h.model)}: one local model works at a time.`
+  }
+
   /**
    * One local agent's attempt, `work`, counted while it runs, so a speed run is refused meanwhile
    * (2.7). While a speed run goes it waits before it starts, and says so through `onWait` each time
    * the run moves on to another model: otherwise the run and the agent would take turns, each
    * measured model unloading the agent's, and each agent turn loading it again and reading its
-   * whole context again. The wait goes through `untimed` (the router's attemptClock), so it never
-   * counts against the attempt's own time: a run that outlasts the attempt's time limit cannot turn
-   * the wait into a failed attempt, a retry and evidence against a model that never started. A
-   * `signal` that fires while it waits (the run is stopped) ends the attempt with an error that says
-   * it was waiting. The last check that no run goes and the count of agents at work are one step,
-   * so no speed run can start between them.
+   * whole context again. With its `model` it holds that model until it ends, by `who` (its task),
+   * and it waits the same way while another attempt holds another model, its line naming who, so two
+   * local agents never take turns unloading each other's model; requests that are no attempt's (a
+   * chat's) still go as they come. One on the model held starts at once, unless an attempt waiting
+   * for another model has waited the cap (`modelWaitCapMinutes`): then it waits behind that one,
+   * whose line says it is next, and those that have waited the cap go in order of arrival. Each wait
+   * goes through `untimed` (the router's attemptClock), so it never counts against the attempt's own
+   * time: a run that outlasts the attempt's time limit cannot turn the wait into a failed attempt, a
+   * retry and evidence against a model that never started. A `signal` that fires while it waits (the
+   * run is stopped) ends the attempt with an error that says what it was waiting for. The last checks
+   * and the count of agents at work with the attempt's hold are one step, so neither a speed run nor
+   * another model's hold can start between.
    */
-  async function localAgentAttempt(work, { signal, onWait, untimed = (p) => p } = {}) {
+  async function localAgentAttempt(work, { signal, onWait, untimed = (p) => p, model = null, who = null } = {}) {
     let said = null
-    while (speedRun) {
-      const line = speedWaitLine(speedRun)
-      if (line !== said) { said = line; try { onWait?.(line) } catch { /* the caller's line */ } }
-      await untimed(new Promise((resolve, reject) => {
-        const stopped = () => new Error(`stopped while it waited for the speed benchmark to finish (${signal.reason?.message ?? signal.reason ?? 'aborted'})`)
-        if (signal?.aborted) return reject(stopped())
-        const done = () => { signal?.removeEventListener('abort', abort); resolve() }
-        const abort = () => { speedWaiters = speedWaiters.filter((w) => w !== done); reject(stopped()) }
-        speedWaiters.push(done)
-        signal?.addEventListener('abort', abort, { once: true })
-      }))
+    const say = (line) => { if (line !== said) { said = line; try { onWait?.(line) } catch { /* the caller's line */ } } }
+    const waitIn = (list, what) => untimed(new Promise((resolve, reject) => {
+      const stopped = () => new Error(`stopped while it waited for ${what} (${signal.reason?.message ?? signal.reason ?? 'aborted'})`)
+      if (signal?.aborted) return reject(stopped())
+      const done = () => { signal?.removeEventListener('abort', abort); resolve() }
+      const abort = () => { list.drop(done); reject(stopped()) }
+      list.add(done)
+      signal?.addEventListener('abort', abort, { once: true })
+    }))
+    // Its place in line, from the first time it waits for its model until it starts or is stopped.
+    let me = null
+    try {
+      for (;;) {
+        if (speedRun) {
+          say(speedWaitLine(speedRun))
+          await waitIn({ add: (d) => speedWaiters.push(d), drop: (d) => { speedWaiters = speedWaiters.filter((w) => w !== d) } }, 'the speed benchmark to finish')
+          continue
+        }
+        const h = model ? heldBack(model, me) : null
+        if (!h) break
+        if (!me) {
+          const mine = { model, who, since: now(), wake: null, cancel: null }
+          // Its line changes once it has waited the cap; a timer that fires before the clock says so,
+          // as one on the wall clock can by a millisecond, is set again for what is left.
+          const arm = (ms) => { mine.cancel = setTimer(() => (overdue(mine) ? moveLine() : arm(mine.since + waitCapMs - now())), ms) }
+          arm(waitCapMs)
+          inLine.push(mine)
+          me = mine
+        }
+        say(holdWaitLine(h, model, me))
+        await waitIn({ add: (d) => { me.wake = d }, drop: () => { me.wake = null } }, `${h.who ?? 'another task'} to finish with ${nameOf(h.model)}`)
+      }
+    } finally {
+      // Out of line, started or stopped: those behind it look again.
+      if (me) { me.cancel(); inLine = inLine.filter((w) => w !== me); moveLine() }
     }
     agentsAtWork++
-    try { return await work() } finally { agentsAtWork-- }
+    const letGo = model ? holdModel(model, who) : null
+    try { return await work() } finally { agentsAtWork--; letGo?.() }
   }
 
   /** A model's line as the card has it; its figures stay in speedResults(). */
@@ -2063,18 +2883,21 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     let lastLog = 0
     let resumedAt = null
     const onProgress = (n) => {
-      resumedAt ??= n
+      // From the lowest point, so a download that started over never shows a speed below zero.
+      resumedAt = Math.min(resumedAt ?? n, n)
       job.received = n
       const secs = (Date.now() - job.startedAt) / 1000
       job.bytesPerSec = secs > 0 ? (n - resumedAt) / secs : 0
       if (Date.now() - lastLog > 5000) { lastLog = Date.now(); log(`local: ${m.id} ${Math.floor((n / m.size) * 100)}% (${(job.bytesPerSec / 1e6).toFixed(1)} MB/s)`) }
     }
+    // A connection that dropped and is tried again, or a resume the server did not honour.
+    const onNote = (t) => log(`local: ${m.id}: ${t}`)
     log(`local: installing ${m.id} from ${m.source} (${gb(m.size)})`)
     try {
       if (m.kind === 'engine') {
         await mkdir(engineDir, { recursive: true })
         const zip = join(engineDir, m.file)
-        await downloadVerified({ url: m.source, dest: zip, size: m.size, sha256: m.sha256, fetch, onProgress })
+        await downloadVerified({ url: m.source, dest: zip, size: m.size, sha256: m.sha256, fetch, onProgress, onNote })
         job.state = 'extracting'
         await unzip(zip, engineDir, spawn)
         await unlink(zip)
@@ -2082,7 +2905,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       } else {
         await mkdir(modelsDir, { recursive: true })
         const dest = join(modelsDir, m.file)
-        await downloadVerified({ url: m.source, dest, size: m.size, sha256: m.sha256, fetch, onProgress })
+        await downloadVerified({ url: m.source, dest, size: m.size, sha256: m.sha256, fetch, onProgress, onNote })
         const st = await stat(dest)
         await writeJson(fileMarker(m), { size: st.size, mtimeMs: st.mtimeMs, sha256: m.sha256 })
       }
@@ -2100,9 +2923,12 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   /**
    * What installing `ids` takes, in order: the engine build for this PC when none
    * is installed, a vision add-on's model, then the modules; installed ones skipped.
+   * A row not pinned yet refuses the whole install, before anything is queued.
    */
   async function plan(ids) {
     const want = ids.map((id) => { const m = mod(id); if (!m) throw new Error(`unknown module ${id}`); return m })
+    const unpinned = want.filter((m) => !isPinned(m))
+    if (unpinned.length) throw new Error(unpinned.map((m) => `${m.name ?? m.id} is ${notCheckedYet(m.id)}; nothing downloads a file it has no size and SHA-256 for`).join('\n'))
     const out = []
     const add = async (m) => { if (!out.includes(m) && (await stateOf(m)) !== 'installed' && !['queued', 'downloading', 'extracting'].includes(jobs.get(m.id)?.state)) out.push(m) }
     if (!(await engineInstalled()) && want.some((m) => m.kind !== 'engine')) {
@@ -2120,7 +2946,8 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   async function install(ids) {
     const todo = await plan(Array.isArray(ids) ? ids : [ids])
     const specs = await getSpecs().catch(() => null)
-    const need = todo.reduce((n, m) => n + m.size * 1.1, 0)
+    // What a download stopped part way left in its .part is not fetched again, so the disk need not hold it twice.
+    const need = (await Promise.all(todo.map(async (m) => m.size * 1.1 - await partBytes(m)))).reduce((n, x) => n + x, 0)
     if (specs?.diskFreeBytes != null && specs.diskFreeBytes < need) throw new Error(`not enough disk space: needs ${gb(need)}, ${gb(specs.diskFreeBytes)} free`)
     for (const m of todo) jobs.set(m.id, { state: 'queued', received: 0, total: m.size, bytesPerSec: 0, error: null })
     const run = installing.then(async () => {
@@ -2152,6 +2979,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
   async function status() {
     const s = await readSettings()
     const states = await Promise.all(modules.map(stateOf))
+    const parts = await Promise.all(modules.map(partBytes))
     const ready = engine ? await Promise.race([engine.ready.then(() => true, () => false), sleep(0).then(() => false)]) : false
     // The run each model would really get here: the context it would start with and the GPU room
     // the budget leaves it, so the memory figures below describe that run rather than a default one.
@@ -2166,12 +2994,12 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     const build = installedVariant ? engineBuild(installedVariant) : null
     const speedOf = (m) => {
       const p = plans.get(m.id)
-      return speedFor(s, m.id, { ctx: p.ctx, roomGB: p.room, gpuLayers: p.gpuLayers, threads: limitsFor(s, specs, p.variant, p.gpuLayers).threads, engine: build, weights: { file: m.file, sha256: m.sha256 }, depth: SPEED_DEPTH, laya })
+      return speedFor(s, m.id, { ctx: p.ctx, roomGB: p.room, gpuLayers: p.gpuLayers, cpuMoe: p.cpuMoe, threads: limitsFor(s, specs, p.variant, p.gpuLayers).threads, engine: build, weights: { file: m.file, sha256: m.sha256 }, depth: SPEED_DEPTH, laya })
     }
     // What the model is rated here, as the install picker rates it: measured from a reading that
     // stands for an installed model, estimated otherwise. For the card's speed line.
     const ratingVariant = installedVariant ?? (specs ? pickEngineVariant(specs, modules) : null)
-    const rated = (m, installedNow, speed) => (specs && ratingVariant ? rateModule(m, specs, ratingVariant, { installed: installedNow, speed: installedNow && speed.stands ? speed.reading : null }) : null)
+    const rated = (m, installedNow, speed, partNow) => (specs && ratingVariant ? rateModule(m, specs, ratingVariant, { installed: installedNow, speed: installedNow && speed.stands ? speed.reading : null, partBytes: partNow }) : null)
     return {
       engine: { installed: await engineInstalled(), variant: await engineVariant(), running: !!engine, ready, model: engine?.modelId ?? null, vision: !!engine?.vision, port: engine?.port ?? null, ctx: engine?.ctx ?? null, gpuLayers: engine?.gpuLayers ?? null, threads: engine?.threads ?? null, fitTargetMiB: engine?.fitTargetMiB ?? null, memory: engine?.memory ?? null, workingSetGB: engine?.resident?.workingSetGB ?? null, startedAt: engine?.startedAt ?? null, busy },
       settings: { ...s, chatModel: await chatModel() },
@@ -2181,8 +3009,13 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
       modules: modules.map((m, i) => {
         const speed = m.kind === 'model' ? speedOf(m) : null
         return {
-          id: m.id, kind: m.kind, variant: m.variant, for: m.for, name: m.name, file: m.file, size: m.size, license: m.license, notes: m.notes, source: m.source,
+          id: m.id, kind: m.kind, variant: m.variant, for: m.for, name: m.name, file: m.file, size: m.size ?? null, license: m.license, notes: m.notes, source: m.source,
           agent: m.agent?.id ?? null, state: states[i], job: jobs.get(m.id) ?? null, badges: badgesOf(m),
+          // A mixture-of-experts row, which the card lists before it is installed; and, for a row
+          // not pinned yet, what pins it, since nothing installs it until then.
+          moe: !!m.moe, unpinned: isPinned(m) ? null : notCheckedYet(m.id),
+          // What a download stopped part way left in its .part, which the disk check counts as there.
+          partBytes: parts[i],
           // What it would take here at the context it would run with, measured if a run has ever
           // reported it and a rough estimate until then. The caller shows which, never both.
           memory: plans.get(m.id)?.memory ?? null,
@@ -2193,7 +3026,7 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
           overBudget: plans.get(m.id)?.refusal ?? null,
           // A model's speed reading for its next load, `{ reading, stands, why }`, and its rating here.
           speed,
-          rating: m.kind === 'model' ? rated(m, states[i] === 'installed', speed) : null,
+          rating: m.kind === 'model' ? rated(m, states[i] === 'installed', speed, parts[i]) : null,
         }
       }),
       speedRun: speedStatus(),
@@ -2204,6 +3037,8 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     readiness, installed, agents, chatModel, stream, acquire, reload, status, install, plan, remove, setSettings, settled, engineVariant, visionFor, readSettings, checkMemory,
     // The speed benchmark (docs/benchmark.md 2): start a run, cancel it, and hold a local agent's attempt back while one goes.
     benchmark, cancelBenchmark, localAgentAttempt,
+    /** Accept new output: a reading held because its output differed from its baseline becomes the model's speed (docs/benchmark.md 2.15). */
+    acceptOutput,
     /** Whether a speed benchmark is going now: a capability benchmark with local agents is refused meanwhile (3.8). */
     speedRunning: () => !!speedRun,
     /** Settles once a run cut off before its end has been written in the history (2.13). */
@@ -2221,6 +3056,14 @@ export function createLocalModels({ modules, engineDir, modelsDir, settingsFile,
     isBusy: () => busy > 0,
     /** Expected load time: the last one measured this session, else ~8 s. */
     loadEstimateMs: (modelId) => loadMs.get(modelId) ?? 8000,
+    /** llama-server's log on disk (`serverLog`), or null when none is kept. */
+    logFile: serverLog,
+    /** Its last `n` lines, every line written so far in them; none when no log is kept. */
+    logTail: async (n = 200) => {
+      if (!engineLog) return []
+      await engineLog.flushed()
+      return readLogTail(serverLog, n)
+    },
     start: async (id) => { const c = await acquire(id); c.release() },
     stop: async () => { if (busy > 0) throw new Error('a local model is answering right now'); await stop() },
     // A speed run going ends with the rest, and nothing is loaded from here on, its restore included:
@@ -2313,7 +3156,7 @@ export async function buildCatalog(local, specs, { downloads = {} } = {}) {
     // An installed model with a speed reading that stands for its next load is rated from it
     // (docs/benchmark.md 2.9); nothing else can have been measured.
     const speed = byIdState.get(m.id).speed
-    return { m, installed, rating: rateModule(m, specs, variant, { installed, speed: installed && speed?.stands ? speed.reading : null }), downloads: downloads[m.hfRepo] }
+    return { m, installed, rating: rateModule(m, specs, variant, { installed, speed: installed && speed?.stands ? speed.reading : null, partBytes: byIdState.get(m.id).partBytes ?? 0 }), downloads: downloads[m.hfRepo] }
   })
   const sug = suggest(rows, specs)
   const engineMods = local.modules.filter((m) => m.kind === 'engine' && m.variant === variant)
@@ -2330,7 +3173,7 @@ export async function buildCatalog(local, specs, { downloads = {} } = {}) {
   }
 }
 
-const listLine = (x) => `- \`${x.id}\` ${x.name} · ${size(x.size)} · ${x.rating.fit === 'no' ? `won't fit: ${x.rating.reason}` : x.rating.label}${x.agent ? ` · agent ${x.agent}` : x.for ? ` · add-on for ${x.for}` : ''} · ${x.installed ? '✓ installed' : 'not installed'}`
+const listLine = (x) => `- \`${x.id}\` ${x.name} · ${x.unpinned ? 'size not checked yet' : size(x.size)} · ${x.rating.fit === 'no' ? `won't fit: ${x.rating.reason}` : x.rating.label}${x.agent ? ` · agent ${x.agent}` : x.for ? ` · add-on for ${x.for}` : ''} · ${x.installed ? '✓ installed' : x.unpinned ?? 'not installed'}`
 
 /** `/install-llm [ids…|all]`: bare lists and suggests; with ids starts the verified install in the background. */
 export async function installLlmCommand(raw, { local, catalog }) {
@@ -2350,7 +3193,10 @@ export async function installLlmCommand(raw, { local, catalog }) {
       ].join('\n'),
     }
   }
-  const want = a.all ? c.modules.filter((x) => !x.installed && x.rating.fit !== 'no').map((x) => x.id) : a.ids
+  const want = a.all ? c.modules.filter((x) => !x.installed && !x.unpinned && x.rating.fit !== 'no').map((x) => x.id) : a.ids
+  // A row not pinned yet is refused by name, before any other: nothing downloads a file it cannot check.
+  const unpinned = c.modules.filter((x) => want.includes(x.id) && x.unpinned)
+  if (unpinned.length) return { kind: 'error', text: unpinned.map((x) => `${x.name} is ${x.unpinned}; nothing downloads a file it has no size and SHA-256 for.`).join('\n') }
   const blocked = c.modules.filter((x) => want.includes(x.id) && !x.installed && x.rating.fit === 'no')
   if (blocked.length) return { kind: 'error', text: blocked.map((x) => `${x.name} won't fit: ${x.rating.reason}`).join('\n') }
   const todo = await local.install(want)

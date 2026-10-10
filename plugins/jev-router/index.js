@@ -20,21 +20,22 @@ import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import { createJev } from './jev.js'
-import { OUT_STATES, formatReport, notReadyWhy, pricingNow, routingPolicy, runRouted } from './router.js'
-import { LEVELS, codexServiceTier } from './effort.js'
+import { OUT_STATES, formatReport, notReadyWhy, pickedBy, plannedEffort, pricingNow, routerStep, routingPolicy, runRouted, whyNotPicked } from './router.js'
+import { LEVELS, RATINGS_AGREE, claudeFastMode, codexServiceTier, effortBias, effortBiases, effortFamily, effortVotes, ratingWay, toAgentEffort } from './effort.js'
 import { run } from './workspace.js'
 import { authAction, canAuth, checkAgents } from './setup.js'
-import { JEV_PROVIDER, jevAdapter, line, nameOfAgent, queuedLine } from './adapter.js'
+import { JEV_PROVIDER, isNoProject, jevAdapter, line, nameOfAgent } from './adapter.js'
 import { LOCK_UNAVAILABLE, NEEDS_LANE, executorsFrom, lockOf } from './capabilities.js'
 import { createDelivery } from './delivery.js'
 import { createFormatter } from './format.js'
-import { CLEAR, createFeedback, validFeedback } from './feedback.js'
-import { TERMINAL_STATES, WAITING, createLanes, createMutex, createRunLog, createTasks, laneKey, runAdmitted, runKeysOf, validJobId } from './tasks.js'
+import { CLEAR, createFeedback, tagVotesOnAgent, validFeedback } from './feedback.js'
+import { TERMINAL_STATES, WAITING, createLanes, createMutex, createRunLog, createTasks, guessMissed, laneKey, runAdmitted, runKeysOf, seenResults, startedNoticeDue, validJobId } from './tasks.js'
+import { againNotice, changeNotice, changeReason, creditLine, effortFrom, followUpTask, learnedLine, liveStatusSentence, movedNotice, noTaskWords, planReply, queuedReply, ratedEffortLine, restartTask, restartedReason, startNowWords, startedNotice, startingReply, steerWords, steeredTaskWords, withRunMark, workerStep } from './reply-words.js'
 import { createWaitStats, waitEstimate } from './waits.js'
 import { SESSION_ID, exportSession, redactSecrets } from './export.js'
 import { KEY_NAME, KEY_NAME_RULE, createAccounts, keyProviderOf, kindOf, parseUse } from './accounts.js'
 import { createUsage, detectLimit, longWindowPercent } from './usage.js'
-import { DOMAINS, resolvePolicy } from './routing-policy.js'
+import { DOMAINS, gatesFor, resolvePolicy } from './routing-policy.js'
 import { answererUnconfigured, createCapabilityRegistry, evidenceFromFeedback, evidenceFromRun, loadPriors, subjectOf } from './profiles.js'
 import { snapshotResources } from './resources.js'
 import { governorSignals } from './governor.js'
@@ -47,10 +48,17 @@ import { createResidency } from './residency.js'
 import { LAYA_TEXT, LayaUnavailable, createLayaSidecar } from './laya-sidecar.js'
 import { createLayaInstaller, installOffer, readPins } from './laya-install.js'
 import { createLayaClient } from './laya-client.js'
+import { createColibriLaya } from './colibri-laya.js'
 import { createProbe, runSelfTest, selfTestCalls, taskCalls } from './laya-selfcheck.js'
 import { estimateRequestTokens, renderForLaya } from './laya-questions.js'
 import { createShadow, jevHostOf } from './shadow.js'
 import { agentEnv, createBenchmark, timedOutBy } from './benchmark.js'
+import { INTENT_TAGS, classifyIntent } from './intent.js'
+import { createReplyLedger, replyFeatures, replyGates } from './reply-ledger.js'
+import { createLiveStore } from './live.js'
+import { processHandover } from './handover.js'
+import { patchKeyOf, patchState } from './engine-patches.js'
+import { createSteerers, heardInEvents, heardInTap, heldWords, idleWhy, livePath, liveWords, nextState, nowHeldWords, nowLeft, nowPath, nowWords, sendLive, sendNow, sendableWhy, steerStateWords, steerableRole } from './steer.js'
 
 export const name = 'jev-router'
 export const inject = ['tools', 'commands', 'subagents', 'credentials']
@@ -131,6 +139,8 @@ export const Config = Schema.object({
   local: Schema.object({
     port: Schema.natural().default(8081).description('First 127.0.0.1 port for llama-server; the next ones are tried when it is taken.'),
     contextSize: Schema.natural().min(2048).description('Context tokens every local model starts with; unset = the model\'s manifest value (16,384), 12,288 on PCs with under 12 GB RAM. A RAM budget may size it down, to 12,288 at least.'),
+    modelWaitCapMinutes: Schema.natural().min(1).max(60).default(2).description('How long, in minutes, a local agent waits for another local model before its own goes next: from then on no local agent joins that model ahead of it, and its model is loaded once the agents already on that model end. 1 to 60; the wait is always capped.'),
+    outputCheckShare: Schema.number().min(0).max(1).default(0.5).description('How much of the output a model gave in its first speed run with this engine build and GPU split a later run must repeat, from its start, for the two to count as the same: 0.5, as shipped, is the first 32 of 64 tokens; 1 all of it; 0 takes every output as the same. A run whose output differs keeps its speed figure apart until it is accepted in Settings, Local models. Provisional until it is measured on this PC.'),
   }).description('Local models (llama.cpp llama-server under <harness>/engine/llama, GGUF files under <harness>/models).'),
   format: Schema.object({
     enabled: Schema.boolean().default(true).description('Rewrite a finished background result into readable prose with the installed local chat model before it is posted. Off, the report is posted exactly as the agent wrote it.'),
@@ -145,6 +155,9 @@ export const Config = Schema.object({
       deepseek: Schema.union(['off', 'low', 'high', 'max']),
     }).default({}).description('Fixed effort per agent; wins over the menu and the default.'),
     codexSpeed: Schema.union(['normal', 'fast']).default('normal').description('fast = Codex 1.5x (service tier priority).'),
+    claudeSpeed: Schema.union(['normal', 'fast']).default('normal').description('fast = Claude Code fast mode, which costs more (it needs usage credits on your Claude account and the engine patch the Live agent view card names).'),
+    ratingsMove: Schema.boolean().default(true).description('Let your `wrong effort` ratings of the picks move Auto effort one step for an agent and a kind of work (Settings, Effort).'),
+    ratingsResetAt: Schema.string().description('Ratings given before this time move Auto effort no more (Settings, Effort, Reset). Nothing is deleted.'),
   }).default({}),
   pricing: Schema.object({
     peak: Schema.dict(Schema.object({
@@ -206,6 +219,18 @@ export const Config = Schema.object({
     drift: Schema.dict(Schema.number()).description('Drift and out-of-distribution thresholds.'),
     priorsFile: Schema.string().description('Capability priors file, relative to the harness root. Default: config/capability-priors.json'),
   }).default({}).description('The adaptive router: what each resource is good at, what it costs, and which routing domains have earned the right to decide without Jev.'),
+  // The measured records the start reply's predictor of the pick must keep (reply-ledger.js
+  // REPLY_GATES); replyGates() refuses a right above its of.
+  replies: Schema.object({
+    quick: Schema.object({
+      right: Schema.natural().min(1).default(45),
+      of: Schema.natural().min(1).default(50),
+    }).default({}).description('A start reply may name the predicted agent before routing once the predictor was right this many times (right) of its last scored replies (of).'),
+    likely: Schema.object({
+      right: Schema.natural().min(1).default(16),
+      of: Schema.natural().min(1).default(20),
+    }).default({}).description('A reply that waits may name the likely agent once the predictor was right this many times (right) of its last scored replies (of).'),
+  }).default({}).description('When a start reply may name the guess of its predictor of the pick. The predictor learns in the background from every routed task and is scored against what the router runs; a reply names its guess only while the predictor keeps the record set here, and the How Jev replies card in Settings shows that record and whether quick replies and the likely agent are on or paused.'),
   resources: Schema.object({
     plans: Schema.dict(Schema.string()).default({}).description('Agent id -> plan name (pro, max, plus, team). Sets the conservation curve for a provider that does not report its plan.'),
     economics: Schema.dict(Schema.object({ marginalCost: Schema.union(['none', 'low', 'metered']) })).default({}).description('Agent id -> how a job on it is funded, when the default by provider is wrong.'),
@@ -298,6 +323,10 @@ export const runEvidence = (record, deps) => evidenceFromRun(record, { ...deps, 
  * @returns {object[]} the rows recorded
  */
 export function creditVerdict(verdict, records, { capabilities, previous = null, learn = true, ...deps }) {
+  // A verdict about the pick a start reply named judges the choice, not an answer: it is no one's
+  // capability evidence (profiles.js verdictIsAbout), so it has nothing to record or take back, nor
+  // has the clear of one, which carries only its keys.
+  if (verdict?.about === 'plan' || (verdict?.verdict === CLEAR && previous?.about === 'plan')) return []
   const run = runOfVerdict(verdict, records, capabilities)
   const cleared = verdict?.verdict === CLEAR
   const rows = cleared || !run || !learn ? [] : evidenceFromFeedback(verdict, run, deps)
@@ -340,10 +369,21 @@ export const verdictRow = (record, learn = true) => (learn === false && record?.
  * after a newer run ended still lands on the answer that was judged. That last rule is a guess:
  * without a runId, a first verdict on an older answer given after a newer run ended lands on the
  * newer run.
+ *
+ * A verdict that names its task (`taskKey`, which one about a start reply's pick always does) is about
+ * the earliest run of that task in its session, the one whose routing its reply named, and about no
+ * run while that run has not ended: a job id is used again after a restart, a task key never is. A
+ * verdict about the pick that names neither is about no run: by time it could only be guessed at.
  */
 export function runOfVerdict(verdict, records, capabilities) {
   const inSession = (records ?? []).filter((r) => r && r.sessionId === verdict?.sessionId)
   if (typeof verdict?.runId === 'string' && verdict.runId) return inSession.find((r) => r.runId === verdict.runId) ?? null
+  if (typeof verdict?.taskKey === 'string' && verdict.taskKey) {
+    let first = null
+    for (const r of inSession) if (r.taskKey === verdict.taskKey && !(Date.parse(first?.ts) <= Date.parse(r.ts))) first = r
+    return first
+  }
+  if (verdict?.about === 'plan') return null
   const creditedTo = capabilities?.creditedRun?.(verdict)
   let run = creditedTo ? inSession.find((r) => r.runId === creditedTo) : undefined
   if (!run) {
@@ -355,12 +395,10 @@ export function runOfVerdict(verdict, records, capabilities) {
 }
 
 // The run an answer came from, carried in the answer's own text the way router.js carries the
-// agent chain: a markdown link reference definition renders as nothing. The engine assigns the
-// message id after this side has returned the text, so the message is the only thing that can
-// hold the link; client.js reads it back (RUN_MARK) and posts it with a verdict as `runId`.
-// A blank line first: a definition cannot interrupt the paragraph a report may end on.
-export const RUN_MARK = /^\[jev-run\]:\s*kzh-run-1-([\w-]{1,80})\s*$/m
-export const withRunMark = (text, runId) => (typeof runId === 'string' && /^[\w-]{1,80}$/.test(runId) ? `${text}\n\n[jev-run]: kzh-run-1-${runId}` : text)
+// agent chain: a markdown link reference definition renders as nothing, after a blank line, since a
+// definition cannot interrupt the paragraph a report may end on. It is written where every hidden
+// mark a message carries is (reply-words.js), since a start reply carries one as a report does.
+export { RUN_MARK, withRunMark } from './reply-words.js'
 
 /**
  * One row per judged message: its NEWEST form (what the person thinks now), dated when the
@@ -386,18 +424,24 @@ export function effectiveVerdicts(rows) {
 
 /**
  * Everything a verdict changes, when it is given: the capability evidence of the run it is about,
- * and that run's routing labels in the domains that read human feedback (task classification and
- * skill selection). Both happen here and only here: a run's own evidence and labels are written
- * as it ends, before anyone can judge its answer. With `learn` off it still runs, for what the
- * person withdrew: a clear or a changed verdict takes back what the earlier form counted, and only
- * new credit waits for learning to be on.
+ * that run's routing labels in the domains that read human feedback (task classification, skill
+ * selection and, from a verdict about the pick, resource selection), and the intent of the message
+ * (a direct answer's own example, or the example of the message that asked for the run). All of it
+ * happens here and only here: a run's own evidence and labels are written as it ends, before anyone
+ * can judge its answer. With `learn` off it still runs, for what the person withdrew: a clear or a
+ * changed verdict takes back what the earlier form counted, and only new credit waits for learning
+ * to be on. A verdict about the pick whose task's run has not ended yet labels nothing (`pending`):
+ * bindRun applies it as that run ends.
  *
  * The labels are relabelled in the store of whoever decided the run (docs/laya-auto.md 6.4): Jev's
  * `training` store for a Jev-decided run, `layaStore` for a run Laya decided, and never the other.
- * A Laya run's samples looked up in the Jev store would be missing there and skipped silently.
+ * A Laya run's samples looked up in the Jev store would be missing there and skipped silently. A
+ * message's intent is only ever recorded in Jev's store (intent.js), so it is labelled there.
  * @param {object} stored the feedback.js row just appended
  * @param {{ feedbackRows: object[], records: object[], capabilities: object, training?: object, layaStore?: object, versionOf?: Function, agents?: object[], priors?: object, learn?: boolean }} deps
- * @returns {Promise<{ run: object|null, evidence: object[], relabelled: string[] }>}
+ * @returns {Promise<{ run: object|null, evidence: object[], relabelled: string[], changes: object[], pending: boolean }>}
+ *   `changes` are the labels given, `{ domain, id, outcome, store }`, `store` 'jev' or 'laya', and
+ *   `outcome` null for a person's label taken off
  */
 export async function onVerdict(stored, { feedbackRows, records, capabilities, training, layaStore, versionOf, agents, priors, learn = true }) {
   const effective = effectiveVerdicts(feedbackRows)
@@ -405,21 +449,58 @@ export async function onVerdict(stored, { feedbackRows, records, capabilities, t
   const verdict = effective.find(isThis) ?? stored
   // The form this verdict had before this one: feedback.jsonl is append-only and this is called
   // after `stored` was appended, so it is the last row of the pair and the one before it is that.
-  const previous = (feedbackRows ?? []).filter(isThis).at(-2) ?? null
-  const run = runOfVerdict(verdict, records, capabilities)
+  const forms = (feedbackRows ?? []).filter(isThis)
+  const previous = forms.at(-2) ?? null
+  // What the verdict is about. A clear carries only its keys, so what it takes back is what the
+  // message's last form before it named (a clear may follow a clear): its run, its task, whether it
+  // judged the pick, and a direct answer's example. Placed by time instead, the clear of a verdict
+  // about the pick landed on the newest run of the chat, and a direct answer's on no example at all.
+  const last = verdict.verdict === CLEAR ? forms.findLast((f) => f?.verdict !== CLEAR) : null
+  const judged = last ? { ...verdict, ...Object.fromEntries(['about', 'taskKey', 'runId', 'intentSample'].filter((k) => last[k]).map((k) => [k, last[k]])) } : verdict
+  const run = runOfVerdict(judged, records, capabilities)
   const evidence = creditVerdict(verdict, records, { capabilities, previous, learn, versionOf, agents, priors })
   const relabelled = []
-  const store = run?.routing?.decider === 'laya' ? layaStore : training
-  if (!run?.runId || !store) return { run, evidence, relabelled }
+  const changes = []
+  const pending = judged.about === 'plan' && !run
+  const done = () => ({ run, evidence, relabelled, changes, pending })
   // With learning off nothing new is learnt, but a verdict the person cleared or changed is
   // withdrawn: a human label it gave is recomputed without it. The same verdict again changes
   // nothing, and a sample no person labelled has nothing of it to withdraw.
   const withdrawn = verdict.verdict === CLEAR || !sameForm(previous, verdict)
-  if (!learn && !withdrawn) return { run, evidence, relabelled }
+  if (!learn && !withdrawn) return done()
   // With learning off the label is recomputed from the verdicts that were learnt from, which
   // leaves out this one and every verdict given while learning was off: those were stored and
   // never applied, and a withdrawal is not the moment to start applying them.
   const feedback = learn ? effective : effective.filter((f) => !isThis(f) && !f.learningOff)
+  /**
+   * Label one sample from `record` and the feedback, unless that is the label it has. A person's label
+   * that no word left gives, where the run alone gives none (a stopped run, or a direct answer's
+   * example, which ran nothing), is taken off: the sample is as it was before the person said it.
+   */
+  const relabel = async (from, domain, sample, record, until) => {
+    if (!learn && sample.outcome?.labelSource !== 'human') return
+    const outcome = labelFromRun(domain, sample, record, { feedback, until })
+    const was = sample.outcome
+    if (!outcome) {
+      if (was?.labelSource !== 'human') return
+      await from.withdrawOutcome(sample.id)
+    } else {
+      if (was && was.labelSource === outcome.labelSource && was.label === outcome.label && was.negativeLabel === outcome.negativeLabel
+        && was.chosenKey === outcome.chosenKey && was.negativeKey === outcome.negativeKey) return
+      await from.resolveOutcome(sample.id, outcome)
+    }
+    relabelled.push(sample.id)
+    changes.push({ domain, id: sample.id, outcome, store: from === training ? 'jev' : 'laya' })
+  }
+  // The message's intent: a direct answer's own example, which ran nothing, else the example of the
+  // message that asked for the run. A verdict about the pick waits for its run, as its labels do.
+  const intent = judged.intentSample ? { id: judged.intentSample, record: {} } : run?.intentSample ? { id: run.intentSample, record: run } : null
+  if (intent && training) {
+    const sample = await training.get(intent.id)
+    if (sample?.domain === 'intent') await relabel(training, 'intent', sample, intent.record)
+  }
+  const store = run?.routing?.decider === 'laya' ? layaStore : training
+  if (!run?.runId || !store) return done()
   // Only the samples the run itself labels (the decision record lists them). One the engine left
   // out on purpose - an off-vocabulary skill answer the run did not carry out, a judgment that
   // could not change the run - says nothing a verdict about the run could confirm or refute.
@@ -430,16 +511,56 @@ export async function onVerdict(stored, { feedbackRows, records, capabilities, t
     for (const sample of await store.list({ domain })) {
       if (sample.runId !== run.runId) continue
       if (labels && !labels.has(sample.id)) continue
-      if (!learn && sample.outcome?.labelSource !== 'human') continue
-      const outcome = labelFromRun(domain, sample, run, { feedback, until: after?.ts })
-      if (!outcome) continue
-      const was = sample.outcome
-      if (was && was.labelSource === outcome.labelSource && was.label === outcome.label && was.negativeLabel === outcome.negativeLabel) continue
-      await store.resolveOutcome(sample.id, outcome)
-      relabelled.push(sample.id)
+      await relabel(store, domain, sample, run, after?.ts)
     }
   }
-  return { run, evidence, relabelled }
+  return done()
+}
+
+// The verdicts about the pick that label something once their run has ended (training.js): what was
+// misread, a pick named right or wrong, and a message that should have been a question.
+const LABELS_AT_RUN_END = new Set(['good pick', 'wrong agent', 'misread my question', 'wrong scope', INTENT_TAGS.question])
+const labelsAtRunEnd = (v) => LABELS_AT_RUN_END.has(v.tag) || (!v.tag && v.verdict === 'dislike' && !!v.suggestedAgent)
+
+/**
+ * What a saved verdict changed, as the one line the person is shown under what they judged
+ * (reply-words.js learnedLine), from what onVerdict did (`applied`): the labels it gave a person's
+ * word to, the agent the session's next task goes to now, how far `wrong effort` ratings of the plan's
+ * agent family and task type have come, or that its labels wait for its task's run to end, or have
+ * none to wait for once its task has ended with no run on record. A clear changed nothing to tell,
+ * so it has no line.
+ * @param {object} verdict the stored row
+ * @param {{ changes?: object[], pending?: boolean }} applied onVerdict's
+ * @param {object} [ctx] `learn` whether learning is on; `jobId` the reply's task; `ended` true once
+ *   that task has ended, so a run its labels wait for never comes; `fresh` false when
+ *   the verdict is applied after it was given (bindRun), when its suggestion may no longer be the
+ *   newest; `nameOf(id)` an agent's name; `intentChecked` the intent domain's checked examples;
+ *   `ratings` `{ rows, resetAt, move }`: every verdict now (feedback.js list()), the last Reset of
+ *   Settings, Effort and whether ratings move Auto effort
+ * @returns {string[]} the line, or none
+ */
+export function verdictEffects(verdict, applied, { learn = true, jobId = null, ended = false, fresh = true, nameOf = (id) => id, intentChecked = 0, ratings = null } = {}) {
+  if (!verdict || verdict.verdict === CLEAR) return []
+  const human = (applied?.changes ?? []).filter((c) => c.outcome?.labelSource === 'human')
+  const of = (...domains) => human.filter((c) => domains.includes(c.domain))
+  const picks = of('resource_selection')
+  const kinds = of('task_classification', 'skill_selection')
+  // A label that names the pick as wrong (a negative) relabels it; one that names it alone confirms it.
+  const pick = picks.some((c) => c.outcome.negativeKey) ? 'labelled' : picks.length || kinds.some((c) => c.outcome.label != null) ? 'confirmed' : null
+  const misread = kinds.some((c) => c.outcome.label == null && c.outcome.negativeLabel != null)
+  const intent = of('intent')[0]
+  const suggested = fresh && verdict.verdict === 'dislike' && verdict.suggestedAgent && tagVotesOnAgent(verdict.tag) ? nameOf(verdict.suggestedAgent) : null
+  let effort = null
+  const way = verdict.about === 'plan' && verdict.tag === 'wrong effort' && verdict.planFamily && verdict.taskType ? ratingWay(verdict) : 0
+  if (way && ratings) {
+    const votes = effortVotes(ratings.rows, verdict.planFamily, verdict.taskType, ratings.resetAt)
+    const moved = effortBias(ratings.rows, verdict.planFamily, verdict.taskType, ratings.resetAt) === way
+    effort = { family: verdict.planFamily, taskType: verdict.taskType, way, agree: way > 0 ? votes.up : votes.down, need: RATINGS_AGREE, moved, off: ratings.move === false }
+  }
+  // Labels that wait for the task's run, which a task that has ended with none on record never has.
+  const waits = !!(applied?.pending && learn && labelsAtRunEnd(verdict))
+  const pending = waits && !ended ? jobId ?? '' : null
+  return [learnedLine({ suggested, pick, misread, store: human.some((c) => c.store === 'laya') ? 'laya' : 'jev', intent: intent ? { label: intent.outcome.label, checked: intentChecked } : null, effort, pending, unran: waits && ended, learning: learn })]
 }
 
 /**
@@ -450,17 +571,28 @@ export async function onVerdict(stored, { feedbackRows, records, capabilities, t
  * Skipping onVerdict altogether with learning off left a withdrawn like counting, then and after
  * learning came back on, since nothing replays feedback.jsonl. A failure to apply it is logged
  * and never loses the stored verdict.
+ *
+ * A verdict about the pick is stamped first with what the plan it judged was (`planOf`, the reply
+ * ledger's row of its task in its chat): the agent, effort, level, model and agent family it ran
+ * with (`planAgent`, `planEffort`, `planLevel`, `planModel`, `planFamily`), the level Auto chose
+ * before your ratings moved it when they did (`planUnmoved`), its task type, and its run (`runId`)
+ * once it has one, server-side facts whatever the reply showed; `planOf` says too whether its task
+ * has ended (`ended`), so labels waiting for a run it never had are not said to come. `explain`
+ * gives what the words of what it changed need (verdictEffects).
  * @param {object} record validFeedback's row
- * @param {{ feedback: object, records: () => Promise<object[]>, agents: () => Promise<object[]>, learn: boolean, log?: (m: string) => void } & object} deps
+ * @param {{ feedback: object, records: () => Promise<object[]>, agents: () => Promise<object[]>, learn: boolean, log?: (m: string) => void, planOf?: Function, explain?: Function } & object} deps
  *   `records` and `agents` are read after the append, so they are as fresh as the verdict
- * @returns {Promise<object>} the stored row
+ * @returns {Promise<{ record: object, effects: string[] }>} the stored row, and what it changed in words
  */
-export async function acceptVerdict(record, { feedback, records, agents, log = () => {}, ...deps }) {
-  const stored = await feedback.append(verdictRow(record, deps.learn))
+export async function acceptVerdict(record, { feedback, records, agents, log = () => {}, planOf = null, explain = null, ...deps }) {
+  const plan = record.about === 'plan' && planOf ? await Promise.resolve().then(() => planOf(record)).catch((err) => { log(`the plan a verdict judged was not read: ${err.message}`); return null }) : null
+  const stored = await feedback.append(verdictRow(plan?.facts ? { ...record, ...plan.facts } : record, deps.learn))
+  let applied = null
   try {
-    await onVerdict(stored, { ...deps, feedbackRows: await feedback.history(stored.sessionId), records: await records(), agents: await agents() })
+    applied = await onVerdict(stored, { ...deps, feedbackRows: await feedback.history(stored.sessionId), records: await records(), agents: await agents() })
   } catch (err) { log(`a verdict was stored but not credited: ${err.message}`) }
-  return stored
+  const told = applied && explain ? await Promise.resolve().then(() => explain(stored, applied)).catch(() => ({})) : {}
+  return { record: stored, effects: applied ? verdictEffects(stored, applied, { ...told, learn: deps.learn !== false, jobId: plan?.jobId ?? null, ended: plan?.ended === true }) : [] }
 }
 
 /**
@@ -470,21 +602,93 @@ export async function acceptVerdict(record, { feedback, records, agents, log = (
  * valid one is stored and applied by acceptVerdict, one verdict at a time: the evidence is
  * recorded in the order feedback.jsonl is written, so a quick like-then-dislike cannot land the
  * other way round. apply() makes one for the plugin's life, which is what makes it one queue. A
- * store that fails throws, and the route answers that as it answers any other failure.
- * @param {{ learn: () => boolean } & object} deps acceptVerdict's, with `learn` read as each
- *   verdict arrives, so a verdict is marked by the setting it was given under
- * @returns {(raw: string) => Promise<{ status: number, body: object }>}
+ * store that fails throws, and the route answers that as it answers any other failure. The answer
+ * carries the stored row and what it changed, in words (`effects`), and `onApplied` is told both.
+ *
+ * Its `bindRun(record)` applies the verdicts about the pick of the task a run was for, once that run
+ * has ended (route() calls it after learnFrom has labelled the run): the newest form of each, in the
+ * same queue as verdicts being given, so neither lands half way through the other. A verdict given
+ * while the run went on labelled nothing then; one applied before, or the same again, relabels
+ * nothing, since a label that is already so is left as it is. A verdict given before routing picked
+ * anything (its task waited in its folder's line, or its reply was the guess's) was stored with no
+ * plan to stamp it with: it is stamped now (`planOf`), stored again as the newest form of the same
+ * verdict and dated as it was given, and applied as that; an effort rating is told how far it has come.
+ *
+ * Its `noRun({ taskKey, sessionId })` is for a task that has ended with no run on record (one that
+ * failed before routing wrote its row, one stopped before it, a restart's): no bindRun ever comes
+ * for it, so each verdict about its pick that was told its labels wait for the task to end is told
+ * now, in the same queue, that there is no run to apply them to. A task with a run on record is
+ * left to bindRun.
+ * @param {{ learn: () => boolean, onApplied?: (record: object, effects: string[]) => unknown } & object} deps
+ *   acceptVerdict's, with `learn` read as each verdict arrives, so a verdict is marked by the
+ *   setting it was given under
+ * @returns {((raw: string) => Promise<{ status: number, body: object }>) & { bindRun: (record: object) => Promise<object[]>, noRun: (task: { taskKey: string, sessionId: string }) => Promise<object[]> }}
  */
-export function createFeedbackRoute({ learn, ...deps }) {
+export function createFeedbackRoute({ learn, onApplied = () => {}, ...deps }) {
   let queue = Promise.resolve()
-  return async (raw) => {
+  const serial = (task) => { const job = queue.then(task); queue = job.catch(() => {}); return job }
+  const told = async (record, effects) => { try { await onApplied(record, effects) } catch { /* the verdict stands either way */ } }
+  const post = async (raw) => {
     let record
     try { record = validFeedback(JSON.parse(raw)) } catch (err) { return { status: 400, body: { error: err.message } } }
     const on = learn()
-    const job = queue.then(() => acceptVerdict(record, { ...deps, learn: on }))
-    queue = job.catch(() => {})
-    return { status: 200, body: { ok: true, record: await job } }
+    const got = await serial(async () => {
+      const out = await acceptVerdict(record, { ...deps, learn: on })
+      await told(out.record, out.effects)
+      return out
+    })
+    return { status: 200, body: { ok: true, record: got.record, effects: got.effects } }
   }
+  // A verdict about the pick with no plan on it, stamped with the plan its task was routed with once
+  // there is one, else as it was. What reads a verdict's plan (effort.js effortVotes, router.js
+  // feedbackPrior) reads the newest form of it, which feedback.jsonl only ever gains by an append.
+  // Its run is left as it was given, by its task's key: the ledger's run is its task's first pass,
+  // which for a read pass handed back is no run on record, and would leave the verdict about none.
+  const stampLate = async (given) => {
+    if (given.planAgent || !deps.planOf) return given
+    const plan = await Promise.resolve().then(() => deps.planOf(given)).catch((err) => { deps.log?.(`the plan a verdict judged was not read: ${err.message}`); return null })
+    if (!plan?.facts?.planAgent) return given
+    const { runId: _run, ...facts } = plan.facts
+    return deps.feedback.append({ ...given, ...facts })
+  }
+  post.bindRun = (record) => (!record?.taskKey || !record.sessionId ? Promise.resolve([]) : serial(async () => {
+    const on = learn()
+    const rows = await deps.feedback.history(record.sessionId)
+    // The newest form of each verdict in the chat: one changed or cleared while the run went on is
+    // applied as it stands now.
+    const newest = new Map()
+    for (const r of rows) if (r?.messageId) newest.set(r.messageId, r)
+    const out = []
+    for (const given of newest.values()) {
+      if (given.about !== 'plan' || given.taskKey !== record.taskKey || given.verdict === CLEAR) continue
+      const stored = await stampLate(given)
+      const stamped = stored !== given
+      if (stamped) rows.push(stored)
+      const applied = await onVerdict(stored, { ...deps, feedbackRows: rows, records: await deps.records(), agents: await deps.agents(), learn: on })
+      // An effort rating stamped now says how far it has come, which it could not say as it was given.
+      if (!applied.changes.length && !(stamped && stored.tag === 'wrong effort')) continue
+      const words = deps.explain ? await Promise.resolve().then(() => deps.explain(stored, applied)).catch(() => ({})) : {}
+      const effects = verdictEffects(stored, applied, { ...words, learn: on, fresh: false })
+      await told(stored, effects)
+      out.push({ record: stored, ...applied, effects })
+    }
+    return out
+  }).catch((err) => { deps.log?.(`verdicts on a task were not applied as its run ended: ${err.message}`); return [] }))
+  post.noRun = (task) => (!task?.taskKey || !task.sessionId ? Promise.resolve([]) : serial(async () => {
+    const newest = new Map()
+    for (const r of await deps.feedback.history(task.sessionId)) if (r?.messageId) newest.set(r.messageId, r)
+    // The ones told their labels wait for the task's run: about its pick, and given with learning on.
+    const waiting = [...newest.values()].filter((v) => v.about === 'plan' && v.taskKey === task.taskKey && v.verdict !== CLEAR && !v.learningOff && labelsAtRunEnd(v))
+    if (!waiting.length || (await deps.records()).some((r) => r?.sessionId === task.sessionId && r.taskKey === task.taskKey)) return []
+    const out = []
+    for (const stored of waiting) {
+      const effects = verdictEffects(stored, { changes: [], pending: true }, { ended: true, fresh: false })
+      await told(stored, effects)
+      out.push({ record: stored, effects })
+    }
+    return out
+  }).catch((err) => { deps.log?.(`verdicts on a task that ended with no run were not told so: ${err.message}`); return [] }))
+  return post
 }
 
 /**
@@ -539,8 +743,10 @@ export function createHistoryDeps({ historyFile, feedback, capabilities, onAppen
   }
 }
 
-// The routing domains whose labels a person's verdict can change (training.js labelClassification).
-const FEEDBACK_DOMAINS = ['task_classification', 'skill_selection']
+// The routing domains whose labels a person's verdict can change (training.js labelClassification,
+// and labelResourceSelection for a verdict about the pick). The message's intent, which a verdict
+// can change too, is found by its example's id, not by the run (onVerdict).
+const FEEDBACK_DOMAINS = ['task_classification', 'skill_selection', 'resource_selection']
 
 /**
  * Run a configured tool in the workspace; its output is the attempt's answer.
@@ -580,6 +786,10 @@ function runTool(cwd, timeoutMs) {
 export function createResourceTracker({ file, store, records, domains }) {
   let known = null
   let queue = Promise.resolve()
+  // Once the plugin closes or is applied again (dispose), the set is saved no more: the plugin that
+  // replaces this one has read the file and saves its own, which this set would be written over. A
+  // note asked before still saves, and closing waits for it.
+  let disposed = false
   const rankingDomains = Object.entries(DOMAINS).filter(([, d]) => d.kind === 'ranking').map(([id]) => id)
   const seed = async () => {
     try {
@@ -618,6 +828,7 @@ export function createResourceTracker({ file, store, records, domains }) {
   return {
     /** Record `agents`; returns the ids that were new to an existing set (and were announced). */
     note(agents) {
+      const saves = !disposed
       const next = queue.then(async () => {
         if (!domains) return []
         const first = known === null
@@ -626,7 +837,7 @@ export function createResourceTracker({ file, store, records, domains }) {
         const fresh = ids.filter((id) => !known.has(id))
         const seeded = known.size > 0
         for (const id of fresh) known.add(id)
-        if (fresh.length || first) await save()
+        if (saves && (fresh.length || first)) await save()
         if (!seeded || !fresh.length) return []
         domains.noteEnvironmentChange({ kind: 'new_resource', detail: fresh.join(', ') })
         return fresh
@@ -635,13 +846,95 @@ export function createResourceTracker({ file, store, records, domains }) {
       queue = next.catch(() => {})
       return next
     },
+    /** The plugin is closing or applied again: resolves once the saves asked for so far have landed, and saves none after. */
+    dispose() {
+      disposed = true
+      return queue
+    },
+  }
+}
+
+/** How long closing waits for the plugin's writes still under way (closeWithin). */
+const CLOSE_WAIT_MS = 5000
+
+/**
+ * Resolves once every promise in `work` has settled, or after `ms`, logging how many had not. The
+ * engine applies the plugin again only once its closing has resolved (cordis awaits a cleanup's
+ * promise), so a write that never ends must not hold that, or KzH quitting, for good. Never rejects;
+ * a null in `work` counts as settled.
+ * @param {Array<Promise<unknown>|null|undefined>} work
+ * @param {{ ms?: number, log?: (m: string) => void }} [o]
+ */
+export async function closeWithin(work, { ms = CLOSE_WAIT_MS, log = () => {} } = {}) {
+  const list = work.filter(Boolean)
+  let left = list.length
+  const all = Promise.allSettled(list.map((p) => Promise.resolve(p).finally(() => { left-- })))
+  // Held, not unref'd: the bound is how long closing may wait, and it goes the moment all is settled.
+  let timer
+  const bound = new Promise((r) => { timer = setTimeout(r, ms, false) })
+  const settled = await Promise.race([all.then(() => true), bound])
+  clearTimeout(timer)
+  if (!settled) log(`${left} of ${list.length} still under way after ${ms / 1000} s; closing without waiting for ${left === 1 ? 'it' : 'them'}`)
+}
+
+/** How often a spawn child's committed session events are read for the live view (followSpawn). */
+const LIVE_PUMP_MS = 400
+
+/**
+ * Follow a spawn child's own work into its attempt's live handle (live.js), beside the run and never
+ * in its way: the agent-scoped `agent/assistant-stream` and `agent/inbox/claimed` listeners, which
+ * hear only this child (dsh-agent runtime-types.d.ts), and a pump over its session's committed events
+ * every `pumpMs`, unref'd, its first read from seq 0 so what came before the follow began is read
+ * too. A listener that cannot be registered leaves the pump alone to give the detail. `drain()`,
+ * called before the child is disposed of, reads the session one last time, ends the handle and lets
+ * go of the listeners. For a child with no local agent (Claude Code, Codex, a remote run) there is
+ * nothing to follow, and `drain()` only ends the handle: its agent is done, and the run moves on.
+ * `onHeard(id)` hears the id of each message the child took in, claimed from its inbox or committed
+ * as a `user/message`, so a Steer sent to it is known read (steer.js); never in the child's way either.
+ */
+export function followSpawn(sub, handle, { pumpMs = LIVE_PUMP_MS, onHeard = () => {} } = {}) {
+  const agent = sub?.localAgent
+  if (!agent) return { drain({ stopReason = null } = {}) { handle.end({ stopReason }) } }
+  const offs = []
+  const listen = (name, fn) => {
+    try {
+      const off = agent.ctx.on(name, (payload) => { try { fn(payload) } catch { /* the live view's own */ } })
+      if (typeof off === 'function') offs.push(off)
+    } catch { /* the pump still reads what was committed */ }
+  }
+  const heard = (id) => { try { onHeard(id) } catch { /* the steer's own */ } }
+  listen('agent/assistant-stream', (p) => handle.frame(p?.frame))
+  listen('agent/inbox/claimed', (p) => { handle.claimed(p?.message?.id); heard(p?.message?.id) })
+  let cursor = 0
+  const pump = () => {
+    let events
+    try { events = agent.session.snapshotEvents(cursor) } catch { return }
+    if (!events?.length) return
+    const last = events[events.length - 1]?.seq
+    cursor = Number.isInteger(last) ? last + 1 : cursor + events.length
+    handle.events(events)
+    for (const id of heardInEvents(events)) heard(id)
+  }
+  pump()
+  const timer = setInterval(pump, pumpMs)
+  timer.unref?.()
+  let drained = false
+  return {
+    drain({ stopReason = null } = {}) {
+      if (drained) return
+      drained = true
+      clearInterval(timer)
+      pump()
+      handle.end({ stopReason })
+      for (const off of offs) { try { off() } catch { /* the agent's context unwinds it on disposal anyway */ } }
+    },
   }
 }
 
 /**
  * @param {object} ctx     the plugin context
  * @param {object} config  Config, as the host validated it
- * @param {{ laya?: object, local?: object, localModels?: object, benchmark?: { scratchRoot?: string, tasksDir?: string } }} [seams]  for tests only; the host passes none.
+ * @param {{ laya?: object, local?: object, localModels?: object, benchmark?: { scratchRoot?: string, tasksDir?: string }, replies?: { graceMs?: number }, live?: { pumpMs?: number, store?: object } }} [seams]  for tests only; the host passes none.
  *   `laya.harnessDir` is the folder Laya's engine, model and pins (config/laya.json) live under
  *   (the harness by default), and the rest of `laya` (`spawn`, `run`, `fetch`, `timing`,
  *   `isAlive`, `killTree`, `readWorkingSet`) goes to Laya's supervisor as it is, so a test can run
@@ -651,8 +944,16 @@ export function createResourceTracker({ file, store, records, domains }) {
  *   so a test can run a fake llama-server with models of its own instead of the harness's.
  *   `benchmark` places the capability benchmark's scratch workspace and task set elsewhere
  *   (docs/benchmark.md 3.7), so a test runs it in a folder of its own over tasks of its choosing.
+ *   `replies.graceMs` is how long after the start reply's wait a reply that never said what it named
+ *   is taken to have named nothing (5 s), so a test of a stopped reply need not wait seconds for it.
+ *   `live.pumpMs` is how often a spawn child's session is read for the live view (400 ms), and
+ *   `live.store` the live store itself (live.js createLiveStore over `<dataDir>/live`), so a test can
+ *   hold it: let a run go as forty others would, or hold a read of a saved transcript.
+ *   `handover` is the registry the work still going as the plugin closes is handed over through
+ *   (handover.js, the process's one by default), so a test's plugins on one data folder are a plugin
+ *   applied again when they share one, and a restart of the app when they do not.
  */
-export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {}, localModels: localModelSeams = {}, benchmark: benchmarkSeams = {} } = {}) {
+export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {}, localModels: localModelSeams = {}, benchmark: benchmarkSeams = {}, replies: replySeams = {}, live: liveSeams = {}, handover: handoverSeam = null } = {}) {
   // A spawn agent without a pinned model inherits the parent's model, which is Jev itself.
   const unpinned = config.agents.filter((a) => a.provider === 'spawn' && !(a.llm?.provider && a.llm?.model))
   if (unpinned.length) throw new Error(`jev-router: spawn agents need llm: { provider, model }: ${unpinned.map((a) => a.id).join(', ')}`)
@@ -716,20 +1017,34 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     .catch((err) => layaLog(`laya: the orphan sweep failed: ${err.message}`))
   // Nothing starts Laya once the plugin is disposed, however long the startup above took: a
   // laya.serve started on a disposed supervisor has no exit hook and nobody to stop it, and that
-  // supervisor would even restart it after a crash, the orphan the sweep is there for.
+  // supervisor would even restart it after a crash, the orphan the sweep is there for. Nor does any
+  // background pass that writes the data folder start (inBackground, below): closing waits for the
+  // ones under way, and one started after could land behind the plugin that replaces this one.
   let disposed = false
   const afterStartup = async () => {
     await layaStartup
     if (disposed) throw new LayaUnavailable('Laya was stopped with KzH', { reason: 'disposed' })
   }
   const layaReady = async (o) => { await afterStartup(); return sidecar.ensureReady(o) }
+  // colibri's Laya beside laya.serve (docs/laya-auto.md 13): while the card's colibri Laya address
+  // is set, each request laya.serve answers for a Laya Auto run or the shadow is asked of it too,
+  // after laya.serve and in the background, and both answers go to colibri-laya.jsonl only. It
+  // decides nothing and teaches nothing; KzH runs nothing of colibri.
+  const colibri = createColibriLaya({
+    file: join(dataDir, 'colibri-laya.jsonl'),
+    address: () => sidecar.readSettings().colibriUrl ?? '',
+    isLocalBusy: () => local.isBusy(),
+    log: layaLog,
+  })
+  // An address saved on an earlier day is checked once now, so the card says whether colibri answers.
+  colibri.check().catch(() => {})
   layaClient = createLayaClient({
     sidecar: { ...sidecar, ensureReady: layaReady },
     settings: layaSettings,
     isLocalBusy: () => local.isBusy(),
     log: layaLog,
+    onAnswered: (answered) => colibri.offer(answered),
   })
-  ctx.effect(() => () => { disposed = true; layaClient.dispose(); sidecar.dispose().catch(() => {}) })
   // Laya can be asked at all: installed, switched on, its settings valid and its pins read. Whether
   // a run may be decided by it is layaUnavailable's, below, which says why not.
   const layaAskable = () => !!LAYA && !pinsError && layaSettings.enabled !== false && !!sidecar.installed()
@@ -750,6 +1065,14 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       jevSamples: join(dataDir, 'routing-samples.jsonl'), layaSamples: join(dataDir, 'laya-samples.jsonl'),
       feedback: join(dataDir, 'feedback.jsonl'), history: config.historyFile, standing: join(dataDir, 'laya-standing.jsonl'),
     },
+  })
+  // Closing stops Laya and its client, which settles every shadow job, queued or on the wire, and
+  // waits until laya.json and the row of each call Jev has answered are on disk and laya.serve has
+  // exited. A request to colibri on its way is abandoned with its socket, and nothing of it is written.
+  ctx.effect(() => () => {
+    disposed = true
+    layaClient.dispose()
+    return closeWithin([sidecar.dispose(), shadow.dispose(), colibri.dispose()], { log: (m) => layaLog(`laya: ${m}`) })
   })
 
   // Like/Dislike on a finished answer, next to history.jsonl, read back by the router below.
@@ -784,12 +1107,63 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     log: (m) => process.stdout.write(`[jev] ${m}\n`),
   })
   domains?.load()
+  // Each message on a Jev row records its intent sample in Jev's store before it is answered
+  // (intent.js), and the store's first use reads and parses the whole file, a second or more on a
+  // well-used PC: it is read now, in the background, so the first question after a start does not
+  // wait for it. Only where the intent domain is used, with adaptive routing and its learning on.
+  if (domains && config.routing?.enabled !== false) training.load().catch((err) => process.stdout.write(`[jev] routing samples not read at start: ${err.message}\n`))
   const decisions = createDecisionEngine({ policy, domains, profiles: capabilities, priors, store: training, economics: config.resources?.economics ?? {}, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
   // Which agent ids the routing domains have already seen. A new one narrows the domains that
   // rank resources, and nothing else: adding a coding model must not reset a mature task
   // classifier. Persisted, because the ordinary way to add one is to edit config and restart.
   const resourceTracker = createResourceTracker({ file: join(dataDir, 'known-resources.json'), store: training, records: allRecords, domains })
   const noteResources = (agents) => resourceTracker.note(agents).catch((err) => process.stdout.write(`[jev] known resources not updated: ${err.message}\n`))
+  // The reply ledger (reply-ledger.js): what each start reply said and what the router then ran, with
+  // a predictor of the pick that learns from the two in a worker thread, whose guess a start reply
+  // names only once the decider's record has earned it (guessFor). With learning off nothing is
+  // recorded in it, as in every other learning record, so no reply names a guess, and nothing is
+  // trained from what it holds (`learns`), though the card still reads it.
+  const ledgerOn = () => config.routing?.learn !== false
+  const ledger = createReplyLedger({ file: join(dataDir, 'reply-ledger.jsonl'), modelFile: join(dataDir, 'reply-model.json'), gates: replyGates(config.replies), learns: ledgerOn, log: (m) => process.stdout.write(`[jev] ${m}\n`) })
+  const ledgerFailed = (err) => process.stdout.write(`[jev] reply ledger not updated: ${err?.message ?? err}\n`)
+  ctx.effect(() => () => closeWithin([ledger.dispose()], { log: (m) => process.stdout.write(`[jev] reply ledger: ${m}\n`) }))
+
+  // The live view of each run (live.js, docs/live-agent-view.md Feature 1): the router's milestones and
+  // each spawn child's own stream, in memory for the Live tab, the card under a start reply, the work
+  // board and the Tasks tab, and each task's transcript in `live/<key>.jsonl` once a run of it ends,
+  // none once the plugin has closed (below). Memory only besides that, and never in tasks.jsonl,
+  // which each event would rewrite.
+  // The plugin that closed on this data folder just before this one, as the engine applied it again,
+  // left what it had going here (handover.js, docs/handoff.md "Decided by the owner, 9 Oct"): its runs
+  // go on in its closures, so its memory-only registries (this live store, the steer registry, the
+  // lanes, its task follows and the agents whose read-only lock did not hold) are this plugin's from
+  // now on, and what those runs write to them is seen, steered and waited for here. They are taken
+  // with its tasks as the task list is made, and the tasks adopted as it loads (createTasks takeOver).
+  const place = (handoverSeam ?? processHandover()).join(dataDir)
+  const inherited = place.kept ?? {}
+  const live = liveSeams.store ?? inherited.live ?? createLiveStore({ dir: join(dataDir, 'live'), log: (m) => process.stdout.write(`[jev] ${m}\n`) })
+  // The live store the plugin before this one disposed of saves and deletes again: it is this one's now.
+  if (live === inherited.live) live.reopen()
+  // Whether the engine patch (scripts/patch-agent-live.mjs) is in the Claude Code and Codex connectors
+  // this PC runs, and if not why (engine-patches.js), read at most once a minute: a run is handed the
+  // patch's fields only when its connector carries it. The Live tab, the work board and Settings, Jev
+  // setup, Live agent view say the same (GET /jev-router/engine-patches).
+  const patchCache = new Map()
+  const enginePatches = () => patchState({ dshHome, cache: patchCache })
+  // Steer on a running task (docs/live-agent-view.md Feature 5): the attempts at work that take the
+  // person's words now, one per run (steer.js), and each run of a task with its task's key and its own
+  // onEvent (`say`), so what becomes of a piece of guidance is said on the run it was sent to, in its
+  // live view and its log, and noted on its task (tasks.js noteSteer). Memory only, let go as each ends.
+  const steerers = inherited.steerers ?? createSteerers()
+  const steerRuns = inherited.steerRuns ?? new Map() // runId -> { key, say, names }
+  // The person's words whole, by the id of a piece the task's record keeps clipped (tasks.js
+  // noteSteer), for the prompts its runs build after them. Memory only, let go as the task settles.
+  const steerTexts = inherited.steerTexts ?? new Map() // steer id -> words
+  /** A task's guidance as the prompts of its runs carry it: each piece in the person's words, whole. */
+  const guidanceOf = (key) => (tasks.byKey(key)?.steers ?? []).map((s) => (steerTexts.has(s?.id) ? { ...s, text: steerTexts.get(s.id) } : s))
+  // Why the live detail of an agent's own work is off: a Claude Code or Codex connector the engine patch
+  // is not in says why it is not, and an agent run out of process has no stream this side can read.
+  const liveOffWhy = (provider) => { const key = patchKeyOf(provider); return key ? enginePatches()[key].why ?? 'the engine patch is not in its connector' : 'it runs out of process, with no stream KzH can read' }
 
   /**
    * What a finished run taught: capability evidence per resource, and the label each routing
@@ -817,6 +1191,9 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     const all = [
       ...(samples ?? []),
       ...(record.assessments ?? []).map((a) => a.outcomeDomain?.sampleId).filter(Boolean).map((id) => ({ domain: 'outcome_disposition', id, store: reviewStore })),
+      // The intent of the message that asked for the run (intent.js), which only Jev Auto records, in
+      // Jev's store: what the run did says whether it was a task or a question (training.js labelIntent).
+      ...(record.intentSample ? [{ domain: 'intent', id: record.intentSample, store: 'jev' }] : []),
     ]
     if (!all.length) return
     try {
@@ -825,20 +1202,33 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       for (const { domain, id, store } of all) {
         const from = storeOf(store)
         const sample = await from.get(id)
-        if (!sample) continue
+        if (!sample || sample.domain !== domain) continue
         const outcome = labelFromRun(domain, sample, record)
         if (outcome) await from.resolveOutcome(id, outcome)
       }
     } catch (err) { process.stdout.write(`[jev] routing outcomes not recorded: ${err.message}\n`) }
   }
 
+  // What the plugin writes to its data folder in the background, with nothing waiting for it: what a
+  // finished run taught, the evaluation pass, Laya's standing, the usage row of a decider call or of
+  // a direct answer, the reply ledger's rows, a task's live transcript and the first read of the
+  // accounts. Closing waits for each one under way, so none lands after it; a transcript a run still
+  // going asks for once the plugin has closed is not saved at all (live.js dispose).
+  const background = new Set()
+  const inBackground = (p) => {
+    const done = Promise.resolve(p).then(() => {}, () => {})
+    background.add(done)
+    done.then(() => background.delete(done))
+    return p
+  }
+
   // Retraining is a background pass, not part of a run: a routing decision never waits for it.
   let retraining = null
   let lastRetrain = 0
   const maybeRetrain = () => {
-    if (!domains || retraining || Date.now() - lastRetrain < 60_000) return
+    if (disposed || !domains || retraining || Date.now() - lastRetrain < 60_000) return
     lastRetrain = Date.now()
-    retraining = domains.evaluateAll().catch((err) => process.stdout.write(`[jev] routing evaluation failed: ${err.message}\n`)).finally(() => { retraining = null })
+    retraining = inBackground(domains.evaluateAll().catch((err) => process.stdout.write(`[jev] routing evaluation failed: ${err.message}\n`)).finally(() => { retraining = null }))
   }
   // Laya's own evaluation pass (6.7): at most once a minute after any run, its standing is worked
   // out in the shadow's worker and appended to laya-standing.jsonl, outside domains/, so no file
@@ -846,9 +1236,9 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   let standing = null
   let lastStanding = 0
   const maybeStanding = () => {
-    if (!layaAskable() || config.routing?.learn === false || standing || Date.now() - lastStanding < 60_000) return
+    if (disposed || !layaAskable() || config.routing?.learn === false || standing || Date.now() - lastStanding < 60_000) return
     lastStanding = Date.now()
-    standing = shadow.recordStanding().catch((err) => process.stdout.write(`[jev] laya standing not recorded: ${err.message}\n`)).finally(() => { standing = null })
+    standing = inBackground(shadow.recordStanding().catch((err) => process.stdout.write(`[jev] laya standing not recorded: ${err.message}\n`)).finally(() => { standing = null }))
   }
 
   // Setup-page state, layered over config: on/off switches and user-added
@@ -901,10 +1291,11 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   let readyCache = null
   let readyGen = 0
   let readyPending = null
+  const READY_MS = 5 * 60_000
   const resolveCredential = (ref) => ctx.credentials.resolve(ref)
   async function readiness(force = false) {
     if (force) { readyGen++; readyPending = null }
-    else if (readyCache && Date.now() - readyCache.at < 5 * 60_000) return readyCache.value
+    else if (readyCache && Date.now() - readyCache.at < READY_MS) return readyCache.value
     if (!readyPending) {
       const gen = readyGen
       readyPending = readSetup().then(async (s) => {
@@ -919,6 +1310,18 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       }).finally(() => { if (gen === readyGen) readyPending = null })
     }
     return readyPending
+  }
+  /**
+   * Which agents are ready by the last reading, for the reply ledger's guess (noteQueued), which a
+   * start reply may wait for: the reading at hand however old, a new one begun in the background once
+   * it is older than routing keeps one, since a new one asks each agent's tool and can take seconds.
+   * Only with no reading at hand, the first after a start, a sign-in or a change in Jev setup, does the
+   * guess wait for one.
+   */
+  async function readinessAtHand() {
+    if (!readyCache) return readiness()
+    if (Date.now() - readyCache.at >= READY_MS) readiness().catch(() => {})
+    return readyCache.value
   }
 
   // Accounts (keys, limits, logins) and usage (quota, state, usage.jsonl).
@@ -966,8 +1369,15 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // Every speed run's summary and its detail log (docs/benchmark.md 2.13), beside local.json,
     // where Speed-Run.bat writes its runs too.
     speedLogDir: join(dataDir, 'speed-runs'),
+    // How much of a speed run's output baseline a later run must repeat to be the same (docs/benchmark.md 2.15).
+    outputShare: config.local.outputCheckShare,
+    // llama-server's own lines and KzH's on each start, rotated at 5 MB with one older file kept,
+    // its key taken out; GET /jev-router/local/log serves the tail.
+    serverLog: join(dataDir, 'llama-server.log'),
     port: config.local.port,
     contextSize: config.local.contextSize,
+    // How long a local agent's attempt waits for another model before its own goes next (the owner, 9 Oct).
+    modelWaitCapMinutes: config.local.modelWaitCapMinutes,
     specs,
     log: (t) => process.stdout.write(`[jev] ${t}\n`),
     onChange: () => { refreshLocal(); resolveAux() },
@@ -1044,8 +1454,9 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     return [aux, same ? null : local].filter(Boolean)
   }
   resolveAux()
-  accounts.ready().catch((err) => process.stdout.write(`[jev] accounts not loaded: ${err.message}
-`))
+  // The first read registers the keys the engine already uses, in accounts.json.
+  inBackground(accounts.ready().catch((err) => process.stdout.write(`[jev] accounts not loaded: ${err.message}
+`)))
 
   // Quota for routing: never waits long; an unanswered fetch leaves the agent 'unknown', which does not block.
   async function quotaFor(agents) {
@@ -1064,6 +1475,9 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   // The outcome domain, for the review service: while it is immature Jev judges every result and
   // teaches it; once it has earned authority the review is decided here without a Jev call.
   const outcomeDomain = () => (config.routing?.enabled === false ? null : domains?.get('outcome_disposition') ?? null)
+  // The intent domain, for sorting a message under Jev Auto (intent.js): none with adaptive routing
+  // off, when Jev is asked as it always was, or with learning off, so nothing is recorded.
+  const intentDomain = () => (config.routing?.enabled === false ? null : domains?.get('intent') ?? null)
 
   // The outcome domain of a run Laya decides, behind a facade that decides for Laya into Laya's
   // store (6.3), so jev-review stays ignorant of stores.
@@ -1117,7 +1531,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
         client: layaClient.client('act', { runId, onWait }),
         onTrace: (t) => {
           onTrace(t)
-          usage.logDecision({ provider: LAYA, runId, phase: t.phase, ms: t.ms, model: t.model, tokens: tokensOf(t) }).catch(() => {})
+          inBackground(usage.logDecision({ provider: LAYA, runId, phase: t.phase, ms: t.ms, model: t.model, tokens: tokensOf(t) }).catch(() => {}))
         },
         onError,
       })
@@ -1135,7 +1549,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       onTrace: (t) => {
         onTrace(t)
         // model and request id together: the two things a TypeSafe support query needs.
-        usage.logDecision({ provider: providers.jev, runId, account: name, phase: t.phase, ms: t.ms, model: t.model, requestId: t.requestId, tokens: tokensOf(t) }).catch(() => {})
+        inBackground(usage.logDecision({ provider: providers.jev, runId, account: name, phase: t.phase, ms: t.ms, model: t.model, requestId: t.requestId, tokens: tokensOf(t) }).catch(() => {}))
       },
       onError,
       onCall,
@@ -1166,17 +1580,24 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
    * bars are the answering provider's, and a `depth` answered too flat to use is left out, so the
    * caller keeps the cheap default.
    *
-   * Jev: without Jev (no key, error) everything is a task, as before.
+   * Jev: through the intent domain (intent.js), which records the message as a sample, with Jev's
+   * answer as the teacher's, and lets a local classifier that has earned a rung say it is a task with
+   * no Jev call; the answer carries the sample's id as `intentSample`. It lets it only where a task
+   * can run (`cwd`, the folder the message was sent in): in No project and the scratch workspace a
+   * task is refused, so a question it took for one would go unanswered, and Jev reads every message
+   * there, as before there was a domain. Without Jev (no key, error) everything is a task, as before.
+   * `modalities` says whether a picture came with the words.
    * Laya (docs/laya-auto.md 3.4): never probes TypeSafe. A message waits for Laya to start, with
    * the Starting Laya line through `onWait`, bounded as a routing call is, and is then asked; only a
    * refusal, a failed start or a timeout makes it a task, marked `unsure` with the reason, because
    * unsure means task and a word rule would send work to a chat model that cannot touch files.
+   * Neither Laya nor offline mode records an intent sample: Laya is no teacher, and offline nobody is.
    * @param {string} message
    * @param {string} mode
    * @param {'jev'|'laya'} [decider]
-   * @param {{ onWait?: (line: string) => void, signal?: AbortSignal }} [o]
+   * @param {{ onWait?: (line: string) => void, signal?: AbortSignal, modalities?: string[], cwd?: string }} [o]
    */
-  async function classify(message, mode, decider = 'jev', { onWait, signal } = {}) {
+  async function classify(message, mode, decider = 'jev', { onWait, signal, modalities, cwd } = {}) {
     const answered = (r, thresholds) => ({ ...r, depth: r.uninformative?.includes('depth') ? undefined : r.depth, thresholds })
     if (decider === 'laya') {
       const thresholds = LAYA?.thresholds
@@ -1193,7 +1614,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     if (mode === 'offline' || await isOffline('jev')) return { kind: looksLikeQuestion(message) ? 'question' : 'task', offline: true, thresholds }
     const jev = await makeDecider('jev', { runId: 'intent' }).catch(() => null)
     if (!jev) return { kind: 'task', thresholds }
-    try { return answered(await jev.intent({ message }, AbortSignal.timeout(config.jevTimeoutMs)), thresholds) } catch { return { kind: 'task', thresholds } }
+    return answered(await classifyIntent({ domain: intentDomain(), message, modalities, localMayDecide: tasksRunIn(cwd), ask: () => jev.intent({ message }, AbortSignal.timeout(config.jevTimeoutMs)) }), thresholds)
   }
 
   // The model each agent runs, for the "Answered by" line. Claude and Codex use their own settings
@@ -1218,13 +1639,80 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   refreshModels()
   // The one versionOf every profile reader and writer gets (localVersionOf).
   const versionOf = localVersionOf(local)
+  /**
+   * What the plan a verdict about the pick judged was (acceptVerdict): from the reply ledger's row of
+   * its task, when that row is of the verdict's chat, the agent, effort, level and model the router ran
+   * the task with at its first routing, the level Auto chose before your ratings moved it when they did
+   * (`planUnmoved`), the agent's family, its task type and its run; and the task's job id and whether
+   * it has ended (out of the list, or in a final state), for the words. With learning off the ledger
+   * keeps no row, and nothing is stamped.
+   */
+  async function planOfVerdict(v) {
+    const t = tasks.byKey(v.taskKey)
+    const jobId = t?.sessionId === v.sessionId ? t.jobId : null
+    const ended = !t || TERMINAL_STATES.includes(t.state)
+    const row = await ledger.row(v.taskKey)
+    if (!row || row.sessionId !== v.sessionId) return { jobId, ended, facts: null }
+    const ran = row.ran ?? {}
+    const agentDef = ran.agent ? (await enabledAgents()).find((a) => a.id === ran.agent) : null
+    const facts = { planAgent: ran.agent, planEffort: ran.effort, planLevel: ran.level, planUnmoved: ran.unmoved, planModel: ran.model, planFamily: effortFamily(agentDef), taskType: ran.taskType, runId: ran.runId }
+    return { jobId: jobId ?? row.jobId ?? null, ended, facts: Object.fromEntries(Object.entries(facts).filter(([, x]) => typeof x === 'string' && x)) }
+  }
+  /** What the words of what a verdict changed need (verdictEffects): the agents' names, the intent domain's checked examples, and your ratings of effort. */
+  async function explainVerdict(_v, applied) {
+    const names = await agentNamesNow()
+    const settings = await readEffort()
+    const intentChanged = applied?.changes?.some((c) => c.domain === 'intent')
+    return {
+      nameOf: (id) => names[id] ?? id,
+      intentChecked: intentChanged ? (await training.list({ domain: 'intent', verifiedOnly: true })).length : 0,
+      ratings: { rows: await feedback.list(), resetAt: settings.ratingsResetAt ?? null, move: settings.ratingsMove !== false },
+    }
+  }
+  /**
+   * A verdict about the pick, and what it changed, kept on its reply's row in the reply ledger, for the
+   * How Jev replies card: a clear keeps none. A clear carries only its keys, so its task is the one the
+   * message's verdict before it named. Only a row of the verdict's chat that exists is noted, which
+   * with learning off none does.
+   */
+  async function noteRated(v, effects) {
+    if (!v || !ledgerOn()) return
+    const rated = v.verdict === CLEAR ? (await feedback.history(v.sessionId)).filter((r) => r?.messageId === v.messageId && r.verdict !== CLEAR).at(-1) : v
+    if (rated?.about !== 'plan' || !rated.taskKey) return
+    const row = await ledger.row(rated.taskKey)
+    if (!row || row.sessionId !== v.sessionId) return
+    await ledger.note(rated.taskKey, { verdict: v.verdict === CLEAR ? null : { verdict: v.verdict, tag: v.tag ?? null, at: v.ts, learned: effects?.[0] ?? null } })
+  }
   // What POST /jev-router/feedback does (createFeedbackRoute), made once so every verdict the
-  // plugin is given goes through its one queue.
+  // plugin is given goes through its one queue, and every verdict about a pick is applied there as
+  // its task's run ends (bindRun), or told there is none to apply it to as its task ends with no run
+  // on record (noRun).
   const postFeedback = createFeedbackRoute({
     feedback, records: allRecords, capabilities, training, layaStore, versionOf, agents: enabledAgents, priors,
     learn: () => config.routing?.learn !== false,
     log: (m) => process.stdout.write(`[jev] ${m}\n`),
+    planOf: planOfVerdict,
+    explain: explainVerdict,
+    onApplied: noteRated,
   })
+  // The verdicts about a task's pick are applied as its run ends by the plugin that holds the task
+  // then: one applied again after this one closed, which took the task over and was given the
+  // verdicts since, when there is one (handover.js), else this one.
+  const bindRunNow = (record) => (place.heir()?.bindRun ?? postFeedback.bindRun)(record)
+  /**
+   * What a run that ended taught, learned by this plugin: the capability evidence and the labels its
+   * routing decisions earned (learnFrom), then the verdicts about its task's pick, applied over them
+   * (bindRun), then an evaluation pass, only Laya's own for a run Laya decided (2.4, 6.7). Never on the
+   * run's critical path, and never fatal.
+   */
+  const learnFromRun = (result, samples, { byLaya = false } = {}) => inBackground(learnFrom(result, samples).then(() => postFeedback.bindRun(result)).then(() => {
+    if (!byLaya) maybeRetrain()
+    maybeStanding()
+  }).catch(() => {}))
+  // Learned by the plugin that holds the run's task as it ends: one applied again after this one
+  // closed learns it in the stores it reads and evaluates, where a row this one appended to its own,
+  // closed, would be missing from them until a restart, and lost once they rewrite their files.
+  const learnFromRunNow = (result, samples, how) => (place.heir()?.learnFromRun ?? learnFromRun)(result, samples, how)
 
   const hoursFromNow = (h) => new Date(Date.now() + h * 3600_000).toISOString()
   const keyOut = (provider, name) => ['stopped', 'exhausted'].includes(usage.last()?.keys?.[provider]?.find((k) => k.name === name)?.state)
@@ -1288,12 +1776,13 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   const switchable = async () => allAgents(await readSetup()).filter((a) => a.enabled).map((a) => a.id)
 
   // Router decision log per session, for the Jev inspector. Memory only; history.jsonl is the durable record.
-  const logs = new Map() // sessionId -> runs [{ id, startedAt, task, events }], most recently used last
+  const logs = new Map() // sessionId -> runs [{ id, startedAt, task, events, jobId?, taskKey? }], most recently used last
   // The entry's id is the run's id (docs/laya-auto.md 2.4), so the live run, Stop, the task
   // record, usage.jsonl, history.jsonl, the samples and the shadow's rows all name one run alike.
-  function logRun(sessionId, task, runId = randomUUID()) {
+  // A pass of a background task names the task too (`of`: its job id and its key).
+  function logRun(sessionId, task, runId = randomUUID(), of = null) {
     const runs = logs.get(sessionId) ?? []
-    const entry = { id: runId, startedAt: Date.now(), task, events: [] }
+    const entry = { id: runId, startedAt: Date.now(), task, events: [], ...(of?.jobId ? { jobId: of.jobId, taskKey: of.taskKey ?? null } : {}) }
     runs.push(entry)
     if (runs.length > 20) runs.shift()
     logs.delete(sessionId)
@@ -1343,15 +1832,17 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // A local agent's attempt is counted while it runs, so a speed benchmark is refused meanwhile,
     // and while one goes it waits before its subagent starts, with a line that says so
     // (docs/benchmark.md 2.6): the two would otherwise take turns unloading each other's model.
-    // The wait is `untimed`: the attempt's time limit stands still while it lasts, so a long
-    // benchmark never runs the task out of time before it has begun.
+    // It holds its model until it ends, so another local agent's attempt on another model waits for
+    // it in the same way, its line naming the task that holds the model (local.js). Each wait is
+    // `untimed`: the attempt's time limit stands still while it lasts, so a long benchmark or
+    // another task's work never runs the task out of time before it has begun.
     const execute = async (agentDef, prompt, agentSignal, options = {}) => {
       const localAgent = kindOf(agentDef) === 'local'
       const report = onExecuted ? { agent: agentDef.id, timedOut: false, disposeError: null, tokens: null, ...(localAgent ? { engine: { before: local.engineCounters(), after: null } } : {}) } : null
       let reached = false
       try {
         return await (localAgent
-          ? local.localAgentAttempt(() => { reached = true; return runAgent(agentDef, prompt, agentSignal, options, report) }, { signal: agentSignal, onWait, untimed: options.untimed })
+          ? local.localAgentAttempt(() => { reached = true; return runAgent(agentDef, prompt, agentSignal, options, report) }, { signal: agentSignal, onWait, untimed: options.untimed, model: agentDef.llm?.model ?? null, who: holderOf(runId) })
           : runAgent(agentDef, prompt, agentSignal, options, report))
       } catch (err) {
         // A locked agent stopped while it still waited for its turn on this PC never started.
@@ -1365,7 +1856,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
         }
       }
     }
-    const runAgent = async (agentDef, prompt, agentSignal, { effort: eff, speed, locked = false, images = false, onStarted, onEnded } = {}, report = null) => {
+    const runAgent = async (agentDef, prompt, agentSignal, { effort: eff, speed, locked = false, images = false, onStarted, onEnded, attempt: attemptIndex = null, role = null } = {}, report = null) => {
       // A read pass starts the agent locked against writing, or not at all (capabilities.js lockOf):
       // Claude Code through its plan-mode provider row, a spawn agent with only the read tools its
       // parent sees. The lock is read again here, at the start itself, so one that stopped holding
@@ -1373,13 +1864,14 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       const lock = locked ? lockFor(agentDef, agent, { images }) : null
       if (lock && !lock.lock) throw Object.assign(new Error(lock.why), { code: LOCK_UNAVAILABLE })
       // Claude Code and Codex executors take no per-run options: they read these from process.env
-      // when the run starts (Claude: SDK child env, read as its start() builds the query; Codex:
+      // when the run starts (Claude: SDK child env, read as its start() builds the query, and its fast
+      // mode read by the engine patch as the start begins, scripts/patch-agent-live.mjs; Codex:
       // patched turn/start, see README). The variables are process-wide, and a read pass now starts
       // beside a writer as a matter of course, so setting them and starting the agent is one step
       // at a time (envStarts): two starts at once would otherwise swap their efforts.
       const envBound = agentDef.provider === 'claude-code' || agentDef.provider === 'codex'
       const setEffortEnv = () => {
-        if (agentDef.provider === 'claude-code') setEnv('CLAUDE_CODE_EFFORT_LEVEL', eff)
+        if (agentDef.provider === 'claude-code') { setEnv('CLAUDE_CODE_EFFORT_LEVEL', eff); setEnv('KZ_CLAUDE_FAST_MODE', claudeFastMode(speed)) }
         if (agentDef.provider === 'codex') { setEnv('KZ_CODEX_EFFORT', eff); setEnv('KZ_CODEX_SERVICE_TIER', codexServiceTier(speed)) }
       }
       // A local run names the weights it ran on, so its history record keeps that version
@@ -1393,8 +1885,27 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       // In-process children see global tools; hide the router so an agent never re-routes its own
       // task. A locked child's allow list hides it too, with everything else that is not reading.
       const toolFilter = lock?.lock?.toolFilter ?? (agentDef.provider === 'spawn' && config.registerTool ? { deny: ['jev_route'] } : null)
+      // The attempt's own handle in the live view, so a parallel opinion never mixes with it.
+      const handle = live.attempt(runId, attemptIndex)
+      // Claude Code and Codex tell what their run does only through the engine patch: its fields go on
+      // the start only when the connector carries it (engine-patches.js), since one without it would
+      // not know them, and only for a run the live view follows. The tap feeds the attempt's handle, and
+      // says which of the person's words a Codex turn took in; the control's hooks are for steering:
+      // Codex's `steer` and `sendNow` take them mid-run (Steer, Send now), and so do Claude Code's
+      // through an input channel, which a task's work attempt is started with only while Settings'
+      // "Let Steer reach a running Claude Code" is on. Each says what became of words it took
+      // (`onOutcome`): Claude Code's read or not said, Codex's Send now gone on with.
+      const provider = lock?.lock?.provider ?? agentDef.provider
+      const patchKey = patchKeyOf(provider)
+      const tap = live.tapFor(handle)
+      const steerable = steerableRole(role) && steerRuns.has(runId)
+      if (patchKey === 'claude-code') await liveSettingsRead
+      const channel = patchKey === 'claude-code' && steerable && liveSettings.claudeSteer === true
+      const kzh = patchKey && live.has(runId) && enginePatches()[patchKey].on
+        ? { kzhTap: (frame) => { tap(frame); steerHeard(runId, heardInTap(frame)) }, kzhControl: { ...(channel ? { channel: true } : {}), onOutcome: (id, outcome) => steerOutcome(runId, id, outcome) } }
+        : null
       let sub
-      const start = () => ctx.subagents.start(lock?.lock?.provider ?? agentDef.provider, {
+      const start = () => ctx.subagents.start(provider, {
         label: `jev:${agentDef.id}`,
         prompt: [{ type: 'text', text: prompt }],
         parent: agent,
@@ -1403,6 +1914,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
         ...(toolFilter ? { toolFilter } : {}),
         // Pin the model: a spawn child otherwise inherits the parent's (Jev) model and routes back into Jev.
         ...(agentDef.llm?.provider && agentDef.llm?.model ? { agentOptions: { provider: agentDef.llm.provider, model: agentDef.llm.model, ...(eff ? { reasoningEffort: eff } : {}) } } : {}),
+        ...(kzh ?? {}),
       })
       try {
         sub = await (envBound ? envStarts(() => {
@@ -1433,14 +1945,59 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       }
       // Started locked: the router's lock check covers it whatever this attempt comes to, a Stop included.
       if (lock) { try { onStarted?.() } catch { /* the router's */ } }
+      // Claude Code thinking: Summarized (Settings, Jev setup, Live agent view) asks a patched run to
+      // share its thinking as summaries (the SDK's setMaxThinkingTokens(null, 'summarized'), which
+      // keeps how much it thinks); As Claude Code shows it asks nothing.
+      if (kzh && patchKey === 'claude-code' && liveSettings.claudeThinking === 'summarized') askThinking(kzh.kzhControl, 'summarized', agentDef.id)
+      // What the agent does as it does it, for the live view, beside the run and never in its way: a
+      // spawn child's own stream and session (followSpawn), a patched connector's taps, or, for an
+      // agent this build cannot read, why its detail is off, and for Claude Code and Codex where
+      // Settings says so.
+      const heard = !!sub.localAgent || !!kzh
+      handle.started({
+        provider: agentDef.provider, model: agentDef.llm?.model ?? modelOf(agentDef) ?? null,
+        child: sub.localAgent ? { id: sub.id, label: `jev:${agentDef.id}` } : null,
+        detail: heard ? 'live' : 'off', why: heard ? null : liveOffWhy(provider),
+        ...(!heard && patchKey ? { see: 'Settings, Jev setup, Live agent view' } : {}),
+        // A local model thinks aloud only when its manifest entry says so (llamaArgs), which the Live tab says.
+        thinking: agentDef.llm?.provider === LOCAL_PROVIDER ? !!local.modelOf?.(agentDef.llm.model)?.thinking : null,
+      })
+      // A run the live view does not hold (the capability benchmark's) is not followed at all.
+      const following = live.has(runId) ? followSpawn(sub, handle, { pumpMs: liveSeams.pumpMs, onHeard: (id) => steerHeard(runId, id) }) : { drain() {} }
+      // A task's work attempt takes the person's words from here until its agent's result is in
+      // (Steer, Send now): never an opinion or a review, nor a run of the chat.
+      const unsteer = steerable
+        ? steerers.add(runId, { attempt: attemptIndex, role, agentId: agentDef.id, name: nameOfAgent(agentDef), provider, sub, control: kzh?.kzhControl ?? null })
+        : () => {}
+      // The words given while it waited to start, after its prompt was built, go to it now (steerOnStart).
+      if (steerable) steerOnStart(runId)
+      let stopReason = null
       try {
         // The agent's result is in once this settles; the router is told before its process is
         // disposed of, which can take a while, so a primary that breaks off meanwhile is not taken
-        // to have stopped it.
-        const r = await Promise.resolve(sub.result).finally(() => { try { onEnded?.() } catch { /* the router's */ } })
-        if (report) report.tokens = usageTokens(r.usage)
-        return { stopReason: r.stopReason, diagnostic: r.diagnostic, answerText: textOf(r.output), usage: r.usage, ...(version ? { modelVersion: version } : {}) }
+        // to have stopped it. From then on no word reaches it: a spawn child given a steer once idle
+        // would start a turn nobody waits for.
+        const r = await Promise.resolve(sub.result).finally(() => { unsteer(); try { onEnded?.() } catch { /* the router's */ } })
+        stopReason = r.stopReason
+        // Neither connector's result says what its run spent: a patched one's tap heard it, tokens,
+        // cost and the model that served it, which the router records as `servedModel`, never as a
+        // model version, so capability evidence keeps its keys.
+        const tapped = kzh ? handle.usage() : null
+        const spent = r.usage && typeof r.usage === 'object' && Object.keys(r.usage).length ? r.usage : tapped?.usage ?? r.usage
+        if (report) report.tokens = usageTokens(spent)
+        return {
+          stopReason: r.stopReason, diagnostic: r.diagnostic, answerText: textOf(r.output), usage: spent, ...(version ? { modelVersion: version } : {}),
+          ...(tapped?.costUsd != null ? { costUsd: tapped.costUsd } : {}),
+          ...(tapped?.apiEquivalentUsd != null ? { apiEquivalentUsd: tapped.apiEquivalentUsd } : {}),
+          ...(tapped?.servedModel ? { servedModel: tapped.servedModel } : {}),
+        }
       } finally {
+        unsteer()
+        // The last of what the child committed is read before it is disposed of, which takes its session.
+        following.drain({ stopReason })
+        // Words Send now gave this attempt that its agent never took in were not used, and the next
+        // attempt's prompt is not given them: they were to replace a step of this one.
+        if (steerable) endNow(runId, attemptIndex)
         // Both providers' dispose() ends the agent's process and waits for its exit. A failure here
         // is still not the run's, but a caller that grades the folder next is told of it: something
         // of the agent may still be running there (docs/benchmark.md 3.6).
@@ -1510,6 +2067,8 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   const sameDir = (a, b) => (process.platform === 'win32' ? resolve(a).toLowerCase() === resolve(b).toLowerCase() : resolve(a) === resolve(b))
   const inScratch = (cwd) => sameDir(cwd, scratchRoot) || resolve(cwd).startsWith(scratchRoot + sep)
   const SCRATCH_ONLY = 'The KzH scratch workspace is for the capability benchmark only; open one of your projects to run tasks.'
+  /** Whether a task sent from a chat in `cwd` can run there: one with no folder, in No project or in the scratch workspace is refused. */
+  const tasksRunIn = (cwd) => !!cwd && !isNoProject(cwd) && !inScratch(cwd)
 
   // A routed agent is started as a child of the chat that routed it (runAgent's `parent`), and a
   // child that called jev_route would route its own task again, waiting on the lane its own parent
@@ -1522,8 +2081,10 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
 
   // Read-only work (docs/queue-and-cost-findings.md 1). An agent whose lock did not hold (files
   // changed while it ran locked and no task was changing the folder) takes no read-only work until
-  // the harness restarts; by agent id, with when and what changed.
-  const distrusted = new Map()
+  // the harness restarts; by agent id, with when and what changed. The plugin that closed just before
+  // leaves its own here, so neither a setting changed nor a breach its run still going finds after the
+  // close trusts the agent again (handover.js).
+  const distrusted = inherited.distrusted ?? new Map()
   // How `a` can be locked against writing when `parent` starts it, or why not: the facts as the
   // engine reports them now (capabilities.js lockOf), the parent's own view of the tools included.
   const lockFor = (a, parent, { images = false } = {}) => {
@@ -1580,7 +2141,10 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     if (e.type === 'routed') held.shape = { ...held.shape, decider: e.routing?.decider ?? held.shape?.decider, agent: e.tool ? null : e.routing?.primaryAgent ?? null, review: !!(e.plan?.forceReview && e.plan?.reviewer) }
     if (e.type === 'attempt_start' && e.role === 'primary' && held.shape && held.shape.effort === undefined) held.shape = { ...held.shape, effort: e.effort ?? null }
   }
-  async function route({ task, agent, forceAgent, answerOnly, effort, mode = 'auto', decider = 'jev', laneHeld = false, who: laneWho = null, access = null, modalities, signal = new AbortController().signal, emit, onEntry }) {
+  // One routed run. A background task's pass also names its task: `jobId` and `taskKey` (tasks.js
+  // key), both on the inspector's entry and the key alone on the history row, and `intentSample`,
+  // the intent sample of the message that queued it.
+  async function route({ task, agent, forceAgent, answerOnly, effort, mode = 'auto', decider = 'jev', laneHeld = false, who: laneWho = null, access = null, modalities, signal = new AbortController().signal, emit, onEntry, taskKey = null, jobId = null, intentSample = null }) {
     const cwd = agent?.session?.header?.cwd
     if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
     if (inScratch(cwd)) throw new Error(SCRATCH_ONLY)
@@ -1608,7 +2172,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // One id for the whole run, minted before anything records it (2.4): the inspector's entry,
     // Stop, the task record, the router, usage.jsonl and the shadow's rows all carry it.
     const runId = randomUUID()
-    const entry = logRun(sessionId, task, runId)
+    const entry = logRun(sessionId, task, runId, { jobId, taskKey })
     const held = who
     if (held) Object.assign(held, { runId, startedAt: entry.startedAt, shape: { decider } })
     onEntry?.(entry)
@@ -1628,8 +2192,22 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // Jev Auto says once, at the routed event, whether Laya answers the same questions in the
     // background, and nothing else of the shadow reaches the live stream (3.3).
     const withShadowNote = (e) => (e.type === 'routed' && !laya && client && shadowOn() ? { ...e, shadow: sidecar.isReady() ? 'answering' : 'not_running' } : e)
-    // Each step also goes to the server log, which the Kz-harness app shows in its log window.
-    const onEvent = (event) => { const e = withShadowNote(event); noteShape(held, e); entry.events.push({ ...e, text: line(e) }); emit?.(e); logStep(line(e)) }
+    // Each step also goes to the server log, which the Kz-harness app shows in its log window, and to
+    // the live view, which takes the milestones it marks and never throws. A piece of the person's
+    // guidance a prompt carried to an attempt (router.js) is noted on its task first (carriedSteer).
+    const told = (e) => { noteShape(held, e); entry.events.push({ ...e, text: line(e) }); live.router(runId, e); emit?.(e); logStep(line(e)) }
+    const onEvent = (event) => { const e = withShadowNote(event); told(e.type === 'steer' && e.state === 'carried' && steerRuns.has(runId) ? carriedSteer(runId, e) : e) }
+    // The live view of the run (live.js), opened before its first event and ended in the finally below:
+    // its milestones, and each agent's own work where this build can read it. A run of the chat is
+    // followed as a task's pass is. `ended` is how it ended: its final status, or how without one.
+    live.open(runId, { taskKey, sessionId, decider })
+    // A task's run takes the person's words as it works (Steer), and says what becomes of them on its
+    // own events; `names` are its agents' names, once known.
+    if (taskKey) steerRuns.set(runId, { key: taskKey, say: told, names: {} })
+    live.describe(runId, { checks: config.checks?.enabled !== false, answerOnly: !!answerOnly || readPass })
+    let ended = null
+    // The run's history.jsonl row once router.js has written it, which it does for a stopped run too.
+    let recorded = null
     try {
       const onTrace = (trace) => onEvent({ type: 'jev', at: Date.now(), trace })
       // A call that did not answer is a line of its own, and never a usage row (2.4, 3.3).
@@ -1654,6 +2232,10 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       // for its own start and, past that, fails as a timeout.
       if (laya) await layaReady({ signal, onWait })
       const { agents, ready, deps } = await runDepsFor({ agent, cwd, sessionId, runId, signal, onEvent })
+      // Who reviews its attempts (offline, the checks alone decide), and the agents by their names.
+      const names = Object.fromEntries(agents.map((a) => [a.id, nameOfAgent(a)]))
+      live.describe(runId, { reviewer: client ? decider : null, names })
+      if (steerRuns.has(runId)) steerRuns.get(runId).names = names
 
       // What each resource actually is right now, through its provider's own adapter: its limits
       // in that provider's own terms, its economics, its hardware, how much to trust the figures.
@@ -1679,6 +2261,8 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
         answerOnly,
         effort,
         access,
+        taskKey,
+        intentSample,
         config: { ...config, agents, effort: await readEffort() },
         signal,
         deps: {
@@ -1722,25 +2306,43 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
             },
             outcomeDomain: laya ? layaOutcomeDomain() : outcomeDomain(),
           }),
-          history,
+          history: { ...history, append: async (record) => { await history.append(record); recorded = record } },
+          // What the person added to the task as it ran (Steer), which every prompt built from here on
+          // carries (router.js withGuidance), in their words whole.
+          guidance: () => (taskKey ? guidanceOf(taskKey) : []),
         },
       })
       // What the run proved, recorded after the fact: capability evidence per resource, and the
       // label each routing decision earned. Never on the run's critical path, and never fatal.
       // A Laya-decided run gives the Jev domains nothing new to evaluate, and their evaluation pass
       // stamps and saves every Jev domain state, so only Laya's own pass follows it (2.4, 6.7).
-      learnFrom(result, decisionSamples).then(() => {
-        if (!laya) maybeRetrain()
-        maybeStanding()
-      }).catch(() => {})
+      // The verdicts about this task's pick given while it ran are applied now, over what learnFrom
+      // labelled from the run alone, by the plugin that holds the task now (learnFromRunNow).
+      learnFromRunNow(result, decisionSamples, { byLaya: laya })
+      ended = result.finalStatus ?? null
       return withRunMark(formatReport(result), result.runId)
     } catch (err) {
       // A read pass that cannot do the task locked is no error: the task goes to its folder's line
       // (tasks.js runAdmitted), and its record and row say why. Nothing is learned from it.
-      if (err?.code === NEEDS_LANE) onEvent({ type: 'access', at: Date.now(), mode: 'write', from: 'read', why: err.message, ...(err.readPass?.breach ? { breach: err.readPass.breach } : {}) })
+      if (err?.code === NEEDS_LANE) onEvent({ type: 'access', at: Date.now(), mode: 'write', from: 'read', why: err.message, ...(err.changesFiles ? { changesFiles: true } : {}), ...(err.readPass?.breach ? { breach: err.readPass.breach } : {}) })
       else onEvent({ type: 'error', at: Date.now(), message: err.message })
+      ended = err?.code === NEEDS_LANE ? 'needs_write' : signal.aborted ? 'stopped' : 'failed'
+      // A stopped run is on the record too, and the verdicts about its task's pick given while it went
+      // are applied to it now, though nothing is labelled from how it ended (no learnFrom). A run that
+      // failed wrote no row, so there is no run to apply them to.
+      if (ended === 'stopped' && recorded) inBackground(bindRunNow(recorded))
       throw err
     } finally {
+      // Guidance no agent had read as the run ends was not used, which its bubble says before the
+      // transcript is saved; a read pass handing its task back keeps it for the pass that writes.
+      if (taskKey && ended !== 'needs_write') { try { endGuidance(runId, taskKey) } catch { /* the task's end says it */ } }
+      steerRuns.delete(runId)
+      // The live view says the run has ended, and a task's transcript is saved as each of its runs ends.
+      live.finish(runId, { status: ended })
+      // Its task's transcript, by the Keep transcripts and the task list of the plugin that has taken
+      // the task over when this one has closed (handover.js).
+      const atEnd = place.heir()?.transcriptAtEnd ?? transcriptAtEnd
+      atEnd(taskKey)
       if (laya) sidecar.release(runId)
       runLog.close(counted)
       if (routingFor) { const n = (routing.get(routingFor) ?? 1) - 1; if (n > 0) routing.set(routingFor, n); else routing.delete(routingFor) }
@@ -1749,11 +2351,11 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     }
   }
 
-  // Each agent at high effort and Codex at its normal service tier, whatever Settings say, so the
-  // spend the confirmation states cannot change after it and a score does not move when Settings
-  // do; one work attempt, no review and one round, so no other agent is ever scored for it
+  // Each agent at high effort and Codex and Claude Code at their normal speed, whatever Settings say,
+  // so the spend the confirmation states cannot change after it and a score does not move when
+  // Settings do; one work attempt, no review and one round, so no other agent is ever scored for it
   // (docs/benchmark.md 3.8).
-  const BENCHMARK_EFFORT = Object.freeze({ default: 'high', perAgent: {}, codexSpeed: 'normal' })
+  const BENCHMARK_EFFORT = Object.freeze({ default: 'high', perAgent: {}, codexSpeed: 'normal', claudeSpeed: 'normal' })
   const BENCHMARK_LIMITS = Object.freeze({ maxAttempts: 1, maxReviews: 0, maxRounds: 1 })
 
   /**
@@ -1833,7 +2435,8 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   // A routed task runs as a DSH background job so the chat stays free, and one
   // at a time per workspace (a lane) so two agents never edit the same folder.
   // The result is posted into the chat on the session's next turn.
-  const lanes = createLanes()
+  // The lanes of the plugin that closed just before, when it left them: its runs still hold theirs.
+  const lanes = inherited.lanes ?? createLanes()
   // The budget's cap on tasks at once, across every workspace. Changes arrive through onSettings.
   local.readSettings().then((s) => lanes.setMax(s.maxConcurrentTasks), () => {})
 
@@ -1855,10 +2458,34 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     // Absent (no tool-jobs plugin) means enqueue() returns null and tasks run blocking.
     jobs: () => { try { return ctx.get?.('jobs') ?? null } catch { return null } },
     // The result goes to its conversation the moment the task settles, and keeps trying if
-    // that first attempt does not land.
-    onSettled: (result, owner) => { delivery.deliverWithRetry(result, owner).catch(() => {}) },
+    // that first attempt does not land; no prompt of its runs needs its guidance whole any more;
+    // and a rating of its pick told to wait for its run is told so if it ended with none on record.
+    onSettled: (result, owner) => {
+      for (const s of result?.steers ?? []) steerTexts.delete(s?.id)
+      delivery.deliverWithRetry(result, owner).catch(() => {})
+      const t = tasks.get(result?.jobId)
+      if (t?.key) inBackground(postFeedback.noRun({ taskKey: t.key, sessionId: t.sessionId }))
+    },
+    // Each task a restart stopped had no run of it end here, so the same goes for it.
+    onRestartStopped: (t) => { inBackground(postFeedback.noRun({ taskKey: t.key, sessionId: t.sessionId })) },
+    // The tasks the plugin that closed just before still had going, taken over here as the list loads:
+    // a pass of one that starts after is run on this plugin's `route` once the list has loaded, so what
+    // it says is heard here from its first event (takeFollows), what each of their runs taught is
+    // learned here as it ends (`learnFromRun`), and so is a rating of a pick given here (`bindRun`, for
+    // a run stopped, which teaches nothing else); its transcript is kept or not by this plugin's Keep
+    // transcripts (`transcriptAtEnd`).
+    takeOver: place.take({ route: (opts) => tasks.ready.catch(() => {}).then(() => route(opts)), learnFromRun, bindRun: (record) => postFeedback.bindRun(record), transcriptAtEnd: (key) => transcriptAtEnd(key) }),
     // How long a waiting task may still wait, from the runs like the one holding its workspace.
     wait: ({ workspace, holder, aheadWho, ...where }) => waitEstimate(waitStatsNow, where, { holder: holder?.startedAt ? { shape: holder.shape, elapsedMs: Date.now() - holder.startedAt, answerOnly: holder.answerOnly } : null, ahead: aheadWho, workspace }),
+    // What its work is doing now (the work board's second line, the Tasks tab's live tail), from the
+    // live view of its runs, read as the list is read and never saved.
+    activity: (t) => live.activityOfRuns(t.runIds),
+    // A task that leaves the list takes its saved live transcript with it.
+    onDrop: (key) => { inBackground(live.drop(key)) },
+    // Send now warns when a local model runs beside it, or it was sent to one itself.
+    isLocal: (id) => localAgents.some((a) => a.id === id),
+    // What Steer does now with words for a task at work, which its dialog says.
+    steering: (t) => steerFacts(t),
     log: (m) => process.stdout.write(`[jev] ${m}
 `),
     run: (t, { signal, emit, onEntry }) => {
@@ -1874,11 +2501,19 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       // Whoever the task was queued for decides it, and route() asks now whether Laya can be
       // asked, however long ago the task was queued.
       return runAdmitted({ lanes, task: t, signal, who: { kind: 'task', decider: t.decider ?? 'jev' }, onWait: (why) => emit({ type: 'queued', text: WAITING[why] }),
-        run: (pass) => route({
-          task: t.task, agent: t.owner, forceAgent, effort, mode: t.mode ?? 'auto', decider: t.decider ?? 'jev', laneHeld: true, who: pass.who,
-          access: verdict || pass.mode === 'read' ? { mode: pass.mode, verdict, ...(pass.from ? { from: pass.from } : pass.mode === 'write' && writeWhy ? { why: writeWhy } : {}) } : null,
-          modalities: t.modalities ?? ['text'], signal, emit, onEntry,
-        }) })
+        // A pass that starts once a plugin applied after this one has taken the task over is run by that
+        // plugin, with its settings: this one has closed, and saves and posts nothing (handover.js). One
+        // that starts after the close, before then, waits for it, within the bound (handedOver).
+        run: async (pass) => {
+          if (disposed) await place.handedOver()
+          return (place.heir()?.route ?? route)({
+            task: t.task, agent: t.owner, forceAgent, effort, mode: t.mode ?? 'auto', decider: t.decider ?? 'jev', laneHeld: true, who: pass.who,
+            access: verdict || pass.mode === 'read' ? { mode: pass.mode, verdict, ...(pass.from ? { from: pass.from } : pass.mode === 'write' && writeWhy ? { why: writeWhy } : {}) } : null,
+            modalities: t.modalities ?? ['text'], signal, emit, onEntry,
+            // Each pass is the task's own, whatever the engine's job id comes to name after a restart.
+            taskKey: t.key, jobId: t.jobId, intentSample: t.intentSample ?? null,
+          })
+        } })
     },
   })
   // Filled in now that the registry exists; onSettled above only dereferences it once a task
@@ -1888,7 +2523,457 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     log: (m) => process.stdout.write(`[jev] ${m}\n`),
     // Lazy: the formatter is built by the llm block below and is null until then.
     format: (r, text) => (formatter ? formatter(r, text) : text),
+    // The result's head names the agent as the start reply did.
+    names: () => agentNamesNow(),
+    progress: () => chatReplies.progress,
   })
+
+  // Closing, as KzH quits or the engine applies the plugin again, settles what the plugin has under
+  // way on disk before the plugin that replaces it reads the folder: every task record asked for so
+  // far, the switches saved so far, the live transcripts saved or deleted so far, and the background
+  // writes (inBackground). Nothing new starts, and no store rewrites its file from what it holds
+  // after, since the plugin that replaces this one writes its own rows there; a run still going keeps
+  // only its appends, and saves no transcript as it ends. The routing domains stop saving last, once
+  // an evaluation pass under way has saved what it found.
+  // What is still going is left for the plugin the engine applies next on this data folder to take
+  // over (handover.js): the tasks in line or at work, and the registries their runs write to from
+  // here. One applied again within the bound records, saves and posts their results, and the live
+  // store, which it reopens, saves their transcripts; as KzH quits, none is applied, and they end here
+  // as before, saving and posting nothing.
+  ctx.effect(() => () => {
+    disposed = true
+    const pending = [tasks.dispose(), training.dispose(), layaStore.dispose(), resourceTracker.dispose(), live.dispose(), setupQueue, ...background]
+    place.leave({ kept: { lanes, live, steerers, steerRuns, steerTexts, following, distrusted }, tasks: tasks.handOff() })
+    return closeWithin(pending, { log: (m) => process.stdout.write(`[jev] data folder: ${m}\n`) }).then(() => { domains?.dispose() })
+  })
+
+  // --- Chat replies: the start reply and the milestone notices (docs/live-agent-view.md Feature 2)
+  // How the chat answers a task it queues (Settings, Jev setup, Chat replies): how long the start
+  // reply waits for the router's pick, and whether milestone notices follow it. One small JSON file,
+  // read once and kept here, so a reply never waits on a disk read; a file that cannot be read is
+  // the settings as shipped.
+  const chatRepliesFile = join(dataDir, 'chat-replies.json')
+  let chatReplies = CHAT_REPLIES
+  const chatRepliesRead = readFile(chatRepliesFile, 'utf8')
+    .then((raw) => { chatReplies = validChatReplies(JSON.parse(raw)) })
+    .catch(() => {})
+  // Settings, Jev setup, Live agent view (validLiveSettings): one small JSON file, read once and kept
+  // here; a file that cannot be read is the settings as shipped. Whether transcripts are kept is read
+  // as each run ends; the two Claude Code settings are kept for Steer and Send now into a running task.
+  const liveSettingsFile = join(dataDir, 'live.json')
+  let liveSettings = LIVE_SETTINGS
+  const liveSettingsRead = readFile(liveSettingsFile, 'utf8')
+    .then((raw) => { liveSettings = validLiveSettings(JSON.parse(raw)) })
+    .catch(() => {})
+  // Keep transcripts, Last 20 tasks: a finished task further back than the task list's newest 20
+  // keeps its record but not its transcript, deleted as each run ends and once at start-up. One
+  // still at work keeps its own until its run ends: that saves it, and the deletes after it take it.
+  // A plugin that has closed leaves that to the one that took its tasks over, by that one's settings.
+  const pruneTranscripts = async () => {
+    await liveSettingsRead
+    if (disposed || liveSettings.transcripts !== 'last20') return
+    await tasks.ready
+    if (disposed) return
+    const list = tasks.list()
+    for (const t of list.slice(0, Math.max(0, list.length - TRANSCRIPTS_LAST))) if (t.key && TERMINAL_STATES.includes(t.state)) inBackground(live.drop(t.key))
+  }
+  inBackground(pruneTranscripts())
+  // A task's transcript as one of its runs ends. Keep transcripts off (Live agent view): none is
+  // saved, and one kept before is deleted. Last 20 tasks: the task's own is saved, and the ones of
+  // tasks now past the newest 20 go. A run of the plugin that closed before this one ends here too,
+  // once this one has taken its task over (handover.js).
+  const transcriptAtEnd = (taskKey) => {
+    if (taskKey) inBackground(liveSettings.transcripts === 'off' ? live.drop(taskKey) : live.persist(taskKey))
+    inBackground(pruneTranscripts())
+  }
+  // Each agent's own name by its id, for the words the chat shows.
+  const agentNamesNow = async () => Object.fromEntries((await enabledAgents().catch(() => [])).map((a) => [a.id, nameOfAgent(a)]))
+
+  // Each task queued from the chat is followed while it lives, for what its router events say that
+  // its record does not keep: whether the decider was asked before the pick, what the task waited
+  // for, which agent works on it now, what moved it, and whether its read pass handed it back
+  // because the work changes files. The start reply's credit and the milestone notices read it.
+  // Memory only, and let go as the task settles. The follows of the plugin that closed just before go
+  // on here, with the tasks this one took over from it (takeFollows, below).
+  const following = inherited.following ?? new Map() // task key -> { key, jobId, owner, decider, asked, called, calledBefore, failedWhy, failedBefore, routed, waitedFor, workAgent, stepAgent, causes, changesFiles, guard, guardAt, unwatch, posting, movedOwed }
+  // The plan reply A names for a task sent to an agent picked in the model menu (enqueue), by task
+  // key, for the reply ledger's note of what that reply said (noteSaid). Kept apart from the follow,
+  // which is let go as the task settles: an agent that refuses the task at once, signed out or at its
+  // usage limit, can end it before its reply A is out. Let go once that reply is noted, or once its
+  // task has left the task list, as one whose reply was stopped before it said what it named.
+  const forcedPlans = new Map()
+  // How a start reply that named the predictor's guess before routing picked came to name it (noteSaid).
+  const GUESSES = ['quick', 'instant', 'likely']
+  // How long after its wait a start reply that never said what it named (stopped mid-wait) is taken
+  // to have named nothing, so the task's started notice still comes.
+  const guardGraceMs = replySeams.graceMs ?? 5000
+  // Whether a router event of a followed task can send its work to another agent, so its line is
+  // among those that say why a retry went there (the moved notice's body): a review, and a usage
+  // limit of the agent whose step it was (the work's, or the plan's before it), with that agent's
+  // balance falling under its floor before it. A balance that only runs low keeps the work where it
+  // is, and a limit of Jev's own key, of a parallel opinion or of a reviewer leaves it there: none of
+  // those is of the agent whose step it was. A gate or a capability moves the work while it is
+  // routed, before the `routed` that clears these, and a stall ends the run, so none of those is
+  // ever among them.
+  const movesWork = (f, e) => e.type === 'review' || (e.agent === f.stepAgent && (e.type === 'limit' || (e.type === 'balance' && OUT_STATES.includes(e.state))))
+  // What a wait was for, from its reason (tasks.js WAITING): the folder, or a free slot.
+  const waitedForOf = (why) => (why === 'workspace' || why === 'chat' ? 'folder' : why === 'cap' || why === 'line' ? 'slot' : null)
+  const whyOfText = (text) => Object.keys(WAITING).find((k) => WAITING[k] === text) ?? null
+  // Why a call to the decider did not answer, from its decider-error event (jev.js errorOf, which the
+  // event carries as `error`), in the words a fallback's reason has (router.js describeError), for a
+  // credit that says why the decider could not pick (router.js pickedBy).
+  const failedWhyOf = (e) => {
+    const x = e.error?.error ?? e.error ?? {}
+    return redactSecrets(`${x.class ?? 'Error'}: ${x.message ?? 'no reason given'}`).slice(0, 300)
+  }
+
+  /** Follow a task just queued from the chat (tasks.js watch) until it settles, for its start reply and its notices. */
+  function follow(t, { owner, decider, asked, waitMs }) {
+    const f = {
+      key: t.key, jobId: t.jobId, owner, decider, asked: asked && asked !== 'auto' ? asked : null,
+      called: false, calledBefore: false, failedWhy: null, failedBefore: null, routed: null, workAgent: null, stepAgent: null, causes: [], changesFiles: false, guard: null, unwatch: null,
+      // A task that waits as it is queued was told so before this could listen (tasks.enqueue).
+      waitedFor: waitedForOf(tasks.get(t.jobId)?.waiting?.why),
+      // Its notices so far, posted one after another (inTurn).
+      posting: Promise.resolve(),
+    }
+    following.set(t.key, f)
+    f.unwatch = tasks.watch(t.key, (e) => heard(f, e))
+    // A start reply that never says what it named notes nothing (adapter.js startReply), as when it is
+    // stopped in its wait for the pick: once it has had that wait and a grace for its text to go out,
+    // it is taken to have named no plan, so the task's started notice still comes.
+    const guardMs = Math.max(0, waitMs) + guardGraceMs
+    // When that is, for a plugin applied again that takes the task over to keep (takeFollows).
+    f.guardAt = Date.now() + guardMs
+    f.guard = setTimeout(() => {
+      if (tasks.byKey(f.key)?.ackGen == null) tasks.noteAck(f.key, { gen: 0, said: null })
+      noticeDue(f)
+    }, guardMs)
+    f.guard.unref?.()
+  }
+  /** Let go of a task that has settled: nothing more is said of it but its result. */
+  function unfollow(f) {
+    clearTimeout(f.guard)
+    f.unwatch?.()
+    following.delete(f.key)
+  }
+  /**
+   * The tasks the plugin that closed just before still followed, and this one took over as its list
+   * loaded (createTasks takeOver), are followed from here (handover.js): that plugin's watch of each is
+   * let go and this one's taken up, so the start reply's guard, the milestone notices and what the
+   * reply ledger notes as each is routed are this plugin's from now on, and a notice owed meanwhile,
+   * which that plugin could not claim, is posted now.
+   */
+  function takeFollows(taken) {
+    // A plugin closed before its list loaded follows nothing: the plugin applied after it takes them.
+    if (disposed) return
+    for (const f of taken) {
+      if (following.get(f.key) !== f || !tasks.byKey(f.key)) continue
+      f.unwatch?.()
+      clearTimeout(f.guard)
+      f.unwatch = tasks.watch(f.key, (e) => heard(f, e))
+      // A start reply not out yet keeps the wait it had: the chat's turn may still be writing it.
+      if (tasks.byKey(f.key).ackGen == null) {
+        f.guard = setTimeout(() => {
+          if (tasks.byKey(f.key)?.ackGen == null) tasks.noteAck(f.key, { gen: 0, said: null })
+          noticeDue(f)
+        }, Math.max(0, (f.guardAt ?? 0) - Date.now()))
+        f.guard.unref?.()
+      }
+      noticeDue(f)
+      // A move heard after that plugin closed, before this one took the task over, is said from here.
+      if (f.movedOwed) { const { e, lines } = f.movedOwed; f.movedOwed = null; moved(f, e, lines) }
+    }
+  }
+  const takenFollows = [...following.values()]
+  if (takenFollows.length) tasks.ready.then(() => takeFollows(takenFollows)).catch(() => {})
+  /** One router event of a followed task, heard once its record holds it (tasks.js watch). */
+  function heard(f, e) {
+    if (e.type === 'settled') return unfollow(f)
+    if (e.type === 'queued' && whyOfText(e.text)) f.waitedFor = waitedForOf(whyOfText(e.text))
+    if (e.type === 'jev' || e.type === 'decider-error') f.called = true
+    // Why the decider's last call did not answer, for a credit that says why it could not pick.
+    if (e.type === 'decider-error') f.failedWhy = failedWhyOf(e)
+    // A read pass handed the task back: the pass that writes after it is routed afresh. Whether it
+    // went back because its work changes files is kept for the notice that it started again.
+    if (e.type === 'access' && e.mode === 'write') Object.assign(f, { called: false, failedWhy: null, routed: null, workAgent: null, stepAgent: null, causes: [], changesFiles: !!e.changesFiles })
+    if (movesWork(f, e)) f.causes.push(e)
+    // A run the router stops for a person starts no agent, so nothing is said to have started.
+    if (e.type === 'routed' && !e.stopsForPerson) {
+      Object.assign(f, { routed: e, calledBefore: f.called, failedBefore: f.failedWhy, workAgent: e.tool ? null : e.primary?.agent ?? e.routing?.primaryAgent ?? null, causes: [] })
+      noticeDue(f)
+      if (ledgerOn()) noteRan(f, e)
+    }
+    // A plan step comes before the work, on an agent of its own whose limit sends the work elsewhere.
+    if (e.type === 'attempt_start' && e.role === 'plan') f.stepAgent = e.agent
+    if (e.type === 'attempt_start' && (e.role === 'primary' || e.role === 'retry')) {
+      if (e.role === 'retry' && f.workAgent && e.agent !== f.workAgent) {
+        // A reply that has not said what it named by the time the work moves was stopped in its wait.
+        // It is taken to have named nothing now, as its guard would take it later, so the notice it is
+        // owed goes first, naming the agent the work started on, and the moved notice follows it: left
+        // to the guard, that notice would come after the moved one and name an agent the work has left.
+        if (tasks.byKey(f.key)?.ackGen == null) { tasks.noteAck(f.key, { gen: 0, said: null }); noticeDue(f) }
+        moved(f, e, [...f.causes.map((c) => line(c)), line(e)])
+      }
+      Object.assign(f, { workAgent: e.agent, stepAgent: e.agent, causes: [] })
+    }
+  }
+  // A notice is extra: one that cannot be worked out or posted is logged, and the task goes on.
+  const noticeFailed = (f) => (err) => process.stdout.write(`[jev] notice for ${f.jobId} not posted: ${err?.message ?? err}\n`)
+  /**
+   * Post one notice of a followed task once every notice claimed for it before has gone out or
+   * failed, so they land in the order they were claimed, however long each takes to word. `claim`
+   * claims the notice (tasks.js claimNotice) before it awaits anything, and resolves with its words,
+   * or with nothing when none is owed. Never rejects.
+   */
+  function inTurn(f, claim) {
+    const before = f.posting
+    const words = claim()
+    const posting = (async () => {
+      const said = await words
+      if (!said) return
+      await before
+      await delivery.notify(f.owner, { key: f.key, ...said })
+    })().catch(noticeFailed(f))
+    f.posting = before.then(() => posting)
+    return posting
+  }
+  /**
+   * Post the milestone notice a followed task is owed now, if any (tasks.js startedNoticeDue). Start
+   * and result only posts one of them: the change of plan of a guess routing did not pick (tasks.js
+   * guessMissed), worded as under Milestones. Never rejects.
+   */
+  function noticeDue(f) {
+    return inTurn(f, async () => {
+      const seen = tasks.byKey(f.key)
+      const kind = startedNoticeDue(seen)
+      const missed = kind === 'change' && guessMissed(seen)
+      if (!kind || (chatReplies.progress === 'off' && !missed) || !tasks.claimNotice(f.key, kind)) return null
+      const names = await agentNamesNow()
+      const nameOf = (id) => names[id] ?? id
+      const p = seen.plan
+      const base = { jobId: f.jobId, workspace: seen.workspace, agent: nameOf(p.agent), model: p.model, effort: p.effort, speed: p.speed, tool: p.tool }
+      if (kind === 'change') {
+        // A reply that named a forced agent's plan, which routing never moves off its agent, or the pick
+        // it waited for can differ only in effort. One that named a guess before the pick (a quick
+        // reply, or the likely agent of one that waited) can name another agent, and then says why the
+        // work went elsewhere when the routing's record holds a hard fact about the agent it named.
+        const cause = missed ? whyNotPicked(f.routed, seen.said.agent) : null
+        const why = cause ? changeReason({ ...cause, agent: nameOf(seen.said.agent) }) : null
+        return { ...changeNotice({ ...base, by: pickedBy(f.routed?.routing, f.calledBefore), decider: f.decider, saidAgent: nameOf(seen.said.agent), saidEffort: seen.said.effort, why }), missedGuess: missed }
+      }
+      return kind === 'again' ? againNotice({ ...base, why: seen.accessWhy, changesFiles: f.changesFiles })
+        : startedNotice({ ...base, waitedMs: f.waitedFor && seen.startedAt ? seen.startedAt - seen.queuedAt : 0, waitedFor: f.waitedFor })
+    })
+  }
+  /**
+   * Post the moved notice for a retry on another agent, with the router's own lines for why. Heard
+   * once this plugin has closed, it is left for the plugin applied again to post as it takes the task
+   * over (takeFollows), since a claim here could not be saved. Never rejects.
+   */
+  function moved(f, e, lines) {
+    if (disposed) { f.movedOwed = { e, lines }; return Promise.resolve() }
+    return inTurn(f, async () => {
+      if (chatReplies.progress === 'off' || !tasks.claimNotice(f.key, 'moved')) return null
+      const names = await agentNamesNow()
+      return movedNotice({ jobId: f.jobId, agent: names[e.agent] ?? e.agent, lines })
+    })
+  }
+  /**
+   * A followed task's plan as the start reply names it: the plan (tasks.js planOf, which says whether
+   * a local model goes first), which routing it is, its run, how long the pick took, the agent
+   * strip's chain, and who picked it and why (reply-words.js creditLine).
+   */
+  async function planned(f, seen, e = f.routed) {
+    const r = e?.routing ?? {}
+    const agentDef = (await enabledAgents().catch(() => [])).find((a) => a.id === seen.plan.agent)
+    const settings = await readEffort()
+    // Who picked, as the strip's router step names it (router.js pickedBy), so the credit never gives
+    // the decider a pick the rules or the local router made after its calls failed.
+    const by = pickedBy(r, f.calledBefore)
+    return {
+      plan: seen.plan, gen: seen.planGen, runId: seen.runId, ms: e?.ms ?? null,
+      steps: [routerStep(r), workerStep(seen.plan)].filter(Boolean),
+      decidedBy: {
+        by, called: !!f.calledBefore, decider: r.decider ?? seen.decider,
+        taskType: r.taskType ?? null, complexity: r.complexity ?? null, risk: r.risk ?? null,
+        from: effortFrom({ asked: f.asked, settings, family: effortFamily(agentDef) }),
+        // The step your ratings moved Auto (router.js plannedEffort), named only when it changed
+        // what the agent is sent: DeepSeek runs medium as it runs high, and Codex stops at its
+        // model's top.
+        nudged: e?.nudged && toAgentEffort(e.nudged.from, agentDef, { model: seen.plan.model }) !== seen.plan.effort ? e.nudged : null,
+        movedOff: r.feedbackFrom ?? null,
+        // Why the decider could not pick: a fallback's own reason, else the last call of it that
+        // failed before a pick the rules or the local router made.
+        reason: r.mode === 'fallback' ? r.reason ?? null : by === 'rules' || by === 'local' ? f.failedBefore ?? null : null,
+      },
+    }
+  }
+  /**
+   * What a forced agent runs with, worked out as its first attempt will (router.js plannedEffort),
+   * so the start reply names it before the task starts: the plan, its words and the credit.
+   */
+  async function forcedPlanOf(agentId, { effort, decider }) {
+    const agentDef = (await enabledAgents()).find((a) => a.id === agentId)
+    if (!agentDef) return null
+    const settings = await readEffort()
+    const model = modelOf(agentDef) ?? null
+    const asked = effort && effort !== 'auto' ? effort : undefined
+    const bands = (decider === 'laya' ? LAYA : providers.jev)?.thresholds?.effortBands
+    const { effort: sent, level, speed } = plannedEffort({ effort: asked, config: { ...config, effort: settings }, agentDef, routing: null, model, bands })
+    const name = nameOfAgent(agentDef)
+    return {
+      plan: { agent: agentId, model, effort: sent, level, speed },
+      words: { agent: name, model, effort: sent, speed },
+      credit: creditLine({ by: 'you', agent: name, effort: sent, speed, from: effortFrom({ asked, settings, family: effortFamily(agentDef) }) }),
+    }
+  }
+
+  /**
+   * The agents a task in `mode` could run on now, as the router will judge them: switched on (`on`),
+   * of those the ones allowed, in this mode and the one asked for when one was (`could`), and why one
+   * of them is not ready (`unready`): signed out, or at its usage limit by the last usage read, which
+   * the router reads afresh. Read-only work asks it which agents could be locked, and the reply
+   * ledger which ones the router could pick, by the last reading of which are ready too (`atHand`,
+   * readinessAtHand), since a reply may not wait for a new one.
+   */
+  async function pickableNow({ mode, forceAgent, atHand = false }) {
+    const { allows } = routingPolicy(config)
+    const localOnly = mode === 'local' || mode === 'offline'
+    const on = (await enabledAgents()).filter((a) => a.enabled)
+    const ready = await (atHand ? readinessAtHand() : readiness()).catch(() => ({}))
+    const out = usage.last()?.out ?? {}
+    // At its limit by the last reading, unless the time it resets has passed since.
+    const spent = (q) => OUT_STATES.includes(q?.state) && !(q.until && Date.parse(q.until) <= Date.now())
+    const could = on.filter((a) => allows(a.id) && (!localOnly || a.kind === 'local') && (mode !== 'online' || a.kind !== 'local') && (!forceAgent || a.id === forceAgent))
+    // One that is signed out or out of allowance is no lock, and the queued line says why.
+    const unready = (a) => (ready?.[a.id] && !ready[a.id].loggedIn ? notReadyWhy(a, ready) : spent(out[a.id]) ? 'at its usage limit' : null)
+    return { on, could, unready }
+  }
+
+  /**
+   * What the reply ledger keeps of a task as it is queued (reply-ledger.js): the message's features
+   * with the pool it is picked from, and the predictor's guess, which resolves once noted. `task` is
+   * the message as the person wrote it, as its intent sample reads it: a picture shows only as
+   * `has_image`, its `modality` and `modal:image`, never as the line that hands the agent its path,
+   * which names folders of this PC and a new attachment each time. The reply waits for it only once
+   * the decider's record has earned naming a guess (guessFor), and then not for a new reading of
+   * which agents are ready, which can take seconds: it reads them as the last reading has them.
+   */
+  async function noteQueued(t, { task, mode, effort, forced, modalities }) {
+    const { could, unready } = await pickableNow({ mode, atHand: true })
+    const available = [...could.filter((a) => !unready(a)).map((a) => a.id), ...(config.tools ?? []).filter((x) => x.enabled !== false).map((x) => `tool:${x.id}`)]
+    const features = replyFeatures({ text: task, modalities, available, mode, level: effort && effort !== 'auto' ? effort : 'auto', decider: t.decider })
+    // A task sent to an agent picked by hand has nothing for the router to pick, so nothing to guess.
+    const predicted = forced ? null : await ledger.predict(features, available)
+    await ledger.note(t.key, { ts: new Date(t.queuedAt).toISOString(), sessionId: t.sessionId, jobId: t.jobId, decider: t.decider, mode, forced, features, predicted })
+    return predicted
+  }
+  /**
+   * What a start reply may say of the pick before routing makes it (docs/live-agent-view.md Feature
+   * 3): the predictor's guess for the task (`noting`, noteQueued's), once the decider's own record has
+   * earned naming it (reply-ledger.js earnedGuess), `quick` for a task that starts at once and
+   * `likely` for one that waits its turn, with the record that earned it. The plan it names is worked
+   * out as the first attempt would run it (router.js plannedEffort): at the level the person picked in
+   * the model menu, else at the default effort in Settings when that is a level, and only with Auto
+   * there too at the guessed one, since routing's read of the task sets an Auto level. Null when it is
+   * not earned; the guess is awaited only once the gate holds, so a reply that cannot name one never
+   * waits for it.
+   */
+  async function guessFor(t, noting, { startsNow, asked }) {
+    const held = await ledger.gates(t.decider)
+    if (!(startsNow ? held.quick : held.likely)) return null
+    // A guess that could not be noted names nothing; its failure is logged where it is noted.
+    const predicted = await noting.catch(() => null)
+    const earned = await ledger.earned(t.decider, predicted)
+    const record = startsNow ? earned.quick : earned.likely
+    const agentDef = record ? (await enabledAgents()).find((a) => a.id === predicted.agent) : null
+    if (!agentDef) return null
+    const settings = await readEffort()
+    const model = modelOf(agentDef) ?? null
+    const bands = (t.decider === 'laya' ? LAYA : providers.jev)?.thresholds?.effortBands
+    // A level the menu or Settings fixes is the one the first attempt starts at, whatever the guess
+    // learned before it was set: handed none, plannedEffort reads the one in Settings.
+    const level = asked && asked !== 'auto' ? asked : settings.default && settings.default !== 'auto' ? undefined : predicted.level ?? undefined
+    const { effort, level: ran, speed } = plannedEffort({ effort: level, config: { ...config, effort: settings }, agentDef, routing: null, model, bands })
+    return { kind: startsNow ? 'quick' : 'likely', plan: { agent: predicted.agent, model, effort, level: ran, speed }, name: nameOfAgent(agentDef), record: { right: record.right, of: record.of } }
+  }
+  /**
+   * What a start reply named, for the reply ledger, once it is out: the agent, effort and model, and
+   * how the reply came to name them: `forced` for an agent picked by hand, `routed` for the pick it
+   * waited for, `bound` for a reply whose wait for the pick ran out first (C at the bound), `now` for
+   * one that went out at once beside a task that starts at once (C with no wait for the pick, or the
+   * sentence of work queued behind a direct answer), with nothing waiting, and `waited` for any other
+   * that named no plan, whose task waited its turn or which waited for a pick that did not come; with
+   * how long after the task was queued. A pick that gives the work to a tool is kept as its reply
+   * named it, the tool alone (`tool:<id>`, as noteRan keeps what ran), never the agent that takes
+   * over only if the tool fails. A reply that went out once its task had ended is noted as any other:
+   * reply A for an agent picked by hand is still `forced`, its plan being kept apart from the follow.
+   * A reply that named the predictor's guess before routing picked (`guess`) is noted as it named it,
+   * with its model, whatever routing has picked by then: `quick` or `instant` beside a task that starts
+   * at once, and `likely` for reply B naming the agent likely to run it.
+   */
+  function noteSaid(key, { gen = 0, said = null, bound = false, now = false, guess = null } = {}) {
+    const t = tasks.byKey(key)
+    const forcedPlan = forcedPlans.get(key) ?? null
+    forcedPlans.delete(key)
+    if (!t) return
+    const guessed = GUESSES.includes(guess) && !!said?.agent
+    const named = !guessed && gen >= 1 && !!said?.agent
+    // The routing's plan the reply named, while it is still the task's.
+    const plan = named && !forcedPlan && t.planGen === gen ? t.plan : null
+    const words = guessed ? { agent: said.agent, effort: said.effort ?? null, model: said.model ?? null }
+      : !named ? { agent: null, effort: null, model: null }
+        : forcedPlan ? { agent: said.agent, effort: said.effort ?? null, model: forcedPlan.model ?? null }
+          : plan?.tool ? { agent: `tool:${plan.tool}`, effort: null, model: null }
+            : { agent: said.agent, effort: said.effort ?? null, model: plan?.model ?? null }
+    const how = guessed ? guess : !named ? (bound === true ? 'bound' : now === true ? 'now' : 'waited') : forcedPlan ? 'forced' : 'routed'
+    inBackground(ledger.note(key, { said: { ...words, how, ms: Math.max(0, Date.now() - t.queuedAt) } }).catch(ledgerFailed))
+  }
+  /** What the router ran for a followed task, from its `routed` event: the predictor's guess is scored against it. */
+  function noteRan(f, e) {
+    const p = e.primary ?? {}
+    // With the task type, which a verdict about the pick is stamped with (planOfVerdict), and the level
+    // Auto chose before your ratings moved it (`nudged`), which an effort rating of it is read against.
+    const ran = e.tool
+      ? { agent: `tool:${e.tool}`, level: null, effort: null, model: null, taskType: e.routing?.taskType ?? null }
+      : { agent: p.agent ?? e.routing?.primaryAgent ?? null, level: p.level ?? null, effort: p.effort ?? null, model: p.model ?? null, taskType: e.routing?.taskType ?? null, ...(e.nudged?.from ? { unmoved: e.nudged.from } : {}) }
+    if (ran.agent) inBackground(ledger.routed(f.key, { ...ran, runId: tasks.byKey(f.key)?.runId ?? null }).catch(ledgerFailed))
+  }
+  /**
+   * GET /jev-router/replies/summary, for the How Jev replies card: how start replies are made now
+   * (the wait for the pick they are given, from the Chat replies card, 0 for none), and how long the
+   * ones that waited for the pick took this week, until it came or the wait ran out, with how many ran
+   * out; how far the intent domain has come toward reading a task on this PC (its verified samples, of
+   * each class, and its recent accuracy, against what GUARDED_LOCAL needs); the reply predictor's
+   * record per decider against the quick and likely gates, and where each gate stands, on, paused or
+   * off (reply-ledger.js gateState); the newest replies, each with how its task ended once it has
+   * (`ended`); and each agent's name. Nothing here carries task text.
+   */
+  async function repliesSummary() {
+    const g = gatesFor(policy, 'intent')
+    const d = intentDomain()?.state() ?? null
+    const ev = d?.lastEvaluation ?? null
+    const s = await ledger.summary()
+    // A task that ended before routing picked anything, stopped as it waited or read as needing a
+    // person, has no `ran` and never will: its final state, or true for one no longer on the task
+    // list (only a finished task leaves it), tells it from a task still to be routed, which has null.
+    const endedOf = (key) => { const t = key ? tasks.byKey(key) : null; return !t ? true : TERMINAL_STATES.includes(t.state) ? t.state : null }
+    return {
+      learning: ledgerOn(),
+      ...s,
+      startReplies: { ...s.startReplies, waitMs: chatReplies.waitMs },
+      recent: s.recent.map(({ key, ...r }) => ({ ...r, ended: endedOf(key) })),
+      intent: d ? {
+        maturity: d.maturity,
+        verified: d.samples?.verified ?? 0,
+        classes: ev?.classes?.counts ?? {},
+        recent: ev?.recent ? { accuracy: ev.recent.accuracy, n: ev.recent.n } : null,
+        needs: { samples: g.guardedSamples, perClass: g.perClassSamples, recentAccuracy: g.guarded.recentAccuracy },
+      } : null,
+      names: await agentNamesNow(),
+    }
+  }
 
   const orchestrator = {
     /** Unread finished results for this session, in the order they finished. */
@@ -1899,54 +2984,501 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     delivering: (jobId) => tasks.delivering(jobId),
     /** The result's message was accepted: stop offering it. */
     delivered: (jobId) => tasks.delivered(jobId),
-    /** Queue one chat task; returns the chat line, or null when background jobs are unavailable. */
+    /**
+     * Queue one chat task, or return null when background jobs are unavailable. Returns what the start
+     * reply needs (adapter.js startReply): `line`, the reply to give without waiting for the pick (A
+     * for a forced agent, whose plan is known now, B for a task that waits its turn, C for one that
+     * starts at once), `jobId`, `key`, `runId` once its run has begun, `startsNow`, `forcedPlan` (the
+     * agent, model and effort a forced agent runs with), the chat replies settings' `waitMs` and
+     * `progress`, where it `waiting`s, and the read-only `access` verdict; and, once the predictor's
+     * record has earned naming its guess (guessFor), `quick`, the guessed plan a task that starts at
+     * once is told before routing picks, with that record, or `likely`, the agent B names as likely.
+     */
     // `modalities` rides along: dropped here the task record falls back to text, the capability
     // filter stops requiring image support, and an attached picture reaches an agent that is blind to it.
     async enqueue({ agent, task, effort, forceAgent, mode, sessionId, modalities }) {
       // The adapter's second argument: `decider`, the row's, kept on the task so it decides the run
       // whenever it starts; `why`, the reason a message the decider could not sort was queued as a
-      // task, said in the line; and `readVerdict`, the decider's verdict on whether the message only
-      // reads the project (adapter.js readOnlyVerdict). Read from `arguments` so this signature
-      // stays the one test/tasks.test.js checks the task's own fields against.
-      const { decider = 'jev', why, readVerdict = null } = arguments[1] ?? {}
+      // task, said in the reply; `readVerdict`, the decider's verdict on whether the message only
+      // reads the project (adapter.js readOnlyVerdict); `intentSample`, the sample the message
+      // was recorded as (intent.js), which the task and each run of it carry; and `message`, the
+      // person's own words, which the reply ledger reads of the message, where `task` is what the
+      // agent is sent, with the line that hands it a picture first. Read from `arguments` so this
+      // signature stays the one test/tasks.test.js checks the task's own fields against.
+      const { decider = 'jev', why, readVerdict = null, intentSample = null, message = null } = arguments[1] ?? {}
       const cwd = agent?.session?.header?.cwd
       if (!cwd) throw new Error('cannot determine the session workspace; open a workspace first')
       if (inScratch(cwd)) throw new Error(SCRATCH_ONLY)
+      await chatRepliesRead
       // A task judged read only runs as a read pass only when some agent this run could pick can be
       // locked against writing now; otherwise it waits in its workspace's line, and says why. The
       // verdict is kept either way: set against what the task changed, it is how the bars are judged.
       let access = 'write'
       let accessWhy = null
       if (readVerdict?.reads) {
-        const { allows } = routingPolicy(config)
-        const local = mode === 'local' || mode === 'offline'
-        // Only agents that could run it now, as the router will judge them: switched on, allowed,
-        // in this mode, the one asked for when one was, signed in and not at its usage limit (the
-        // last usage read, which the router reads afresh). Any other lock is no promise, and the
-        // read pass would only hand it back.
-        const on = (await enabledAgents()).filter((a) => a.enabled)
+        // Only agents that could run it now: any other lock is no promise, and the read pass would
+        // only hand it back.
+        const { on, could, unready } = await pickableNow({ mode, forceAgent })
         logReadOnly(on)
-        const ready = await readiness().catch(() => ({}))
-        const out = usage.last()?.out ?? {}
-        // At its limit by the last reading, unless the time it resets has passed since.
-        const spent = (q) => OUT_STATES.includes(q?.state) && !(q.until && Date.parse(q.until) <= Date.now())
-        const could = on.filter((a) => allows(a.id) && (!local || a.kind === 'local') && (mode !== 'online' || a.kind !== 'local') && (!forceAgent || a.id === forceAgent))
-        // One that is signed out or out of allowance is no lock, and the queued line says why.
-        const unready = (a) => (ready?.[a.id] && !ready[a.id].loggedIn ? notReadyWhy(a, ready) : spent(out[a.id]) ? 'at its usage limit' : null)
         const images = (modalities ?? []).includes('image')
         const locks = could.map((a) => (unready(a) ? { id: a.id, lock: null, why: unready(a) } : { id: a.id, ...lockFor(a, agent, { images }) }))
         if (locks.some((l) => l.lock)) access = 'read'
         else accessWhy = `no agent here can be locked against writing (${locks.map((l) => `${l.id}: ${l.why}`).join('; ') || (on.length ? 'none of the agents switched on may take this task' : 'no agent is switched on')})`
       }
       // sessionId comes from the caller that will also read the results back.
-      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode, decider, modalities, readVerdict, access, accessWhy })
+      const t = tasks.enqueue({ owner: agent, sessionId: sessionId ?? sessionIdOf(agent) ?? cwd, workspace: cwd, task, forceAgent, effort, mode, decider, modalities, readVerdict, access, accessWhy, intentSample })
       if (!t) return null
+      // Followed before anything is awaited: its router events start at the next microtask.
+      const replies = chatReplies
+      follow(t, { owner: agent, decider: t.decider, asked: effort, waitMs: replies.waitMs })
+      const noting = ledgerOn() ? noteQueued(t, { task: message ?? task, mode, effort, forced: !!forceAgent, modalities }) : null
+      if (noting) inBackground(noting.catch(ledgerFailed))
       // Read from the line the task joined as it was queued (tasks.enqueue starts its runner, which
       // joins before enqueue returns), which counts every run holding or waiting for it, a foreground
       // one as much as a task. A read task's own lane is read the same way: it waits only for a slot.
-      return queuedLine({ jobId: t.jobId, agent: t.agent, wait: tasks.get(t.jobId)?.waiting ?? null, workspace: cwd, decider: t.decider, why, ...(readVerdict ? { access: { mode: t.access, verdict: readVerdict, why: accessWhy } } : {}) })
+      const waiting = tasks.get(t.jobId)?.waiting ?? null
+      const facts = { jobId: t.jobId, workspace: cwd, decider: t.decider, why, progress: replies.progress, ...(readVerdict ? { access: { mode: t.access, verdict: readVerdict, why: accessWhy } } : {}) }
+      // The task is queued now, so nothing from here on may fail the reply: a forced agent's plan that
+      // cannot be worked out (its agent list unreadable for a moment) is left out, and the reply is the
+      // one a task with no plan yet gets. An error here would say nothing was queued, and a person who
+      // sent the task again would run it twice.
+      const forced = forceAgent
+        ? await forcedPlanOf(forceAgent, { effort, decider: t.decider }).catch((err) => { process.stdout.write(`[jev] plan for ${t.jobId}'s reply not worked out: ${err?.message ?? err}\n`); return null })
+        : null
+      // What reply A names, for the reply ledger's note of what it said once it is out (noteSaid).
+      if (forced && ledgerOn()) {
+        for (const k of forcedPlans.keys()) if (!tasks.byKey(k)) forcedPlans.delete(k)
+        forcedPlans.set(t.key, forced.plan)
+      }
+      // A guess at the pick the decider's record has earned naming (guessFor): the plan a task that
+      // starts at once is told before routing picks (`quick`, which the adapter words), or the agent a
+      // task that waits its turn is told is likely to run it, in reply B itself. None for a forced agent.
+      const guess = noting && !forceAgent
+        ? await guessFor(t, noting, { startsNow: !waiting, asked: effort }).catch((err) => { process.stdout.write(`[jev] guess for ${t.jobId}'s reply not worked out: ${err?.message ?? err}\n`); return null })
+        : null
+      const likely = waiting && guess?.kind === 'likely' ? guess : null
+      const line = forced ? planReply({ ...facts, ...forced.words, waiting, credit: forced.credit })
+        : waiting ? queuedReply({ ...facts, waiting, likely: likely ? { agent: likely.name, effort: likely.plan.effort, speed: likely.plan.speed } : null })
+          : startingReply(facts)
+      return {
+        line, jobId: t.jobId, key: t.key, runId: tasks.get(t.jobId)?.runId ?? null, startsNow: !waiting, forcedPlan: forced?.plan ?? null,
+        waitMs: replies.waitMs, progress: replies.progress, waiting, access: facts.access ?? null,
+        // What a reply that names the guess says of it once it is out (noteAck): its plan, and the
+        // record that earned it.
+        ...(!waiting && guess?.kind === 'quick' ? { quick: { plan: guess.plan, record: guess.record } } : {}),
+        ...(likely ? { likely: { agent: likely.plan.agent, effort: likely.plan.effort ?? null, model: likely.plan.model ?? null } } : {}),
+      }
     },
+    /**
+     * Wait for the router's pick for the task with this key, at most `waitMs` (the setting's), telling
+     * `onLine` each router line meanwhile. Resolves with the plan once picked ({ plan, gen, runId, ms,
+     * steps, decidedBy }: planned()), with `{ handedBack, waiting, why }` when a read pass
+     * hands the task back to its folder's line first, with `{ settled }` when it ends first (a run the
+     * router stops for a person picks no agent, and so ends first), and with null at the bound, on
+     * Stop, or for a key that names no task. It lets go of the task in every case.
+     */
+    watchPlan(key, { signal, waitMs = chatReplies.waitMs, onLine } = {}) {
+      return new Promise((resolve) => {
+        let over = false
+        let timer = null
+        let off = () => {}
+        const end = (value) => {
+          if (over) return
+          over = true
+          clearTimeout(timer)
+          off()
+          signal?.removeEventListener('abort', stop)
+          resolve(value)
+        }
+        const stop = () => end(null)
+        const seen = tasks.byKey(key)
+        if (!seen) return end(null)
+        if (TERMINAL_STATES.includes(seen.state)) return end({ settled: seen.state })
+        // Handed back or picked before the wait began: said at once.
+        if (seen.requeuedAt) return end({ handedBack: true, waiting: seen.waiting ?? null, why: seen.accessWhy ?? null })
+        const f = following.get(key)
+        if (seen.plan && f?.routed) return end(planned(f, seen))
+        if (signal?.aborted) return end(null)
+        off = tasks.watch(key, (e, now) => {
+          if (e.type === 'settled') return end({ settled: e.state })
+          // Handed back by its read pass: where it stands is read once it has joined its folder's line,
+          // which runAdmitted does as the pass's end unwinds, so a task that waits is not said to start.
+          if (e.type === 'access' && e.mode === 'write') {
+            off()
+            return setImmediate(() => end({ handedBack: true, waiting: tasks.byKey(key)?.waiting ?? null, why: e.why ?? null }))
+          }
+          try { onLine?.(e.text ?? line(e)) } catch { /* the reply's lines are its own; the task goes on */ }
+          // A run the router stops for a person has no agent to name: the wait goes on to its end,
+          // which follows at once, so the reply says it ended rather than what would have run.
+          if (e.type === 'routed' && !e.stopsForPerson) end(planned(following.get(key) ?? { calledBefore: false }, now, e))
+        })
+        timer = setTimeout(stop, Math.max(0, waitMs))
+        timer.unref?.()
+        signal?.addEventListener('abort', stop, { once: true })
+      })
+    },
+    /**
+     * The run the task with this key has begun, or null. A start reply written after the task was
+     * queued carries it: `enqueue` answers before a task that starts at once has reached its run.
+     */
+    runOf: (key) => tasks.byKey(key)?.runId ?? null,
+    /**
+     * What the start reply named of a task, once it is out (tasks.js noteAck): a notice may be due
+     * now, and the reply ledger keeps what it said. A reply that goes out once its task has ended,
+     * as one whose wait for the pick ended with it (read as needing a person, stopped, failed) or
+     * reply A for an agent that refused the task at once, is kept in the ledger all the same, though
+     * no notice is due. False for a task no longer waiting or running.
+     */
+    noteAck(key, ack) {
+      const live = tasks.noteAck(key, ack)
+      if (live) { const f = following.get(key); if (f) noticeDue(f) }
+      if (ledgerOn()) noteSaid(key, ack)
+      return live
+    },
+    /** One sentence of what this chat's tasks are doing now, for a question answered directly; '' when nothing is. */
+    async liveStatus(sessionId) {
+      const live = tasks.list().filter((t) => t.sessionId === sessionId && !TERMINAL_STATES.includes(t.state))
+      return live.length ? liveStatusSentence(live, await agentNamesNow()) : ''
+    },
+    /**
+     * The task `jobId` of this chat as the list shows it, or null. The newest is taken: the engine hands
+     * a job id out again after a restart, and the older task under it is the one that has ended.
+     */
+    taskOf: (sessionId, jobId) => tasks.list().findLast((t) => t.sessionId === sessionId && t.jobId === jobId) ?? null,
+    /** Send now for the task with this key (startTaskNow). */
+    startNow: (key, options) => startTaskNow(key, options),
+    /** Steer the task with this key with the person's words (steerTask). */
+    steer: (key, options) => steerTask(key, options),
   }
+
+  // --- Send now and Steer (docs/live-agent-view.md Feature 5) ---------------------------------------
+  // The routes, the /now and /steer commands and the adapter's `@jev-5 <words>` all come here, so each
+  // says the same thing of the same outcome (reply-words.js). Words for a task at work reach the agent
+  // at work where its provider takes them mid-run (steer.js), and every prompt its run builds after
+  // carries them (router.js withGuidance); what becomes of each piece is noted on its task.
+
+  /** Who holds a local model for run `runId`, as a wait for it names it: its task, else another run. */
+  const holderOf = (runId) => tasks.byKey(steerRuns.get(runId)?.key)?.jobId ?? 'another run'
+
+  /** The run a task at work is on now, its last pass's: the one its words go to. */
+  const runOfTask = (t) => (Array.isArray(t?.runIds) && t.runIds.length ? t.runIds.at(-1) : t?.runId ?? null)
+
+  /**
+   * What Steer does now with words for the task at work `t` (tasks.js view().controls.steer): the
+   * agent at work takes them (`path`), or why they wait for its next attempt (`why`), whether its
+   * dialog can send them (`sendable`), and the words it says so in. With none that takes them at
+   * work, why is read off where its run stands and the attempt it has at work: an agent's review or
+   * a configured tool takes no words either.
+   */
+  function steerFacts(t) {
+    const runId = runOfTask(t)
+    const entry = runId ? steerers.of(runId) : null
+    const claudeSteer = liveSettings.claudeSteer === true
+    const way = livePath(entry, { claudeSteer })
+    const going = !!runId && steerRuns.has(runId)
+    const atWork = !entry && going ? live.atWorkOf(runId) : null
+    const why = way.why === 'idle' ? idleWhy(going ? live.phaseOf(runId) : 'ending', atWork) : way.why
+    const name = entry?.name ?? atWork?.name ?? null
+    // Send now (slice 10): whether the agent at work can be stopped for the words now, and if not why,
+    // read off where the run stands as Steer's is while none is at work.
+    const stop = nowPath(entry, { claudeSteer })
+    const nowWhy = stop.why === 'idle' ? why : stop.why
+    return {
+      path: way.path, why, agent: entry?.agentId ?? atWork?.agent ?? null, name, sendable: sendableWhy(way.path, why), words: way.path ? liveWords(name, way.path) : heldWords({ jobId: t.jobId, why, name }),
+      now: { path: stop.path, why: stop.path ? null : nowWhy, words: stop.path ? nowWords(name) : nowHeldWords({ jobId: t.jobId, why: nowWhy, name }) },
+    }
+  }
+
+  /**
+   * Say a piece of guidance as it is now on the run it went to: its live view's bubble and its log's
+   * line. `replacing` says Send now is stopping the step at work for it (true) or could not (false),
+   * so the live view reads the step it ends as replaced by the person's message.
+   */
+  function sayGuidance(run, s, { replacing = null } = {}) {
+    if (!run || !s) return
+    try {
+      run.say({ type: 'steer', at: Date.now(), id: s.id, guidance: s.text, state: s.state, ...(s.how ? { how: s.how } : {}), ...(replacing === null ? {} : { replacing }), ...(Number.isInteger(s.attempt) ? { attempt: s.attempt } : {}), name: s.name ?? null, ...(s.readAt ? { readAt: s.readAt } : {}), ...(s.to ? { to: s.to } : {}), words: steerStateWords(s) })
+    } catch { /* the live view's own */ }
+  }
+
+  /** Move the piece of guidance `s` of the task with this key by `event` (steer.js nextState): noted on the task, and said on its run. */
+  function moveSteer(run, key, s, event, patch = {}) {
+    const state = nextState(s.state, event)
+    if (state === s.state) return s
+    const now = tasks.noteSteer(key, s.id, { ...patch, state })
+    sayGuidance(run, now)
+    return now
+  }
+
+  /**
+   * The agent at work in run `runId` took in the message `id`: a piece of guidance sent to it is read,
+   * and so are the steers a Send now gave back from its inbox to go with it (`foldedInto`).
+   */
+  function steerHeard(runId, id) {
+    if (typeof id !== 'string' || !id) return
+    try {
+      const run = steerRuns.get(runId)
+      const steers = run ? tasks.byKey(run.key)?.steers ?? [] : []
+      const s = steers.find((x) => x?.id === id && (x.how === 'live' || x.how === 'now'))
+      if (!s) return
+      const at = Date.now()
+      moveSteer(run, run.key, s, 'read', { readAt: at })
+      if (s.how === 'now') for (const x of steers) if (x?.foldedInto === id) moveSteer(run, run.key, x, 'read', { readAt: at })
+    } catch (err) { process.stdout.write(`[jev] a steer read by its agent was not noted: ${err.message}\n`) }
+  }
+
+  /**
+   * What a connector's hook says became of the message `id` it was given (the engine patch's
+   * `onOutcome`): Claude Code read it ('delivered') or closed its input without saying ('unknown'),
+   * and Codex went on with a Send now's words as its next turn ('continued'), which is reading them.
+   */
+  function steerOutcome(runId, id, outcome) {
+    if (outcome === 'delivered' || outcome === 'continued') return steerHeard(runId, id)
+    if (outcome !== 'unknown' || typeof id !== 'string') return
+    try {
+      const run = steerRuns.get(runId)
+      const s = run ? tasks.byKey(run.key)?.steers?.find((x) => x?.id === id && (x.how === 'live' || x.how === 'now')) : null
+      if (s) moveSteer(run, run.key, s, 'unsure')
+    } catch (err) { process.stdout.write(`[jev] what became of a steer was not noted: ${err.message}\n`) }
+  }
+
+  /** Attempt `attempt` of run `runId` has ended: the words Send now gave it that its agent never took in were not used (steer.js nowLeft). */
+  function endNow(runId, attempt) {
+    try {
+      const run = steerRuns.get(runId)
+      for (const s of run ? nowLeft(tasks.byKey(run.key)?.steers, { runId, attempt }) : []) moveSteer(run, run.key, s, 'ended', { endedAt: Date.now() })
+    } catch (err) { process.stdout.write(`[jev] a Send now its agent never took in was not noted: ${err.message}\n`) }
+  }
+
+  /** Ask a patched Claude Code run to show its thinking as `display` says; one that cannot is said in the log and runs on as it was. */
+  function askThinking(control, display, agentId) {
+    const failed = (err) => process.stdout.write(`[jev] ${agentId} keeps its own thinking display: ${err?.message ?? err}\n`)
+    try { Promise.resolve(control?.thinkingDisplay?.(display)).catch(failed) } catch (err) { failed(err) }
+  }
+
+  /**
+   * A prompt of run `runId` carried a piece of guidance no agent had read to the next attempt (a
+   * `steer` event of router.js): noted on the task with the agent it went to, by name, which the event
+   * the live view and the log hear says too.
+   */
+  function carriedSteer(runId, e) {
+    const run = steerRuns.get(runId)
+    const s = run ? tasks.byKey(run.key)?.steers?.find((x) => x?.id === e.id) : null
+    if (!s) return e
+    const to = { agent: e.to?.agent ?? null, name: run.names[e.to?.agent] ?? e.to?.agent ?? null, role: e.to?.role ?? null }
+    const now = nextState(s.state, 'carried') === s.state ? s : tasks.noteSteer(run.key, s.id, { state: 'carried', to, carriedAt: Date.now() })
+    return { ...e, ...(Number.isInteger(s.attempt) ? { attempt: s.attempt } : {}), state: now.state, to: now.to ?? to, name: now.name ?? null, words: steerStateWords(now) }
+  }
+
+  /**
+   * Run `runId` of the task with this key has ended: its guidance no agent had read was not used, a
+   * Send now its agent refused included (the other words Send now gave were moved as their attempt
+   * ended, endNow).
+   */
+  function endGuidance(runId, key) {
+    const run = steerRuns.get(runId)
+    for (const s of tasks.byKey(key)?.steers ?? []) if ((s?.how === 'live' || s?.how === 'now') && s.state === 'pending') moveSteer(run, key, s, 'ended', { endedAt: Date.now() })
+  }
+
+  /**
+   * Words for the task at work `t`, noted on it, and sent to the agent at work where its provider
+   * takes them mid-run; otherwise, or when it refuses them, they wait for its next attempt, whose
+   * prompt carries them. Answers `{ result: 'sent' | 'pending', state, id, words }`, or null for a
+   * task that has ended, which takes no more words (tasks.js noteSteer).
+   */
+  async function steerLive(t, words, names) {
+    const runId = runOfTask(t)
+    const run = runId ? steerRuns.get(runId) : null
+    const entry = runId ? steerers.of(runId) : null
+    const facts = steerFacts(t)
+    const s = tasks.noteSteer(t.key, randomUUID(), { text: words, how: 'live', state: 'pending', runId, ...(entry ? { attempt: entry.attempt, agent: entry.agentId, name: entry.name } : {}) })
+    if (!s) return null
+    // The task's record keeps the words clipped; the agent at work and every prompt built after them
+    // have them whole.
+    if (s.text !== words) steerTexts.set(s.id, words)
+    sayGuidance(run, s)
+    const agent = entry?.agentId ?? facts.agent ?? null
+    const named = entry ? { ...names, [entry.agentId]: entry.name } : names
+    const answer = (result, why = null, path = null) => ({ result, state: tasks.byKey(t.key)?.steers?.find((x) => x?.id === s.id)?.state ?? s.state, id: s.id, words: steerWords({ jobId: t.jobId, result, agent, names: named, why, path }) })
+    if (!facts.path) return answer('pending', facts.why)
+    const sent = await sendLive(entry, facts.path, { id: s.id, text: words })
+    if (sent.sent) return answer('sent', null, facts.path)
+    process.stdout.write(`[jev] ${entry.name} did not take the steer for ${t.jobId} now (${sent.why}); it goes with the next attempt\n`)
+    return answer('pending', 'refused')
+  }
+
+  /**
+   * The work attempt of run `runId` has just started its agent (runAgent). Words given to its task
+   * after the attempt's prompt was built, while it waited to start (for another task's local model, a
+   * speed run), took no attempt and are in no prompt: they go to this agent now, as they would have
+   * had it been at work (steerLive). An agent that takes no words mid-run, or refuses them, leaves
+   * them for the next attempt, as before.
+   */
+  function steerOnStart(runId) {
+    try {
+      const run = steerRuns.get(runId)
+      const entry = steerers.of(runId)
+      const t = run ? tasks.byKey(run.key) : null
+      const way = livePath(entry, { claudeSteer: liveSettings.claudeSteer === true })
+      if (!t || !way.path) return
+      const waiting = (t.steers ?? []).filter((s) => s?.how === 'live' && s.state === 'pending' && s.runId === runId && !Number.isInteger(s.attempt))
+      for (const s of waiting) {
+        // Still `pending`, which its bubble already says: only the attempt and agent it went to are new.
+        tasks.noteSteer(run.key, s.id, { attempt: entry.attempt, agent: entry.agentId, name: entry.name })
+        sendLive(entry, way.path, { id: s.id, text: steerTexts.get(s.id) ?? s.text }).then((sent) => {
+          if (!sent.sent) process.stdout.write(`[jev] ${entry.name} did not take the steer for ${t.jobId} as it started (${sent.why}); it goes with the next attempt\n`)
+        })
+      }
+    } catch (err) { process.stdout.write(`[jev] the words given before an agent started were not sent to it: ${err.message}\n`) }
+  }
+
+  /**
+   * Send now for the task at work `t` (slice 10): its agent stops its current step and takes the
+   * words as what it does next (steer.js sendNow), noted on the task with `how: 'now'`. Where nothing
+   * can be stopped for them it answers `not-now` with why and notes nothing, so the words stay with
+   * the person for Steer's other choices; an agent that refuses them leaves them for the next attempt
+   * (`refused`), as a refused steer does. A spawn child's steers it has not taken in go with the
+   * words, ahead of them, and are read when they are. Answers `{ result: 'replaced' | 'pending' |
+   * 'not-now', state, id, words }`, or null for a task that has ended.
+   */
+  async function steerNow(t, words, names) {
+    const runId = runOfTask(t)
+    const run = runId ? steerRuns.get(runId) : null
+    const entry = runId ? steerers.of(runId) : null
+    const facts = steerFacts(t)
+    const named = entry ? { ...names, [entry.agentId]: entry.name } : names
+    const agent = entry?.agentId ?? facts.agent ?? null
+    if (!facts.now.path) return { result: 'not-now', state: null, words: steerWords({ jobId: t.jobId, result: 'not-now', agent, names: named, why: facts.now.why }) }
+    const s = tasks.noteSteer(t.key, randomUUID(), { text: words, how: 'now', state: 'pending', runId, attempt: entry.attempt, agent: entry.agentId, name: entry.name })
+    if (!s) return null
+    if (s.text !== words) steerTexts.set(s.id, words)
+    const unclaimed = (tasks.byKey(t.key)?.steers ?? []).filter((x) => x?.how === 'live' && x.state === 'pending' && x.runId === runId && x.attempt === entry.attempt).map((x) => ({ id: x.id, text: steerTexts.get(x.id) ?? x.text }))
+    // Said before the step is stopped, so the live view reads the step it ends as replaced.
+    sayGuidance(run, s, { replacing: true })
+    const answer = (result, why = null) => ({ result, state: tasks.byKey(t.key)?.steers?.find((x) => x?.id === s.id)?.state ?? s.state, id: s.id, words: steerWords({ jobId: t.jobId, result, agent, names: named, why }) })
+    const sent = await sendNow(entry, facts.now.path, { id: s.id, text: words, unclaimed })
+    if (sent.sent) {
+      for (const id of sent.folded) tasks.noteSteer(t.key, id, { foldedInto: s.id })
+      return answer('replaced')
+    }
+    process.stdout.write(`[jev] ${entry.name} could not be stopped for the words sent now to ${t.jobId} (${sent.why}); they go with the next attempt\n`)
+    sayGuidance(run, tasks.noteSteer(t.key, s.id, { refused: true }) ?? s, { replacing: false })
+    return answer('pending', 'refused')
+  }
+
+  /**
+   * Send now: start the waiting task with this key at once (tasks.js startNow), and what came of it in
+   * words. `stop` names the task holding its folder, stopped for it (Stop it and start this). Answers
+   * `{ result, holder, words }`, `holder` the task in the folder's way, if one is.
+   */
+  async function startTaskNow(key, { stop = null } = {}) {
+    await tasks.ready
+    const t = tasks.byKey(key)
+    if (!t) throw Object.assign(new Error('no task with that key'), { status: 404 })
+    const before = t.controls ?? {}
+    const result = tasks.startNow(key, stop ? { stop } : {})
+    // Over the cap when every slot was in use already, as the dialog said before it was confirmed.
+    const over = result === 'started' && before.max != null && before.held >= before.max
+    const holder = result === 'stopping' ? stop : tasks.byKey(key)?.controls?.holder ?? before.holder ?? null
+    return { result, holder, words: startNowWords({ jobId: t.jobId, result, workspace: t.workspace, holder, over, max: before.max ?? null }) }
+  }
+
+  /**
+   * Steer the task with this key with the person's words. `how`: 'amend' adds them to a task that has
+   * not started; 'live' gives them to a task at work (steerLive); 'now' stops the step a task at work
+   * is on and gives them to it as what it does next (steerNow); 'follow-up' queues them as a task of
+   * their own in its folder, on the agent it works on, first in line; 'restart' stops a task at work
+   * and starts it again with them, on the same agent, first in line and the moment the folder is free;
+   * 'auto' amends a task that has not started and gives them to one at work. `via` words the answer
+   * for `@jev-5` ('@') or the rest ('steer'). Answers `{ result, state, words }`, `state` the words'
+   * on the task ('added', 'pending', or null), with the `jobId` and `key` of a task it queued, or the
+   * `id` of a piece given to a task at work.
+   */
+  async function steerTask(key, { text, how = 'auto', via = 'steer' } = {}) {
+    await tasks.ready
+    // The agents' names are read first, from disk: the task is read after them, with nothing awaited
+    // between that and what is done with the words, so a task that ends meanwhile is taken as ended.
+    const names = await agentNamesNow().catch(() => ({}))
+    const t = tasks.byKey(key)
+    if (!t) throw Object.assign(new Error('no task with that key'), { status: 404 })
+    if (!['auto', 'amend', 'live', 'now', 'follow-up', 'restart'].includes(how)) throw Object.assign(new Error('how: auto, amend, live, now, follow-up or restart'), { status: 400 })
+    const words = typeof text === 'string' ? text.trim() : ''
+    if (!words) throw Object.assign(new Error('text: the words to send'), { status: 400 })
+    // A forced agent takes the words with the task; otherwise its decider picks the agent with them.
+    const basis = tasks.queuedWith(key)
+    const said = (result) => ({ result, state: result === 'added' ? 'added' : null, words: steerWords({ jobId: t.jobId, result, via, decider: t.decider, agent: t.state === 'queued' ? basis?.agent ?? null : null, names }) })
+    const ended = TERMINAL_STATES.includes(t.state)
+    if (how === 'amend' || (how === 'auto' && (t.state === 'queued' || ended))) return said(tasks.amend(key, words))
+    if ((how === 'live' || how === 'now') && ended) return said('already-finished')
+    if (t.state === 'queued') return said('not-started')
+    if (how === 'auto' || how === 'live') return (await steerLive(t, words, names)) ?? said('already-finished')
+    if (how === 'now') return (await steerNow(t, words, names)) ?? said('already-finished')
+    if (how === 'restart' && ended) return said('already-finished')
+    if (!basis) return said('no-owner')
+    const restart = how === 'restart'
+    const next = tasks.enqueue({
+      owner: basis.owner, sessionId: basis.sessionId, workspace: basis.workspace, mode: basis.mode, decider: basis.decider,
+      task: restart ? restartTask({ task: basis.task, jobId: t.jobId, text: words }) : followUpTask({ jobId: t.jobId, text: words }),
+      forceAgent: basis.agent ?? undefined,
+      // A fresh start runs as the task was asked for: its effort, and its pictures handed over again.
+      effort: restart ? basis.effort ?? undefined : undefined,
+      modalities: restart ? basis.modalities : ['text'],
+    })
+    if (!next) return said('unavailable')
+    // No start reply goes out for it, so its started notice is what tells the chat it began.
+    follow(next, { owner: basis.owner, decider: next.decider, asked: restart ? basis.effort : null, waitMs: 0 })
+    // First in its folder's line: only the task at work there goes before it.
+    if (tasks.get(next.jobId)?.waiting) tasks.reorder(basis.workspace, [next.jobId])
+    if (restart) {
+      // It takes the folder the moment the stopped task lets it go, whatever the cap; a task at work
+      // that holds no folder line of its own (a read pass) is stopped all the same.
+      const why = restartedReason(next.jobId)
+      if (tasks.startNow(next.key, { stop: t.jobId, why }) !== 'stopping') tasks.stop(t.jobId, { why })
+    }
+    const result = restart ? 'restarting' : 'queued'
+    const waiting = !!tasks.get(next.jobId)?.waiting
+    return { result, state: null, jobId: next.jobId, key: next.key, words: steeredTaskWords({ jobId: t.jobId, newJobId: next.jobId, result, workspace: basis.workspace, agent: basis.agent, names, waiting }) }
+  }
+
+  /** The task key a request names, or a 400. */
+  const taskKeyIn = (body) => {
+    if (typeof body?.key !== 'string' || !/^[\w-]{1,80}$/.test(body.key)) throw Object.assign(new Error('key: a task key'), { status: 400 })
+    return body.key
+  }
+
+  // `/now jev-5` and `/steer jev-5 <words>`: the same as the buttons, for this chat's task by its id.
+  const taskRef = (agent, jobId) => orchestrator.taskOf(sessionIdOf(agent), jobId)
+  ctx.commands.register({
+    name: 'now',
+    description: 'Start a waiting background task now, ahead of its line and over Tasks at once if need be, e.g. /now jev-5',
+    input: { hint: '<task id>' },
+    handler: async ({ agent, rawInput }) => {
+      const jobId = rawInput.trim().toLowerCase()
+      if (!/^jev-\d+$/.test(jobId)) return { kind: 'error', text: 'Usage: /now <task id>, e.g. /now jev-5' }
+      const t = taskRef(agent, jobId)
+      if (!t) return { kind: 'error', text: noTaskWords(jobId) }
+      try {
+        const r = await startTaskNow(t.key)
+        return { kind: r.result === 'started' ? 'success' : 'error', text: r.words }
+      } catch (err) { return { kind: 'error', text: `jev-router: ${err.message}` } }
+    },
+  })
+  ctx.commands.register({
+    name: 'steer',
+    description: 'Give a background task your words: added before it starts, or to the agent at work, e.g. /steer jev-5 also update the README',
+    input: { hint: '<task id> <words>' },
+    handler: async ({ agent, rawInput }) => {
+      const [, ref, text] = /^\s*(\S+)\s*([\s\S]*)$/.exec(rawInput ?? '') ?? []
+      const jobId = String(ref ?? '').toLowerCase()
+      if (!/^jev-\d+$/.test(jobId) || !text?.trim()) return { kind: 'error', text: 'Usage: /steer <task id> <words>, e.g. /steer jev-5 also update the README' }
+      const t = taskRef(agent, jobId)
+      if (!t) return { kind: 'error', text: noTaskWords(jobId) }
+      try {
+        const r = await steerTask(t.key, { text, how: 'auto' })
+        return { kind: ['added', 'sent', 'pending'].includes(r.result) ? 'success' : 'error', text: r.words }
+      } catch (err) { return { kind: 'error', text: `jev-router: ${err.message}` } }
+    },
+  })
 
   ctx.commands.register({
     name: 'use',
@@ -2148,6 +3680,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       ...s,
       running: s.running ? { ...s.running, ...layaCosts(measured[s.running.device]?.msPerToken) } : null,
       shadow: shadow.counters(),
+      colibri: colibri.summary(),
       recovered: installer?.status().message ?? null,
       configError: layaError ?? null,
       pinsError,
@@ -2196,6 +3729,8 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
         if (!runId) return send(400, { error: 'runId: the run id' })
         return send(200, { rows: shadow.read({ runId }), waiting: shadow.waiting({ runId }) })
       }
+      // colibri's Laya beside laya.serve (13): the figures the card shows, also with no address set.
+      if (op === '/colibri') return send(200, colibri.summary())
       if (op === '/compare') {
         const days = url.searchParams.get('days') ?? '7'
         const identity = url.searchParams.get('identity') ?? 'current'
@@ -2211,7 +3746,12 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
     }
     if (req.method !== 'POST') return send(404, { error: 'not found' })
     const body = JSON.parse((await readBody(req)) || '{}')
-    if (op === '/settings') return send(200, await sidecar.setSettings(body))
+    if (op === '/settings') {
+      const saved = await sidecar.setSettings(body)
+      // A colibri Laya address saved is checked at once with the test question; the card's next read shows what it found.
+      if (Object.hasOwn(body, 'colibriUrl')) colibri.check().catch(() => {})
+      return send(200, saved)
+    }
     if (op === '/selftest') return send(200, await layaSelfTest())
     if (op === '/start') { await afterStartup(); await sidecar.start({ reason: 'user' }); return send(200, { ok: true }) }
     if (op === '/stop') { await sidecar.stop({ reason: 'user' }); return send(200, { ok: true }) }
@@ -2270,7 +3810,7 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
       },
       // A question answered without an agent: the "Saved by Jev" estimate counts these, only the
       // ones that came through a row Jev decides (2.5).
-      onDirectAnswer: (durationMs, m, row) => usage.logAttempt({ agent: 'chat', role: 'direct-answer', durationMs, provider: m.provider, model: m.model, decider: row?.decider ?? 'jev' }).catch(() => {}),
+      onDirectAnswer: (durationMs, m, row) => inBackground(usage.logAttempt({ agent: 'chat', role: 'direct-answer', durationMs, provider: m.provider, model: m.model, decider: row?.decider ?? 'jev' }).catch(() => {})),
       // Laya Auto refuses a message at once when Laya cannot be asked, and is on offer, with what
       // a task costs on this PC, only while it can (3.1, 3.5).
       layaUnavailable,
@@ -2290,6 +3830,17 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
   // Effort settings from Settings -> Jev setup, over the Config defaults.
   const effortFile = join(dataDir, 'effort.json')
   const readEffort = async () => { try { return Config.dict.effort({ ...config.effort, ...JSON.parse(await readFile(effortFile, 'utf8').catch(() => '{}')) }) } catch { return config.effort } }
+  const saveEffort = async (clean) => {
+    await mkdir(dataDir, { recursive: true })
+    await writeFile(`${effortFile}.tmp`, JSON.stringify(clean, null, 2))
+    await rename(`${effortFile}.tmp`, effortFile)
+  }
+  /** Settings, Effort as its card reads it: the settings, and what your ratings move Auto effort by now (effort.js effortBiases), in words. */
+  const effortView = async () => {
+    const settings = await readEffort()
+    const learned = effortBiases(await feedback.list(), settings.ratingsResetAt ?? null).map((b) => ({ ...b, text: ratedEffortLine(b) }))
+    return { ...settings, learned }
+  }
 
   // --- The capability benchmark (docs/benchmark.md 3) -----------------------
   // Its runner, over this plugin's own state: the agents, readiness, the quota and the usage figures
@@ -2468,6 +4019,42 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
             const all = tasks.list()
             return send(200, { tasks: ws ? all.filter((t) => laneKey(t.workspace) === laneKey(ws)) : all })
           }
+          // The Live tab, the card under a start reply and the Tasks tab's live tail (live.js): a task's
+          // runs by its key (a read pass and the pass that writes after it), or one run by its id,
+          // each with its items changed since `after`. A run of a task the store no longer holds, as
+          // after a restart, is read from its saved transcript, and `saved` says so of a task that has
+          // ended. `done` once nothing more will come: the task has ended, or the run.
+          if (req.method === 'GET' && url.pathname === '/jev-router/live') {
+            await tasks.ready
+            const key = url.searchParams.get('task')
+            const run = url.searchParams.get('run')
+            const after = Number(url.searchParams.get('after') ?? 0)
+            const LIVE_ID = /^[\w-]{1,80}$/
+            if ((key === null) === (run === null) || !LIVE_ID.test(key ?? run)) return send(400, { error: 'task: a task key, or run: a run id' })
+            if (!Number.isSafeInteger(after) || after < 0) return send(400, { error: 'after: a version, a whole number from 0' })
+            const t = key ? tasks.byKey(key) : null
+            if (key && !t) return send(404, { error: 'no task with that key' })
+            const ids = key ? t.runIds : [run]
+            let runs = ids.map((id) => live.read(id, after))
+            // The version these reads are of, taken with them: whatever changes while the saved
+            // transcript is read below comes after it, so the next poll, which asks after it, has it.
+            const v = live.v
+            let saved = false
+            // Runs the store no longer holds come from the saved transcript, once: it does not change.
+            if (key && runs.some((r) => !r)) {
+              const s = after > 0 ? null : await live.load(key)
+              const kept = new Map((s?.runs ?? []).map((r) => [r.runId, r]))
+              const fromFile = runs.map((r, i) => !r && kept.has(ids[i]))
+              runs = ids.map((id, i) => runs[i] ?? kept.get(id) ?? null)
+              // Said only of a task that has ended, whose report is in the chat: a pass the store let
+              // go of while the task still works is shown from the file without the note.
+              saved = TERMINAL_STATES.includes(t.state) && fromFile.some(Boolean)
+            }
+            runs = runs.filter(Boolean)
+            if (run && !runs.length) return send(404, { error: 'no live run with that id' })
+            const done = key ? TERMINAL_STATES.includes(t.state) : runs.every((r) => r.summary?.done)
+            return send(200, { runs, v, patches: enginePatches(), done, saved, ...(t ? { task: { key: t.key, jobId: t.jobId, taskName: t.taskName, state: t.state, sessionId: t.sessionId } } : {}) })
+          }
           if (req.method === 'GET' && url.pathname === '/jev-router/tasks/report') {
             await tasks.ready // a task restored from tasks.jsonl has a report before the list is asked for
             const report = tasks.report(url.searchParams.get('id') ?? '')
@@ -2479,25 +4066,99 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
               if (url.pathname === '/jev-router/tasks/stop') return send(200, { result: tasks.stop(validJobId(body.jobId), { onlyIfWaiting: body.onlyIfWaiting === true }) })
               if (url.pathname === '/jev-router/tasks/reorder') { tasks.reorder(body.workspace, body.order ?? []); return send(200, { ok: true }) }
               if (url.pathname === '/jev-router/tasks/clear') return send(200, { cleared: tasks.clear(body.jobIds ?? []) })
+              // Send now and Steer (docs/live-agent-view.md Feature 5), for a task by its key, which no
+              // restart hands to another task as the engine does a job id. Each answers what came of it in
+              // words, which the browser shows as they are.
+              if (url.pathname === '/jev-router/tasks/start-now') return send(200, await startTaskNow(taskKeyIn(body), { stop: body.stop == null ? null : validJobId(body.stop) }))
+              if (url.pathname === '/jev-router/tasks/steer') return send(200, await steerTask(taskKeyIn(body), { text: body.text, how: body.how ?? 'auto' }))
               // The browser reporting that it has actually rendered these result messages. This
-              // is the only thing that marks a result read, which is what "unread" means.
+              // is the only thing that marks a result read, which is what "unread" means. Each
+              // result names its task as its notice does, and the page names the chat the rows are
+              // in, so an old notice under a job id the engine reused after a restart, in this chat
+              // or another, never marks the new task read (tasks.js delivered()); an older page's
+              // bare `jobIds` are still heard.
               if (url.pathname === '/jev-router/tasks/seen') {
                 await tasks.ready
-                const seen = (body.jobIds ?? []).map((id) => { try { return validJobId(id) } catch { return null } }).filter(Boolean)
-                return send(200, { acknowledged: seen.filter((id) => tasks.delivered(id)) })
+                const seen = seenResults(body)
+                return send(200, { acknowledged: seen.filter((r) => tasks.delivered(r.jobId, { name: r.name, sessionId: r.sessionId })).map((r) => r.jobId) })
               }
             } catch (err) { return send(err.status ?? 400, { error: err.message }) }
           }
           // Shortcuts page: key bindings and the right sidebar width, one small JSON file.
-          if (req.method === 'GET' && url.pathname === '/jev-router/effort') return send(200, await readEffort())
+          if (req.method === 'GET' && url.pathname === '/jev-router/effort') return send(200, await effortView())
           if (req.method === 'POST' && url.pathname === '/jev-router/effort') {
             if (String(req.headers['content-type'] ?? '').split(';')[0].trim() !== 'application/json') return send(415, { error: 'JSON only' })
             let clean
-            try { clean = Config.dict.effort(JSON.parse(await readBody(req))) } catch (err) { return send(400, { error: err.message }) }
-            await mkdir(dataDir, { recursive: true })
-            await writeFile(`${effortFile}.tmp`, JSON.stringify(clean, null, 2))
-            await rename(`${effortFile}.tmp`, effortFile)
+            // What your ratings moved is worked out from them each time it is read, never saved.
+            try { const { learned: _shown, ...body } = JSON.parse(await readBody(req)) ?? {}; clean = Config.dict.effort(body) } catch (err) { return send(400, { error: err.message }) }
+            await saveEffort(clean)
             return send(200, clean)
+          }
+          // Settings, Effort, Reset: your ratings given before now move Auto effort no more. Nothing is
+          // deleted: the time is kept beside the settings, and the ratings are read from it on.
+          if (req.method === 'POST' && url.pathname === '/jev-router/effort/ratings-reset') {
+            await saveEffort({ ...(await readEffort()), ratingsResetAt: new Date().toISOString() })
+            return send(200, await effortView())
+          }
+          // How the chat answers a task it queues (Settings, Jev setup, Chat replies): a patch of the
+          // fields to change, each checked, saved whole and taken by the next reply.
+          if (req.method === 'GET' && url.pathname === '/jev-router/chat-replies/settings') { await chatRepliesRead; return send(200, chatReplies) }
+          if (req.method === 'POST' && url.pathname === '/jev-router/chat-replies/settings') {
+            await chatRepliesRead
+            let next
+            try { next = validChatReplies(JSON.parse(await readBody(req)), chatReplies) } catch (err) { return send(400, { error: err.message }) }
+            await mkdir(dataDir, { recursive: true })
+            await writeFile(`${chatRepliesFile}.tmp`, JSON.stringify(next, null, 2))
+            await rename(`${chatRepliesFile}.tmp`, chatRepliesFile)
+            chatReplies = next
+            return send(200, next)
+          }
+          // Settings, Jev setup, Live agent view: whether the engine patch is in the Claude Code and Codex
+          // connectors, and why not (engine-patches.js), and the live settings, saved whole.
+          if (req.method === 'GET' && url.pathname === '/jev-router/engine-patches') return send(200, enginePatches())
+          if (req.method === 'GET' && url.pathname === '/jev-router/live/settings') { await liveSettingsRead; return send(200, liveSettings) }
+          if (req.method === 'POST' && url.pathname === '/jev-router/live/settings') {
+            if (String(req.headers['content-type'] ?? '').split(';')[0].trim() !== 'application/json') return send(415, { error: 'JSON only' })
+            await liveSettingsRead
+            let next
+            try { next = validLiveSettings(JSON.parse(await readBody(req)), liveSettings) } catch (err) { return send(400, { error: err.message }) }
+            await mkdir(dataDir, { recursive: true })
+            await writeFile(`${liveSettingsFile}.tmp`, JSON.stringify(next, null, 2))
+            await rename(`${liveSettingsFile}.tmp`, liveSettingsFile)
+            const was = liveSettings
+            liveSettings = next
+            // Keep transcripts off: the ones kept so far go too, each in its task's own turn.
+            if (next.transcripts === 'off' && was.transcripts !== 'off') { await tasks.ready; for (const t of tasks.list()) if (t.key) inBackground(live.drop(t.key)) }
+            return send(200, next)
+          }
+          // Settings, Jev setup, How Jev replies: how start replies are made, how far task or question
+          // has come, and the reply predictor's record (repliesSummary), read only.
+          if (req.method === 'GET' && url.pathname === '/jev-router/replies/summary') return send(200, await repliesSummary())
+          // One start reply's row, by its task's key (the reply's [jev-job] mark), for the ask under a
+          // reply whose plan changed (docs/live-agent-view.md Feature 4): what it named and what then
+          // ran, how its pick was rated and the ask answered, whether asking is on, and whether its task
+          // has ended. A reply of another chat, when the page names its chat, is none of this one's.
+          if (req.method === 'GET' && url.pathname === '/jev-router/replies') {
+            const key = url.searchParams.get('key') ?? ''
+            const session = url.searchParams.get('session')
+            if (!TASK_KEY.test(key)) return send(400, { error: 'key: the task key a start reply carries' })
+            const row = await ledger.row(key)
+            if (!row || (session !== null && row.sessionId !== session)) return send(404, { error: 'no start reply of that task is recorded' })
+            const t = tasks.byKey(key)
+            return send(200, { key, jobId: row.jobId, said: row.said, ran: row.ran, verdict: row.verdict, ask: row.ask, askWhenWrong: chatReplies.askWhenWrong !== false, ended: !t ? true : TERMINAL_STATES.includes(t.state) ? t.state : null })
+          }
+          // The person's answer to that ask, kept on the reply's row so the reply is never asked about
+          // again: `said` (the agent the reply named was right), `ran` (the one that ran was) or `either`.
+          if (req.method === 'POST' && url.pathname === '/jev-router/replies/ask') {
+            let body
+            try { body = JSON.parse(await readBody(req)) } catch { return send(400, { error: 'expected JSON' }) }
+            const answer = body?.answer
+            if (!TASK_KEY.test(String(body?.key ?? ''))) return send(400, { error: 'key: the task key a start reply carries' })
+            if (!ASK_ANSWERS.includes(answer)) return send(400, { error: `answer: one of ${ASK_ANSWERS.join(', ')}` })
+            const row = ledgerOn() ? await ledger.row(body.key) : null
+            if (!row || (body.sessionId !== undefined && row.sessionId !== body.sessionId)) return send(404, { error: 'no start reply of that task is recorded' })
+            const next = await ledger.note(body.key, { ask: { answer, at: new Date().toISOString() } })
+            return send(200, { key: body.key, ask: next.ask })
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/hotkeys') {
             const raw = await readFile(hotkeysFile, 'utf8').catch((err) => { if (err.code === 'ENOENT') return '{}'; throw err })
@@ -2649,6 +4310,11 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
             return send(200, await localStatus({ local, lanes, online: connectivity.last()?.online ?? null }))
           }
           if (req.method === 'GET' && url.pathname === '/jev-router/local/catalog') return send(200, await catalog())
+          // The tail of llama-server's log on disk, as GET /jev-router/laya/log serves Laya's: `lines` of it, 200 unless said, 500 at most.
+          if (req.method === 'GET' && url.pathname === '/jev-router/local/log') {
+            const n = Math.min(500, Math.max(1, Math.trunc(Number(url.searchParams.get('lines'))) || 200))
+            return send(200, { file: local.logFile ?? null, lines: await local.logTail(n) })
+          }
           if (req.method === 'POST' && url.pathname.startsWith('/jev-router/local/')) {
             const b = JSON.parse((await readBody(req)) || '{}')
             const op = url.pathname.slice('/jev-router/local/'.length)
@@ -2660,6 +4326,11 @@ export function apply(ctx, config, { laya: layaSeams = {}, local: localSeams = {
             // Cancel: 200, also when nothing runs; 409 with why while the run puts the engine back.
             if (op === 'benchmark/cancel') {
               try { local.cancelBenchmark(); return send(200, { ok: true }) } catch (err) { return send(err.status ?? 400, { error: err.message }) }
+            }
+            // Accept new output (2.15): the model's figure held because its output differed from its
+            // baseline becomes its speed, and that output its baseline. 400 when it has none held, 409 while a run goes.
+            if (op === 'benchmark/accept-output') {
+              try { await local.acceptOutput(b.id); return send(200, { ok: true }) } catch (err) { return send(err.status ?? 400, { error: err.message }) }
             }
             const ids = Array.isArray(b.ids) ? b.ids.map(String) : []
             if (op === 'start') await local.start(String(b.model ?? ''))
@@ -2713,6 +4384,76 @@ export function validHotkeys(body) {
   }
   if (rightbarRatio !== undefined && !(Number.isInteger(rightbarRatio) && rightbarRatio >= 15 && rightbarRatio <= 50)) throw new Error('rightbarRatio: whole number 15-50')
   return { bindings: Object.fromEntries(entries), ...(rightbarRatio !== undefined ? { rightbarRatio } : {}) }
+}
+
+/**
+ * How the chat answers a task it queues, as shipped (docs/live-agent-view.md Feature 2): the start
+ * reply waits up to 15 s for the router's pick, milestone notices follow it, and a reply that named
+ * another plan than ran may ask which was right.
+ */
+export const CHAT_REPLIES = Object.freeze({ waitMs: 15_000, progress: 'milestones', askWhenWrong: true })
+/** The answers the ask under a start reply takes (POST /jev-router/replies/ask): the agent it named was right, the one that ran was, or either was. */
+export const ASK_ANSWERS = Object.freeze(['said', 'ran', 'either'])
+// A task's key as tasks.js makes it (randomUUID), which its start reply carries in its [jev-job] mark.
+const TASK_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * The chat replies settings with `patch` laid over `current` (POST /jev-router/chat-replies/settings):
+ * a field left out keeps its value, and one this build does not know is dropped. Throws on the first
+ * field that is wrong, naming what it takes, so a refused patch saves nothing. `progress` 'off' is
+ * Settings' "Start and result only": the start reply and the result, and no milestone notice between
+ * but the change of plan of a guess routing did not pick (tasks.js guessMissed).
+ */
+export function validChatReplies(patch, current = CHAT_REPLIES) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('chat replies: an object of the settings to change')
+  const next = { ...CHAT_REPLIES, ...current }
+  if ('waitMs' in patch) {
+    if (!Number.isInteger(patch.waitMs) || patch.waitMs < 0 || patch.waitMs > 60_000) throw new Error('waitMs: whole milliseconds from 0 to 60000 (0 replies at once)')
+    next.waitMs = patch.waitMs
+  }
+  if ('progress' in patch) {
+    if (patch.progress !== 'milestones' && patch.progress !== 'off') throw new Error("progress: 'milestones', or 'off' for the start reply and the result only")
+    next.progress = patch.progress
+  }
+  if ('askWhenWrong' in patch) {
+    if (typeof patch.askWhenWrong !== 'boolean') throw new Error('askWhenWrong: true or false')
+    next.askWhenWrong = patch.askWhenWrong
+  }
+  return { waitMs: next.waitMs, progress: next.progress, askWhenWrong: next.askWhenWrong }
+}
+
+/**
+ * Settings, Jev setup, Live agent view, as shipped (docs/live-agent-view.md Feature 1): whether Steer may
+ * reach a running Claude Code through its input channel (experimental, off), how Claude Code shows its
+ * thinking ('default', as it shows it, or 'summarized'), and whether each task's transcript is kept on
+ * disk ('last20', the newest 20 tasks of the task list, 'last100', every task the list keeps, or 'off').
+ */
+export const LIVE_SETTINGS = Object.freeze({ claudeSteer: false, claudeThinking: 'default', transcripts: 'last20' })
+
+/** Keep transcripts, Last 20 tasks: how many of the task list's newest tasks keep their transcripts. */
+export const TRANSCRIPTS_LAST = 20
+
+/**
+ * The live settings with `patch` laid over `current` (POST /jev-router/live/settings): a field left out
+ * keeps its value, and one this build does not know is dropped. Throws on the first field that is
+ * wrong, naming what it takes, so a refused patch saves nothing.
+ */
+export function validLiveSettings(patch, current = LIVE_SETTINGS) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('live settings: an object of the settings to change')
+  const next = { ...LIVE_SETTINGS, ...current }
+  if ('claudeSteer' in patch) {
+    if (typeof patch.claudeSteer !== 'boolean') throw new Error('claudeSteer: true or false')
+    next.claudeSteer = patch.claudeSteer
+  }
+  if ('claudeThinking' in patch) {
+    if (patch.claudeThinking !== 'default' && patch.claudeThinking !== 'summarized') throw new Error("claudeThinking: 'default', as Claude Code shows it, or 'summarized'")
+    next.claudeThinking = patch.claudeThinking
+  }
+  if ('transcripts' in patch) {
+    if (!['last20', 'last100', 'off'].includes(patch.transcripts)) throw new Error("transcripts: 'last20', 'last100', or 'off' to keep none")
+    next.transcripts = patch.transcripts
+  }
+  return { claudeSteer: next.claudeSteer, claudeThinking: next.claudeThinking, transcripts: next.transcripts }
 }
 
 /** The folder a terminal may open in: an existing directory that is a DSH project folder. */

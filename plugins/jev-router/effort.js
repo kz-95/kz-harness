@@ -107,19 +107,38 @@ export function autoLevel({ complexity, risk } = {}, bands = { low: 0.125, mediu
   return x < (bands.low ?? 0) ? 'low' : x < bands.medium ? 'medium' : x < bands.high ? 'high' : 'xhigh'
 }
 
+// The rungs Auto may be moved along by your ratings (effortBias): never to max or ultra, as Auto
+// itself never goes there.
+const AUTO_RUNGS = ['low', 'medium', 'high', 'xhigh']
+
+/**
+ * The unified level an agent runs at, read one way by toAgentEffort and by whatever names the plan:
+ * the agent's own Settings value, else the level asked, else Auto from complexity and risk, moved
+ * `shift` rungs (-1, 0 or +1, effortBias) within low to xhigh. Only Auto moves: a level picked in the
+ * model menu or in Settings is kept as it was picked.
+ */
+export function unifiedLevel(level, { complexity, risk, override, bands, shift = 0 } = {}) {
+  if (override) return override
+  if (level && level !== 'auto') return level
+  const auto = autoLevel({ complexity, risk }, bands)
+  const at = AUTO_RUNGS.indexOf(auto) + (Number.isInteger(shift) ? shift : 0)
+  return AUTO_RUNGS[Math.max(0, Math.min(AUTO_RUNGS.length - 1, at))]
+}
+
 /**
  * Effort value to send to one agent, or null to leave its default.
  * @param {string} level  unified level (LEVELS)
  * @param {object} agentDef
- * @param {{complexity?: number, risk?: number, override?: string, model?: string, bands?: {low?: number, medium: number, high: number}}} [jev]
- *   override: the agent's own value from Settings (wins over level); bands: autoLevel's cuts
+ * @param {{complexity?: number, risk?: number, override?: string, model?: string, bands?: {low?: number, medium: number, high: number}, shift?: number}} [jev]
+ *   override: the agent's own value from Settings (wins over level); bands: autoLevel's cuts;
+ *   shift: the rungs your ratings move Auto by (unifiedLevel)
  */
-export function toAgentEffort(level, agentDef, { complexity, risk, override, model, bands } = {}) {
+export function toAgentEffort(level, agentDef, { complexity, risk, override, model, bands, shift } = {}) {
   const family = effortFamily(agentDef)
   if (!family) return null
   // A local-* level names a model, not an effort: the agent keeps its own default.
   if (isLocalLevel(override || level)) return null
-  const l = override || (!level || level === 'auto' ? autoLevel({ complexity, risk }, bands) : level)
+  const l = unifiedLevel(level, { complexity, risk, override, bands, shift })
   if (family === 'claude') return CLAUDE[l] ?? null
   if (family === 'deepseek') return DEEPSEEK[l] ?? null
   const i = CODEX_ORDER.indexOf(l)
@@ -130,3 +149,84 @@ export function toAgentEffort(level, agentDef, { complexity, risk, override, mod
 
 /** Codex service tier for a speed setting: 1.5x is 'priority', normal leaves the default. */
 export const codexServiceTier = (speed) => (speed === 'fast' ? 'priority' : null)
+
+/**
+ * The speed an agent's attempt runs at, from Settings, Effort: Codex's 'normal' or 'fast' (1.5x),
+ * 'fast-mode' for Claude Code's fast mode, and null for Claude Code at normal speed or any other agent.
+ */
+export function agentSpeed(family, effortSettings) {
+  if (family === 'codex') return effortSettings?.codexSpeed ?? null
+  if (family === 'claude') return effortSettings?.claudeSpeed === 'fast' ? 'fast-mode' : null
+  return null
+}
+
+/** KZ_CLAUDE_FAST_MODE for a speed: '1' has the patched connector ask the SDK for fast mode, anything else leaves it off. */
+export const claudeFastMode = (speed) => (speed === 'fast-mode' ? '1' : null)
+
+/** What a speed adds to the effort the task list and the replies show: Codex's 1.5x, Claude Code's fast mode. */
+export const speedWord = (speed) => (speed === 'fast' ? ' 1.5x' : speed === 'fast-mode' ? ', fast mode' : '')
+
+// ---- what your ratings say of Auto effort (docs/live-agent-view.md Feature 4) ----
+
+/** The efforts a rating can name, weakest first: the unified levels a verdict about the pick takes. */
+const RATED = ['low', 'medium', 'high', 'xhigh', 'max']
+/** How many of the newest `wrong effort` ratings of one agent family and task type are read, and how many must agree. */
+export const RATINGS_READ = 5
+export const RATINGS_AGREE = 3
+
+/**
+ * The level a `wrong effort` rating is read against: the one Auto would have chosen, before your
+ * ratings moved it (`planUnmoved`, stamped when they had), else the level the plan ran at
+ * (`planLevel`). Against the moved level, a rating that asked for Auto's own level read as a vote
+ * past it, and three of them moved Auto a step beyond what they asked for.
+ */
+const ratedAgainst = (r) => (RATED.includes(r?.planUnmoved) ? r.planUnmoved : r?.planLevel)
+
+/**
+ * The newest `wrong effort` ratings of one agent family on one task type since `resetAt`, at most
+ * RATINGS_READ of them: `up` say the pick ran too low (the effort it should have run at is above the
+ * level Auto would have chosen, ratedAgainst), `down` too high, of `n` read. A rating whose plan ran
+ * at no unified level says neither, nor does one that names the level Auto would have chosen, which
+ * counts among the `n` read and so takes the place of an older one that moved it. Rows are
+ * feedback.js rows as stored, which index.js stamps with the plan's family, levels and task type
+ * (acceptVerdict, or bindRun for a rating given before routing picked anything).
+ */
+export function effortVotes(rows, family, taskType, resetAt = null) {
+  // A rating given before the last Reset is read no more; one whose time cannot be read, once there
+  // has been a Reset, cannot be shown to come after it.
+  const since = resetAt ? Date.parse(resetAt) : NaN
+  const after = (r) => Number.isNaN(since) || Date.parse(r.ts) >= since
+  const read = (rows ?? []).filter((r) => r?.about === 'plan' && r.verdict === 'dislike' && r.tag === 'wrong effort'
+    && r.planFamily === family && r.taskType === taskType && RATED.includes(r.suggestedEffort) && RATED.includes(ratedAgainst(r))
+    && after(r)).slice(-RATINGS_READ)
+  return { up: read.filter((r) => ratingWay(r) > 0).length, down: read.filter((r) => ratingWay(r) < 0).length, n: read.length }
+}
+
+/** Which way one `wrong effort` rating says Auto should go: +1 up, -1 down, 0 for none it can say. */
+export const ratingWay = (r) => (RATED.includes(r?.suggestedEffort) && RATED.includes(ratedAgainst(r)) ? Math.sign(RATED.indexOf(r.suggestedEffort) - RATED.indexOf(ratedAgainst(r))) : 0)
+
+/**
+ * The rungs your ratings move Auto effort by for one agent family on one task type: +1 when at least
+ * RATINGS_AGREE of its newest RATINGS_READ `wrong effort` ratings since `resetAt` say it ran too low,
+ * -1 when they say too high, else 0.
+ */
+export function effortBias(rows, family, taskType, resetAt = null) {
+  const { up, down } = effortVotes(rows, family, taskType, resetAt)
+  return up >= RATINGS_AGREE ? 1 : down >= RATINGS_AGREE ? -1 : 0
+}
+
+/**
+ * Every agent family and task type your ratings move Auto effort for now, as Settings, Effort lists
+ * them: `{ family, taskType, shift, agree, n }`, `agree` of the `n` ratings read saying so.
+ */
+export function effortBiases(rows, resetAt = null) {
+  const pairs = new Map()
+  for (const r of rows ?? []) if (r?.about === 'plan' && r.tag === 'wrong effort' && r.planFamily && r.taskType) pairs.set(`${r.planFamily}\u0000${r.taskType}`, [r.planFamily, r.taskType])
+  const out = []
+  for (const [family, taskType] of pairs.values()) {
+    const v = effortVotes(rows, family, taskType, resetAt)
+    const shift = effortBias(rows, family, taskType, resetAt)
+    if (shift) out.push({ family, taskType, shift, agree: shift > 0 ? v.up : v.down, n: v.n })
+  }
+  return out
+}

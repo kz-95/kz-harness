@@ -484,6 +484,38 @@ test('on a file at the cap, the rows of a run are read from memory in well under
   assert.equal(existsSync(`${file}.tmp`), false)
 })
 
+test('a shadow disposed of, as the plugin closing or applied again leaves it, compacts the file no more and only appends, so the rows the shadow that replaces it appended stay', async () => {
+  const file = join(tmp('closed'), 'laya-shadow.jsonl')
+  writeFileSync(file, [0, 1, 2].map((i) => `${JSON.stringify(bigRow(i))}\n`).join(''))
+  const closed = createShadow({ file, laya: stubLaya({ drop: 'not_running' }), providers: PROVIDERS, cap: 3, slack: 1 })
+  await closed.loaded()
+  await closed.dispose?.()
+  // The shadow that replaces it appends a row of its own.
+  writeFileSync(file, `${readFileSync(file, 'utf8')}${JSON.stringify(bigRow(3))}\n`)
+  // A Jev call of a run of the closed plugin still going settles, past the cap.
+  const jev = createJev({ provider: JEV, apiKey: 'k', client: fakeJev({ latencyMs: 1 }), onCall: closed.offerer({ runId: 'late' }) })
+  await jev.intent({ message: 'late' })
+  await waitFor('the late row in memory', () => closed.read({}).some((r) => r.phase === 'intent'), Boolean)
+  await closed.flush()
+  assert.deepEqual(rowsIn(file).map((r) => r.id).slice(0, 4), ['row-0', 'row-1', 'row-2', 'row-3'], 'never compacted: every row of the shadow that replaced it is there')
+  assert.equal(rowsIn(file).length, 5, 'and the late row is appended')
+})
+
+test('a shadow disposed of has on disk, once its dispose resolves, the row of a call Jev has answered whose Laya side the Laya client\'s dispose ends a moment later', async () => {
+  const file = join(tmp('closing'), 'laya-shadow.jsonl')
+  const laya = stubLaya()
+  const shadow = createShadow({ file, laya, providers: PROVIDERS })
+  const jev = createJev({ provider: JEV, apiKey: 'k', client: fakeJev({ latencyMs: 1 }), onCall: shadow.offerer({ runId: 'r1' }) })
+  await jev.intent({ message: 'which is it' })
+  const [callId] = laya.offers.keys()
+  // The plugin closes with Laya still answering: the Laya client's dispose abandons the request, and
+  // its call settles as the socket closes, on a later turn.
+  const closing = shadow.dispose?.()
+  setTimeout(() => laya.offers.get(callId).onDone({ status: 'failed', reason: 'not_running', queuedMs: 0, ms: 0 }), 30)
+  await closing
+  assert.deepEqual(rowsIn(file).map((r) => r.callId), [callId], 'its row is written before closing resolves, never after')
+})
+
 /** The longest `work` held the event loop up, in ms: how long a run streaming on this thread would have stalled. */
 async function heldUp(work) {
   const h = monitorEventLoopDelay({ resolution: 1 })

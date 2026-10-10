@@ -61,29 +61,57 @@ export function hashedText(text, { buckets = TEXT_BUCKETS, prefix = 'h' } = {}) 
 }
 
 /**
+ * The words' own part of a message's features: shape signals read off the text, its hashed
+ * unigrams and bigrams, and whether a picture came with it. One builder for the task's features
+ * and the intent's, so the two cannot come to read the same words differently.
+ */
+function textPart(text, modalities) {
+  const t = String(text ?? '')
+  const lines = t.split('\n')
+  return {
+    shape: {
+      text_length_log: r3(Math.log1p(t.length)),
+      line_count_log: r3(Math.log1p(lines.length)),
+      question_mark: /\?\s*$/.test(t.trim()) || /\?/.test(t) ? 1 : 0,
+      code_fence: /```/.test(t) ? 1 : 0,
+      has_path: /[\w-]+\/[\w./-]+|\w+\.(js|ts|py|go|rs|java|cs|md|json|yml|yaml|css|html)\b/.test(t) ? 1 : 0,
+      has_error_text: /\b(error|exception|traceback|stack ?trace|failed|failing|crash)\b/i.test(t) ? 1 : 0,
+      has_image: modalities.includes('image') ? 1 : 0,
+    },
+    hashed: hashedText(t),
+    categorical: { modality: modalities.includes('image') ? 'text+image' : 'text' },
+  }
+}
+
+/**
  * Routing-time features of the request itself, for the task-classification domain: a few
  * shape signals plus hashed text. `context` is the workspace summary the router already
  * gathers (file counts, scripts, dependencies); only counts are read, never contents.
  * @returns {{ numeric: Record<string, number>, categorical: Record<string, string> }}
  */
 export function taskTextFeatures(task, { context = {}, modalities = ['text'] } = {}) {
-  const t = String(task ?? '')
-  const lines = t.split('\n')
+  const { shape, hashed, categorical } = textPart(task, modalities)
   const numeric = {
-    text_length_log: r3(Math.log1p(t.length)),
-    line_count_log: r3(Math.log1p(lines.length)),
-    question_mark: /\?\s*$/.test(t.trim()) || /\?/.test(t) ? 1 : 0,
-    code_fence: /```/.test(t) ? 1 : 0,
-    has_path: /[\w-]+\/[\w./-]+|\w+\.(js|ts|py|go|rs|java|cs|md|json|yml|yaml|css|html)\b/.test(t) ? 1 : 0,
-    has_error_text: /\b(error|exception|traceback|stack ?trace|failed|failing|crash)\b/i.test(t) ? 1 : 0,
-    has_image: modalities.includes('image') ? 1 : 0,
+    ...shape,
     file_count_log: r3(Math.log1p(num(context.fileCount ?? context.files))),
     dependency_count_log: r3(Math.log1p(num(context.dependencyCount ?? (Array.isArray(context.dependencies) ? context.dependencies.length : 0)))),
     has_tests_script: Array.isArray(context.scripts) && context.scripts.some((s) => /test/i.test(String(s))) ? 1 : 0,
     changed_files_log: r3(Math.log1p(num(Array.isArray(context.changedFiles) ? context.changedFiles.length : context.changedFileCount))),
-    ...hashedText(t),
+    ...hashed,
   }
-  return { numeric, categorical: { modality: modalities.includes('image') ? 'text+image' : 'text' } }
+  return { numeric, categorical }
+}
+
+/**
+ * Features of a chat message for the intent domain (task or question), and for the reply
+ * predictor that reads them too (reply-ledger.js): the text part of taskTextFeatures and nothing
+ * of the workspace. A message is sorted before any workspace is read, and the same words mean the
+ * same thing in every project.
+ * @returns {{ numeric: Record<string, number>, categorical: Record<string, string> }}
+ */
+export function intentFeatures(text, { modalities = ['text'] } = {}) {
+  const { shape, hashed, categorical } = textPart(text, modalities)
+  return { numeric: { ...shape, ...hashed }, categorical }
 }
 
 /**

@@ -86,6 +86,19 @@ test('failing checks override a Jev accept; loop stops at maxAttempts', async ()
   assert.ok(r.assessments.every((s) => s.action === 'retry'))
 })
 
+test('work an agent did before its usage limit is checked again by the next attempt, even one that changes nothing', async () => {
+  const dir = repo()
+  const used = []
+  const jev = { route: async () => routeResult(), assess: async () => verdict('accept') }
+  // codex fixes the work, then its limit stops it; claude, its stand-in, finds nothing left to change.
+  const execute = async (a) => { used.push(a.id); return used.length === 1 ? fixer(dir)() : noop() }
+  const isLimitError = (a) => ({ hit: a.id === 'codex' && used.length === 1, until: null })
+  const r = await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { jev, execute, isLimitError, history: history() } })
+  assert.deepEqual(used, ['codex', 'claude'])
+  assert.deepEqual(r.attempts[1].checks.map(({ name, passed }) => ({ name, passed })), [{ name: 'test', passed: true }], 'the checks ran on the fixed work, not the stale failing baseline')
+  assert.equal(r.finalStatus, 'accepted')
+})
+
 test('second opinion goes to a different agent, then accepts', async () => {
   const dir = repo()
   const used = []
@@ -174,6 +187,26 @@ test('signed-out agents are never picked; none signed in is an error', async () 
   await assert.rejects(runRouted({ task: 'fix', cwd: dir, forceAgent: 'claude', config, signal, deps: { ready, jev, execute, history: history() } }), /claude cannot run/)
   const none = { ...ready, deepseek: { loggedIn: false, detail: 'key missing' } }
   await assert.rejects(runRouted({ task: 'fix', cwd: dir, config, signal, deps: { ready: none, jev, execute, history: history() } }), /no LLM agent is switched on and signed in/)
+})
+
+test('the routed event names each agent that could not be picked and why, signed out or at its usage limit until it resets, which whyNotPicked reads beside a weekly gate or your feedback moving the pick off an agent, and nothing for a judgment', async () => {
+  const { whyNotPicked } = await import('../router.js')
+  assert.equal(typeof whyNotPicked, 'function', 'router.js says why a routing did not give the work to an agent')
+  const dir = repo()
+  const until = new Date(Date.now() + 3_600_000).toISOString()
+  const ready = { claude: { loggedIn: false, detail: 'not signed in' }, codex: { loggedIn: true }, deepseek: { loggedIn: true } }
+  const events = []
+  const jev = { route: async () => routeResult(), assess: async () => verdict('accept') }
+  await runRouted({ task: 'fix', cwd: dir, config, signal, deps: { ready, quota: { codex: { state: 'exhausted', until } }, jev, execute: fixer(dir), history: history(), emit: (e) => events.push(e) } })
+  const routed = events.find((e) => e.type === 'routed')
+  assert.deepEqual(routed.unavailable, [{ agent: 'claude', why: 'signed-out' }, { agent: 'codex', why: 'limit', until }])
+  assert.deepEqual(whyNotPicked(routed, 'claude'), { kind: 'signed-out', until: null })
+  assert.deepEqual(whyNotPicked(routed, 'codex'), { kind: 'limit', until })
+  assert.equal(whyNotPicked(routed, 'deepseek'), null, 'the agent that was picked')
+  assert.deepEqual(whyNotPicked({ routing: { primaryAgent: 'codex', feedbackFrom: 'claude' } }, 'claude'), { kind: 'feedback', until: null })
+  assert.deepEqual(whyNotPicked({ routing: { primaryAgent: 'codex', moves: [{ kind: 'gate', from: 'claude', to: 'codex' }] } }, 'claude'), { kind: 'gate', until: null })
+  assert.equal(whyNotPicked({ routing: { primaryAgent: 'codex', capabilityFrom: 'claude' } }, 'claude'), null, 'a capability judgment is no hard fact')
+  assert.equal(whyNotPicked(null, 'claude'), null)
 })
 
 test('after a tool escalates, an agent that breaks a passing test is not accepted', async () => {
@@ -1548,6 +1581,22 @@ test('each attempt ends under its own index when a parallel opinion rides along'
   assert.deepEqual(ends.sort(), [[0, 'deepseek'], [1, 'claude']], 'the primary\'s end is paired with its start, not filed under the opinion')
 })
 
+test('a parallel opinion keeps the model its provider reports as servedModel, never as a model version, and its API-equivalent cost on its usage row, as a primary attempt does; an attempt that reports neither gets neither', async () => {
+  const cands = [{ id: 'deepseek', key: 'RESOURCE_A', tier: 'strong' }, { id: 'claude', key: 'RESOURCE_B', tier: 'frontier' }]
+  const decide = async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), decision: { candidates: cands } }, plan: directPlan('deepseek', { strategy: 'PARALLEL_SECOND_OPINION', parallelWith: 'claude' }) })
+  const usage = { inputTokens: 1200, outputTokens: 300, totalTokens: 1500 }
+  // Claude Code through the engine patch says which model served it and what that would cost on the API.
+  const execute = async (a) => ({ stopReason: 'completed', answerText: `${a.id} says done`, diagnostic: null, usage, ...(a.id === 'claude' ? { servedModel: 'claude-opus-4-1', apiEquivalentUsd: 0.42 } : {}) })
+  const rows = []
+  const { r } = await adaptiveRun({ answerOnly: true, deps: { decide, execute, logAttempt: (e) => rows.push(e) } })
+  const attempt = (agent) => r.attempts.find((x) => x.agent === agent)
+  assert.deepEqual([attempt('claude').role, attempt('claude').servedModel, 'modelVersion' in attempt('claude')], ['opinion', 'claude-opus-4-1', false])
+  assert.deepEqual(['servedModel' in attempt('deepseek'), 'modelVersion' in attempt('deepseek')], [false, false])
+  const row = (agent) => rows.find((x) => x.agent === agent)
+  assert.deepEqual([row('claude').role, row('claude').apiEquivalentUsd, row('claude').costUsd], ['opinion', 0.42, null])
+  assert.equal('apiEquivalentUsd' in row('deepseek'), false)
+})
+
 // ---------- the decider: a run Laya decides, branch by branch (docs/laya-auto.md 3.2) ----------
 // Laya is handed to the loop as Jev is, a client beside its record, and every cut-off is then read
 // from that record. Each test holds Laya and Jev side by side, so a bar that moved for Laya is seen
@@ -1943,4 +1992,286 @@ test('an agent\'s track record leaves out a run a person stopped or that paused,
   const rows = [run('accepted'), run('accepted'), run('accepted'), run('stopped'), run('stopped'), run('paused_limit', [{ agent: 'claude', role: 'primary', durationMs: 1000 }, { agent: 'claude', role: 'retry', limitHit: true }])]
   const t = trackRecord(rows, '/ws', [{ id: 'claude', provider: 'claude-code' }]).claude
   assert.deepEqual([t.overall.attempts, t.overall.accepted_rate, t.overall.limit_hits], [3, 1, 1])
+})
+
+// ---------- what a routed plan says runs, and what a run is told (docs/live-agent-view.md, slice 1) ----------
+
+// Agents that each take an effort of their own (effort.js effortFamily), and the model each runs.
+const EFFORT_AGENTS = [
+  { id: 'claude', provider: 'claude-code', description: 'a', enabled: true },
+  { id: 'codex', provider: 'codex', description: 'b', enabled: true },
+  { id: 'deepseek', provider: 'spawn', description: 'c', enabled: true, llm: { provider: 'deepseek', model: 'deepseek-flash' } },
+]
+const MODELS = { claude: 'claude-opus-4-1', codex: 'gpt-5.5' }
+const modelOfAgent = (a) => MODELS[a?.id] ?? a?.llm?.model
+/** One run, keeping every event and what each execute call was told. */
+async function effortRun({ effort, forceAgent, cfg = {}, deps = {} } = {}) {
+  const events = []
+  const told = []
+  const r = await runRouted({
+    task: 'fix', cwd: repo(), config: adaptiveConfig({ agents: EFFORT_AGENTS, ...cfg }), effort, forceAgent, signal,
+    deps: {
+      review: accept, history: quiet, modelOf: modelOfAgent, emit: (e) => events.push(e),
+      execute: async (a, _prompt, _signal, options) => { told.push({ agent: a.id, ...options }); return { stopReason: 'completed', answerText: 'done' } },
+      ...deps,
+    },
+  })
+  return { r, events, told, routed: events.find((e) => e.type === 'routed'), starts: events.filter((e) => e.type === 'attempt_start') }
+}
+// The effort an attempt_start says, from a planned effort, as router.js words it.
+const effortSaid = (p) => (p.effort ? `${p.effort}${p.speed === 'fast' ? ' 1.5x' : ''}` : undefined)
+
+test('routed carries primary {agent, model, effort, level} equal to the following attempt_start effort for auto effort at complexity 0.7, a Settings override and a forced agent; planner and reviewer are named', async () => {
+  // Auto effort at complexity 0.7 on Jev's bands is xhigh, which Codex on gpt-5.5 takes as it is; at 1.5x speed.
+  const jev = { route: async () => pick('codex', 0.9, { codex: 0.9 }, { complexity: 0.7, risk: 0.2 }), assess: async () => ({}) }
+  const auto = await effortRun({ cfg: { effort: { default: 'auto', perAgent: {}, codexSpeed: 'fast' } }, deps: { jev } })
+  assert.deepEqual(auto.routed.primary, { agent: 'codex', model: 'gpt-5.5', effort: 'xhigh', level: 'xhigh', speed: 'fast' })
+  assert.equal(auto.starts[0].effort, effortSaid(auto.routed.primary), 'what the first attempt starts at')
+  assert.equal(auto.starts[0].effort, 'xhigh 1.5x')
+  // The menu's Max is past what gpt-5.5 takes: the level asked for, and the effort Codex is sent.
+  const max = await effortRun({ effort: 'max', deps: { jev } })
+  assert.deepEqual([max.routed.primary.effort, max.routed.primary.level, max.starts[0].effort], ['xhigh', 'max', 'xhigh'])
+  // Claude's own Settings value wins over the auto reading.
+  const claude = { route: async () => pick('claude', 0.9, { claude: 0.9 }, { complexity: 0.7, risk: 0.2 }), assess: async () => ({}) }
+  const override = await effortRun({ cfg: { effort: { default: 'auto', perAgent: { claude: 'low' } } }, deps: { jev: claude } })
+  assert.deepEqual(override.routed.primary, { agent: 'claude', model: 'claude-opus-4-1', effort: 'low', level: 'low', speed: null })
+  assert.equal(override.starts[0].effort, effortSaid(override.routed.primary))
+  // A forced agent at the menu's Medium: DeepSeek takes medium as high.
+  const forced = await effortRun({ forceAgent: 'deepseek', effort: 'medium', deps: { jev: null } })
+  assert.deepEqual(forced.routed.primary, { agent: 'deepseek', model: 'deepseek-flash', effort: 'high', level: 'medium', speed: null })
+  assert.equal(forced.starts[0].effort, 'high')
+  // A plan with a planner and a review names both, and its primary is the agent that does the work.
+  const planned = { strategy: 'PREMIUM_PLAN_CHEAP_EXECUTE', steps: [{ role: 'plan', agent: 'claude' }, { role: 'primary', agent: 'deepseek' }], reviewer: 'claude', forceReview: true, frontierReview: false, parallelWith: null, fallbackOrder: [], notes: [] }
+  const decide = async () => ({ routing: pick('deepseek', 0.9, { deepseek: 0.9 }, { complexity: 0.3, risk: 0.3 }), plan: planned })
+  const both = await effortRun({ deps: { decide } })
+  assert.deepEqual(both.routed.primary, { agent: 'deepseek', model: 'deepseek-flash', effort: 'high', level: 'medium', speed: null })
+  assert.deepEqual([both.routed.planner, both.routed.reviewer], [{ agent: 'claude', model: 'claude-opus-4-1' }, { agent: 'claude', model: 'claude-opus-4-1' }])
+  assert.deepEqual(both.starts.map((s) => [s.role, s.agent]), [['plan', 'claude'], ['primary', 'deepseek'], ['review', 'claude']], 'the planner, the worker and the reviewer ran')
+  assert.equal(both.starts.find((s) => s.role === 'primary').effort, effortSaid(both.routed.primary), 'the worker starts at the effort its plan said')
+  // A plan with neither names neither.
+  assert.deepEqual(['planner' in auto.routed, 'reviewer' in auto.routed], [false, false])
+})
+
+test('execute is told {attempt, role} for primary, opinion, retry and review', async () => {
+  // Work: the review sends it back once, then asks a second reviewer, then accepts.
+  let n = 0
+  const verdicts = [{ action: 'retry', why: 'not yet' }, { action: 'second_review', why: 'look again' }, { status: 'accepted', action: 'accept', why: 'ok' }]
+  const dir = repo()
+  const told = []
+  const starts = []
+  let touched = 0
+  await runRouted({
+    task: 'fix', cwd: dir, config: adaptiveConfig(), signal,
+    deps: {
+      jev: { route: async () => pick('claude', 0.9, { claude: 0.9 }), assess: async () => ({}) },
+      review: async () => verdicts[n++], history: quiet, emit: (e) => { if (e.type === 'attempt_start') starts.push([e.index, e.role]) },
+      // Each attempt changes a file, so a retry is progress and the stall guard stays out of it.
+      execute: async (a, _prompt, _signal, options) => { told.push([options.attempt, options.role]); writeFileSync(join(dir, `f${++touched}.txt`), 'x'); return { stopReason: 'completed', answerText: 'done' } },
+    },
+  })
+  assert.deepEqual(told, [[0, 'primary'], [1, 'retry'], [2, 'review']])
+  assert.deepEqual(told, starts, 'the same index and role each attempt_start says')
+  // An answer with a parallel second opinion beside it.
+  const cands = [{ id: 'deepseek', key: 'RESOURCE_A', tier: 'strong' }, { id: 'claude', key: 'RESOURCE_B', tier: 'frontier' }]
+  const decide = async () => ({ routing: { ...pick('deepseek', 0.9, { deepseek: 0.9 }), decision: { candidates: cands } }, plan: directPlan('deepseek', { strategy: 'PARALLEL_SECOND_OPINION', parallelWith: 'claude' }) })
+  const asked = []
+  await adaptiveRun({ answerOnly: true, deps: { decide, execute: async (a, _prompt, _signal, options) => { asked.push([a.id, options.attempt, options.role]); return { stopReason: 'completed', answerText: 'the answer' } } } })
+  assert.deepEqual(asked.sort(), [['claude', 1, 'opinion'], ['deepseek', 0, 'primary']])
+})
+
+test('the history record carries taskKey and intentSample', async () => {
+  const dir = repo()
+  const h = history()
+  const r = await runRouted({ task: 'fix', cwd: dir, config, signal, taskKey: '0f8c2a6e-4b1d-4c3a-9e7f-5d2b1a0c9e8f', intentSample: 'intent-s-17', deps: { jev: null, execute: fixer(dir), history: h } })
+  assert.deepEqual([h.rows[0].taskKey, h.rows[0].intentSample], ['0f8c2a6e-4b1d-4c3a-9e7f-5d2b1a0c9e8f', 'intent-s-17'])
+  assert.deepEqual([r.taskKey, r.intentSample], ['0f8c2a6e-4b1d-4c3a-9e7f-5d2b1a0c9e8f', 'intent-s-17'], 'and so does the result route() reports from')
+  // A run from the chat is no task's, and its row says nothing of one.
+  const chat = history()
+  await runRouted({ task: 'fix', cwd: repo(), config, signal, deps: { jev: null, execute: noop, history: chat } })
+  assert.deepEqual(['taskKey' in chat.rows[0], 'intentSample' in chat.rows[0]], [false, false])
+})
+
+test('plannedEffort: the level asked for and the value the agent is sent, the menu over Settings, the agent\'s own setting over both, and Codex\'s speed', async () => {
+  const { plannedEffort } = await import('../router.js')
+  assert.equal(typeof plannedEffort, 'function', 'router.js says what effort an agent\'s attempt starts at')
+  const [claude, codex, deepseek] = EFFORT_AGENTS
+  const local = { id: 'qwen-local', kind: 'local', provider: 'spawn', llm: { provider: 'local', model: 'qwen3-8b' } }
+  const cfg = (effort) => ({ effort })
+  const hard = { complexity: 0.7, risk: 0.2 }
+  assert.deepEqual(plannedEffort({ effort: 'auto', config: cfg({ default: 'auto' }), agentDef: claude, routing: hard }), { effort: 'xhigh', level: 'xhigh', speed: null })
+  assert.deepEqual(plannedEffort({ effort: 'ultra', config: cfg({ default: 'low' }), agentDef: claude, routing: hard }), { effort: 'ultracode', level: 'ultra', speed: null }, 'the menu wins over Settings, in Claude\'s own word')
+  assert.deepEqual(plannedEffort({ effort: 'auto', config: cfg({ default: 'medium' }), agentDef: deepseek, routing: hard }), { effort: 'high', level: 'medium', speed: null }, 'Auto in the menu defers to Settings')
+  assert.deepEqual(plannedEffort({ effort: 'high', config: cfg({ perAgent: { claude: 'low' } }), agentDef: claude, routing: hard }), { effort: 'low', level: 'low', speed: null }, 'the agent\'s own value wins')
+  assert.deepEqual(plannedEffort({ effort: 'max', config: cfg({ codexSpeed: 'fast' }), agentDef: codex, model: 'gpt-5.5' }), { effort: 'xhigh', level: 'max', speed: 'fast' }, 'clamped to what the model takes')
+  assert.deepEqual(plannedEffort({ effort: 'auto', config: cfg({}), agentDef: claude, routing: { complexity: 0.3, risk: 0.2 }, bands: { low: 0.05, medium: 0.1, high: 0.2 } }), { effort: 'xhigh', level: 'xhigh', speed: null }, 'on the decider\'s own bands')
+  assert.deepEqual(plannedEffort({ effort: 'auto', config: cfg({}), agentDef: claude }), { effort: 'high', level: 'high', speed: null }, 'unknown complexity and risk read 0.5, as for a forced agent')
+  assert.deepEqual(plannedEffort({ effort: 'high', config: cfg({}), agentDef: local }), { effort: null, level: null, speed: null }, 'a local model takes no effort')
+  assert.deepEqual(plannedEffort({ effort: 'local-low', config: cfg({}), agentDef: claude }), { effort: null, level: null, speed: null }, 'a local-* level names a model, not an effort')
+})
+
+test('agentsMark is the chain mark a report ends with, and reads back as the steps it was given', async () => {
+  const { agentsMark, answeredSteps } = await import('../router.js')
+  assert.equal(typeof agentsMark, 'function', 'router.js encodes the agent strip\'s chain on its own')
+  const steps = [{ agent: 'Jev', model: 'jev-1.13.0', roles: [] }, { agent: 'claude', model: 'claude-opus-4-1, high', roles: ['work'], answered: true }]
+  const mark = agentsMark(steps)
+  const m = /^\[jev-agents\]: kzh-agents-1-([A-Za-z0-9_-]+)$/.exec(mark)
+  assert.ok(m, mark)
+  assert.deepEqual(JSON.parse(Buffer.from(m[1], 'base64url').toString()), steps)
+  const r = {
+    routing: { mode: 'jev', model: 'jev-1.13.0', primaryAgent: 'claude', agentProbabilities: {}, taskType: 'debugging' },
+    context: {}, availability: { out: [], near: [] }, limits: [], baseline: [], assessments: [],
+    attempts: [{ agent: 'claude', role: 'primary', model: 'claude-opus-4-1', effort: 'high', stopReason: 'completed', durationMs: 1000, changedFiles: [], answerExcerpt: 'done' }],
+    finalStatus: 'accepted', statusReason: '', lastAnswer: 'done',
+  }
+  assert.ok(formatReport(r).endsWith(`\n\n${agentsMark(answeredSteps(r))}`), 'the report ends with the same mark')
+})
+
+test('who decided a routing is one rule for the agent strip\'s router step and a start reply\'s credit: the decider when it answered a domain, else the local router, else the routing rules, and never the decider when it was not asked', async () => {
+  const r = await import('../router.js')
+  assert.equal(typeof r.routedBy, 'function', 'router.js says who decided a routing on its own')
+  assert.equal(typeof r.pickedBy, 'function', 'and who picked, for the credit')
+  // A routing record whose per-domain report has these authorities, one domain each.
+  const decided = (decider, ...auths) => ({ mode: 'jev', decider, model: 'jev-1.13.0', decision: { domains: Object.fromEntries(auths.map((a, i) => [`domain_${i}`, { authority: a }])) } })
+  for (const [routing, by, agent] of [
+    [{ mode: 'jev', decider: 'jev', model: 'jev-1.13.0' }, 'decider', 'Jev'],
+    [decided('jev', 'jev', 'fallback', 'code'), 'decider', 'Jev'],
+    [{ ...decided('laya', 'laya', 'code'), mode: 'local' }, 'decider', 'Laya'],
+    [decided('jev', 'local', 'fallback', 'code'), 'local', 'Local router'],
+    [decided('jev', 'fallback', 'fallback', 'code'), 'rules', 'Routing rules'],
+    [decided('laya', 'jev', 'fallback', 'code'), 'rules', 'Routing rules'],
+  ]) {
+    assert.equal(r.routedBy(routing), by, JSON.stringify(routing))
+    assert.equal(r.routerStep(routing)?.agent, agent, JSON.stringify(routing))
+    // The credit names the same picker once the decider was asked before the pick, and a pick made on
+    // this PC when it was not.
+    assert.equal(r.pickedBy(routing, true), by, JSON.stringify(routing))
+    assert.equal(r.pickedBy(routing, false), 'local', JSON.stringify(routing))
+  }
+  for (const mode of ['manual', 'fallback', 'offline']) {
+    assert.equal(r.routedBy({ mode, decider: 'jev' }), null, `nothing routed a ${mode} run`)
+    assert.equal(r.routerStep({ mode, decider: 'jev' }), null)
+  }
+  assert.deepEqual(['manual', 'fallback', 'offline'].map((mode) => [r.pickedBy({ mode }, true), r.pickedBy({ mode }, false)]), [['you', 'you'], ['rules', 'rules'], ['local', 'local']], 'a forced agent, a fallback and the offline rule')
+})
+
+// ---------- verdicts about the pick (docs/live-agent-view.md Feature 4, slice 6) ----------
+const PLAN_KEY = '0f8fad5b-d9cb-469f-a165-70867728950e'
+const planRow = (over = {}) => ({ ts: '2026-10-01T10:00:00.000Z', sessionId: 's', messageId: 'm-plan', verdict: 'dislike', reason: '', about: 'plan', taskKey: PLAN_KEY, ...over })
+
+test('feedbackPrior: a plan wrong agent dislike counts against the agent it judged, and wrong effort and should have been a question count nothing while their words reach the prompt, marked plan', async () => {
+  const { feedbackPrior } = await import('../router.js')
+  const agents = [{ id: 'claude', provider: 'claude-code' }, { id: 'codex', provider: 'codex' }]
+  const wrong = feedbackPrior([planRow({ provider: 'claude', tag: 'wrong agent', reason: 'it is a codex job', suggestedAgent: 'codex' })], agents)
+  assert.equal(wrong.agents.get('claude').dislikes, 1, 'a dislike of the pick counts against claude')
+  assert.ok(wrong.agents.get('claude').bias < 0)
+  assert.deepEqual(wrong.agents.get('claude').reasons, ['plan: wrong agent: it is a codex job'])
+  assert.equal(wrong.suggestion, 'codex', 'and it names the agent the next task goes to')
+  // A plan row the reply named no agent on is about the agent the plan ran (acceptVerdict stamps it).
+  assert.equal(feedbackPrior([planRow({ planAgent: 'claude', tag: 'wrong agent' })], agents).agents.get('claude').dislikes, 1)
+  for (const tag of ['wrong effort', 'should have been a question']) {
+    const p = feedbackPrior([planRow({ provider: 'claude', tag, reason: 'see why', suggestedAgent: 'codex', ...(tag === 'wrong effort' ? { suggestedEffort: 'xhigh' } : {}) })], agents)
+    const c = p.agents.get('claude')
+    assert.deepEqual([c.likes, c.dislikes, c.bias], [0, 0, 0], `${tag} votes on no agent`)
+    assert.deepEqual(c.reasons, [`plan: ${tag}: see why`], `${tag}: its words still ride the track record`)
+    assert.equal(p.suggestion, undefined, `${tag} names no agent for the next task`)
+  }
+  const task = feedbackPrior([{ ts: '2026-10-01T10:00:00.000Z', sessionId: 's', messageId: 'm-a', verdict: 'dislike', provider: 'codex', tag: 'should have been a task', reason: 'r' }], agents)
+  assert.deepEqual([task.agents.get('codex').dislikes, task.agents.get('codex').reasons], [0, ['should have been a task: r']], 'an answer that should have been a task votes on no agent either')
+})
+
+test('routing: three wrong effort ratings on this task type move Auto a rung, which the routed event and its line name, and not with the setting off or after a Reset', async () => {
+  const dir = repo()
+  const { line } = await import('../adapter.js')
+  const jev = { route: async () => routeResult({ primaryAgent: 'claude', agentConfidence: 0.9, agentProbabilities: { claude: 0.9, codex: 0.1 }, complexity: 0.5, risk: 0.5 }), assess: async () => verdict('accept') }
+  const rated = [1, 2, 3].map((i) => planRow({ ts: `2026-10-01T10:0${i}:00.000Z`, messageId: `m${i}`, provider: 'claude', tag: 'wrong effort', suggestedEffort: 'xhigh', planFamily: 'claude', planLevel: 'high', taskType: 'debugging' }))
+  const run = async (effort = {}) => {
+    const events = []
+    const sent = []
+    const execute = async (agent, _p, _s, opts) => { sent.push(opts?.effort ?? null); return fixer(dir)() }
+    writeFileSync(join(dir, 'state.txt'), 'broken')
+    await runRouted({ task: 'fix', cwd: dir, sessionId: 's', config: { ...FB_CONFIG, effort }, signal, deps: { jev, execute, history: fbHistory(rated), emit: (e) => events.push(e) } })
+    return { routed: events.find((e) => e.type === 'routed'), sent }
+  }
+  const moved = await run()
+  assert.deepEqual(moved.routed.nudged, { from: 'high', to: 'xhigh', why: 'your ratings' })
+  assert.equal(moved.routed.primary.level, 'xhigh')
+  assert.equal(moved.routed.primary.effort, 'xhigh', 'the plan names the effort the attempt runs at')
+  assert.equal('nudged' in moved.routed.primary, false, 'said beside the plan, not in it')
+  assert.equal(moved.sent[0], 'xhigh', 'and the first attempt runs at it')
+  assert.match(line(moved.routed), /; effort raised one step for debugging: your ratings/)
+  const off = await run({ ratingsMove: false })
+  assert.deepEqual([off.routed.primary.level, 'nudged' in off.routed, off.sent[0]], ['high', false, 'high'], 'Let my ratings move Auto effort, off')
+  const reset = await run({ ratingsResetAt: '2026-10-01T10:02:30.000Z' })
+  assert.deepEqual([reset.routed.primary.level, 'nudged' in reset.routed], ['high', false], 'a Reset after two of the three')
+  const menu = await runRouted({ task: 'fix', cwd: dir, sessionId: 's', effort: 'medium', config: FB_CONFIG, signal, deps: { jev, execute: fixer(dir), history: fbHistory(rated) } })
+  assert.equal(menu.attempts[0].effort, 'medium', 'a level picked in the model menu is kept')
+})
+
+test('a ratings step that leaves the effort an agent is sent as it was is marked so, and the routed line does not call it a change', async () => {
+  const { plannedEffort } = await import('../router.js')
+  const { line } = await import('../adapter.js')
+  const deepseek = EFFORT_AGENTS[2]
+  const routing = { complexity: 0.3, risk: 0.3 }
+  // DeepSeek runs medium as it runs high, so a step from medium to high sends it high either way.
+  const same = plannedEffort({ effort: 'auto', config: { effort: { default: 'auto' } }, agentDef: deepseek, routing, shift: 1 })
+  assert.deepEqual(same, { effort: 'high', level: 'high', speed: null, nudged: { from: 'medium', to: 'high', why: 'your ratings', sameEffort: true } }, 'the step is kept, for the ratings read against the level Auto chose')
+  const routed = { type: 'routed', routing: { primaryAgent: 'deepseek', mode: 'jev', taskType: 'debugging' }, primary: { agent: 'deepseek', ...same }, nudged: same.nudged }
+  assert.doesNotMatch(line(routed), /effort raised/, line(routed))
+  // A step that changes what it is sent is still named.
+  const moved = plannedEffort({ effort: 'auto', config: { effort: { default: 'auto' } }, agentDef: deepseek, routing: { complexity: 0.5, risk: 0.5 }, shift: 1 })
+  assert.deepEqual(moved.nudged, { from: 'high', to: 'xhigh', why: 'your ratings' })
+  assert.match(line({ ...routed, primary: { agent: 'deepseek', ...moved }, nudged: moved.nudged }), /; effort raised one step for debugging: your ratings/)
+})
+
+// ---------- Steer on a running task: the person's guidance in every prompt built after it (docs/live-agent-view.md Feature 5, slice 8) ----------
+
+test('withGuidance adds the person\'s guidance to a prompt, a piece a line, leaving out words added before the start and a piece the task ended without; with none the prompt is unchanged', async () => {
+  const router = await import('../router.js')
+  assert.equal(typeof router.withGuidance, 'function', 'router.js adds the person\'s guidance to a prompt')
+  const items = [
+    { id: 'a1', how: 'amend', state: 'added', text: 'and the README' },
+    { id: 'g1', how: 'live', state: 'delivered', text: 'use tabs' },
+    { id: 'g2', how: 'live', state: 'pending', text: 'keep the old grammar\nworking' },
+    { id: 'g3', how: 'live', state: 'returned', text: 'too late' },
+    { id: 'g4', how: 'live', state: 'carried', text: '  ' },
+  ]
+  assert.equal(router.withGuidance('Do it.', items), 'Do it.\n\nThe person added this while the task ran; follow it:\n- use tabs\n- keep the old grammar\n  working')
+  assert.equal(router.withGuidance('Do it.', [items[0], items[3]]), 'Do it.')
+  assert.equal(router.withGuidance('Do it.', []), 'Do it.')
+  assert.equal(router.withGuidance('Do it.', null), 'Do it.')
+})
+
+test('the person\'s guidance reaches every prompt built after it: the plan step, the retry and the review carry it, a piece no agent had read is carried and said so, and the record counts what reached the work', async () => {
+  const router = await import('../router.js')
+  assert.equal(typeof router.withGuidance, 'function', 'router.js adds the person\'s guidance to a prompt')
+  // The task's steers as tasks.js holds them: words added before it started, and a piece given while it was routed.
+  const steers = [{ id: 'a1', how: 'amend', state: 'added', text: 'and the README' }, { id: 'g0', how: 'live', state: 'pending', text: 'keep it small' }]
+  const prompts = []
+  const events = []
+  const decide = async () => ({ routing: pick('deepseek', 0.9, { deepseek: 0.9 }), plan: { ...directPlan('deepseek', { reviewer: 'acme', forceReview: true }), strategy: 'PREMIUM_PLAN_CHEAP_EXECUTE', steps: [{ role: 'plan', agent: 'claude' }, { role: 'primary', agent: 'deepseek' }] } })
+  const review = rejectOnce({ disposition: 'RETRY_SAME_RESOURCE' })
+  const execute = async (a, prompt, _signal, o) => {
+    prompts.push({ role: o.role, prompt })
+    // While the work runs the person adds a piece its agent reads, and one it never gets to.
+    if (o.role === 'primary') steers.push({ id: 'g1', how: 'live', state: 'delivered', text: 'use tabs' }, { id: 'g2', how: 'live', state: 'pending', text: 'run the linter' })
+    return { stopReason: 'completed', answerText: 'done' }
+  }
+  // A carried piece is noted on the task as index.js notes it, so the next prompt reads it carried.
+  const emit = (e) => { events.push(e); const s = e.type === 'steer' ? steers.find((x) => x.id === e.id) : null; if (s) s.state = e.state }
+  const { r } = await adaptiveRun({ deps: { decide, review, execute, emit, guidance: () => steers } })
+  const of = (role) => prompts.find((p) => p.role === role)?.prompt ?? ''
+  assert.deepEqual(prompts.map((p) => p.role), ['plan', 'primary', 'retry', 'review'])
+  const head = 'The person added this while the task ran; follow it:'
+  assert.ok(of('plan').endsWith(`${head}\n- keep it small`), of('plan'))
+  assert.ok(of('primary').endsWith(`${head}\n- keep it small`), of('primary'))
+  for (const role of ['retry', 'review']) assert.ok(of(role).endsWith(`${head}\n- keep it small\n- use tabs\n- run the linter`), `${role}: ${of(role)}`)
+  for (const p of prompts) assert.doesNotMatch(p.prompt, /- and the README/, 'words added before the start are in the task already')
+  const carried = events.filter((e) => e.type === 'steer')
+  assert.deepEqual(carried.map((e) => [e.id, e.state, e.to?.role, e.guidance]), [['g0', 'carried', 'plan', 'keep it small'], ['g2', 'carried', 'retry', 'run the linter']], 'each piece no agent had read is carried once, to the attempt its prompt went to')
+  assert.deepEqual(carried.map((e) => e.to.agent), ['claude', prompts.length && r.attempts.find((a) => a.role === 'retry').agent])
+  assert.equal(r.steered, 3, 'two carried and one read')
+  assert.equal(r.amended, true)
+  // A run nobody steered says nothing of it.
+  const plain = await adaptiveRun()
+  assert.deepEqual(['steered' in plain.r, 'amended' in plain.r], [false, false])
 })

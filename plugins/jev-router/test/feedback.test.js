@@ -6,6 +6,9 @@ import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ANSWER_TAGS, MAX_REASON, ROUTING_TAGS, TAGS, createFeedback, tagIsAnswerOnly, validFeedback } from '../feedback.js'
+// What slice 6 adds is read through the namespace, so this file loads before it and each of its tests
+// fails by its own assertion there.
+import * as feedbackModule from '../feedback.js'
 
 const tmp = () => join(mkdtempSync(join(tmpdir(), 'jev-feedback-')), 'feedback.jsonl')
 const body = (over = {}) => ({ sessionId: 'sess-1', messageId: 'msg-1', verdict: 'like', ...over })
@@ -165,4 +168,46 @@ test('validFeedback: the run the answer came from is kept when given, checked, a
   assert.throws(() => validFeedback(body({ runId: 'no spaces allowed' })), /runId/)
   assert.throws(() => validFeedback(body({ runId: 'x'.repeat(81) })), /runId/)
   assert.equal('runId' in validFeedback(body({ verdict: 'clear', runId: 'run-1' })), false, 'a clear needs only its keys')
+})
+
+// ---------- verdicts about the pick (docs/live-agent-view.md Feature 4, slice 6) ----------
+const KEY = '0f8fad5b-d9cb-469f-a165-70867728950e'
+
+test('validFeedback: a verdict about the pick keeps its task key, the effort it should have run at and its tag', () => {
+  assert.ok(Array.isArray(feedbackModule.PLAN_TAGS), 'feedback.js has the tags of a verdict about the pick')
+  const r = validFeedback(body({ verdict: 'dislike', about: 'plan', taskKey: ` ${KEY} `, tag: 'wrong effort', suggestedEffort: 'xhigh', reason: 'too shallow' }), { now: () => '2026-10-01T00:00:00.000Z' })
+  assert.deepEqual(r, { ts: '2026-10-01T00:00:00.000Z', sessionId: 'sess-1', messageId: 'msg-1', verdict: 'dislike', reason: 'too shallow', tag: 'wrong effort', about: 'plan', taskKey: KEY, suggestedEffort: 'xhigh' })
+  assert.deepEqual(feedbackModule.PLAN_TAGS, ['good pick', 'wrong agent', 'wrong effort', 'misread my question', 'wrong scope', 'should have been a question'])
+  for (const t of feedbackModule.PLAN_TAGS ?? []) assert.equal(validFeedback(body({ about: 'plan', taskKey: KEY, tag: t })).tag, t, t)
+  // An answer's row keeps the shape it always had: `about` is left off it.
+  assert.equal('about' in validFeedback(body({ about: 'answer' })), false)
+  assert.deepEqual(validFeedback(body({ about: 'answer', intentSample: 'sample-1' })).intentSample, 'sample-1', 'the example a direct answer was recorded as')
+})
+
+test('validFeedback: plan tags on an answer, an unknown about, an effort past max and a task key that is none are refused, and nothing is half kept', () => {
+  for (const [over, reason] of [
+    [{ verdict: 'dislike', tag: 'wrong effort' }, /tag: one of/],
+    [{ verdict: 'dislike', tag: 'should have been a question' }, /tag: one of/],
+    [{ verdict: 'dislike', about: 'plan', taskKey: KEY, tag: 'should have been a task' }, /tag: one of/],
+    [{ verdict: 'dislike', about: 'plan', taskKey: KEY, tag: 'too slow' }, /tag: one of/],
+    [{ about: 'x' }, /about: answer or plan/],
+    [{ verdict: 'dislike', about: 'plan', taskKey: KEY, tag: 'wrong effort', suggestedEffort: 'ultra' }, /suggestedEffort/],
+    [{ verdict: 'dislike', suggestedEffort: 'high' }, /suggestedEffort/],
+    [{ about: 'plan', taskKey: 'jev-3' }, /taskKey/],
+    [{ about: 'plan' }, /taskKey/],
+    [{ intentSample: 'no spaces' }, /intentSample/],
+  ]) assert.throws(() => validFeedback(body(over)), reason, JSON.stringify(over))
+})
+
+test('validFeedback: an answer takes should have been a task, and a clear still stores only its keys', () => {
+  assert.doesNotThrow(() => validFeedback(body({ verdict: 'dislike', tag: 'should have been a task' })), 'an answer may say its message should have been a task')
+  assert.equal(validFeedback(body({ verdict: 'dislike', tag: 'should have been a task', intentSample: 'sample-1' })).tag, 'should have been a task')
+  const r = validFeedback(body({ verdict: 'clear', about: 'plan', taskKey: KEY, tag: 'wrong effort', suggestedEffort: 'xhigh', intentSample: 'sample-1' }), { now: () => '2026-10-01T00:00:00.000Z' })
+  assert.deepEqual(r, { ts: '2026-10-01T00:00:00.000Z', sessionId: 'sess-1', messageId: 'msg-1', verdict: 'clear' })
+})
+
+test('tagVotesOnAgent: the effort, the intent and the answer-only tags vote on no agent, and every other tag does, untagged too', () => {
+  assert.equal(typeof feedbackModule.tagVotesOnAgent, 'function', 'feedback.js says which tags vote on the agent')
+  for (const t of ['wrong effort', 'should have been a question', 'should have been a task', ...ANSWER_TAGS]) assert.equal(feedbackModule.tagVotesOnAgent(t), false, t)
+  for (const t of ['wrong agent', 'misread my question', 'wrong scope', 'good pick', undefined, '']) assert.equal(feedbackModule.tagVotesOnAgent(t), true, String(t))
 })

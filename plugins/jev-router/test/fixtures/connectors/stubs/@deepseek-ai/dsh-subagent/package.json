@@ -1,0 +1,6 @@
+{
+  "name": "@deepseek-ai/dsh-subagent",
+  "private": true,
+  "type": "module",
+  "exports": "./index.js"
+}

@@ -84,6 +84,21 @@ const stable = (v) => (Array.isArray(v) ? v.map(stable) : v && typeof v === 'obj
 /** The 12-hex fingerprint of a provider's thresholds, as a shadow row records it (5.3). */
 export const thresholdsHash = (t) => (t ? createHash('sha256').update(JSON.stringify(stable(t))).digest('hex').slice(0, 12) : null)
 
+/**
+ * The 95% interval of a share of `k` in `n` (the Wilson score interval), as `{ low, high }` to three
+ * decimals, or null with nothing counted: how far a longer record could put the share, so a figure of
+ * a few rows is never read as settled. Strata reports a standard error beside each figure it compares
+ * for the same reason (docs/live-agent-view.md 6, slice 9).
+ */
+export function interval(k, n, z = 1.96) {
+  if (!Number.isInteger(n) || n < 1 || !Number.isInteger(k) || k < 0 || k > n) return null
+  const p = k / n
+  const z2 = z * z
+  const centre = (p + z2 / (2 * n)) / (1 + z2 / n)
+  const half = (z * Math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))) / (1 + z2 / n)
+  return { low: r3(Math.max(0, centre - half)), high: r3(Math.min(1, centre + half)) }
+}
+
 /** A bar a value clears: `'always'` always, a number at or over it. */
 const clears = (x, bar) => bar === 'always' || (num(x) && num(bar) && x >= bar)
 /**
@@ -215,13 +230,14 @@ function indexOf({ jevSamples = [], layaSamples = [], feedback = [], history = [
   }
   // A person's verdict on a run's answer, read back as feedback.js list() reads it: the newest row
   // per (sessionId, messageId), a pair whose newest row clears it dropped, then by time, newest
-  // last. Only like and dislike, never the words.
+  // last. Only like and dislike, never the words, and never a rating of a start reply's pick, which
+  // carries its run's id but judges the choice, not the answer (it still replaces the form before it).
   const newest = new Map()
   for (const f of feedback) if (f && typeof f === 'object' && f.sessionId && f.messageId) newest.set(`${f.sessionId}\n${f.messageId}`, f)
   const kept = [...newest.values()].filter((f) => f.verdict !== CLEAR).map((f, i) => [f, i]).sort((a, b) => at(a[0].ts) - at(b[0].ts) || a[1] - b[1])
   const verdicts = new Map()
   for (const [f] of kept) {
-    if (f.runId && (f.verdict === 'like' || f.verdict === 'dislike')) verdicts.set(f.runId, f.verdict)
+    if (f.runId && f.about !== 'plan' && (f.verdict === 'like' || f.verdict === 'dislike')) verdicts.set(f.runId, f.verdict)
   }
   const runs = new Map()
   for (const h of history) if (h?.runId) runs.set(h.runId, h)
@@ -404,6 +420,7 @@ function questionTable(rows, T) {
   return [...byName.values()].map((s) => ({
     name: s.name, type: s.type, options: s.options, corrected: s.corrected,
     compared: s.compared, agree: { all: s.all, informative: s.inf },
+    intervals: { all: interval(s.all.agree, s.all.n), informative: interval(s.inf.agree, s.inf.n) },
     inTopTwo: s.type === 'choice' ? s.inTopTwo : null,
     meanDifference: s.type === 'choice' || !s.diffs.length ? null : r3(s.diffs.reduce((a, b) => a + b, 0) / s.diffs.length),
     atBar: s.hasBar ? s.bar : null,
@@ -535,8 +552,10 @@ export function standing({ shadowRows = [], jevSamples = [], layaSamples = [], f
 
 /**
  * The comparison of 8.4, every figure a count so the reader can show `n` beside each rate; a
- * source with no rows is `{ n: 0 }`, never a rate. By default the current identity, thresholds
- * pair and Jev host only, over `days` (7, or 'all').
+ * source with no rows is `{ n: 0 }`, never a rate. Each domain and question also gives the 95%
+ * interval of each of its shares (`intervals`, interval()), so a share of a few rows reads as the
+ * range it is. By default the current identity, thresholds pair and Jev host only, over `days` (7,
+ * or 'all').
  * @param {object} p  as standing(), and:
  * @param {number|'all'} [p.days]
  * @param {'current'|'all'} [p.scope]  'all' reads every identity, thresholds pair and Jev host
@@ -560,6 +579,14 @@ export function compare({ shadowRows = [], jevSamples = [], layaSamples = [], fe
       whereJevWasContradicted: f.contradicted.n ? { n: f.contradicted.n, layaRight: f.contradicted.right } : { n: 0 },
       layaAutoRuns: f.layaAuto.runs.size ? { runs: f.layaAuto.runs.size, failed: f.layaAuto.failed?.size ?? null } : { n: 0 },
       fieldAgreement: f.fields,
+      // Each share above with its 95% interval, null where nothing is counted or it is not measured.
+      intervals: {
+        agree: interval(f.agree.informative.agree, f.agree.informative.n),
+        jevRight: interval(f.paired.jevRight, f.paired.n),
+        layaRight: interval(f.paired.layaRight, f.paired.n),
+        contradicted: interval(f.contradicted.right, f.contradicted.n),
+        failed: f.layaAuto.failed ? interval(f.layaAuto.failed.size, f.layaAuto.runs.size) : null,
+      },
     }
   })
   return {

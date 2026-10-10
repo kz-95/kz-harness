@@ -1048,3 +1048,705 @@ test('Jev setup reads the page back after an action that failed, and still shows
   assert.equal(nodes(view.tree).find((n) => typeof n.props?.onToggle === 'function').props.agents[0].enabled, true, 'showing the state the server is in')
   assert.equal(textOf(nodes(view.tree).find((n) => n.props?.role === 'alert')), 'the setup file could not be written')
 })
+
+test('Jev setup shows the Chat replies card, whose rows post the wait in whole milliseconds and the progress setting, each as the settings route takes it', async () => {
+  const { validChatReplies } = await import('../index.js')
+  let saved = { waitMs: 15_000, progress: 'milestones', askWhenWrong: true }
+  const posts = []
+  let busy = 0
+  const fetch = async (path, init) => {
+    busy++
+    try {
+      let code = 200
+      let body = {}
+      if (path === '/jev-router/setup') body = { agents: [], providers: [], tools: [], jev: { configured: true, credentialRef: 'TYPESAFE_API_KEY' }, keysRestartPending: [] }
+      else if (path === '/jev-router/chat-replies/settings' && init?.method === 'POST') {
+        // Answered as the route answers it: the patch laid over what is saved, or a 400 saying why not.
+        const sent = JSON.parse(init.body)
+        posts.push(sent)
+        try { saved = validChatReplies(sent, saved); body = saved } catch (err) { code = 400; body = { error: err.message } }
+      } else if (path === '/jev-router/chat-replies/settings') body = saved
+      const text = JSON.stringify(body)
+      return { ok: code === 200, status: code, json: async () => JSON.parse(text) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const { SetupSection, ChatRepliesCard } = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  assert.equal(typeof ChatRepliesCard, 'function', 'client.js has the Chat replies card')
+  const settle = async (view) => { for (let quiet = 0; quiet < 2; quiet = !busy && !view.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  const page = mount(SetupSection, {}, { shallow: true })
+  await settle(page)
+  assert.ok(page.tree.children.some((n) => n?.type === ChatRepliesCard), 'the Jev setup page shows it, where the README sends the owner')
+  page.unmount()
+  // The card as the page runs it, behind the settings route.
+  const card = mount(ChatRepliesCard, {})
+  await settle(card)
+  const select = (id) => nodes(card.tree).find((n) => n.type === 'select' && n.props.id === id)
+  const alerts = () => nodes(card.tree).filter((n) => n.props.role === 'alert').map(textOf)
+  assert.equal(textOf(nodes(card.tree).find((n) => n.props.id === 'jevi-replies-h')), 'Chat replies')
+  assert.deepEqual([select('jevi-rp-w')?.props.value, select('jevi-rp-p')?.props.value], ['15000', 'milestones'], 'the saved settings')
+  await select('jevi-rp-w').props.onChange({ target: { value: '5000' } })
+  await settle(card)
+  assert.deepEqual(posts, [{ waitMs: 5000 }], 'the wait goes as whole milliseconds')
+  assert.deepEqual(alerts(), [], 'which the route takes')
+  assert.equal(select('jevi-rp-w').props.value, '5000', 'and the row shows what it kept')
+  await select('jevi-rp-p').props.onChange({ target: { value: 'off' } })
+  await settle(card)
+  assert.deepEqual(posts.at(-1), { progress: 'off' })
+  assert.deepEqual(alerts(), [])
+  assert.equal(select('jevi-rp-p').props.value, 'off')
+  assert.deepEqual(saved, { waitMs: 5000, progress: 'off', askWhenWrong: true })
+  card.unmount()
+})
+
+test('Jev setup shows the Live agent view card: whether each agent\'s work shows live, from the engine patch, and rows that post the live settings as the settings route takes them', async () => {
+  const { validLiveSettings } = await import('../index.js')
+  let saved = { claudeSteer: false, claudeThinking: 'default', transcripts: 'last20' }
+  const posts = []
+  let busy = 0
+  const why = 'dsh-subagent-codex 0.1.6 is installed, and this patch was written for 0.1.5-rc.2'
+  const fetch = async (path, init) => {
+    busy++
+    try {
+      let code = 200
+      let body = {}
+      if (path === '/jev-router/setup') body = { agents: [], providers: [], tools: [], jev: { configured: true, credentialRef: 'TYPESAFE_API_KEY' }, keysRestartPending: [] }
+      else if (path === '/jev-router/engine-patches') body = { 'claude-code': { on: true, why: null }, codex: { on: false, why } }
+      else if (path === '/jev-router/live/settings' && init?.method === 'POST') {
+        // Answered as the route answers it: the patch laid over what is saved, or a 400 saying why not.
+        const sent = JSON.parse(init.body)
+        posts.push(sent)
+        try { saved = validLiveSettings(sent, saved); body = saved } catch (err) { code = 400; body = { error: err.message } }
+      } else if (path === '/jev-router/live/settings') body = saved
+      const text = JSON.stringify(body)
+      return { ok: code === 200, status: code, json: async () => JSON.parse(text) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const { SetupSection, LiveAgentViewCard } = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  assert.equal(typeof LiveAgentViewCard, 'function', 'client.js has the Live agent view card')
+  const settle = async (view) => { for (let quiet = 0; quiet < 2; quiet = !busy && !view.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  const page = mount(SetupSection, {}, { shallow: true })
+  await settle(page)
+  assert.ok(page.tree.children.some((n) => n?.type === LiveAgentViewCard), 'the Jev setup page shows it, where the README sends the owner')
+  page.unmount()
+  const card = mount(LiveAgentViewCard, {})
+  await settle(card)
+  const terms = nodes(card.tree).filter((n) => n.type === 'dt').map(textOf)
+  const words = nodes(card.tree).filter((n) => n.type === 'dd').map(textOf)
+  assert.deepEqual(terms.slice(0, 3).map((x, i) => [x, words[i]]), [
+    ['Claude Code', 'live detail on'],
+    ['Codex', `live detail off (${why})`],
+    ['DeepSeek, API and local models', 'always on (no patch needed)'],
+  ])
+  const select = (id) => nodes(card.tree).find((n) => n.type === 'select' && n.props.id === id)
+  const toggle = () => nodes(card.tree).find((n) => n.type === 'input' && n.props.role === 'switch')
+  const alerts = () => nodes(card.tree).filter((n) => n.props.role === 'alert').map(textOf)
+  assert.deepEqual([toggle()?.props.checked, select('jevi-lv-t')?.props.value, select('jevi-lv-k')?.props.value], [false, 'default', 'last20'], 'the settings as shipped')
+  assert.deepEqual(nodes(select('jevi-lv-k')).filter((n) => n.type === 'option').map((n) => [n.props.value, textOf(n)]), [['last20', 'Last 20 tasks'], ['last100', 'Last 100 tasks'], ['off', 'Off']])
+  await toggle().props.onChange({ target: { checked: true } })
+  await settle(card)
+  await select('jevi-lv-t').props.onChange({ target: { value: 'summarized' } })
+  await settle(card)
+  await select('jevi-lv-k').props.onChange({ target: { value: 'last100' } })
+  await settle(card)
+  assert.equal(select('jevi-lv-k').props.value, 'last100', 'Last 100 tasks is still one the route takes')
+  await select('jevi-lv-k').props.onChange({ target: { value: 'off' } })
+  await settle(card)
+  assert.deepEqual(posts, [{ claudeSteer: true }, { claudeThinking: 'summarized' }, { transcripts: 'last100' }, { transcripts: 'off' }])
+  assert.deepEqual(alerts(), [], 'each one the route takes')
+  assert.deepEqual([toggle().props.checked, select('jevi-lv-t').props.value, select('jevi-lv-k').props.value], [true, 'summarized', 'off'], 'and the rows show what it kept')
+  assert.deepEqual(saved, { claudeSteer: true, claudeThinking: 'summarized', transcripts: 'off' })
+  card.unmount()
+})
+
+test('the Chat replies card says what Milestones post: a notice when a task starts on an agent its reply did not name, at another effort, again as work that writes, or moves to another agent; and that Start and result only keeps the one for an agent its reply guessed', async () => {
+  let busy = 0
+  const fetch = async (path) => {
+    busy++
+    try {
+      const text = JSON.stringify(path === '/jev-router/chat-replies/settings' ? { waitMs: 15_000, progress: 'milestones', askWhenWrong: true } : {})
+      return { ok: true, status: 200, json: async () => JSON.parse(text) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const { ChatRepliesCard } = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  assert.equal(typeof ChatRepliesCard, 'function', 'client.js has the Chat replies card')
+  const card = mount(ChatRepliesCard, {})
+  for (let quiet = 0; quiet < 2; quiet = !busy && !card.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r))
+  // The four kinds of notice the README's Milestone notices list names, and nothing else, and the one
+  // Start and result only keeps (decided by the owner, 9 Oct), so the owner choosing between them is
+  // told what the choice posts.
+  assert.equal(textOf(nodes(card.tree).find((n) => n.props.className === 'why')), 'A task you send starts in the background. Its reply names the agent, model and effort once Jev has picked them, waiting for the pick at most this long, or the guessed ones before the pick once How Jev replies shows quick replies on; a task that waits its turn is answered at once. Milestones add a short notice when a task starts on an agent its reply did not name, starts at another effort than its reply named, starts again as work that writes once its read pass hands it back, or moves to another agent on a retry. Start and result only drops all of them but one: a task that starts on another agent than its reply guessed still gets that notice.')
+  card.unmount()
+})
+
+test('the How Jev replies card renders the gate figures from a stubbed /replies/summary', async () => {
+  // What GET /jev-router/replies/summary answers (index.js repliesSummary), as a PC some way along has it.
+  const summary = {
+    learning: true,
+    startReplies: { medianMs: 2400, n: 3, days: 7 },
+    prediction: {
+      gates: { quick: { right: 45, of: 50 }, likely: { right: 16, of: 20 } }, labelled: 75, minRows: 60, trained: { at: '2026-09-30T10:00:00.000Z', rows: 75 },
+      records: { jev: { quick: { decider: 'jev', of: 50, n: 50, right: 41 }, likely: { decider: 'jev', of: 20, n: 20, right: 15 } }, laya: { quick: { decider: 'laya', of: 50, n: 20, right: 18 }, likely: { decider: 'laya', of: 20, n: 20, right: 18 } } },
+    },
+    recent: [
+      { jobId: 'jev-12', decider: 'jev', said: { agent: 'claude', effort: 'high', model: 'claude-opus-4-1', how: 'routed', ms: 2400 }, ran: { agent: 'claude', level: 'high', effort: 'high', model: 'claude-opus-4-1', runId: 'run-12' }, predicted: { agent: 'claude', level: 'high', confidence: 0.81, trusted: true }, match: true },
+      { jobId: 'jev-11', decider: 'jev', said: { agent: null, effort: null, model: null, how: 'waited', ms: 15_000 }, ran: { agent: 'tool:fixer', level: null, effort: null, model: null, runId: 'run-11' }, predicted: null, match: null },
+      { jobId: 'jev-10', decider: 'jev', said: { agent: 'codex', effort: null, model: null, how: 'forced', ms: 40 }, ran: null, predicted: null, match: null },
+    ],
+    intent: { maturity: 'SHADOW', verified: 212, classes: { task: 190, question: 22 }, recent: { accuracy: 0.952, n: 100 }, needs: { samples: 750, perClass: 100, recentAccuracy: 0.94 } },
+    names: { claude: 'Claude Code', codex: 'Codex' },
+  }
+  const asked = []
+  let busy = 0
+  const fetch = async (path) => {
+    busy++
+    try {
+      asked.push(path)
+      const body = path === '/jev-router/replies/summary' ? summary
+        : path === '/jev-router/setup' ? { agents: [], providers: [], tools: [], jev: { configured: true, credentialRef: 'TYPESAFE_API_KEY' }, keysRestartPending: [] }
+          : path === '/jev-router/chat-replies/settings' ? { waitMs: 15_000, progress: 'milestones', askWhenWrong: true } : {}
+      const text = JSON.stringify(body)
+      return { ok: true, status: 200, json: async () => JSON.parse(text) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const { SetupSection, ChatRepliesCard, HowJevRepliesCard, SortTable, howJevRepliesLines } = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  assert.equal(typeof HowJevRepliesCard, 'function', 'client.js has the How Jev replies card')
+  const settle = async (view) => { for (let quiet = 0; quiet < 2; quiet = !busy && !view.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  const page = mount(SetupSection, {}, { shallow: true })
+  await settle(page)
+  const cards = page.tree.children
+  assert.equal(cards[cards.findIndex((n) => n?.type === ChatRepliesCard) + 1]?.type, HowJevRepliesCard, 'the Jev setup page shows it after the Chat replies card')
+  page.unmount()
+  // The card behind the summary route. Shallow, because its table keeps state of its own.
+  const card = mount(HowJevRepliesCard, {}, { shallow: true })
+  await settle(card)
+  assert.ok(asked.includes('/jev-router/replies/summary'))
+  assert.equal(textOf(nodes(card.tree).find((n) => n.props.id === 'jevi-how-h')), 'How Jev replies')
+  assert.deepEqual(card.tree.children.filter((n) => n?.type === 'div' && !n.props.className).map(textOf), [
+    'Start replies: after routing (median 2.4 s this week)',
+    'Task or question: learning, 212 of 750 checked examples (task 190, question 22 of 100 needed); 95% right of the last 100 checked (needs 94%).',
+    'Agent and effort prediction: right 41 of the last 50 (quick replies need 45; "likely" needs 16 of the last 20).',
+    'Under Laya Auto: right 18 of the last 20 (quick replies need 45; "likely" needs 16 of the last 20).',
+  ])
+  const table = nodes(card.tree).find((n) => n.type === SortTable)
+  assert.ok(table, 'the recent replies are a table with a sort and a filter on every column')
+  assert.deepEqual(table.props.columns.map((c) => c.label), ['Job', 'What it said', 'What ran', 'How', 'Rating'])
+  assert.deepEqual(table.props.rows.map((r) => r.map((c) => c.text)), [
+    ['jev-12', 'Claude Code · claude-opus-4-1 · effort high', 'Claude Code · claude-opus-4-1 · effort high', 'after routing', ''],
+    ['jev-11', 'no agent named', 'the fixer tool', 'waited', ''],
+    ['jev-10', 'Codex', 'not routed yet', 'your pick', ''],
+  ])
+  card.unmount()
+  // Earlier and later on: nothing waited this week, nothing scored or trained yet, a rung that reads
+  // tasks on this PC, and learning off.
+  const early = { ...summary, startReplies: { medianMs: null, n: 0, days: 7 }, intent: { ...summary.intent, maturity: 'JEV_PRIMARY', verified: 3, classes: { task: 3 }, recent: null }, prediction: { ...summary.prediction, labelled: 12, trained: null } }
+  assert.deepEqual(howJevRepliesLines(early), [
+    'Start replies: after routing (none timed this week)',
+    'Task or question: learning, 3 of 750 checked examples (task 3, question 0 of 100 needed); not scored yet.',
+    'Agent and effort prediction: not trained yet; it starts once 60 routed tasks are on record (12 so far).',
+    'Under Laya Auto: right 18 of the last 20 (quick replies need 45; "likely" needs 16 of the last 20).',
+  ])
+  const unscored = { decider: 'jev', of: 50, n: 0, right: 0 }
+  assert.equal(howJevRepliesLines({ ...summary, prediction: { ...summary.prediction, records: { jev: { quick: unscored }, laya: { quick: { ...unscored, decider: 'laya' } } } } })[2], 'Agent and effort prediction: trained on 75 routed tasks; no guess has been checked yet (quick replies need 45; "likely" needs 16 of the last 20).')
+  assert.equal(howJevRepliesLines({ ...summary, intent: { ...summary.intent, maturity: 'GUARDED_LOCAL', verified: 812 } })[1], 'Task or question: read on this PC when it is sure a message is a task, and by Jev otherwise (812 checked examples); 95% right of the last 100 checked.')
+  assert.equal(howJevRepliesLines({ ...summary, learning: false, intent: null })[1], 'Task or question: Jev reads every message, and nothing is learned from it while adaptive routing or its learning is off.')
+})
+
+/**
+ * The How Jev replies card behind a stubbed GET /jev-router/replies/summary that answers `summary`,
+ * shallow, since its table keeps state of its own, once it has settled; with client.js's test exports.
+ */
+async function howJevRepliesCard(summary) {
+  let busy = 0
+  const fetch = async (path) => {
+    busy++
+    try {
+      const text = JSON.stringify(path === '/jev-router/replies/summary' ? summary : {})
+      return { ok: true, status: 200, json: async () => JSON.parse(text) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const lib = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  assert.equal(typeof lib.HowJevRepliesCard, 'function', 'client.js has the How Jev replies card')
+  const card = mount(lib.HowJevRepliesCard, {}, { shallow: true })
+  for (let quiet = 0; quiet < 2; quiet = !busy && !card.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r))
+  return { card, lib, why: textOf(nodes(card.tree).find((n) => n.props.className === 'why')), lines: card.tree.children.filter((n) => n?.type === 'div' && !n.props.className).map(textOf) }
+}
+const HOW_GATES = { quick: { right: 45, of: 50 }, likely: { right: 16, of: 20 } }
+const howScored = (decider, n, right) => ({ quick: { decider, of: 50, n, right }, likely: { decider, of: 20, n: Math.min(n, 20), right: Math.min(right, 20) } })
+
+test('with learning off the How Jev replies card says nothing here learns: no start reply is timed or recorded, and the prediction is off, neither trained nor checked, whatever it learned before', async () => {
+  // What GET /jev-router/replies/summary answers with routing.learn false (index.js repliesSummary):
+  // no intent domain, and a ledger that records nothing.
+  const off = {
+    learning: false, startReplies: { medianMs: null, n: 0, days: 7 }, intent: null, recent: [], names: {},
+    prediction: { gates: HOW_GATES, labelled: 0, minRows: 60, trained: null, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) } },
+  }
+  const { card, lib, why, lines } = await howJevRepliesCard(off)
+  assert.equal(why, 'A start reply names the agent once routing has picked it. Learning is switched off (routing.learn in the jev-router configuration), so nothing here learns, and no start reply is recorded.')
+  assert.deepEqual(lines, [
+    'Start replies: after routing (not timed while learning is off)',
+    'Task or question: Jev reads every message, and nothing is learned from it while adaptive routing or its learning is off.',
+    'Agent and effort prediction: off while learning is off; nothing is recorded for it, so it does not train.',
+  ], 'no count that cannot grow, and no promise that it starts')
+  assert.equal(nodes(card.tree).find((n) => n.type === lib.SortTable)?.props.empty, 'No start reply is recorded while learning is off.')
+  card.unmount()
+  // Switched off after a predictor was trained and scored, with replies from before on record: what
+  // they say is from before, so the card neither times them as this week's nor gives the old record.
+  const before = {
+    ...off, startReplies: { medianMs: 2400, n: 3, days: 7 },
+    prediction: { ...off.prediction, labelled: 75, trained: { at: '2026-09-30T10:00:00.000Z', rows: 75 }, records: { jev: howScored('jev', 50, 41), laya: howScored('laya', 20, 18) } },
+  }
+  assert.deepEqual(lib.howJevRepliesLines(before), [
+    'Start replies: after routing (not timed while learning is off)',
+    'Task or question: Jev reads every message, and nothing is learned from it while adaptive routing or its learning is off.',
+    'Agent and effort prediction: off while learning is off; it was trained on 75 routed tasks before, and no guess is made or checked now.',
+  ])
+  // With learning on, the same figures are this week's and the predictor's own.
+  assert.deepEqual(lib.howJevRepliesLines({ ...before, learning: true }), [
+    'Start replies: after routing (median 2.4 s this week)',
+    'Task or question: Jev reads every message, and nothing is learned from it while adaptive routing or its learning is off.',
+    'Agent and effort prediction: right 41 of the last 50 (quick replies need 45; "likely" needs 16 of the last 20).',
+    'Under Laya Auto: right 18 of the last 20 (quick replies need 45; "likely" needs 16 of the last 20).',
+  ])
+})
+
+test('the How Jev replies card says which replies the guess at the agent changes once its record keeps the gates, and that task or question changes one only once it is read on this PC, for a message it is sure is a task, which Jev is not asked about and so runs as work that writes, its quick reply instant', async () => {
+  const on = {
+    learning: true, startReplies: { medianMs: 2400, n: 3, days: 7 }, recent: [], names: {},
+    intent: { maturity: 'GUARDED_LOCAL', verified: 812, classes: { task: 690, question: 122 }, recent: { accuracy: 0.952, n: 100 }, needs: { samples: 750, perClass: 100, recentAccuracy: 0.94 } },
+    prediction: { gates: HOW_GATES, labelled: 75, minRows: 60, trained: { at: '2026-09-30T10:00:00.000Z', rows: 75 }, records: { jev: howScored('jev', 50, 41), laya: howScored('laya', 0, 0) } },
+  }
+  const { card, why, lines } = await howJevRepliesCard(on)
+  assert.equal(why, 'A start reply names the agent once routing has picked it. Two things learn in the background to make that sooner: whether a message is a task or a question, read on this PC once it has been right often enough, and a guess at the agent and effort, checked against what routing then picks. Once the guess has been right 45 of the last 50 times, a task that starts at once is told the guessed agent before routing picks (a quick reply), and once right 16 of the last 20, a task that waits its turn is told the agent likely to run it. Routing still picks, and a pick it makes otherwise is said in a notice, even with Progress in chat at Start and result only, and asked about under the reply while Ask which was right is on. Task or question changes a reply only once it is read on this PC, and then only for a message it is sure is a task: Jev is not asked about that message, so it gets no read-only verdict and runs as work that writes, and a quick reply to it is instant, with no Jev call at all.')
+  assert.equal(lines[1], 'Task or question: read on this PC when it is sure a message is a task, and by Jev otherwise (812 checked examples); 95% right of the last 100 checked.', 'the rung where it does, which the line beside it names')
+  card.unmount()
+})
+
+test('with adaptive routing off the How Jev replies card opens by saying only the guess at the agent learns, as the line on task or question below it says: Jev reads every message, and nothing is learned from it', async () => {
+  // What GET /jev-router/replies/summary answers with routing.enabled false and learning on
+  // (index.js repliesSummary): no intent domain, and a ledger that still keeps each start reply.
+  const off = {
+    learning: true, startReplies: { medianMs: 2400, n: 3, days: 7 }, intent: null, recent: [], names: {},
+    prediction: { gates: HOW_GATES, labelled: 75, minRows: 60, trained: { at: '2026-09-30T10:00:00.000Z', rows: 75 }, records: { jev: howScored('jev', 50, 41), laya: howScored('laya', 0, 0) } },
+  }
+  const { card, why, lines } = await howJevRepliesCard(off)
+  assert.equal(why, 'A start reply names the agent once routing has picked it. A guess at the agent and effort learns in the background to make that sooner, checked against what routing then picks. Once the guess has been right 45 of the last 50 times, a task that starts at once is told the guessed agent before routing picks (a quick reply), and once right 16 of the last 20, a task that waits its turn is told the agent likely to run it. Routing still picks, and a pick it makes otherwise is said in a notice, even with Progress in chat at Start and result only, and asked about under the reply while Ask which was right is on. Task or question is not learned while adaptive routing is off (routing.enabled in the jev-router configuration): Jev reads every message.')
+  assert.doesNotMatch(why, /whether a message is a task or a question|read on this PC/, 'no promise that task or question learns')
+  assert.deepEqual(lines, [
+    'Start replies: after routing (median 2.4 s this week)',
+    'Task or question: Jev reads every message, and nothing is learned from it while adaptive routing or its learning is off.',
+    'Agent and effort prediction: right 41 of the last 50 (quick replies need 45; "likely" needs 16 of the last 20).',
+  ], 'the lines are as they were')
+  card.unmount()
+})
+
+test('the How Jev replies card times the start replies whose wait for the pick ran out with those that named it, says how many ran out, and says replies go out at once when the wait for the pick is set to none', async () => {
+  const base = { learning: true, intent: null, recent: [], names: {}, prediction: { gates: HOW_GATES, labelled: 0, minRows: 60, trained: null, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) } } }
+  // Routing slower than the wait all week: every reply went out when its wait ran out.
+  const { card, lib, lines } = await howJevRepliesCard({ ...base, startReplies: { medianMs: 15_020, n: 3, atBound: 3, days: 7, waitMs: 15_000 } })
+  assert.equal(lines[0], 'Start replies: after routing (median 15 s this week; 3 of 3 went out when the wait ran out, before the pick)')
+  card.unmount()
+  const first = (startReplies) => lib.howJevRepliesLines({ ...base, startReplies })[0]
+  assert.equal(first({ medianMs: 9500, n: 4, atBound: 2, days: 7, waitMs: 15_000 }), 'Start replies: after routing (median 9.5 s this week; 2 of 4 went out when the wait ran out, before the pick)')
+  assert.equal(first({ medianMs: 4200, n: 5, atBound: 0, days: 7, waitMs: 15_000 }), 'Start replies: after routing (median 4.2 s this week)')
+  assert.equal(first({ medianMs: null, n: 0, atBound: 0, days: 7, waitMs: 15_000 }), 'Start replies: after routing (none timed this week)')
+  // With the wait for the pick set to none, no reply waits for routing, whatever the week's replies did before.
+  assert.equal(first({ medianMs: 4200, n: 5, atBound: 0, days: 7, waitMs: 0 }), 'Start replies: at once, without waiting for the pick (Reply at once, in Chat replies)')
+  // The table says whose wait ran out.
+  const recent = [{ jobId: 'jev-7', said: { agent: null, effort: null, model: null, how: 'bound', ms: 15_020 }, ran: { agent: 'claude', level: 'high', effort: 'high', model: 'claude-opus-4-1' } }]
+  assert.deepEqual(lib.recentReplyRows({ ...base, recent, names: { claude: 'Claude Code' } }).map((r) => r.map((c) => c.text)), [['jev-7', 'no agent named', 'Claude Code · claude-opus-4-1 · effort high', 'wait ran out', '']])
+})
+
+test('at a rung where task or question is read on this PC, the How Jev replies card gives its recent accuracy without the bar it climbed past, which is not what keeps it there', async () => {
+  const at = (maturity, accuracy, n, verified = 812) => ({
+    learning: true, startReplies: { medianMs: 2400, n: 3, atBound: 0, days: 7, waitMs: 15_000 }, recent: [], names: {},
+    intent: { maturity, verified, classes: { task: verified - 122, question: 122 }, recent: { accuracy, n }, needs: { samples: 750, perClass: 100, recentAccuracy: 0.94 } },
+    prediction: { gates: HOW_GATES, labelled: 0, minRows: 60, trained: null, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) } },
+  })
+  // Under the 94% it climbed past and over the 93% under which a rung starts to be lost: it keeps its rung.
+  const { card, lib, lines } = await howJevRepliesCard(at('GUARDED_LOCAL', 0.932, 225))
+  assert.equal(lines[1], 'Task or question: read on this PC when it is sure a message is a task, and by Jev otherwise (812 checked examples); 93% right of the last 225 checked.', 'no "needs 94%" beside a rung it holds')
+  card.unmount()
+  assert.equal(lib.howJevRepliesLines(at('LOCAL_ONLY', 0.931, 300))[1], 'Task or question: read on this PC when it is sure a message is a task, and by Jev otherwise (812 checked examples); 93% right of the last 300 checked.')
+  // While it learns, the bar it needs is still the one to read on this PC.
+  assert.equal(lib.howJevRepliesLines(at('SHADOW', 0.932, 225, 600))[1], 'Task or question: learning, 600 of 750 checked examples (task 478, question 122 of 100 needed); 93% right of the last 225 checked (needs 94%).')
+})
+
+test('the How Jev replies card never rounds the recent accuracy of task or question up to a bar it misses: 211 right of the last 225 reads 93% beside a need of 94%, as the domain holds the share itself to the bar, and a bar set between two whole percents is given as set', async () => {
+  const at = (maturity, accuracy, n, recentAccuracy = 0.94) => ({
+    learning: true, startReplies: { medianMs: 2400, n: 3, atBound: 0, days: 7, waitMs: 15_000 }, recent: [], names: {},
+    intent: { maturity, verified: 760, classes: { task: 640, question: 120 }, recent: { accuracy, n }, needs: { samples: 750, perClass: 100, recentAccuracy } },
+    prediction: { gates: HOW_GATES, labelled: 0, minRows: 60, trained: null, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) } },
+  })
+  // 93.8% right: under the 94% domains.js gatesOf holds the share to, so the domain stays at SHADOW
+  // with every other figure met.
+  const { card, lib, lines } = await howJevRepliesCard(at('SHADOW', 211 / 225, 225))
+  assert.equal(lines[1], 'Task or question: learning, 760 of 750 checked examples (task 640, question 120 of 100 needed); 93% right of the last 225 checked (needs 94%).')
+  card.unmount()
+  const right = (maturity, accuracy, n, bar) => lib.howJevRepliesLines(at(maturity, accuracy, n, bar))[1].split('; ').at(-1)
+  // A share at the bar reads as the bar, and a share that is a whole percent is never cut below it.
+  assert.equal(right('SHADOW', 141 / 150, 150), '94% right of the last 150 checked (needs 94%).')
+  assert.equal(right('SHADOW', 282 / 300, 300), '94% right of the last 300 checked (needs 94%).')
+  assert.equal(right('SHADOW', 57 / 100, 100), '57% right of the last 100 checked (needs 94%).')
+  // A bar a policy sets between two whole percents is given as set, and the share to the same tenth.
+  assert.equal(right('SHADOW', 377 / 400, 400, 0.945), '94.2% right of the last 400 checked (needs 94.5%).')
+  assert.equal(right('SHADOW', 189 / 200, 200, 0.945), '94.5% right of the last 200 checked (needs 94.5%).')
+  // At a rung where it is read on this PC no bar follows it, and it is still never rounded up.
+  assert.equal(right('GUARDED_LOCAL', 211 / 225, 225), '93% right of the last 225 checked.')
+})
+
+test('the How Jev replies card says nothing ran for a reply whose task ended before routing picked anything, and how it ended, and says not routed yet only while its task is still to run', async () => {
+  const none = { agent: null, effort: null, model: null }
+  const summary = {
+    learning: true, startReplies: { medianMs: 2400, n: 3, atBound: 1, days: 7, waitMs: 15_000 }, intent: null, names: { claude: 'Claude Code' },
+    prediction: { gates: HOW_GATES, labelled: 0, minRows: 60, trained: null, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) } },
+    // What GET /jev-router/replies/summary answers (index.js repliesSummary): `ended` is the final
+    // state of the reply's task, true for one no longer on the task list, and null while it is live.
+    recent: [
+      { jobId: 'jev-9', said: { ...none, how: 'waited', ms: 40 }, ran: null, ended: 'stopped' },
+      { jobId: 'jev-8', said: { ...none, how: 'bound', ms: 15_010 }, ran: null, ended: 'needs_human' },
+      { jobId: 'jev-7', said: { ...none, how: 'waited', ms: 30 }, ran: null, ended: true },
+      { jobId: 'jev-6', said: { ...none, how: 'waited', ms: 20 }, ran: null, ended: null },
+      { jobId: 'jev-5', said: { agent: 'claude', effort: 'high', model: 'claude-opus-4-1', how: 'routed', ms: 2400 }, ran: { agent: 'claude', level: 'high', effort: 'high', model: 'claude-opus-4-1' }, ended: 'completed' },
+    ],
+  }
+  const { card, lib } = await howJevRepliesCard(summary)
+  const table = nodes(card.tree).find((n) => n.type === lib.SortTable)
+  assert.deepEqual(table?.props.rows.map((r) => r.map((c) => c.text)), [
+    ['jev-9', 'no agent named', 'nothing ran (Stopped)', 'waited', ''],
+    ['jev-8', 'no agent named', 'nothing ran (Needs input)', 'wait ran out', ''],
+    ['jev-7', 'no agent named', 'nothing ran', 'waited', ''],
+    ['jev-6', 'no agent named', 'not routed yet', 'waited', ''],
+    ['jev-5', 'Claude Code · claude-opus-4-1 · effort high', 'Claude Code · claude-opus-4-1 · effort high', 'after routing', ''],
+  ], 'stopped as it waited, read as needing a person once its wait ran out, gone from the task list, still waiting, and routed and done')
+  card.unmount()
+})
+
+test('the How Jev replies card says a prediction not trained yet is training while its first training runs, and that one that failed is tried again after more routed tasks, never that it starts once 60 are on record beside more than 60', async () => {
+  const base = { learning: true, startReplies: { medianMs: 2400, n: 3, atBound: 0, days: 7, waitMs: 15_000 }, intent: null, recent: [], names: {} }
+  const untrained = (over) => ({ ...base, prediction: { gates: HOW_GATES, labelled: 70, minRows: 60, retrainEvery: 25, training: false, trained: null, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) }, ...over } })
+  // What the summary says as the ledger trains on the seventy it read after a start with no predictor saved.
+  const { card, lib, lines } = await howJevRepliesCard(untrained({ training: true }))
+  assert.equal(lines[2], 'Agent and effort prediction: not trained yet; it is training now, on the routed tasks on record (70 so far).')
+  card.unmount()
+  assert.equal(lib.howJevRepliesLines(untrained({}))[2], 'Agent and effort prediction: not trained yet; its training failed, and it is tried again after 25 more routed tasks (70 so far).')
+  assert.equal(lib.howJevRepliesLines(untrained({ labelled: 12 }))[2], 'Agent and effort prediction: not trained yet; it starts once 60 routed tasks are on record (12 so far).')
+})
+
+test('the How Jev replies card never says no guess has been checked beside a record of Laya\'s: a predictor trained with none of Jev\'s guesses checked yet says that of Jev Auto alone, above the record of Laya\'s guesses', async () => {
+  // Someone who routes on Laya Auto only: the predictor trained on Laya's picks, and twenty of its
+  // guesses scored against them, with no task routed under Jev yet. Laya records no intent sample.
+  const summary = {
+    learning: true, startReplies: { medianMs: 1200, n: 20, atBound: 0, days: 7, waitMs: 15_000 }, recent: [], names: {},
+    intent: { maturity: 'JEV_PRIMARY', verified: 0, classes: {}, recent: null, needs: { samples: 750, perClass: 100, recentAccuracy: 0.94 } },
+    prediction: { gates: HOW_GATES, labelled: 75, minRows: 60, retrainEvery: 25, training: false, trained: { at: '2026-09-30T10:00:00.000Z', rows: 75 }, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 20, 18) } },
+  }
+  const { card, lib, lines } = await howJevRepliesCard(summary)
+  assert.deepEqual(lines.slice(2), [
+    'Agent and effort prediction: trained on 75 routed tasks; no guess under Jev Auto has been checked yet (quick replies need 45; "likely" needs 16 of the last 20).',
+    'Under Laya Auto: right 18 of the last 20 (quick replies need 45; "likely" needs 16 of the last 20).',
+  ], 'none of Jev\'s checked, and twenty of Laya\'s')
+  assert.ok(!lines.some((l) => l.includes('no guess has been checked yet')), lines.join('\n'))
+  card.unmount()
+  // With no guess of either checked yet, none has been.
+  const neither = { ...summary, prediction: { ...summary.prediction, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) } } }
+  assert.deepEqual(lib.howJevRepliesLines(neither).slice(2), ['Agent and effort prediction: trained on 75 routed tasks; no guess has been checked yet (quick replies need 45; "likely" needs 16 of the last 20).'])
+})
+
+test('the How Jev replies card says a start reply that went out at once beside a task that starts at once went out at once, as its first line says replies do with the wait for the pick set to none, and never that it waited', async () => {
+  const none = { agent: null, effort: null, model: null }
+  const summary = {
+    learning: true, startReplies: { medianMs: null, n: 0, atBound: 0, days: 7, waitMs: 0 }, intent: null, names: { claude: 'Claude Code' },
+    prediction: { gates: HOW_GATES, labelled: 0, minRows: 60, trained: null, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) } },
+    // What GET /jev-router/replies/summary answers (index.js repliesSummary): `now` for a reply that
+    // went out at once beside a task that starts at once, `waited` for one whose task waits its turn.
+    recent: [
+      { jobId: 'jev-3', said: { ...none, how: 'waited', ms: 30 }, ran: null, ended: null },
+      { jobId: 'jev-2', said: { ...none, how: 'now', ms: 20 }, ran: { agent: 'claude', level: 'high', effort: 'high', model: 'claude-opus-4-1' }, ended: null },
+    ],
+  }
+  const { card, lib, lines } = await howJevRepliesCard(summary)
+  assert.equal(lines[0], 'Start replies: at once, without waiting for the pick (Reply at once, in Chat replies)')
+  const table = nodes(card.tree).find((n) => n.type === lib.SortTable)
+  assert.deepEqual(table?.props.rows.map((r) => r.map((c) => c.text)), [
+    ['jev-3', 'no agent named', 'not routed yet', 'waited', ''],
+    ['jev-2', 'no agent named', 'Claude Code · claude-opus-4-1 · effort high', 'at once', ''],
+  ], 'one whose task waits its turn, and one that went out at once')
+  card.unmount()
+})
+
+// ---------- your ratings of the replies' picks (docs/live-agent-view.md Feature 4, slice 6) ----------
+test('the How Jev replies card counts your ratings of the replies\' picks, lists what the newest changed, and gives each reply\'s rating in its table', async () => {
+  const summary = {
+    learning: true,
+    startReplies: { medianMs: 2400, n: 1, days: 7 },
+    prediction: { gates: HOW_GATES, labelled: 3, minRows: 60, trained: null, records: { jev: howScored('jev', 0, 0), laya: howScored('laya', 0, 0) } },
+    ratings: { liked: 12, disliked: 3, changed: [{ jobId: 'jev-4', line: 'Learned: this run\'s task type is marked wrong for the local classifier.' }, { jobId: 'jev-2', line: 'Saved. It is applied when jev-2 ends.' }] },
+    recent: [
+      { jobId: 'jev-4', decider: 'jev', said: { agent: 'claude', effort: 'high', model: 'claude-opus-4-1', how: 'routed', ms: 2400 }, ran: { agent: 'claude', level: 'high', effort: 'high', model: 'claude-opus-4-1', runId: 'run-4' }, verdict: { verdict: 'dislike', tag: 'misread my question' } },
+      { jobId: 'jev-3', decider: 'jev', said: { agent: 'claude', effort: 'high', model: 'claude-opus-4-1', how: 'routed', ms: 2400 }, ran: { agent: 'claude', level: 'high', effort: 'high', model: 'claude-opus-4-1', runId: 'run-3' }, verdict: { verdict: 'like', tag: null } },
+      { jobId: 'jev-1', decider: 'jev', said: { agent: null, effort: null, model: null, how: 'waited', ms: 15_000 }, ran: null, verdict: null },
+    ],
+    intent: null,
+    names: { claude: 'Claude Code' },
+  }
+  const { card, lib, lines } = await howJevRepliesCard(summary)
+  assert.equal(typeof lib.ratingChanges, 'function', 'client.js lists what your ratings changed')
+  assert.equal(lines.at(-1), 'Your ratings on replies: 12 liked, 3 disliked')
+  const all = nodes(card.tree)
+  const heading = all.findIndex((n) => n.props?.className === 'label' && textOf(n) === 'What it changed')
+  assert.ok(heading > 0, 'What it changed has a heading of its own')
+  assert.deepEqual(all.filter((n) => n.props?.className === 'muted').map(textOf), ['jev-4: Learned: this run\'s task type is marked wrong for the local classifier.', 'jev-2: Saved. It is applied when jev-2 ends.'])
+  const table = all.find((n) => n.type === lib.SortTable)
+  assert.deepEqual(table.props.rows.map((r) => r.at(-1).text), ['Disliked: misread my question', 'Liked', ''])
+  assert.equal(lib.howJevRepliesLines({ ...summary, ratings: { liked: 0, disliked: 0, changed: [] } }).some((l) => l.startsWith('Your ratings')), false, 'no ratings, no line')
+  card.unmount()
+})
+
+test('the How Jev replies card shows when each reply the guess earns switches on: quick replies on, with instant ones while task or question is read on this PC, paused at 43 of 50, the likely agent on or paused, Laya\'s apart, and a first line saying replies can go out before routing', async () => {
+  // What GET /jev-router/replies/summary answers once the record kept its gates (reply-ledger.js
+  // gateState): Jev's quick replies on and its likely agent paused, Laya's quick replies paused at 43
+  // of 50 and its likely agent on.
+  const record = (decider, right, likelyRight) => ({ quick: { decider, of: 50, n: 50, right }, likely: { decider, of: 20, n: 20, right: likelyRight } })
+  const summary = {
+    learning: true, startReplies: { medianMs: 2400, n: 3, atBound: 0, days: 7, waitMs: 15_000 }, names: { claude: 'Claude Code', codex: 'Codex' },
+    intent: { maturity: 'GUARDED_LOCAL', verified: 812, classes: { task: 690, question: 122 }, recent: { accuracy: 0.952, n: 100 }, needs: { samples: 750, perClass: 100, recentAccuracy: 0.94 } },
+    prediction: {
+      gates: HOW_GATES, labelled: 75, minRows: 60, trained: { at: '2026-09-30T10:00:00.000Z', rows: 75 },
+      records: { jev: record('jev', 47, 15), laya: record('laya', 43, 18) },
+      states: { jev: { quick: 'on', likely: 'paused' }, laya: { quick: 'paused', likely: 'on' } },
+    },
+    recent: [
+      { jobId: 'jev-7', said: { agent: 'claude', effort: 'high', model: 'claude-opus-4-1', how: 'instant', ms: 40 }, ran: { agent: 'claude', level: 'high', effort: 'high', model: 'claude-opus-4-1' }, ended: null },
+      { jobId: 'jev-6', said: { agent: 'claude', effort: 'high', model: 'claude-opus-4-1', how: 'quick', ms: 1900 }, ran: { agent: 'codex', level: 'medium', effort: 'medium', model: 'gpt-5.5' }, ended: null },
+      { jobId: 'jev-5', said: { agent: 'codex', effort: 'medium', model: 'gpt-5.5', how: 'likely', ms: 30 }, ran: null, ended: null },
+    ],
+  }
+  const { card, lib, lines } = await howJevRepliesCard(summary)
+  assert.deepEqual(lines, [
+    'Start replies: before routing when the guess has earned it, else after routing (median 2.4 s this week)',
+    'Task or question: read on this PC when it is sure a message is a task, and by Jev otherwise (812 checked examples); 95% right of the last 100 checked.',
+    'Agent and effort prediction: right 47 of the last 50 (quick replies need 45; "likely" needs 16 of the last 20).',
+    'Quick replies on: right 47 of the last 50, so a task that starts at once is told the guessed agent before routing picks.',
+    'Instant replies on: a message read on this PC as a task gets its reply with no Jev call.',
+    '"Likely" paused: right 15 of the last 20 (it needs 16), so a reply that waits names no agent again.',
+    'Under Laya Auto: right 43 of the last 50 (quick replies need 45; "likely" needs 16 of the last 20).',
+    'Under Laya Auto, quick replies paused: right 43 of the last 50 (they need 45), so replies wait for routing again.',
+    'Under Laya Auto, "likely" on: right 18 of the last 20, so a task that waits its turn is told the agent likely to run it.',
+  ])
+  const table = nodes(card.tree).find((n) => n.type === lib.SortTable)
+  assert.deepEqual(table.props.rows.map((r) => [r[0].text, r[1].text, r[2].text, r[3].text]), [
+    ['jev-7', 'Claude Code · claude-opus-4-1 · effort high', 'Claude Code · claude-opus-4-1 · effort high', 'instant'],
+    ['jev-6', 'Claude Code · claude-opus-4-1 · effort high', 'Codex · gpt-5.5 · effort medium', 'quick'],
+    ['jev-5', 'Codex · gpt-5.5 · effort medium', 'not routed yet', 'likely'],
+  ])
+  card.unmount()
+  // Quick replies on while task or question still learns: no instant reply yet; and with adaptive routing off, none at all.
+  const learning = { ...summary, intent: { ...summary.intent, maturity: 'SHADOW', verified: 212 } }
+  assert.ok(lib.howJevRepliesLines(learning).includes('Instant replies: not until task or question is read on this PC.'))
+  assert.ok(lib.howJevRepliesLines({ ...summary, intent: null }).includes('Instant replies: none while adaptive routing is off, since Jev reads every message.'))
+  // Nothing switched on yet, or learning off: the lines are as they were.
+  const never = { ...summary, prediction: { ...summary.prediction, states: { jev: { quick: 'off', likely: 'off' }, laya: { quick: 'off', likely: 'off' } } } }
+  assert.equal(lib.howJevRepliesLines(never)[0], 'Start replies: after routing (median 2.4 s this week)')
+  assert.equal(lib.howJevRepliesLines(never).length, 4)
+})
+
+test('Settings, Effort names what your ratings moved, with Reset, and Let my ratings move Auto effort, whose save sends nothing of what was read with it', async () => {
+  const posted = []
+  let effort = { default: 'auto', perAgent: {}, codexSpeed: 'normal', ratingsMove: true, learned: [{ family: 'codex', taskType: 'debugging', shift: 1, agree: 3, n: 4, text: 'Learned from your ratings: Codex Auto effort one step higher for debugging (3 of your last 4 "wrong effort" ratings).' }] }
+  let busy = 0
+  const fetch = async (path, init) => {
+    busy++
+    try {
+      if (init?.method === 'POST') posted.push([path, JSON.parse(init.body)])
+      if (path === '/jev-router/effort/ratings-reset') effort = { ...effort, ratingsResetAt: '2026-10-01T10:00:00.000Z', learned: [] }
+      else if (path === '/jev-router/effort' && init?.method === 'POST') { const { learned: _l, ...saved } = { ...effort, ...JSON.parse(init.body) }; return { ok: true, status: 200, json: async () => saved } }
+      return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(path.startsWith('/jev-router/effort') ? effort : {})) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const lib = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  assert.equal(typeof lib.ratedEffortLines, 'function', 'client.js says what your ratings moved')
+  const card = mount(lib.EffortCard, {}, { shallow: true })
+  const settle = async () => { for (let quiet = 0; quiet < 2; quiet = !busy && !card.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  await settle()
+  const all = () => nodes(card.tree)
+  assert.deepEqual(all().filter((n) => n.props?.className === 'muted').map(textOf), ['Learned from your ratings: Codex Auto effort one step higher for debugging (3 of your last 4 "wrong effort" ratings).'])
+  const toggle = all().find((n) => n.type === 'input' && n.props['aria-label'] === 'Let my ratings move Auto effort')
+  assert.equal(toggle.props.checked, true, 'on by default')
+  toggle.props.onChange({ target: { checked: false } })
+  await settle()
+  assert.deepEqual(posted.at(-1), ['/jev-router/effort', { default: 'auto', perAgent: {}, codexSpeed: 'normal', ratingsMove: false }], 'what was learned is never sent back')
+  assert.match(all().filter((n) => n.props?.className === 'muted').map(textOf).at(-1), /does not follow these while Let my ratings move Auto effort is off/)
+  all().find((n) => n.type === 'button' && textOf(n) === 'Reset').props.onClick()
+  await settle()
+  assert.equal(posted.at(-1)[0], '/jev-router/effort/ratings-reset')
+  assert.deepEqual(all().filter((n) => n.props?.className === 'muted').map(textOf), [], 'after Reset nothing is moved by the ratings before it')
+  assert.equal(all().some((n) => n.type === 'button' && textOf(n) === 'Reset'), false)
+  card.unmount()
+})
+
+test('Settings, Effort has Claude Code speed beside Codex speed, says Fast costs more whichever way it is set, and saves claudeSpeed', async () => {
+  const posted = []
+  let effort = { default: 'auto', perAgent: {}, codexSpeed: 'normal', claudeSpeed: 'normal', ratingsMove: true, learned: [] }
+  let busy = 0
+  const fetch = async (path, init) => {
+    busy++
+    try {
+      if (init?.method === 'POST') { posted.push([path, JSON.parse(init.body)]); effort = { ...effort, ...JSON.parse(init.body) } }
+      return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(path.startsWith('/jev-router/effort') ? effort : {})) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const lib = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  const card = mount(lib.EffortCard, {}, { shallow: true })
+  const settle = async () => { for (let quiet = 0; quiet < 2; quiet = !busy && !card.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  await settle()
+  const all = () => nodes(card.tree)
+  const terms = all().filter((n) => n.type === 'dt').map(textOf)
+  assert.ok(terms.includes('Claude Code speed'), 'the card has the setting')
+  assert.equal(terms.indexOf('Claude Code speed'), terms.indexOf('Codex speed') + 1, 'beside Codex speed')
+  const toggle = () => all().find((n) => n.type === 'input' && n.props['aria-label'] === 'Claude Code fast mode')
+  const costs = () => all().filter((n) => n.props?.className === 'why' && /costs more/.test(textOf(n))).map(textOf)
+  assert.equal(toggle().props.checked, false, 'Normal by default')
+  assert.equal(costs().length, 1, 'the cost is said before Fast is chosen')
+  assert.match(costs()[0], /usage credits/)
+  toggle().props.onChange({ target: { checked: true } })
+  await settle()
+  assert.deepEqual(posted.at(-1), ['/jev-router/effort', { default: 'auto', perAgent: {}, codexSpeed: 'normal', claudeSpeed: 'fast', ratingsMove: true }])
+  assert.equal(toggle().props.checked, true)
+  assert.ok(all().some((n) => n.type === 'label' && /Fast \(costs more\)/.test(textOf(n))), 'and the switch says it once on')
+  assert.equal(costs().length, 1)
+})
+
+test('the Chat replies card switches the ask under a reply whose plan changed back on, or off, as Don\'t ask me this does', async () => {
+  const { validChatReplies } = await import('../index.js')
+  let saved = { waitMs: 15_000, progress: 'milestones', askWhenWrong: false }
+  const posts = []
+  let busy = 0
+  const fetch = async (path, init) => {
+    busy++
+    try {
+      if (path === '/jev-router/chat-replies/settings' && init?.method === 'POST') { posts.push(JSON.parse(init.body)); saved = validChatReplies(JSON.parse(init.body), saved) }
+      const text = JSON.stringify(path === '/jev-router/chat-replies/settings' ? saved : {})
+      return { ok: true, status: 200, json: async () => JSON.parse(text) }
+    } finally { busy-- }
+  }
+  const { React, mount } = statefulReact()
+  const document = { hidden: false, getElementById: () => ({}), head: { appendChild() {} } }
+  const { ChatRepliesCard } = loadPlugin(React, { fetch, document, setInterval: () => 0, clearInterval: () => {} }).__test
+  const card = mount(ChatRepliesCard, {})
+  const settle = async () => { for (let quiet = 0; quiet < 2; quiet = !busy && !card.queued ? quiet + 1 : 0) await new Promise((r) => setImmediate(r)) }
+  await settle()
+  const toggle = () => nodes(card.tree).find((n) => n.type === 'input' && n.props['aria-label'] === 'Ask which was right when what ran is not what the reply said')
+  assert.ok(toggle(), 'the card has the ask\'s switch')
+  assert.equal(toggle().props.checked, false, 'off, as Don\'t ask me this left it')
+  toggle().props.onChange({ target: { checked: true } })
+  await settle()
+  assert.deepEqual(posts, [{ askWhenWrong: true }])
+  assert.equal(toggle().props.checked, true)
+  card.unmount()
+})
+
+// ---------------------------------------------------------------- colibri Laya, side by side (13)
+
+/** The card's colibri lines, from the helper block on its own; a block without them fails by assertion. */
+function colibriLines(figures) {
+  const start = client.indexOf('// ---- pure laya helpers')
+  const end = client.indexOf('// ---- end pure laya helpers')
+  const block = client.slice(start, end)
+  assert.match(block, /function colibriLines\(/, 'the Laya helpers say what colibri compared')
+  return new Function(`${block}\nreturn colibriLines`)()(figures)
+}
+
+/** The colibri figures as GET /jev-router/laya carries them (colibri-laya.js summary()). */
+const COLIBRI_FIGURES = {
+  on: true, address: 'http://127.0.0.1:8000', used: false, file: 'colibri-laya.jsonl',
+  reachable: { ok: true, why: null, checkedAt: '2026-10-10T08:00:00.000Z', ms: 230, model: 'laya', checking: false, how: "one test question, since colibri's /health lists no loaded model" },
+  compared: { requests: 12, partial: 0, questions: 87, since: '2026-10-10T08:00:01.000Z' },
+  failed: { timeout: 1, unreachable: 0, refused: 0, bad_answer: 0 },
+  dropped: { busy: 3, local_busy: 0, laya_busy: 0, not_reachable: 0 },
+  agreement: { choice: { compared: 40, agreed: 38 }, score: { compared: 10, agreed: 9, tolerance: 0.5 }, noul: { compared: 37, agreed: 30 } },
+  medianMs: { laya: 1300, colibri: 700 },
+  rawNouls: 37,
+  confidenceUnknown: 37,
+}
+
+test('colibri Laya, side by side (13): whether colibri answers or why not, what was compared, agreement with laya.serve by question type, the median time of each, colibri\'s three gaps, and that nothing it answers is used', () => {
+  const lines = colibriLines(COLIBRI_FIGURES)
+  assert.deepEqual(lines.map((l) => l.text), [
+    "Reachable: colibri answered its test question in 0.2 s as laya. KzH checks it with one test question, since colibri's /health lists no loaded model.",
+    'Compared 87 questions in 12 requests since 2026-10-10. Not answered: 1 past its deadline. Not asked since KzH started: 3 while colibri was answering another.',
+    'Agreement with laya.serve: choice 38 of 40 (95%), score 9 of 10 (90%) within 0.5 of a level and yes/no 30 of 37 (81%).',
+    'Median time per request: laya.serve 1.3 s, colibri 0.7 s.',
+    'Yes/no questions go to colibri as KzH sends them, labels and all; colibri ignores the labels, so it reads each in its raw false/true form, unlike laya.serve (37 so far).',
+    'colibri gives a yes/no answer no confidence: each is recorded as unknown and left out of every figure that needs one (37 so far).',
+    'Nothing colibri answers is used: it decides nothing, and nothing learns from it. Its answers are kept in colibri-laya.jsonl only.',
+  ])
+  assert.deepEqual(lines.map((l) => l.tone), ['', 'why', '', 'why', 'why', 'why', 'note'])
+
+  // Not reachable, with why; and while it is being asked, or not asked yet.
+  const why = 'nothing answers at http://127.0.0.1:8000: start colibri with its Laya engine, or empty the address'
+  const down = colibriLines({ ...COLIBRI_FIGURES, reachable: { ok: false, why } })
+  assert.deepEqual(down[0], { text: `Not reachable: ${why}. KzH checks it with one test question, since colibri's /health lists no loaded model.`, tone: 'warn' })
+  assert.match(colibriLines({ ...COLIBRI_FIGURES, reachable: { ok: null, checking: true } })[0].text, /^Asking colibri its test question…/)
+  assert.match(colibriLines({ ...COLIBRI_FIGURES, reachable: { ok: null } })[0].text, /^Not checked yet\./)
+  // A server on the address that names another model than Laya is said so.
+  assert.deepEqual(colibriLines({ ...COLIBRI_FIGURES, reachable: { ok: true, ms: 900, model: 'qwen36' } })[1], { text: "colibri says it serves qwen36, not Laya: start it with Laya's model, as its docs/laya.md says.", tone: 'warn' })
+
+  // Nothing compared yet: no agreement and no time, and the gaps and the rule still said.
+  const fresh = colibriLines({ ...COLIBRI_FIGURES, compared: { requests: 0, partial: 0, questions: 0, since: null }, failed: {}, dropped: {}, agreement: { choice: { compared: 0, agreed: 0 }, score: { compared: 0, agreed: 0, tolerance: 0.5 }, noul: { compared: 0, agreed: 0 } }, medianMs: { laya: null, colibri: null }, rawNouls: 0, confidenceUnknown: 0 })
+  assert.deepEqual(fresh.map((l) => l.text.split(/[:;]/)[0]), ['Reachable', 'Nothing compared yet', 'Yes/no questions go to colibri as KzH sends them, labels and all', 'colibri gives a yes/no answer no confidence', 'Nothing colibri answers is used'])
+  assert.ok(fresh.every((l) => !l.text.includes('so far')), 'no count of nothing')
+  // A share is never rounded up: 199 of 200 is 99%.
+  assert.match(colibriLines({ ...COLIBRI_FIGURES, agreement: { choice: { compared: 200, agreed: 199 } } })[2].text, /choice 199 of 200 \(99%\)/)
+  // Each way a request went unanswered is named, an answer KzH could not read among them, and each
+  // reason one was not asked, a request laya.serve had more after on the CPU among them.
+  assert.match(colibriLines({ ...COLIBRI_FIGURES, failed: { timeout: 0, unreachable: 1, refused: 2, bad_answer: 1 } })[1].text, / Not answered: 2 refused by colibri, 1 cut off and 1 answered in a shape KzH could not read\. Not asked /)
+  assert.match(colibriLines({ ...COLIBRI_FIGURES, dropped: { busy: 0, local_busy: 1, laya_busy: 4, not_reachable: 0 } })[1].text, / Not asked since KzH started: 1 while a local model was answering and 4 while laya\.serve had more to answer on the CPU\.$/)
+  // No address, no section.
+  assert.deepEqual(colibriLines({ ...COLIBRI_FIGURES, on: false }), [])
+})
+
+test('the card has the colibri Laya address among Laya\'s settings: empty is off and shows no section; it saves as typed, less the spaces around it; a refused one is shown as the server words it; once set the card shows colibri Laya, side by side (13)', async () => {
+  const page = await card(status(), {
+    replies: { '/jev-router/laya/settings': (sent) => { page.status = status({ settings: { ...page.status.settings, ...sent }, colibri: { ...COLIBRI_FIGURES, address: sent.colibriUrl } }) } },
+  })
+  const field = page.input('jevi-laya-colibri')
+  assert.ok(field, 'the colibri Laya address field')
+  assert.deepEqual([field.props.value, field.props.placeholder], ['', 'http://127.0.0.1:8000'])
+  assert.match(page.text(), /colibri Laya address/)
+  assert.match(page.text(), /Empty is off\. The address of a colibri you run yourself on this PC with its Laya engine/)
+  assert.ok(!page.text().includes('colibri Laya, side by side'), 'no section while it is empty')
+  field.props.onChange({ target: { value: ' http://127.0.0.1:8000 ' } })
+  await page.settle()
+  await page.input('jevi-laya-colibri').props.onBlur()
+  await page.settle()
+  assert.deepEqual(page.posts, [['/jev-router/laya/settings', { colibriUrl: 'http://127.0.0.1:8000' }]])
+  assert.equal(page.input('jevi-laya-colibri').props.value, 'http://127.0.0.1:8000', 'the saved value, reloaded')
+  const section = page.all().find((n) => n.type === 'section' && n.props['aria-labelledby'] === 'jevi-laya-colibri-h')
+  assert.ok(section, 'the section, once the address is set')
+  assert.deepEqual(section.children.slice(1).map(textOf), colibriLines(COLIBRI_FIGURES).map((l) => l.text), 'with the lines of the figures the status carries')
+  assert.equal(textOf(section.children[0]), 'colibri Laya, side by side')
+  page.close()
+
+  const strict = await card(status(), { replies: { '/jev-router/laya/settings': { code: 400, body: { error: 'colibri Laya address: this PC only (127.0.0.1, localhost or [::1]), not 192.168.1.20' } } } })
+  strict.input('jevi-laya-colibri').props.onChange({ target: { value: 'http://192.168.1.20:8000' } })
+  await strict.settle()
+  await strict.input('jevi-laya-colibri').props.onBlur()
+  await strict.settle()
+  assert.deepEqual(strict.alerts(), ['colibri Laya address: this PC only (127.0.0.1, localhost or [::1]), not 192.168.1.20'])
+  assert.equal(strict.input('jevi-laya-colibri').props.value, '', 'the saved value, beside the refusal')
+  strict.close()
+})

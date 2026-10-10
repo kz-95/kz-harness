@@ -159,6 +159,7 @@ function wire({ laya = layaClient(), jev: jevClient, offline = false, work } = {
         runId: `run-${records.length + 1}`,
         offline,
         localOnly: offline || mode === 'local' || mode === 'offline',
+        remoteOnly: mode === 'online',
         jevUnavailableReason: 'offline: no internet, checks only',
         decide: (args) => w.engine.decide({ ...args, sink: decider === 'laya' ? w.sink : undefined }),
         outcomeDomain: decider === 'laya' ? w.outcome : w.domains.get('outcome_disposition'),
@@ -369,7 +370,7 @@ test('Laya Auto is on the menu only while it is offered, and says what a task co
   assert.deepEqual((await menu(async () => { throw new Error('status unreadable') })).map((m) => m.id), ['jev-auto'], 'a state nobody can read offers nothing')
   const ready = async () => ({ state: 'ready', device: 'cuda', routeMs: 1500, reviewMs: 900, lastStartMs: 41_000 })
   assert.deepEqual((await menu(ready)).map((m) => m.id), ['jev-auto', 'laya-auto'], 'right after Jev Auto')
-  assert.deepEqual((await menu(ready, LOCAL)).map((m) => m.id), ['jev-auto', 'laya-auto', 'jev-online', 'jev-local', 'jev-offline', 'agent-qwen-local'], 'and before the local-only rows')
+  assert.deepEqual((await menu(ready, LOCAL)).map((m) => m.id), ['jev-auto', 'laya-auto', 'laya-online', 'laya-local', 'jev-online', 'jev-local', 'jev-offline', 'agent-qwen-local'], 'and before the local-only rows, with its own Online and Local rows after it')
   const BASE = 'Laya, a decision model on this PC, routes every message and reviews the result instead of Jev. No Jev call is made and no routing or review question leaves this PC; offline it keeps routing, to the local models. The agent it picks still sees your task and code, and questions are answered by the chat model as in Jev Auto.'
   const described = async (state) => (await menu(async () => state)).find((m) => m.id === 'laya-auto')
   const row = await described(await ready())
@@ -382,6 +383,78 @@ test('Laya Auto is on the menu only while it is offered, and says what a task co
   // Always a known id, so a saved selection resolves to Laya Auto, never to Jev.
   const resolved = await adapter.jevAdapter({ ctx: chatCtx(), route: async () => '', auxModel: { provider: 'x', model: 'y' } }).resolveModel('jev', 'laya-auto')
   assert.deepEqual([resolved.id, resolved.name], ['laya-auto', 'Laya Auto'])
+})
+
+test('Laya Auto · Online and · Local follow Laya Auto on the menu, only once a local model is installed and while Laya Auto is offered, Laya\'s rows to the last word', async () => {
+  const LOCAL = [{ id: 'qwen-local', kind: 'local', enabled: true }]
+  const menu = async (layaRow, agents = []) => adapter.jevAdapter({ ctx: chatCtx(), route: async () => '', auxModel: { provider: 'x', model: 'y' }, agents: async () => agents, layaRow }).listModels('jev')
+  const ready = async () => ({ state: 'ready', device: 'cuda', routeMs: 1500, reviewMs: 900, lastStartMs: 41_000 })
+  const ids = async (...args) => (await menu(...args)).map((m) => m.id)
+  assert.deepEqual((await ids(ready, LOCAL)).slice(1, 4), ['laya-auto', 'laya-online', 'laya-local'], 'right after Laya Auto')
+  assert.deepEqual(await ids(ready), ['jev-auto', 'laya-auto'], 'with no local model there is no line to draw, as for Jev\'s rows')
+  assert.deepEqual(await ids(async () => null, LOCAL), ['jev-auto', 'jev-online', 'jev-local', 'jev-offline', 'agent-qwen-local'], 'and not while Laya Auto is not offered')
+  const rows = Object.fromEntries((await menu(ready, LOCAL)).map((m) => [m.id, m]))
+  assert.deepEqual([rows['laya-online'].name, rows['laya-local'].name], ['Laya Auto · Online', 'Laya Auto · Local'])
+  const SENTENCE = 'Measured on this PC, on the GPU: about 1.5 s to route a task and 0.9 s to review each attempt.'
+  for (const id of ['laya-online', 'laya-local']) {
+    assert.ok(rows[id].description.endsWith(` ${SENTENCE}`), `${id} says what a task costs, as Laya Auto does`)
+    assert.deepEqual(rows[id].reasoning, rows['laya-auto'].reasoning, `${id} offers Laya Auto's efforts`)
+    assert.doesNotMatch(rows[id].description, /Jev routes/)
+  }
+  assert.match(rows['laya-online'].description, /only over the cloud and subscription agents/)
+  assert.match(rows['laya-local'].description, /only the local models on this PC work, so a task's whole run stays on this PC/)
+  assert.deepEqual(['laya-online', 'laya-local'].map(adapter.rowOf), [{ mode: 'online', decider: 'laya' }, { mode: 'local', decider: 'laya' }])
+  // Always known ids, so a saved selection resolves to its own row, never to Jev Auto.
+  const resolved = await adapter.jevAdapter({ ctx: chatCtx(), route: async () => '', auxModel: { provider: 'x', model: 'y' } }).resolveModel('jev', 'laya-local')
+  assert.deepEqual([resolved.id, resolved.name], ['laya-local', 'Laya Auto · Local'])
+})
+
+test('Laya Auto · Online: Laya routes over the cloud and subscription agents only, says (laya, online), and Jev is never asked', async () => {
+  const x = wire()
+  const a = adapter.jevAdapter({ ctx: chatCtx(), route: x.route, classify: x.classify, auxModel: { provider: 'x', model: 'y' }, agents: async () => AGENTS })
+  assert.deepEqual(adapter.rowOf('laya-online'), { mode: 'online', decider: 'laya' }, 'a row of its own, not Jev Auto')
+  const { reasoning, reply } = await send(a, 'fix the parser', { model: 'laya-online' })
+  const r = x.records[0]
+  assert.ok(r, reply)
+  assert.deepEqual([r.routing.mode, r.routing.decider, r.routing.online], ['jev', 'laya', true])
+  assert.notEqual(r.routing.primaryAgent, 'qwen-local', 'the local model is never picked')
+  assert.ok(!x.executed.includes('qwen-local'))
+  assert.match(reply.split('\n')[0], /^\*\*Laya router\*\* · AUTO \(Laya[^)]* decided\), CLOUD AND SUBSCRIPTION AGENTS ONLY$/)
+  assert.match(reasoning, new RegExp(`Routed to ${r.routing.primaryAgent} \\(laya, online\\)`))
+  assert.ok(x.laya.phases.includes('route') && x.laya.phases.includes('review'), 'Laya routed and reviewed')
+  assert.deepEqual(x.jevAsked, [], 'Jev was never asked')
+  // Jev Auto · Online's record and lines are as they were.
+  const y = wire({ jev: x.laya })
+  await y.route({ task: 'fix the parser', mode: 'online', decider: 'jev' })
+  assert.equal('online' in y.records[0].routing, false)
+})
+
+test('Laya Auto · Local: Laya routes over the local models only, says (laya, local), and Jev is never asked', async () => {
+  const x = wire()
+  const a = adapter.jevAdapter({ ctx: chatCtx(), route: x.route, classify: x.classify, auxModel: { provider: 'x', model: 'y' }, agents: async () => AGENTS })
+  assert.deepEqual(adapter.rowOf('laya-local'), { mode: 'local', decider: 'laya' }, 'a row of its own, not Jev Auto')
+  const { reasoning, reply } = await send(a, 'fix the parser', { model: 'laya-local' })
+  const r = x.records[0]
+  assert.ok(r, reply)
+  assert.deepEqual([r.routing.mode, r.routing.decider, r.routing.primaryAgent], ['local', 'laya', 'qwen-local'])
+  assert.deepEqual(x.executed, ['qwen-local'], 'only the local model worked')
+  assert.match(reply.split('\n')[0], /^\*\*Laya router\*\* · AUTO \(Laya[^)]* decided\), LOCAL MODELS ONLY$/)
+  assert.match(reasoning, /Routed to qwen-local \(laya, local\)/)
+  assert.ok(x.laya.phases.includes('route') && x.laya.phases.includes('review'), 'Laya routed and reviewed')
+  assert.deepEqual(x.jevAsked, [], 'Jev was never asked')
+})
+
+test('Laya Auto · Online and · Local refuse as Laya Auto does, before anything is sorted or run', async () => {
+  const REFUSAL = 'Laya Auto did not run this: Laya is switched off in the configuration (jev-router laya.enabled). Nothing was run.'
+  const seen = { classify: 0, route: 0, refusal: [] }
+  const a = adapter.jevAdapter({
+    ctx: chatCtx(), auxModel: { provider: 'x', model: 'y' },
+    route: async () => { seen.route++; return 'routed' },
+    classify: async () => { seen.classify++; return { kind: 'task' } },
+    layaUnavailable: async (role) => { seen.refusal.push(role); throw new Error(REFUSAL) },
+  })
+  for (const model of ['laya-online', 'laya-local']) assert.equal((await send(a, 'fix the parser', { model })).reply, REFUSAL, model)
+  assert.deepEqual([seen.classify, seen.route, seen.refusal], [0, 0, ['act', 'act']])
 })
 
 test('a route Laya answered all flat: the task-group line names exactly the fields the report says the rules filled, and the second opinion only on the judgments call', async () => {
@@ -482,7 +555,7 @@ test('while Laya starts the message waits with the Starting line, then is asked;
   assert.deepEqual(routed, ['laya'])
   const orchestrator = { results: () => [], live: () => 0, enqueue: (fields, extra) => { queued.push({ fields, extra }); return 'queued' } }
   const later = await send(make({ kind: 'task', unsure: true, why }, orchestrator), 'what is a parser?')
-  assert.deepEqual(queued[0].extra, { decider: 'laya', why, readVerdict: null }, 'a queued task carries who decides it and why it is a task, and an unsure Laya gives no read verdict')
+  assert.deepEqual(queued[0].extra, { decider: 'laya', why, readVerdict: null, message: 'what is a parser?' }, 'a queued task carries who decides it, why it is a task and the person\'s own words, and an unsure Laya gives no read verdict')
   assert.deepEqual([blocks(later.chunks, 'reasoning'), blocks(later.chunks, 'text')], [[0], [1]])
   assert.equal(queued[0].fields.task, 'what is a parser?')
 })

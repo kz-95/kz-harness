@@ -4,6 +4,7 @@
 // driver's CUDA version, what a failure leaves, the journalled swap and its recovery, the install
 // lock, an update around a running Laya, the records written, and the step that stops moving.
 import { createLayaInstaller, createRotatingLog, isAlive, layaPaths, readPins, recordWeights, snapshotDir, takeInstallLock, torchIndexes, verifyWeights } from '../laya-install.js'
+import { fakeDownload } from './fixtures/fake-llama-server.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
@@ -305,6 +306,22 @@ test('a fresh PC without uv gets the pinned build, checked by size and SHA-256',
   assert.ok(!existsSync(join(h.paths.uvDir, 'uv-x86_64-pc-windows-msvc.zip')), 'the archive goes once unpacked')
   const version = m.calls.findIndex((c) => c.cmd === h.paths.uv && c.args[0] === '--version')
   assert.ok(version > m.calls.indexOf(tar), 'the version is checked once it is unpacked')
+})
+
+test('the pinned uv download survives a dropped connection: it is tried again from where it stopped, and the install\'s lines say so', async () => {
+  const h = harness()
+  const archive = Buffer.from('the uv release archive, sent in two pieces')
+  const pins = { ...PINS, uv: { ...PINS.uv, size: archive.length, sha256: sha(archive) } }
+  const m = machine(h)
+  const host = fakeDownload(archive, [{ cutAfter: 10 }])
+  const fetch = async (url, opts) => (opts?.method === 'HEAD' ? { ok: true, status: 200 } : host.fetch(url, opts))
+  const installer = createLayaInstaller({ harnessDir: h.harnessDir, dataDir: h.dataDir, pins, platform: 'win32', spawn: m.spawn, sidecar: sidecarStub(), specs: async () => ({ cuda: 12.8 }), fetch, freeBytes: async () => 100 * GB, sleep: async () => {}, progressEveryMs: 5 })
+  const failed = await installer.install({ device: 'gpu' }).then(() => null, (err) => err)
+  assert.equal(failed, null, 'the dropped connection does not fail the install')
+  assert.deepEqual(host.ranges, [null, 'bytes=10-'])
+  const lines = installer.status().job.lines
+  assert.ok(lines.includes('uv download: terminated (other side closed); trying again in 2 s'), lines.join('\n'))
+  assert.ok(m.calls.some((c) => basename(c.cmd) === 'tar.exe'), 'the archive is unpacked')
 })
 
 test('PyTorch falls through the CUDA tags on a 404 or no matching distribution, naming each tag tried; with every tag failing it offers the CPU', async () => {

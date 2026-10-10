@@ -19,9 +19,9 @@
 import { spawn as nodeSpawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { appendFile, lstat, mkdir, open, readFile, readdir, rename as fsRename, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, readdir, rename as fsRename, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
-import { downloadVerified, renameRetry, sha256File } from './local.js'
+import { createRotatingLog, downloadVerified, renameRetry, sha256File } from './local.js'
 
 const GB = 1024 ** 3
 const r1 = (x) => Math.round(x * 10) / 10
@@ -201,31 +201,9 @@ export async function rmRetry(path, { sleep = sleepMs, limitMs = 30_000, remove 
   }
 }
 
-/**
- * A log file of Laya's own (laya-serve.log, install.log): appended in order, rotated once it passes
- * `maxBytes`, with two older files kept (.1 and .2). A write that fails is dropped, never thrown.
- */
-export function createRotatingLog(file, { maxBytes = 5 * 1024 * 1024 } = {}) {
-  let bytes = null
-  let queue = Promise.resolve()
-  return {
-    append(text) {
-      queue = queue.then(async () => {
-        await mkdir(dirname(file), { recursive: true })
-        bytes ??= (await stat(file).catch(() => null))?.size ?? 0
-        if (bytes > maxBytes) {
-          await fsRename(`${file}.1`, `${file}.2`).catch(() => {})
-          await fsRename(file, `${file}.1`).catch(() => {})
-          bytes = 0
-        }
-        await appendFile(file, text)
-        bytes += Buffer.byteLength(text)
-      }).catch(() => {})
-      return queue
-    },
-    flushed: () => queue,
-  }
-}
+// A log file of Laya's own (laya-serve.log, install.log), rotated at 5 MB with two older files kept:
+// the helper lives in local.js beside llama-server's, and is exported from here as it always was.
+export { createRotatingLog }
 
 /**
  * The environment a process Laya's installer or sidecar starts gets, as a copy of `env`: every
@@ -491,7 +469,7 @@ export function createLayaInstaller({
     await mkdir(paths.uvDir, { recursive: true })
     const archive = join(paths.uvDir, basename(new URL(build.source).pathname))
     job.total = build.size
-    await downloadVerified({ url: build.source, dest: archive, size: build.size, sha256: build.sha256, fetch, onProgress: (n) => { job.received = n; told() } })
+    await downloadVerified({ url: build.source, dest: archive, size: build.size, sha256: build.sha256, fetch, onProgress: (n) => { job.received = n; told() }, onNote: (t) => say(`uv download: ${t}`) })
     const tar = platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar'
     const r = await command(tar, ['-xf', archive, '-C', paths.uvDir, ...(platform === 'win32' ? [] : ['--strip-components=1'])])
     await unlink(archive).catch(() => {})

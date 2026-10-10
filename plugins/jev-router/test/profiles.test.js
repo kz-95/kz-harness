@@ -1107,7 +1107,7 @@ test('the feedback route with learning off stores the verdict and still applies 
   })
   await post({ verdict: 'like' }, later(1), true)
   assert.ok(humanOf(reg, claudeSubject()).length > 0)
-  const stored = await post({ verdict: 'clear' }, later(2), false)
+  const { record: stored } = await post({ verdict: 'clear' }, later(2), false)
   assert.equal(stored.verdict, 'clear')
   assert.deepEqual(await fb.list('sess-1'), [], 'stored')
   assert.equal(humanOf(reg, claudeSubject()).length, 0, 'and the like it withdrew no longer counts')
@@ -1370,4 +1370,32 @@ test('benchmark rows of a model known only by a name stop counting 45 days after
 test('a read pass handed to its folder\'s line is no evidence about the agent', () => {
   assert.deepEqual(evidenceFromRun(run({ finalStatus: 'needs_write' }), { modelOf, agents, priors }), [])
   assert.ok(evidenceFromRun(run({ finalStatus: 'answered' }), { modelOf, agents, priors }).length > 0, 'an answer still is')
+})
+
+// ---------- a verdict about the pick (docs/live-agent-view.md Feature 4, slice 6) ----------
+test('verdictIsAbout is false for a verdict about the pick: it judges the choice, so no run\'s capability is credited with it, by its run, by time or as the answer of an agent no longer configured', async () => {
+  const { answererUnconfigured } = await import('../profiles.js')
+  const r = run()
+  const like = { ts: T0, sessionId: 'sess-1', messageId: 'm1', verdict: 'like', provider: 'claude' }
+  assert.ok(evidenceFromFeedback(like, r, { modelOf, agents, priors }).length > 0, 'the setting: a like of the answer is a person\'s evidence')
+  const plan = { ...like, about: 'plan', taskKey: '0f8fad5b-d9cb-469f-a165-70867728950e', tag: 'good pick' }
+  assert.deepEqual(evidenceFromFeedback(plan, r, { modelOf, agents, priors }), [])
+  assert.deepEqual(evidenceFromFeedback({ ...plan, runId: 'run-1' }, r, { modelOf, agents, priors }), [], 'by its run too')
+  assert.deepEqual(evidenceFromRun(r, { modelOf, agents, feedback: [plan, { ...plan, messageId: 'm2', verdict: 'dislike', tag: 'wrong agent', runId: 'run-1' }], priors }).filter((x) => x.source === 'human_outcome'), [])
+  assert.equal(answererUnconfigured({ ...plan, runId: 'run-1' }, r, { agents: [] }), false)
+})
+
+test('a run the person steered as it ran gives no first_pass_quality or instruction_following row, from its outcome, its review, a verdict on it or a verdict given later, and keeps its other rows', () => {
+  const dislike = { ts: T0, sessionId: 'sess-1', messageId: 'm1', verdict: 'dislike', provider: 'claude' }
+  const steered = run({ steered: 2 })
+  const rows = evidenceFromRun(steered, { modelOf, agents, feedback: [dislike], priors })
+  assert.deepEqual([...new Set(rows.map((r) => r.dimension))].sort(), ['coding', 'reliability'], 'what its agents did alone, and how well they followed the task as first given, it does not show')
+  assert.deepEqual(pick(rows, 'objective_deterministic').map((r) => r.dimension).sort(), ['coding', 'reliability'])
+  assert.deepEqual(pick(rows, 'independent_review').map((r) => r.dimension), ['coding'])
+  assert.deepEqual(pick(rows, 'human_outcome').map((r) => r.dimension), ['coding'])
+  assert.deepEqual(evidenceFromFeedback(dislike, steered, { modelOf, agents, priors }).map((r) => r.dimension), ['coding'])
+  // Words added before it started are its task: a run of an amended task is scored as any other.
+  const amended = evidenceFromRun(run({ amended: true }), { modelOf, agents, priors })
+  assert.deepEqual([...new Set(amended.map((r) => r.dimension))].sort(), ['coding', 'first_pass_quality', 'instruction_following', 'reliability'])
+  assert.deepEqual(evidenceFromRun(run({ steered: 0 }), { modelOf, agents, priors }).length, evidenceFromRun(run(), { modelOf, agents, priors }).length)
 })

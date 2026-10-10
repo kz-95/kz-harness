@@ -105,6 +105,8 @@ if (-not $dshBin) {
 # After the engine is resolved, never before: these patch the copy that is about to run.
 # Per-run effort and 1.5x speed for Codex (re-applied if the connector was reinstalled).
 node (Join-Path $PSScriptRoot 'scripts\patch-codex-effort.mjs')
+# What each Claude Code and Codex run is doing (the Live tab), and Steer / Send now into them.
+node (Join-Path $PSScriptRoot 'scripts\patch-agent-live.mjs')
 # Upstream wording the app and the prompts show: DeepSeek Harness / DSH -> Kz-harness.
 node (Join-Path $PSScriptRoot 'scripts\patch-dsh-branding.mjs')
 # Search, bookmarks and a taller scrolling list in the composer's model menu.

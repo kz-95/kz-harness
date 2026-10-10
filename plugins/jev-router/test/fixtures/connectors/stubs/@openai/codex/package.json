@@ -1,0 +1,5 @@
+{
+  "name": "@openai/codex",
+  "private": true,
+  "bin": { "codex": "bin/codex.js" }
+}

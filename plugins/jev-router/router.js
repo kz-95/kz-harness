@@ -16,12 +16,14 @@ import { kindOf, marginalCostOf } from './accounts.js'
 import { decidedBy, deviceName, timeoutSize } from './adapter.js'
 import { CHARS_PER_TOKEN, LOCK_UNAVAILABLE, READ_PASS_CAPABILITIES, eligible, needsLane, rank } from './capabilities.js'
 import { NO_CANDIDATES, contextEstimate } from './decision.js'
-import { effortFamily, toAgentEffort } from './effort.js'
+import { agentSpeed, effortBias, effortFamily, speedWord, toAgentEffort, unifiedLevel } from './effort.js'
 import { redactSecrets } from './export.js'
-import { tagIsAnswerOnly } from './feedback.js'
+import { tagVotesOnAgent } from './feedback.js'
 import { offlinePick } from './local.js'
 import { SILENT_STATUSES, isWorkAttempt, succeeded } from './outcome.js'
 import { TEACHER, jevRecord, providerName } from './providers.js'
+import { agentsMark } from './reply-words.js'
+import { reachedWork } from './steer.js'
 import { assertWorkspace, changedSince, compareChecks, ensureHandoffIgnored, gatherContext, headOf, runChecks, snapshot, snapshotDiff, unseenPaths } from './workspace.js'
 
 const pct = (n) => (typeof n === 'number' ? n.toFixed(2) : 'n/a')
@@ -98,6 +100,13 @@ const servedModel = (result) => {
   const v = result?.modelVersion ?? result?.model
   return typeof v === 'string' && v ? { modelVersion: v } : {}
 }
+// The model a provider's own report names as the one that served the attempt (Claude Code's and
+// Codex's, through the engine patch), kept apart from `modelVersion`: it names a model, not a version
+// of the one asked for, and profiles key their evidence on the model asked for, which it must not change.
+const reportedModel = (result) => (typeof result?.servedModel === 'string' && result.servedModel ? { servedModel: result.servedModel } : {})
+// What an attempt would have cost on the API, beside what it cost: a Claude subscription's, which is
+// no money paid (usage.jsonl `apiEquivalentUsd`).
+const apiEquivalent = (result) => (Number.isFinite(result?.apiEquivalentUsd) ? { apiEquivalentUsd: result.apiEquivalentUsd } : {})
 
 const diagText = (d) => (d == null ? '' : typeof d === 'string' ? d : JSON.stringify(d))
 const LIMIT_TEXT = /usage limit|rate[ _]limit|insufficient balance|quota/i
@@ -375,6 +384,13 @@ export function verdictWeight({ taskType, sessionId, runOf } = {}) {
  * about the answer: its text and tag still ride `reasons` into the routing prompt as context,
  * but it never reaches `likes` / `dislikes`, so the bias it feeds is untouched, and it cannot
  * raise a `suggestion` either, because that would promote an agent through the answer door.
+ * So it is for a tag about something other than the agent (feedback.js tagVotesOnAgent): the
+ * effort it ran at, or whether the message was a task at all.
+ *
+ * A verdict about the pick a start reply named (`about: 'plan'`) is read as any other, its words
+ * marked `plan:` in `reasons`, so the routing prompt can tell a judgment of the pick from one of an
+ * answer. It is about the agent the reply named (`provider`), else the one the plan ran
+ * (`planAgent`, index.js acceptVerdict).
  */
 export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf, weightOf = () => 1 } = {}) {
   // Newest first until the window holds n verdicts' worth of weight, so a long log is only
@@ -394,7 +410,7 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf, w
   }
   const modelOfAgent = (a) => a.llm?.model ?? modelOf?.(a) ?? ''
   const agentOf = (r) => {
-    if (!r?.provider) return undefined
+    if (!r?.provider) return r?.about === 'plan' && agents.some((a) => a.id === r.planAgent) ? r.planAgent : undefined
     // An agent id first (the client sends the chain chip's agent), then a real provider id,
     // optionally narrowed by the model the chip shows.
     const byId = agents.find((a) => a.id === r.provider)
@@ -412,13 +428,13 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf, w
   // track record into the routing prompt. An answer-only row gets no further than this.
   const note = (r) => {
     const tag = typeof r.tag === 'string' ? r.tag.trim() : ''
-    if (!tag) return r.reason ?? ''
-    return r.reason ? `${tag}: ${r.reason}` : tag
+    const text = !tag ? r.reason ?? '' : r.reason ? `${tag}: ${r.reason}` : tag
+    return text && r.about === 'plan' ? `plan: ${text}` : text
   }
   for (const r of recent) {
     if (r?.verdict !== 'like' && r?.verdict !== 'dislike') continue
-    // The split, in one line: only a routing-affecting row is allowed to vote.
-    const counts = !tagIsAnswerOnly(r.tag)
+    // The split, in one line: only a row about the agent is allowed to vote.
+    const counts = tagVotesOnAgent(r.tag)
     bump(agentOf(r), (t) => {
       if (counts) {
         if (r.verdict === 'dislike') { t.dislikes++; t.down += weight.get(r) }
@@ -442,7 +458,7 @@ export function feedbackPrior(records, agents, { n = FEEDBACK_WINDOW, modelOf, w
     })
   }
   const latest = recent.at(-1)
-  const suggestible = latest?.verdict === 'dislike' && latest.suggestedAgent && !tagIsAnswerOnly(latest.tag)
+  const suggestible = latest?.verdict === 'dislike' && latest.suggestedAgent && tagVotesOnAgent(latest.tag)
   return { agents: out, suggestion: suggestible ? latest.suggestedAgent : undefined }
 }
 
@@ -541,6 +557,21 @@ function readRetryPrompt(task, cwd, attempts, opts) {
   ].join('\n')
 }
 
+/** The line the person's guidance starts with in a prompt (withGuidance). */
+export const GUIDANCE_HEAD = 'The person added this while the task ran; follow it:'
+
+/**
+ * `prompt` with what the person added while the task ran (Steer, docs/live-agent-view.md Feature 5),
+ * one piece a line, so a retry, a plan or a review works to it as the agent it reached did: every
+ * piece given so far, read, carried or still waiting. Words added before the task started are part of
+ * its text already (`amend`), and a piece its task ended without was not used, so neither is added.
+ * `prompt` unchanged when there is nothing to add. Pure.
+ */
+export function withGuidance(prompt, items) {
+  const said = (Array.isArray(items) ? items : []).filter((s) => s && s.how !== 'amend' && s.state !== 'returned' && typeof s.text === 'string' && s.text.trim())
+  return said.length ? `${prompt}\n\n${GUIDANCE_HEAD}\n${said.map((s) => `- ${s.text.trim().replace(/\n/g, '\n  ')}`).join('\n')}` : prompt
+}
+
 function reviewPrompt(task, cwd, diff) {
   return [
     `Independently review the work another agent did for this task in ${cwd}.`,
@@ -614,14 +645,18 @@ function harnessHandoff({ task, attempts, diff, checks, previous }) {
  * @param {string} p.cwd
  * @param {string} [p.forceAgent]  manual override; skips Jev routing only
  * @param {object} p.config        plugin config (agents, tools, limits, thresholds, checks)
- * @param {object} p.deps          { offline?: true when the internet is unreachable (local agents only, no Jev), localOnly?: true to use local agents only while Jev still routes, checkBalance?(agentId) -> {state, balance, until} re-read after each attempt, ready?: {[agentId]: {loggedIn, detail}}, quota?: {[agentId]: {state, until}}, isLimitError?, onLimit?, logAttempt?, jev | null, jevUnavailableReason, execute(agentDef, prompt, signal, { effort, speed, untimed }) where untimed(promise) is a wait before the work that the agent's time limit does not count (attemptClock), runTool?(tool, args, task, signal), review?, emit?, history }
+ * @param {object} p.deps          { offline?: true when the internet is unreachable (local agents only, no Jev), localOnly?: true to use local agents only while Jev still routes, checkBalance?(agentId) -> {state, balance, until} re-read after each attempt, ready?: {[agentId]: {loggedIn, detail}}, quota?: {[agentId]: {state, until}}, isLimitError?, onLimit?, logAttempt?, jev | null, jevUnavailableReason, execute(agentDef, prompt, signal, { effort, speed, untimed, attempt, role }) where untimed(promise) is a wait before the work that the agent's time limit does not count (attemptClock), attempt is the attempt's index in the record (attempt_start's) and role its role (primary, retry, plan, review or opinion), runTool?(tool, args, task, signal), review?, emit?, history }
  *   and, for whoever decides: decider?: the createJev() client that answers, or null for none (`jev`
  *   is its old name, read only when `decider` is not given),
  *   provider?: that client's record (providers.js; a Jev record from config.thresholds without one);
  *   a client whose own record is another provider's is refused before anything runs,
  *   runId?: the run's id, minted by the caller so every file of the run shares it,
+ *   guidance?(runId): the steers of the task the run is a pass of (tasks.js), whose words every prompt
+ *   built carries (withGuidance); a piece no agent had read is carried with it, as a `steer` event says,
  *   deciderDevice?(): where a provider on this PC ran its calls ('cuda' | 'cpu'), for the report
  * @param {AbortSignal} p.signal
+ * @param {string|null} [p.taskKey]      the background task this run is a pass of (tasks.js key), kept on the history row
+ * @param {string|null} [p.intentSample] the intent sample of the message that asked for it, kept on the history row
  */
 /** The routing record's field for each kind of move the router makes on its own. */
 const MOVE_FIELD = Object.freeze({ capability: 'capabilityFrom', tiebreak: 'tiebrokeFrom', gate: 'gatedFrom', feedback: 'feedbackFrom' })
@@ -665,9 +700,32 @@ function accessRecord(access, { lockOfId, lockedIds, besideOther, lockCheck }) {
   return { mode: 'write', verdict, ...from }
 }
 
-export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: askedAnswerOnly = false, access = null, effort, config, deps, signal = new AbortController().signal }) {
-  // Menu choice wins over the Settings default; 'auto' in the menu defers to that default.
-  const level = effort && effort !== 'auto' ? effort : config.effort?.default ?? 'auto'
+/**
+ * The effort one agent's attempt starts at, worked out one way for every reader: the routed event's
+ * plan, each attempt_start and the parallel opinion, and whatever names the plan before it runs.
+ * The menu's `effort` wins over Settings' default ('auto' in the menu defers to it), and the agent's
+ * own Settings value wins over both; 'auto' reads the decider's complexity and risk (`routing`)
+ * against its effort `bands`, moved `shift` rungs by your ratings (effort.js effortBias). Returns
+ * `effort`, the value the agent is sent (null leaves its own default), `level`, the unified level it
+ * came from (null when the agent is sent none), `speed`, Codex's or Claude Code's speed setting (effort.js
+ * agentSpeed), and `nudged` when your ratings moved the level: `{ from, to, why }`, with `sameEffort` when
+ * the agent is sent the same effort either way.
+ */
+export function plannedEffort({ effort, config, agentDef, routing, model, bands, shift = 0 }) {
+  const asked = effort && effort !== 'auto' ? effort : config?.effort?.default ?? 'auto'
+  const family = effortFamily(agentDef)
+  const override = config?.effort?.perAgent?.[family]
+  const read = { complexity: routing?.complexity, risk: routing?.risk, override, bands }
+  const sent = toAgentEffort(asked, agentDef, { ...read, model, shift })
+  const level = sent == null ? null : unifiedLevel(asked, { ...read, shift })
+  const unmoved = sent == null || !shift ? level : unifiedLevel(asked, read)
+  // A step can leave what the agent is sent as it was (DeepSeek runs medium as it runs high, and
+  // Codex stops at its model's top): `sameEffort` says so, and nothing then names the step as a change.
+  const sameEffort = level !== unmoved && toAgentEffort(asked, agentDef, { ...read, model }) === sent
+  return { effort: sent, level, speed: agentSpeed(family, config?.effort), ...(level !== unmoved ? { nudged: { from: unmoved, to: level, why: 'your ratings', ...(sameEffort ? { sameEffort } : {}) } } : {}) }
+}
+
+export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: askedAnswerOnly = false, access = null, effort, config, deps, signal = new AbortController().signal, taskKey = null, intentSample = null }) {
   const emit = (type, data = {}) => deps.emit?.({ type, at: Date.now(), ...data })
   // A read pass (access.mode 'read'): a task the decider judged only reads, run beside any task
   // changing its folder on agents locked against writing (docs/queue-and-cost-findings.md 1). In
@@ -1030,6 +1088,9 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
   // that was, for every run, a manual one included: a forced agent under Laya Auto is still
   // Laya's to review. history.jsonl keeps it with the rest of `routing`.
   routing = { ...routing, decider: P.id }
+  // Laya Auto · Online's pool was the cloud and subscription agents only, which its record says beside
+  // `mode` (its lines read `(laya, online)`), so no reader of `mode` changes; Jev's record is as it was.
+  if (remoteOnly && routing.mode === 'jev' && P.id !== TEACHER) routing = { ...routing, online: true }
   // Jev has now said what the request needs, so the filter runs a second time with that answer
   // in hand: a `web_research` job must not run on an agent with no network, and a read-only
   // request must not demand - or be granted - write permission (a read pass is not: every agent
@@ -1274,13 +1335,48 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
     const cap = routing.capability
     const sure = typeof routing.capabilityConfidence === 'number' ? ` (${Math.round(routing.capabilityConfidence * 100)}%)` : ''
     if (cap && cap !== 'human_required' && !READ_PASS_CAPABILITIES.includes(cap)) {
-      throw needsLane(cap === 'other' ? `${P.name}'s routing could not name what it needs (other), and unsure means it may write`
-        : cap === 'web_research' ? `${P.name}'s routing named web_research${sure}, and no locked agent is known to reach the web`
-          : `${P.name}'s routing named ${cap}${sure}, which may change files`)
+      // A capability named as one that may change files says the work itself does (`changesFiles`);
+      // an unsure one says only that it might, and a look-up needs the web no locked agent reaches.
+      if (cap === 'other') throw needsLane(`${P.name}'s routing could not name what it needs (other), and unsure means it may write`)
+      if (cap === 'web_research') throw needsLane(`${P.name}'s routing named web_research${sure}, and no locked agent is known to reach the web`)
+      throw needsLane(`${P.name}'s routing named ${cap}${sure}, which may change files`, { changesFiles: true })
     }
     if (!lockOfId(workerAgent).lock) throw needsLane(`${workerAgent}, the agent picked for it, cannot be locked against writing: ${lockOfId(workerAgent).why}`)
   }
-  emit('routed', { routing, context, ms: Date.now() - routeStarted, tool: tool?.id, plan: { strategy: plan.strategy, steps: plan.steps, reviewer: plan.reviewer, forceReview: plan.forceReview, parallelWith: plan.parallelWith } })
+  // The effort each attempt starts at, read one way for the routed event and every attempt. Your
+  // ratings of the picks move Auto a rung for an agent's family on this task type (effort.js
+  // effortBias), unless Settings, Effort says they move nothing; ratings before its Reset are not read.
+  // A run with no task type (a forced agent, offline) is never moved.
+  const shiftFor = (agentDef) => (config.effort?.ratingsMove === false || !routing.taskType ? 0
+    : effortBias(everyVerdict, effortFamily(agentDef), routing.taskType, config.effort?.ratingsResetAt ?? null))
+  const effortFor = (agentDef) => plannedEffort({ effort, config, agentDef, routing, model: deps.modelOf?.(agentDef), bands: T.effortBands, shift: shiftFor(agentDef) })
+  // What runs, said with the plan: the agent that does the work with its model and the effort its
+  // first attempt starts at, and the planner and the reviewer when the plan has them, so whatever
+  // names the plan before it runs names what really runs.
+  const modelNamed = (id) => deps.modelOf?.(byId.get(id)) ?? null
+  const planAgent = plan.steps.find((st) => st.role === 'plan')?.agent
+  const reviews = plan.forceReview && plan.reviewer
+  // Whether your ratings moved the worker's Auto effort is said beside the plan, not in it.
+  const { nudged = null, ...workerEffort } = stopsForPerson ? {} : effortFor(byId.get(workerAgent))
+  // The agents switched on and allowed that could not be picked as this run was routed, and why: the
+  // hard facts by which a start reply that named one of them before the pick says why the plan
+  // changed (whyNotPicked).
+  const unavailable = [
+    ...notReady.map((a) => ({ agent: a.id, why: kindOf(a) === 'local' ? 'not-ready' : 'signed-out' })),
+    ...outAtStart.map((a) => ({ agent: a.id, why: 'limit', until: quota[a.id]?.until ?? null })),
+  ]
+  emit('routed', {
+    routing, context, ms: Date.now() - routeStarted, tool: tool?.id,
+    ...(unavailable.length ? { unavailable } : {}),
+    plan: { strategy: plan.strategy, steps: plan.steps, reviewer: plan.reviewer, forceReview: plan.forceReview, parallelWith: plan.parallelWith },
+    // A run about to stop for a person runs nothing, so it says so and names no agent that would.
+    ...(stopsForPerson ? { stopsForPerson: true } : {
+      primary: { agent: workerAgent, model: modelNamed(workerAgent), ...workerEffort },
+      ...(nudged ? { nudged } : {}),
+      ...(planAgent ? { planner: { agent: planAgent, model: modelNamed(planAgent) } } : {}),
+      ...(reviews ? { reviewer: { agent: plan.reviewer, model: modelNamed(plan.reviewer) } } : {}),
+    }),
+  })
 
   // 2. Baseline checks, so later failures can be told apart from pre-existing ones.
   //    Taken before the first agent attempt; a tool run skips them to stay fast.
@@ -1288,6 +1384,9 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
   // `env`, when the config gives one, is the environment the checks run the agent's code with.
   const checkOpts = { scripts: config.checks.scripts, timeoutMs: config.checks.timeoutMs, outputChars: config.checks.outputChars, signal, ...(config.checks.env ? { env: config.checks.env } : {}) }
   let baseline = null
+  // Whether files changed since the checks last ran: an attempt a usage limit stopped skips them,
+  // and the one that takes over may change nothing more on top of what it did.
+  let checksStale = false
   const ensureBaseline = async () => {
     if (baseline) return
     baseline = config.checks.enabled ? await runChecks(cwd, checkOpts) : []
@@ -1359,7 +1458,14 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
   let next = tool ? { agent: `tool:${tool.id}`, role: 'tool' } : { agent: firstStep.agent, role: firstStep.role }
   let status = null
   let statusReason = ''
+  // Whether a read pass goes back to its folder's line because its agent said the work changes
+  // files, as against a lock it could not have or keep (the hand-back's `changesFiles`).
+  let changesFiles = false
   let reviewed = false
+  // What the person added to the task while it ran (Steer, docs/live-agent-view.md Feature 5), as its
+  // task holds it now (deps.guidance), and the pieces no agent had read that a prompt here carried on.
+  const guidanceNow = () => { try { const g = deps.guidance?.(runId); return Array.isArray(g) ? g : [] } catch { return [] } }
+  const carried = new Set()
 
   // The decider can read a request as needing a person: a permission nobody granted, a
   // consequential choice, information only they have. Nothing is executed in that case - an agent
@@ -1391,11 +1497,14 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
       const before = readPass ? null : await snapshot(cwd, signal, gitOpts)
       const diffSoFar = attempts.length && !readPass ? await changedSince(cwd, startSnap, signal, gitOpts) : { stat: '', patch: '' }
       const opts = { near: near(next.agent), handoff: handoffNote, plan: planText, skill: plan.skill }
-      const prompt = next.role === 'tool' ? '' : readPass ? (next.role === 'primary' ? readPrompt(task, cwd, { skill: plan.skill }) : readRetryPrompt(task, cwd, attempts, { skill: plan.skill }))
+      const built = next.role === 'tool' ? '' : readPass ? (next.role === 'primary' ? readPrompt(task, cwd, { skill: plan.skill }) : readRetryPrompt(task, cwd, attempts, { skill: plan.skill }))
         : next.role === 'primary' ? basePrompt(task, cwd, opts)
         : next.role === 'plan' ? planPrompt(task, cwd, { skill: plan.skill })
         : next.role === 'review' ? reviewPrompt(task, cwd, diffSoFar)
         : retryPrompt(task, cwd, attempts, lastChecks, opts)
+      // Every prompt built from here on carries all the guidance given so far; a tool takes none.
+      const guidance = next.role === 'tool' ? [] : guidanceNow()
+      const prompt = next.role === 'tool' ? '' : withGuidance(built, guidance)
 
       const started = Date.now()
       // This attempt's place in the record. A parallel opinion is pushed right after it, so its
@@ -1403,14 +1512,20 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
       // index, and the primary would show no result at all.
       const attemptIndex = attempts.length
       const agentDef = byId.get(next.agent)
-      const family = effortFamily(agentDef)
-      const eff = next.role === 'tool' ? null
-        : toAgentEffort(level, agentDef, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[family], model: deps.modelOf?.(agentDef), bands: T.effortBands })
-      const speed = family === 'codex' ? config.effort?.codexSpeed : undefined
+      // As the routed event planned it for this agent (effortFor).
+      const planned = next.role === 'tool' ? null : effortFor(agentDef)
+      const eff = planned?.effort ?? null
+      const speed = planned?.speed ?? undefined
       // The effort as the attempt's record will say it, told as it starts: what a run holding the
       // lane is, for the estimate of the tasks waiting behind it (waits.js), before it has ended.
-      const effortWord = eff ? `${eff}${speed === 'fast' ? ' 1.5x' : ''}` : null
+      const effortWord = eff ? `${eff}${speedWord(speed)}` : null
       emit('attempt_start', { index: attemptIndex, agent: next.agent, role: next.role, ...(effortWord ? { effort: effortWord } : {}), ...(next.role === 'tool' ? { args: routing.toolArgs } : {}) })
+      // Guidance no agent had read goes to this attempt with its prompt: carried, and said so.
+      for (const s of guidance) {
+        if (s?.state !== 'pending' || s.how === 'amend' || typeof s.id !== 'string' || carried.has(s.id)) continue
+        carried.add(s.id)
+        emit('steer', { id: s.id, guidance: s.text, state: 'carried', attempt: attemptIndex, to: { agent: next.agent, role: next.role } })
+      }
       let result
       let lockLost = null
       let neverStarted = false
@@ -1444,12 +1559,12 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
       try {
         const main = Promise.resolve(next.role === 'tool'
           ? deps.runTool(tool, routing.toolArgs ?? {}, task, clock.signal)
-          : deps.execute(agentDef, prompt, clock.signal, { effort: eff, speed, untimed: clock.untimed, ...(readPass ? { locked: true, images, onStarted: () => startedLocked.add(agentDef.id) } : {}) }))
+          : deps.execute(agentDef, prompt, clock.signal, { effort: eff, speed, untimed: clock.untimed, attempt: attemptIndex, role: next.role, ...(readPass ? { locked: true, images, onStarted: () => startedLocked.add(agentDef.id) } : {}) }))
           .then((r) => { mainEndAt = Date.now(); return r }, (err) => { mainEndAt = Date.now(); throw err })
         if (opinionAgent) {
           parallelDone = true
           emit('attempt_start', { index: attemptIndex + 1, agent: opinionAgent.id, role: 'opinion' })
-          const side = deps.execute(opinionAgent, prompt, sideClock.signal, { effort: toAgentEffort(level, opinionAgent, { complexity: routing.complexity, risk: routing.risk, override: config.effort?.perAgent?.[effortFamily(opinionAgent)], model: deps.modelOf?.(opinionAgent), bands: T.effortBands }), untimed: sideClock.untimed, onEnded: sideEnd, ...(readPass ? { locked: true, images, onStarted: () => startedLocked.add(opinionAgent.id) } : {}) })
+          const side = deps.execute(opinionAgent, prompt, sideClock.signal, { effort: effortFor(opinionAgent).effort, untimed: sideClock.untimed, onEnded: sideEnd, attempt: attemptIndex + 1, role: 'opinion', ...(readPass ? { locked: true, images, onStarted: () => startedLocked.add(opinionAgent.id) } : {}) })
             .then((r) => { sideEnd(); return r }, (err) => { sideEnd(); return signal.aborted ? Promise.reject(err) : { stopReason: 'error', diagnostic: describeError(err), answerText: '', ...(err?.code === LOCK_UNAVAILABLE ? { notStarted: true, lockLost: true } : err?.notStarted ? { notStarted: true } : {}) } })
           // A primary that breaks off (it throws: it could not start locked, or its agent failed
           // outright) stops the opinion and waits for it to end: one left running would work on
@@ -1479,6 +1594,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
       // Locked against writing, a read pass changed nothing by construction; it is never credited
       // with what a task writing beside it changed.
       const changes = readPass ? { files: [] } : await changedSince(cwd, before, signal, gitOpts)
+      if (next.role !== 'tool' && (changes.files === null || changes.files.length > 0)) checksStale = true
       let limit = next.role === 'tool' ? { hit: false }
         : (deps.isLimitError ? deps.isLimitError(byId.get(next.agent), result) : builtinLimit(result)) ?? { hit: false }
       const attempt = {
@@ -1495,6 +1611,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
         changedFiles: changes.files,
         ...(next.role === 'tool' ? {} : { model: deps.modelOf?.(agentDef) }),
         ...(next.role === 'tool' ? {} : servedModel(result)),
+        ...(next.role === 'tool' ? {} : reportedModel(result)),
         ...(effortWord ? { effort: effortWord } : {}),
         ...(limit.hit ? { limitHit: true } : {}),
         // Why it never started: its lock could not be had, or it was stopped first (lockLost says which).
@@ -1503,7 +1620,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
       attempts.push(attempt)
       if (opinion) {
         const cutOff = brokeOffFirst && opinion.stopReason !== 'completed' && !opinion.lockLost
-        const o = { agent: opinionAgent.id, role: 'opinion', stopReason: opinion.stopReason, diagnostic: cutOff ? `stopped when ${attempt.agent} broke off` : opinion.diagnostic, answerText: opinion.answerText, ...(cutOff ? { cutOff: true } : {}), durationMs: (sideEndAt ?? Date.now()) - started - sideClock.waitedMs, ...(sideClock.waitedMs ? { waitedMs: sideClock.waitedMs } : {}), changedFiles: [], model: deps.modelOf?.(opinionAgent), ...servedModel(opinion), ...(readPass ? (opinion.notStarted ? { notStarted: true, ...(opinion.lockLost ? { lockLost: true } : {}) } : { locked: true }) : {}) }
+        const o = { agent: opinionAgent.id, role: 'opinion', stopReason: opinion.stopReason, diagnostic: cutOff ? `stopped when ${attempt.agent} broke off` : opinion.diagnostic, answerText: opinion.answerText, ...(cutOff ? { cutOff: true } : {}), durationMs: (sideEndAt ?? Date.now()) - started - sideClock.waitedMs, ...(sideClock.waitedMs ? { waitedMs: sideClock.waitedMs } : {}), changedFiles: [], model: deps.modelOf?.(opinionAgent), ...servedModel(opinion), ...reportedModel(opinion), ...(readPass ? (opinion.notStarted ? { notStarted: true, ...(opinion.lockLost ? { lockLost: true } : {}) } : { locked: true }) : {}) }
         attempts.push(o)
         // The opinion's own usage limit and its call's row in usage.jsonl, as for the primary's
         // below: a spent key is rotated, or the agent is out for the rest of the run (never asked
@@ -1513,7 +1630,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
           const oLimit = cutOff ? { hit: false } : (deps.isLimitError ? deps.isLimitError(opinionAgent, opinion) : builtinLimit(opinion)) ?? { hit: false }
           // A complete answer stands, as a primary's does, and the key is spent all the same.
           if (oLimit.hit) { if (opinion.stopReason === 'completed' && opinion.answerText?.trim()) o.spentAfter = true; else o.limitHit = true }
-          const entry = { ts: new Date().toISOString(), runId, workspace: cwd, agent: opinionAgent.id, role: 'opinion', durationMs: o.durationMs, tokens: opinion.usage ?? null, costUsd: opinion.costUsd ?? null, stopReason: opinion.stopReason, limitHit: !!oLimit.hit, ...(sideAt ? { account: sideAt.account } : {}) }
+          const entry = { ts: new Date().toISOString(), runId, workspace: cwd, agent: opinionAgent.id, role: 'opinion', durationMs: o.durationMs, tokens: opinion.usage ?? null, costUsd: opinion.costUsd ?? null, ...apiEquivalent(opinion), stopReason: opinion.stopReason, limitHit: !!oLimit.hit, ...(sideAt ? { account: sideAt.account } : {}) }
           await (async () => deps.logAttempt?.(entry))().catch(() => {})
           if (oLimit.hit) {
             const until = oLimit.until ?? null
@@ -1555,6 +1672,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
           const said = opinion.answerText.slice(wants.index + wants[0].length).replace(/\s+/g, ' ').trim().slice(0, 200)
           status = 'needs_write'
           statusReason = `${opinionAgent.id} said it needs to change files${said ? `: ${said}` : ''}`
+          changesFiles = true
           return true
         }
         const answered = attempts.findLast((a) => a.role === 'opinion')
@@ -1574,6 +1692,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
           const said = result.answerText.slice(wantsWrite.index + wantsWrite[0].length).replace(/\s+/g, ' ').trim().slice(0, 200)
           status = 'needs_write'
           statusReason = `${attempt.agent} said it needs to change files${said ? `: ${said}` : ''}`
+          changesFiles = true
           return 'line'
         }
         if (answered) { status = 'answered'; return 'answered' }
@@ -1612,7 +1731,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
       }
 
       if (next.role !== 'tool') {
-        const entry = { ts: new Date().toISOString(), runId, workspace: cwd, agent: next.agent, role: next.role, durationMs: attempt.durationMs, tokens: result.usage ?? null, costUsd: result.costUsd ?? null, stopReason: result.stopReason, limitHit: !!limit.hit, ...(mainAt ? { account: mainAt.account } : {}) }
+        const entry = { ts: new Date().toISOString(), runId, workspace: cwd, agent: next.agent, role: next.role, durationMs: attempt.durationMs, tokens: result.usage ?? null, costUsd: result.costUsd ?? null, ...apiEquivalent(result), stopReason: result.stopReason, limitHit: !!limit.hit, ...(mainAt ? { account: mainAt.account } : {}) }
         await (async () => deps.logAttempt?.(entry))().catch(() => {})
       }
 
@@ -1707,7 +1826,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
         continue
       }
 
-      if (config.checks.enabled && next.role !== 'tool' && (changes.files === null || changes.files.length > 0)) lastChecks = await runChecks(cwd, checkOpts)
+      if (config.checks.enabled && next.role !== 'tool' && checksStale) { lastChecks = await runChecks(cwd, checkOpts); checksStale = false }
       attempt.checks = lastChecks.map(({ name, passed, exitCode, durationMs }) => ({ name, passed, exitCode, durationMs }))
       emit('attempt_end', { index: attemptIndex, attempt: { ...attempt, answerText: (attempt.answerText ?? '').slice(0, 4000) } })
       const cmp = compareChecks(baseline ?? [], lastChecks)
@@ -1850,6 +1969,14 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
     // Which conversation this run belongs to. Without it consecutive runs look unrelated, so
     // "that was wrong, do it again" reads as a brand new job and the correction is lost.
     ...(sessionId ? { sessionId } : {}),
+    // The background task this run is a pass of, by the key no restart hands to another task (a job
+    // id it may), and the intent sample of the message that asked for it.
+    ...(taskKey ? { taskKey } : {}),
+    ...(intentSample ? { intentSample } : {}),
+    // The person's guidance that reached the work as it ran (read, carried, or sent with no word back),
+    // and whether words were added to the task before it started: the run then says less of how well
+    // its agents did alone, which what is learned from it leaves out (profiles.js, training.js).
+    ...steeredOf(guidanceNow(), carried),
     workspace: cwd,
     task,
     context,
@@ -1884,7 +2011,7 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
     // A breach the lock check measured goes with the task: the writer that runs after it starts from
     // the changed files, and nothing else would ever name them.
     const breach = lockCheck?.measured && lockCheck.changed?.length ? { changed: lockCheck.changed, agents: lockedIds } : null
-    throw needsLane(statusReason, { readPass: { runId, agent: reader?.agent ?? null, durationMs: reader?.durationMs ?? null, ...(lockCheck ? { lockCheck } : {}), ...(breach ? { breach } : {}) } })
+    throw needsLane(statusReason, { ...(changesFiles ? { changesFiles } : {}), readPass: { runId, agent: reader?.agent ?? null, durationMs: reader?.durationMs ?? null, ...(lockCheck ? { lockCheck } : {}), ...(breach ? { breach } : {}) } })
   }
   emit('final', { status, statusReason })
   // Whose words the person is shown: the PRIMARY's answer. A parallel second opinion is pushed
@@ -1893,6 +2020,13 @@ export async function runRouted({ task, cwd, sessionId, forceAgent, answerOnly: 
   // attempt completed an answer.
   const last = answeringAttempt(attempts)
   return { ...record, lastAnswer: last?.answerText ?? '', lastAnswerBy: last ? `${last.agent}${last.model || last.effort ? ` (${[last.model, last.effort].filter(Boolean).join(', ')})` : ''}, ${last.role}` : '' }
+}
+
+/** The record's `steered` (how many pieces of guidance reached the work) and `amended`, each only when it holds. */
+function steeredOf(guidance, carried) {
+  const steered = new Set([...carried, ...guidance.filter(reachedWork).map((s) => s.id)]).size
+  const amended = guidance.some((s) => s?.how === 'amend')
+  return { ...(steered ? { steered } : {}), ...(amended ? { amended: true } : {}) }
 }
 
 /** A read verdict in words: who judged it, how sure, against which bar. */
@@ -1957,6 +2091,20 @@ export function movesOf(R) {
   return Object.entries(MOVE_FIELD).filter(([, f]) => R?.[f]).map(([kind, f]) => ({ kind, from: R[f], to: R.primaryAgent }))
 }
 
+/**
+ * Why the routing whose `routed` event is `e` did not give the work to the agent `agentId`, when a
+ * hard fact on the event says so (reply-words.js changeReason): it could not be picked, signed out
+ * (`signed-out`), a model on this PC that cannot run (`not-ready`) or at its usage limit (`limit`,
+ * with `until`, when it resets), or the pick was moved off it past its weekly gate (`gate`) or by
+ * your feedback (`feedback`). Null when nothing on the event explains it: the pick was a judgment.
+ */
+export function whyNotPicked(e, agentId) {
+  const out = (Array.isArray(e?.unavailable) ? e.unavailable : []).find((u) => u?.agent === agentId)
+  if (out) return { kind: out.why, until: out.until ?? null }
+  const move = movesOf(e?.routing).find((m) => m.from === agentId && (m.kind === 'gate' || m.kind === 'feedback'))
+  return move ? { kind: move.kind, until: null } : null
+}
+
 /** One move in words, for the report. */
 export function moveLine(m, R = {}) {
   if (m.kind === 'capability') return `${m.from} cannot do this (${R.capability ?? 'capability unclear'}): ${m.to} took the work`
@@ -1966,8 +2114,9 @@ export function moveLine(m, R = {}) {
   return `Work moved from ${m.from} to ${m.to}`
 }
 
-const STRIP_LABEL = 'jev-agents'
-const STRIP_PREFIX = 'kzh-agents-1-'
+// The chain as the chat's agent strip reads it (client.js STRIP_MARK), encoded where every hidden
+// mark a message carries is (reply-words.js), since a start reply carries one as a report does.
+export { agentsMark }
 
 // Whose words you are reading: the last attempt that produced an answer, never a parallel
 // second opinion - that one is its own step in the chain, not the answer - unless nothing else
@@ -2000,17 +2149,51 @@ export function answeredSteps(r) {
   // One chain, in the order the work actually moved: router, then whoever worked, then
   // whoever judged. Agents used to be joined with a middot, which read as an unordered list
   // and hid the handover.
-  // The router's step names who decided, as the report's heading does (adapter.js decidedBy):
-  // the run's decider (Jev, or Laya with its client's model label) whenever it answered a domain,
-  // or when there is no per-domain report (legacy named routing); else the local router; else the
-  // rules in code alone.
-  const decider = r.routing?.decider ?? TEACHER
-  const auths = new Set(Object.values(r.routing?.decision?.domains ?? {}).map((d) => d?.authority))
-  const byDecider = !r.routing?.decision || auths.has(decider)
-  const router = r.routing?.mode === 'jev' || r.routing?.mode === 'local'
-    ? [byDecider ? { agent: providerName(decider), model: r.routing.model ?? '', roles: [] } : { agent: auths.has('local') ? 'Local router' : 'Routing rules', model: '', roles: [] }]
-    : []
-  return [...router, ...steps]
+  const router = routerStep(r.routing)
+  return [...(router ? [router] : []), ...steps]
+}
+
+/**
+ * Who decided a run's routing, from its routing record, as the report's heading says it (adapter.js
+ * decidedBy): 'decider', the run's decider (Jev, or Laya), whenever it answered a domain, or when
+ * there is no per-domain report (legacy named routing); else 'local', the local router, when it
+ * decided one; else 'rules', the rules in code alone, which is what a routing the decider was asked
+ * for and could not answer comes to. Null when nothing routed: a forced agent, the offline rule or a
+ * fallback. The agent strip's router step names it (routerStep), and a start reply's credit follows
+ * it (pickedBy), so the two never name different pickers.
+ */
+export function routedBy(routing) {
+  if (routing?.mode !== 'jev' && routing?.mode !== 'local') return null
+  const auths = new Set(Object.values(routing.decision?.domains ?? {}).map((d) => d?.authority))
+  return !routing.decision || auths.has(routing.decider ?? TEACHER) ? 'decider' : auths.has('local') ? 'local' : 'rules'
+}
+
+/**
+ * Who picked a run's plan, as a start reply's credit names it (reply-words.js creditLine): 'you' for
+ * a forced agent; 'rules' for a fallback; and for a routing whose decider was asked before the pick
+ * (`called`), who decided it (routedBy), as the agent strip under the reply names the router:
+ * 'decider', 'rules' when the decider answered no domain of it (its calls failed, or its answers were
+ * too flat to use), or 'local'. A pick made with no call to the decider, the offline rule's included,
+ * is 'local', so the decider is never credited with a pick it was not asked for.
+ */
+export function pickedBy(routing, called) {
+  if (routing?.mode === 'manual') return 'you'
+  if (routing?.mode === 'fallback') return 'rules'
+  const by = called ? routedBy(routing) : null
+  return by === 'decider' || by === 'rules' ? by : 'local'
+}
+
+/**
+ * The router's step of the chain, from a run's routing record: who decided (routedBy), named as the
+ * report's heading names it, the run's decider with the model its answers came from (Jev, or Laya
+ * with its client's model label), the local router or the routing rules. None when nothing routed.
+ */
+export function routerStep(routing) {
+  const by = routedBy(routing)
+  if (!by) return null
+  return by === 'decider'
+    ? { agent: providerName(routing.decider ?? TEACHER), model: routing.model ?? '', roles: [] }
+    : { agent: by === 'local' ? 'Local router' : 'Routing rules', model: '', roles: [] }
 }
 
 /** "Jev (jev-1.13.0) → deepseek (deepseek-flash) → claude (opus) [reviewer]": who took part, in order. */
@@ -2033,7 +2216,7 @@ export function formatReport(r) {
   // with no per-domain report (legacy named routing) was the decider's. The heading names them
   // only: the "Decided by" line under it says which domain each one answered.
   const decided = decidedBy(R.decision?.domains, { detail: false }) ?? `${name} decided`
-  const modeLabel = { jev: `AUTO (${decided})`, manual: `MANUAL /${R.primaryAgent}`, fallback: `AUTO, ${name.toUpperCase()} UNAVAILABLE: routing fallback activated`, offline: 'OFFLINE: local models only', local: `AUTO (${decided}), LOCAL MODELS ONLY` }[R.mode]
+  const modeLabel = { jev: `AUTO (${decided})${R.online ? ', CLOUD AND SUBSCRIPTION AGENTS ONLY' : ''}`, manual: `MANUAL /${R.primaryAgent}`, fallback: `AUTO, ${name.toUpperCase()} UNAVAILABLE: routing fallback activated`, offline: 'OFFLINE: local models only', local: `AUTO (${decided}), LOCAL MODELS ONLY` }[R.mode]
   lines.push(`**${name} router** · ${modeLabel}${R.mode !== 'offline' && r.offline ? ' · OFFLINE: local models only' : ''}`)
   if (R.mode === 'fallback') lines.push(`Fallback reason: ${R.reason}. Default agent: ${R.primaryAgent}`)
   lines.push(`- Selected agent: **${R.primaryAgent}**${R.mode === 'jev' ? ` (confidence ${pct(R.agentConfidence)}; ${Object.entries(R.agentProbabilities).map(([k, v]) => `${k} ${pct(v)}`).join(', ')})` : ''}`)
@@ -2147,6 +2330,6 @@ export function formatReport(r) {
   // reference definition renders as nothing, while raw HTML in message text comes out escaped,
   // so this is the only channel that carries data without showing it.
   const steps = answeredSteps(r)
-  if (steps.length) lines.push('', `[${STRIP_LABEL}]: ${STRIP_PREFIX}${Buffer.from(JSON.stringify(steps)).toString('base64url')}`)
+  if (steps.length) lines.push('', agentsMark(steps))
   return lines.join('\n')
 }

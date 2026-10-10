@@ -1,0 +1,36 @@
+The two folders dsh-subagent-claude-code and dsh-subagent-codex hold lib/index.js and package.json
+of the npm packages @deepseek-ai/dsh-subagent-claude-code and @deepseek-ai/dsh-subagent-codex,
+version 0.1.5-rc.2 (repository https://github.com/deepseek-ai/deepseek-harness, folders
+packages/subagent/subagent-claude-code and packages/subagent/subagent-codex), copied from the published
+packages byte for byte but for one character: the em-dash in each file's "no working directory"
+error is a hyphen here, since this repository keeps that character out of every file. They are the connector files scripts/patch-agent-live.mjs is written
+against, kept here so its tests patch exactly what the harness installs (test/patch-agent-live.test.js).
+
+The folder stubs holds small stand-ins, written for these tests, for the packages those files
+import: @deepseek-ai/schemastery, dsh-timeout, dsh-subagent, dsh-brand, dsh-subprocess and
+dsh-sdk-protocol, @anthropic-ai/claude-agent-sdk and @openai/codex. They are not copies of those
+packages.
+
+Both connector packages are published under this license:
+
+MIT License
+
+Copyright (c) 2026 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

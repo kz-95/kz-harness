@@ -16,7 +16,9 @@ function describe(value) {
 
 /**
  * Poll `read` until `ok(read())` is true, then return that value. Throw once `timeoutMs`
- * has passed. A throw from `read` counts as "not ready yet" and is retried.
+ * has passed. A throw from `read` counts as "not ready yet" and is retried, and is never handed
+ * to `ok`: a check such as `Boolean` would take the error's text for the value, as a JSONL row
+ * read while its line is half appended once made a read of `history.jsonl` return a string.
  *
  * @param {string} label    what is being waited for, used in the failure message
  * @param {() => any} read  reads the current state
@@ -26,8 +28,9 @@ export async function waitFor(label, read, ok, { timeoutMs = 2000, everyMs = 10 
   const deadline = Date.now() + timeoutMs
   for (;;) {
     let value
-    try { value = read() } catch (err) { value = `not readable yet: ${err.message}` }
-    if (ok(value)) return value
+    let readable = true
+    try { value = read() } catch (err) { value = `not readable yet: ${err.message}`; readable = false }
+    if (readable && ok(value)) return value
     if (Date.now() >= deadline) throw new Error(`${label}: still not true after ${timeoutMs}ms, last state: ${describe(value)}`)
     await new Promise((r) => setTimeout(r, everyMs))
   }

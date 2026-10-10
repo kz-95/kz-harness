@@ -15,7 +15,9 @@
 //   - no retries, since a retry only queues the same work again; the one exception is a 401, which
 //     usually means the SDK client was built before a restart changed the key.
 // Each call is rendered for Laya, merged and normalised here (laya-questions.js), so the acting
-// path and the shadow path read the same answers, and relabelled with what really answered.
+// path and the shadow path read the same answers, and relabelled with what really answered. Each
+// request laya.serve answers is also handed, as it was sent, to `onAnswered` (the comparison with
+// colibri's Laya, colibri-laya.js), which nothing here waits for.
 import { TypeSafeClient } from '@typesafe-ai/sdk'
 import {
   ADAPTER_VERSION, DEFAULT_CORRECTIONS, DEFAULT_MIN_TOP_MARGIN, LAYA_MODEL,
@@ -97,8 +99,12 @@ function unavailableReason(err) {
  * @param {Function} [p.fetch]   the fetch the SDK uses, for tests
  * @param {object} [p.adapter]   { renderForLaya, mergeLaya, normalizeLayaAnswers }, for tests
  * @param {object} [p.timing]    { waitAfterMs, waitEveryMs, pollMs, exitSettleMs }, for tests
+ * @param {(answered: object) => unknown} [p.onAnswered]  each request laya.serve answered, the moment
+ *   its answer is in: `{ request, response, ms, phase, role, runId, device, more }`, `more` when
+ *   laya.serve has more to answer at once, called synchronously and never awaited; whatever it does,
+ *   the call goes on (docs/laya-auto.md 13)
  */
-export function createLayaClient({ sidecar, settings, isLocalBusy = () => false, log = () => {}, now = Date.now, fetch, adapter = {}, timing = {} } = {}) {
+export function createLayaClient({ sidecar, settings, isLocalBusy = () => false, log = () => {}, now = Date.now, fetch, adapter = {}, timing = {}, onAnswered = null } = {}) {
   const cfg = settings ?? {}
   const D = { floorMs: 8000, ceilingMs: 120_000, hardMs: 270_000, ...cfg.deadlines }
   const S = { maxQueue: 8, maxAgeMs: 600_000, chunkRows: 4, ...cfg.shadow }
@@ -182,9 +188,10 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
    * One HTTP request of a call, already rendered, on the connection given. A 401 rebuilds the client
    * from the sidecar's current connection and is sent once more; anything else fails the request,
    * classified, after the sidecar is told how it went (500 and 401 counting, the idle timer, the
-   * measured cost, the GPU spill check).
+   * measured cost, the GPU spill check). `more()` says, once the answer is in, whether laya.serve has
+   * more to answer at once.
    */
-  async function send(request, conn, { phase, role }) {
+  async function send(request, conn, { phase, role, runId = null, more = () => false }) {
     let api = apiFor(conn)
     for (let tries = 0; ; tries++) {
       const t0 = now()
@@ -211,9 +218,23 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
         await note({ status: 200, ms: now() - t0, tokens: 0, phase, role })
         throw layaError('LAYA_BAD_ANSWER', 'Laya answered with something that is not an answer')
       }
-      const noted = await note({ status: 200, ms: now() - t0, tokens: Number(data.usage?.input_tokens) || 0, phase, role })
+      const ms = now() - t0
+      handOn({ request, response: data, ms, phase, role, runId, device: conn?.device ?? null, more: !!more() })
+      const noted = await note({ status: 200, ms, tokens: Number(data.usage?.input_tokens) || 0, phase, role })
       return { data, conn, spilling: noted?.line ?? null }
     }
+  }
+
+  /** Another call waits for laya.serve besides `current`: an acting call, or a shadow job. */
+  const callsWaiting = (current) => actQueue.some((j) => !j.abandoned && !j.settled) || shadowQueue.some((j) => j !== current && !j.withdrawn)
+
+  /** A request laya.serve answered, handed to `onAnswered` at once and never waited for: a throw or a rejection is logged, and the call goes on. */
+  function handOn(answered) {
+    if (!onAnswered) return
+    try {
+      const out = onAnswered(answered)
+      if (typeof out?.catch === 'function') out.catch((err) => log(`laya: ${err?.message ?? err}`))
+    } catch (err) { log(`laya: ${err?.message ?? err}`) }
   }
 
   /** A failed request as the Laya error the caller reads. */
@@ -291,7 +312,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
    * the deadline or when the caller's signal fires, at once, while a request already on the wire
    * keeps the slot until its own response arrives.
    */
-  async function act({ state, questions }, { signal, phase } = {}, { onWait } = {}) {
+  async function act({ state, questions }, { signal, phase } = {}, { onWait, runId = null } = {}) {
     const line = (text) => { try { onWait?.(text) } catch { /* the caller's line */ } }
     signal?.throwIfAborted()
     if (disposed) throw layaError('LAYA_UNAVAILABLE', 'Laya was stopped with KzH')
@@ -321,7 +342,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
 
     return new Promise((resolve, reject) => {
       const job = {
-        kind: 'act', phase, state, questions, requests, predicted, totalMs, deadlineMs, rows, device, line,
+        kind: 'act', runId, phase, state, questions, requests, predicted, totalMs, deadlineMs, rows, device, line,
         enqueuedAt: now(), startedAt: null, abandoned: false, settled: false, gone: new AbortController(), timers: {},
         ...queuedBehind(),
       }
@@ -390,7 +411,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
         setLevel('normal', { force: true })
         slot.predictedEndAt = now() + sum(job.predicted.slice(i))
         const r = job.requests[i]
-        const out = await send(r, conn, { phase: job.phase, role: 'act' })
+        const out = await send(r, conn, { phase: job.phase, role: 'act', runId: job.runId, more: () => i < job.requests.length - 1 || callsWaiting(null) })
         parts.push({ key: r.key, response: out.data, device: out.conn.device ?? conn.device })
         spillLine ??= out.spilling
       }
@@ -502,7 +523,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
     setLevel('below_normal')
     let failure = null
     try {
-      const out = await send(request, conn, { phase: job.phase, role: 'shadow' })
+      const out = await send(request, conn, { phase: job.phase, role: 'shadow', runId: job.runId, more: () => job.next < job.requests.length || callsWaiting(job) })
       job.parts.push({ key: request.key, response: out.data, device: out.conn.device ?? conn.device })
     } catch (err) {
       failure = err
@@ -622,7 +643,7 @@ export function createLayaClient({ sidecar, settings, isLocalBusy = () => false,
       }
     }
     if (role !== 'act') throw new Error("laya client: role is 'act' or 'shadow'")
-    return { systemOne: (body, options) => act(body, options, { onWait }) }
+    return { systemOne: (body, options) => act(body, options, { onWait, runId }) }
   }
 
   return {

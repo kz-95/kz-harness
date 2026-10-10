@@ -5,7 +5,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { availableParallelism, tmpdir, userInfo } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -328,6 +328,10 @@ test('protected files, the only files that may change, what the agent left outsi
   const root = scratch()
   mkdirSync(join(root, 'mine'))
   writeFileSync(join(root, 'README.md'), 'scratch\n')
+  // Dated a minute back, as a file there before a task is: its change below keeps its size, so only its time shows it,
+  // and a write in the same tick of the clock as this one would keep that.
+  const minuteAgo = new Date(Date.now() - 60_000)
+  utimesSync(join(root, 'README.md'), minuteAgo, minuteAgo)
   const before = await listTree(root, { skip: 'mine' })
   writeFileSync(join(root, 'stray.txt'), 'left here\n')
   mkdirSync(join(root, 'newdir', 'deep'), { recursive: true })

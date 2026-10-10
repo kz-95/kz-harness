@@ -141,7 +141,10 @@ function Test-Module($m) {
   $ms = [DateTimeOffset]::new($item.LastWriteTimeUtc).ToUnixTimeMilliseconds()
   return $mark -and $mark.size -eq $item.Length -and [math]::Floor($mark.mtimeMs) -eq $ms -and $mark.sha256 -eq $m.sha256
 }
+# A candidate row carries no size or SHA256 until scripts\pin-model.mjs pins it: nothing downloads it.
+function Test-Pinned($m) { return ($m.size -gt 0) -and ("$($m.sha256)" -match '^[0-9a-f]{64}$') }
 function Get-Verified($m, $dest) {
+  if (-not (Test-Pinned $m)) { throw "$($m.file): no size and SHA256 to check it against, so it is not downloaded" }
   $part = "$dest.part"
   & curl.exe -fL --retry 5 -C - -o $part $m.source
   if ($LASTEXITCODE) { throw "download of $($m.file) failed (run again to resume)" }
@@ -175,12 +178,15 @@ $variant = ($manifest | Where-Object { $_.kind -eq 'engine' -and $_.minCuda -and
 if (-not $variant) { $variant = if (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA|GeForce|AMD|Radeon|Intel' }) { 'vulkan' } else { 'cpu' } }
 $engineMods = @($manifest | Where-Object { $_.kind -eq 'engine' -and $_.variant -eq $variant })
 $models = @($manifest | Where-Object { $_.kind -ne 'engine' })
-foreach ($m in $models) { Write-Host ("   {0,-20} {1,-28} {2,5:N1} GB  {3}" -f $m.id, $m.name, ($m.size / 1GB), $(if (Test-Module $m) { 'installed' } else { '-' })) }
+foreach ($m in $models) {
+  if (-not (Test-Pinned $m)) { Write-Host ("   {0,-20} {1,-28} not checked yet: run node scripts\pin-model.mjs {0}" -f $m.id, $m.name); continue }
+  Write-Host ("   {0,-20} {1,-28} {2,5:N1} GB  {3}" -f $m.id, $m.name, ($m.size / 1GB), $(if (Test-Module $m) { 'installed' } else { '-' }))
+}
 if (-not $LocalModels) {
   Write-Host "   Nothing downloaded. Install with -LocalModels <id,id|all>, or type /install-llm in Kz-harness (it suggests what fits this PC)."
 } else {
   $ids = @($LocalModels | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
-  $want = if ($ids -contains 'all') { $models } else { @($ids | ForEach-Object { $id = $_; $m = $models | Where-Object { $_.id -eq $id }; if (-not $m) { throw "unknown local model '$id'; valid: $(($models.id) -join ', '), all" }; $m }) }
+  $want = if ($ids -contains 'all') { @($models | Where-Object { Test-Pinned $_ }) } else { @($ids | ForEach-Object { $id = $_; $m = $models | Where-Object { $_.id -eq $id }; if (-not $m) { throw "unknown local model '$id'; valid: $(($models.id) -join ', '), all" }; if (-not (Test-Pinned $m)) { throw "$id is not checked yet: run node scripts\pin-model.mjs $id first; nothing was downloaded" }; $m }) }
   $todo = @()
   if (-not (@($manifest | Where-Object kind -eq 'engine' | Group-Object variant | Where-Object { @($_.Group | Where-Object { -not (Test-Module $_) }).Count -eq 0 }).Count)) { $todo += $engineMods }
   foreach ($m in $want) {

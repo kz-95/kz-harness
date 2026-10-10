@@ -7,13 +7,19 @@ rem   Speed-Run.bat --context 24576          the context KzH starts local models
 rem                                          the profile sets one this cannot read
 rem   Speed-Run.bat --no-pause               no key press at the end (Task Scheduler)
 rem   Speed-Run.bat --verbose                the engine log as it runs
+rem   Speed-Run.bat --accept-output          accept the new output a run kept aside, for the
+rem                                          models named with --models or every one waiting;
+rem                                          it measures nothing
 rem Readings go to local.json, where KzH reads them at its next start. Every run is logged in
 rem %USERPROFILE%\.kzh\jev-router\speed-runs: speed-runs.log, one entry per run, and a detail
 rem log per run beside it (see scripts\speed-run.mjs).
 rem Ctrl+C cancels; cmd then asks "Terminate batch job (Y/N)?": answer N to keep the window
 rem open on the results.
 rem Exit codes: 0 all measured, 1 a model not measured, 2 could not run, 3 KzH or another
-rem speed run is running, 130 cancelled with Ctrl+C.
+rem speed run is running, 4 all measured but a model's output differs from its baseline (its
+rem figure is kept aside until accepted), 130 cancelled with Ctrl+C. --accept-output exits 0
+rem when every output asked for is accepted (or none was waiting), 2 when a model named has
+rem none waiting, 3 as a run does.
 setlocal
 set pause=1
 for %%a in (%*) do if /i "%%~a"=="--no-pause" set pause=0

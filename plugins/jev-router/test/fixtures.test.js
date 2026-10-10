@@ -1,5 +1,7 @@
 // The shared test code in test/fixtures, which every group's tests run against (docs/laya-auto.md
-// 9.2): the fake laya.serve, and kzh-bodies.json, KzH's four request bodies.
+// 9.2): the fake laya.serve, kzh-bodies.json, KzH's four request bodies, the chat stream of the
+// fake llama-server (docs/live-agent-view.md 6), its /v1/models, refused ports and strangers, and the
+// fake download host.
 //
 // These tests test test code, not the plugin: the fake imports nothing of it, and kzh-bodies.json
 // is held to the jev.js builders, which this change leaves as they were. So they pass on any code
@@ -19,6 +21,8 @@ import { TypeSafeClient } from '@typesafe-ai/sdk'
 import { createJev } from '../jev.js'
 import { CAPABILITIES } from '../capabilities.js'
 import { defaultAnswer, startFakeLaya } from './fixtures/fake-laya-serve.mjs'
+import { startFakeColibri } from './fixtures/fake-colibri-laya.mjs'
+import { fakeDownload, fakeLlamaServer } from './fixtures/fake-llama-server.mjs'
 import { waitFor } from './wait-for.js'
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-laya-serve.mjs', import.meta.url))
@@ -315,4 +319,157 @@ test('run as the interpreter, the fake exits when told to, and a taken port fail
   await waitFor('the bind failure', () => taken.out.code, (c) => c !== undefined, { timeoutMs: 10000 })
   assert.equal(taken.out.code, 1)
   assert.equal(taken.out.stderr, `ERROR:    [Errno 98] error while attempting to bind on address ('127.0.0.1', ${holder.port}): address already in use\n`)
+})
+
+// ---------------------------------------------------------------- the fake llama-server's chat stream
+
+/** The fake with an engine loaded under the key `k`, as local.js starts one. */
+function llamaWith(options) {
+  const server = fakeLlamaServer(options)
+  server.spawn('llama-server', ['--alias', 'm', '-c', '4096'], { env: { LLAMA_API_KEY: 'k' } })
+  const ask = (signal) => server.fetch('http://127.0.0.1:1/v1/chat/completions', { method: 'POST', headers: { authorization: 'Bearer k', 'content-type': 'application/json' }, body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true }), signal })
+  return { server, ask }
+}
+/** Each `data:` payload of a streamed answer, with the time it came. */
+async function payloadsOf(response) {
+  const got = []
+  const dec = new TextDecoder()
+  let buf = ''
+  for await (const bytes of response.body) {
+    buf += dec.decode(bytes, { stream: true })
+    for (let i; (i = buf.indexOf('\n\n')) >= 0; buf = buf.slice(i + 2)) got.push({ at: Date.now(), data: buf.slice(0, i).replace(/^data: /, '') })
+  }
+  return got
+}
+
+test('the fake llama-server streams a chat answer a word an event, paced, with a quiet pause where it is asked for, and ends with the finish, the usage and [DONE]', async () => {
+  const { ask } = llamaWith({ chat: () => ({ reasoning: 'Look first.', content: 'It is in parse.js', toolCalls: [{ id: 'c1', name: 'read', arguments: '{"path": "parse.js"}' }], paceMs: 20, quiet: { after: 2, ms: 400 } }) })
+  const res = await ask()
+  assert.equal(res.headers.get('content-type'), 'text/event-stream')
+  const got = await payloadsOf(res)
+  assert.equal(got.at(-1).data, '[DONE]')
+  const events = got.slice(0, -1).map((g) => JSON.parse(g.data))
+  const deltas = events.flatMap((e) => e.choices.map((c) => c.delta))
+  assert.deepEqual(deltas.filter((d) => d.reasoning_content).map((d) => d.reasoning_content), ['Look ', 'first.'])
+  assert.deepEqual(deltas.filter((d) => d.content).map((d) => d.content), ['It ', 'is ', 'in ', 'parse.js'])
+  const calls = deltas.flatMap((d) => d.tool_calls ?? [])
+  assert.deepEqual([calls[0].id, calls[0].function.name], ['c1', 'read'])
+  assert.equal(calls.map((c) => c.function.arguments).join(''), '{"path": "parse.js"}')
+  assert.equal(events.at(-2).choices[0].finish_reason, 'tool_calls')
+  assert.deepEqual(events.at(-1).usage, { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 })
+  // Each event comes its pace after the last, and the pause after the second, a model thinking
+  // before it speaks, is the longest wait of all.
+  const gaps = got.slice(1).map((g, i) => g.at - got[i].at)
+  assert.ok(gaps.every((g) => g >= 15), `paced: ${gaps.join(', ')} ms`)
+  assert.ok(gaps[1] >= 380 && gaps[1] === Math.max(...gaps), `a quiet pause after the second event: ${gaps.join(', ')} ms`)
+})
+
+test('the fake llama-server cuts a stream where it is asked to, with no finish_reason and no [DONE], as a server that died', async () => {
+  const { ask } = llamaWith({ chat: () => ({ content: 'The fix is in parse.js and', cut: { after: 3 } }) })
+  const got = await payloadsOf(await ask())
+  assert.deepEqual(got.map((g) => JSON.parse(g.data).choices[0].delta.content), ['The ', 'fix ', 'is '])
+  assert.equal(got.some((g) => g.data === '[DONE]' || JSON.parse(g.data).choices[0].finish_reason), false)
+  // Without a script, a short answer that ends as a whole one does.
+  const plain = await payloadsOf(await llamaWith().ask())
+  assert.deepEqual(plain.slice(0, 1).map((g) => JSON.parse(g.data).choices[0].delta.content), ['Done.'])
+  assert.equal(plain.at(-1).data, '[DONE]')
+})
+
+test('the fake llama-server stops an answer aborted mid-stream with the signal\'s reason, and logs each abort with the events it had sent, a held request\'s included', async () => {
+  const { server, ask } = llamaWith({ chat: () => ({ content: 'one two three four five six', paceMs: 40 }) })
+  const ac = new AbortController()
+  const res = await ask(ac.signal)
+  const reader = res.body.getReader()
+  await reader.read()
+  await reader.read()
+  ac.abort()
+  await assert.rejects(reader.read(), (err) => err.name === 'AbortError')
+  assert.equal(server.aborts.length, 1)
+  assert.deepEqual([server.aborts[0].path, server.aborts[0].model], ['/v1/chat/completions', 'm'])
+  assert.ok(server.aborts[0].sent >= 2 && server.aborts[0].sent < 7, JSON.stringify(server.aborts))
+  // One held before it is answered is aborted with nothing sent.
+  const held = server.hold('/v1/chat/completions')
+  const again = new AbortController()
+  const asking = ask(again.signal)
+  await held.arrived
+  again.abort()
+  await assert.rejects(asking, (err) => err.name === 'AbortError')
+  assert.deepEqual(server.aborts.at(-1), { path: '/v1/chat/completions', model: 'm', sent: 0 })
+})
+
+test('the fake llama-server answers /v1/models with the start\'s key only, an engine on a port it refuses says so and exits without answering, and a stranger answers its port in the engine\'s place', async () => {
+  const server = fakeLlamaServer({ refuses: (port) => port === 8081, stranger: (port) => (port === 9000 ? () => new Response('not llama-server') : null) })
+  const refused = server.spawn('llama-server', ['--alias', 'm', '--port', '8081'], { env: { LLAMA_API_KEY: 'k1' } })
+  const said = []
+  refused.stderr.on('data', (d) => said.push(String(d)))
+  const exited = new Promise((r) => refused.once('exit', r))
+  await assert.rejects(server.fetch('http://127.0.0.1:8081/health'), /connection refused/, 'it never answers on a port it could not bind')
+  assert.equal(await exited, 1)
+  assert.match(said.join(''), /couldn't bind HTTP server socket, hostname: 127\.0\.0\.1, port: 8081/)
+  server.spawn('llama-server', ['--alias', 'm', '--port', '8082'], { env: { LLAMA_API_KEY: 'k2' } })
+  const models = (key) => server.fetch('http://127.0.0.1:8082/v1/models', { headers: { authorization: `Bearer ${key}` } })
+  assert.deepEqual(await (await models('k2')).json(), { object: 'list', data: [{ id: 'm', aliases: ['m'], object: 'model', owned_by: 'llamacpp' }] })
+  assert.equal((await models('k1')).status, 401)
+  assert.deepEqual(server.probes.map((p) => [p.port, p.authorization]), [[8082, 'Bearer k2'], [8082, 'Bearer k1']])
+  assert.equal(server.requests.length, 0, 'the checks are kept apart from the requests')
+  assert.equal(await (await server.fetch('http://127.0.0.1:9000/health')).text(), 'not llama-server')
+})
+
+test('the fake download host serves a Range with its Content-Range, and cuts, resumes from elsewhere, ignores the Range, fails or stalls where it is told to', async () => {
+  const data = Buffer.from('0123456789')
+  const host = fakeDownload(data, [{ cutAfter: 4 }, { from: 0 }, { ignoreRange: true }, { status: 503 }, { stall: true }])
+  const text = async (r) => Buffer.from(await r.arrayBuffer()).toString()
+  const cut = await host.fetch('u')
+  const reader = cut.body.getReader()
+  assert.equal(Buffer.from((await reader.read()).value).toString(), '0123', 'the bytes before the cut arrive')
+  await assert.rejects(reader.read(), (err) => err.message === 'terminated' && err.cause.message === 'other side closed')
+  const elsewhere = await host.fetch('u', { headers: { range: 'bytes=4-' } })
+  assert.deepEqual([elsewhere.status, elsewhere.headers.get('content-range'), await text(elsewhere)], [206, 'bytes 0-9/10', '0123456789'])
+  const whole = await host.fetch('u', { headers: { range: 'bytes=4-' } })
+  assert.deepEqual([whole.status, whole.headers.get('content-range'), await text(whole)], [200, null, '0123456789'])
+  assert.equal((await host.fetch('u')).status, 503)
+  const stop = new AbortController()
+  const stalled = await host.fetch('u', { signal: stop.signal })
+  const quiet = stalled.arrayBuffer()
+  stop.abort(new Error('given up'))
+  await assert.rejects(quiet, /given up/)
+  const past = await host.fetch('u', { headers: { range: 'bytes=6-' } })
+  assert.deepEqual([past.status, past.headers.get('content-range'), await text(past)], [206, 'bytes 6-9/10', '6789'], 'past the plan, served as asked')
+  assert.deepEqual(host.ranges, [null, 'bytes=4-', 'bytes=4-', null, null, 'bytes=6-'])
+})
+
+test('the fake colibri answers colibri\'s own example as colibri documents it: a noul with no confidence, a choice and a score with (n * peak - 1) / (n - 1), /health with no loaded list, and its 422 envelope for a choice whose criteria are a list', async (t) => {
+  // colibri docs/laya.md's request, answered with its probabilities, to 6 decimals as colibri gives them.
+  // The score and the urgency's confidence come out a millionth off the docs' 1.772169 and 0.71661,
+  // which colibri works out before rounding; the fake starts from the rounded figures.
+  const said = { department: [0.986516, 0.007975, 0.005509], urgency: [0.038904, 0.150022, 0.811074], churn_risk: [0.120981, 0.879019] }
+  const fake = await startFakeColibri({ answer: (name) => said[name] })
+  t.after(() => fake.close())
+  const post = (body) => fetch(`${fake.url}/v1/systemone`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  const res = await post({
+    model: 'jev-latest',
+    state: 'Hi, we were billed twice for March. Please refund the duplicate today or we will cancel our plan.',
+    questions: {
+      department: { type: 'choice', instructions: 'Which department should handle this?', criteria: { billing: 'invoices, payments, refunds', technical: 'bugs, outages, system errors', other: 'everything else' } },
+      urgency: { type: 'score', instructions: 'How urgent is this?', criteria: ['not urgent', 'soon', 'blocking'] },
+      churn_risk: { type: 'noul', instructions: 'Does the user threaten to cancel or leave?', labels: { true: 'A', false: 'B' } },
+    },
+  })
+  assert.equal(res.status, 200)
+  const reply = await res.json()
+  assert.match(reply.id, /^req_/)
+  assert.deepEqual({ ...reply, id: 'req' }, {
+    id: 'req', model: 'laya', provider: 'colibri',
+    answers: {
+      department: { type: 'choice', choice: 'billing', probabilities: { billing: 0.986516, technical: 0.007975, other: 0.005509 }, confidence: 0.979774 },
+      urgency: { type: 'score', score: 1.77217, legend: { 0: 'not urgent', 1: 'soon', 2: 'blocking' }, probabilities: { 0: 0.038904, 1: 0.150022, 2: 0.811074 }, confidence: 0.716611 },
+      churn_risk: { type: 'noul', noul: 0.879019 },
+    },
+    usage: { input_tokens: reply.usage.input_tokens, output_tokens: 0, cost: 0 },
+  })
+  assert.equal(await (await fetch(`${fake.url}/health`)).text(), '{"status":"ok"}', 'no loaded list')
+  const refused = await post({ state: 'x', questions: { pick: { type: 'choice', criteria: ['a', 'b'] } } })
+  assert.equal(refused.status, 422)
+  assert.deepEqual(await refused.json(), { error: { message: '`questions.pick.criteria` must be a non-empty object of label: description.', type: 'invalid_request_error', param: 'questions.pick.criteria', code: null } })
+  assert.equal(fake.requests.filter((r) => r.path === '/v1/systemone').length, 2)
 })

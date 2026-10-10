@@ -7,7 +7,7 @@
 // really is not: nothing here asserts on a number a stub handed it.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { saveArtifact, trainMulticlass } from '../classifier.js'
@@ -463,6 +463,25 @@ test('scenario AA and AB: domains mature on their own, and a new resource touche
   assert.equal(reg.get('resource_selection').state().maturity, 'JEV_PRIMARY')
 })
 
+test('a registry disposed of, as the plugin closing or applied again leaves it, saves no domain state or artifact after, so the ones the plugin that replaces it saved stay', async () => {
+  const root = dir()
+  const store = storeAt(root)
+  await fill(store, 'task_classification', 20)
+  const registry = () => { const reg = createDomainRegistry({ policy: smallPolicy(), store, artifactsDir: join(root, 'classifiers'), stateDir: root, now: () => NOW }); reg.load(); return reg }
+  /** Every file the domains keep, with its size and time, so a rewrite of the same bytes shows too. */
+  const stamps = (at = root) => readdirSync(at, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? stamps(join(at, e.name)) : e.name.endsWith('.json') ? [`${join(at, e.name)}\t${statSync(join(at, e.name)).size}\t${statSync(join(at, e.name)).mtimeMs}`] : []))
+  const closed = registry()
+  closed.dispose?.()
+  // The plugin that replaces it evaluates every domain, trains a classifier and saves it all.
+  await registry().evaluateAll()
+  const theirs = stamps()
+  assert.ok(theirs.some((s) => s.includes(join('classifiers', 'task_classification.json'))), 'it saved an artifact')
+  // An evaluation pass of the closed plugin, still going once closing stopped waiting for it, ends now.
+  await new Promise((r) => setTimeout(r, 20))
+  await closed.evaluateAll()
+  assert.deepEqual(stamps(), theirs, 'no state file or artifact was written again')
+})
+
 test('a resource ranker at LOCAL_ONLY steps down when a resource is added', async () => {
   const root = dir()
   const store = storeAt(root)
@@ -580,6 +599,66 @@ test('where the caller says a local classifier may not decide, it does not, on t
   const down = await ctl.decide({ features: highFeatures, jev: async () => { throw new Error('teacher down') }, fallback: fallback('low'), localMayDecide: false })
   assert.deepEqual([down.authority, down.label], ['fallback', 'low'], 'with the teacher down too, the deterministic answer stands and the classifier does not')
   assert.equal(down.local?.label, 'high')
+})
+
+// The message intent's rules, on a domain stated here as routing-policy.js ships it, so the rules are
+// domains.js's to keep whatever the shipped policy says (test/policy.test.js holds that).
+const INTENT = { risk: 'LOW', kind: 'multiclass', label: 'message intent', localLabels: ['task'], requiredClasses: ['task', 'question'] }
+const intentPolicy = () => smallPolicy({ domains: { intent: INTENT } })
+/** One verified intent row in `sample()`'s separable shape: a task on its high side, a question on its low side. */
+async function verifiedIntent(store, i, label) {
+  const s = sample(label === 'task' ? 2 * i : 2 * i + 1)
+  const row = await store.append({ domain: 'intent', input: { features: s.features }, teacher: { label, probabilities: { [label]: 0.9 }, confidence: 0.9, model: 'jev-test' }, local: null, authority: 'jev' })
+  await store.resolveOutcome(row.id, { label, labelSource: 'verified_outcome', verified: true, details: { finalStatus: 'accepted', attempts: 1, escalated: false } })
+}
+const lowFeatures = { numeric: { score: 0.25, other: 0.3 }, categorical: { kind: 'b' } }
+
+test('a domain with localLabels [\'task\'] at LOCAL_ONLY asks the teacher for a trusted local \'question\' and reports authority jev; a trusted local \'task\' decides without the teacher', async () => {
+  const root = dir()
+  const store = storeAt(root)
+  for (let i = 0; i < 100; i++) await verifiedIntent(store, i, i % 2 ? 'question' : 'task')
+  const ctl = controller({ domain: 'intent', policy: intentPolicy(), store, root })
+  assert.equal(await climbTo(ctl, 'LOCAL_ONLY'), 'LOCAL_ONLY')
+  let asked = 0
+  const jev = async () => { asked++; return { label: 'task', probabilities: { task: 0.8, question: 0.2 }, confidence: 0.8, model: 'jev-test' } }
+  const task = () => ({ label: 'task', probabilities: { task: 1 }, confidence: 0.5 })
+  const q = await ctl.decide({ features: lowFeatures, jev, fallback: task })
+  assert.equal(q.local?.label, 'question', 'the setting: the classifier says question')
+  assert.ok(q.local.confidence >= q.requiredConfidence && !q.ood.flag, 'and is sure enough, on familiar input, that any other answer would have been decided here')
+  assert.equal(asked, 1, 'the teacher is asked')
+  assert.deepEqual([q.authority, q.label], ['jev', 'task'], 'and decides')
+  assert.equal(q.reason, 'local answer question recorded; only task may be decided on this PC')
+  assert.equal((await store.get(q.sampleId)).local.label, 'question', 'the classifier\'s answer is kept beside the teacher\'s')
+  // With the teacher down, the deterministic answer stands: a mature classifier answers for a teacher
+  // that is down only with an answer it may decide.
+  const down = await ctl.decide({ features: lowFeatures, jev: async () => { asked++; throw new Error('teacher down') }, fallback: task })
+  assert.deepEqual([down.authority, down.label], ['fallback', 'task'])
+  const t = await ctl.decide({ features: highFeatures, jev, fallback: task })
+  assert.deepEqual([t.authority, t.label], ['local', 'task'], 'a trusted local task decides')
+  assert.equal(asked, 2, 'without the teacher')
+  assert.deepEqual(ctl.state().localLabels, ['task'], 'and the domain says what its rung buys it, which is what the Router tab reads')
+})
+
+test('requiredClasses blocks GUARDED_LOCAL until each class has perClassSamples verified rows', async () => {
+  // A question in every 26 messages: 4 in 104, under the share that makes a class significant, so
+  // no gate that reads the significant classes sees them, and every other gate passes.
+  const root = dir()
+  const store = storeAt(root)
+  for (let i = 0; i < 104; i++) await verifiedIntent(store, i, i % 26 === 13 ? 'question' : 'task')
+  const ctl = controller({ domain: 'intent', policy: intentPolicy(), store, root })
+  assert.equal(await climbTo(ctl, 'GUARDED_LOCAL'), 'SHADOW', 'a store of nearly one class reaches SHADOW, where the classifier decides nothing, and no further')
+  const gates = (await ctl.evaluate()).gates
+  assert.deepEqual(gates.filter((g) => !g.ok).map((g) => [g.name, g.required, g.actual]), [['verified samples of question', 10, 4]], 'the questions it has not seen enough of are all that stops it')
+  assert.deepEqual(gates.find((g) => g.name === 'verified samples of task'), { name: 'verified samples of task', required: 10, actual: 100, ok: true })
+  // A question in every 8: 13 of them, enough, in a store of the same size.
+  const enough = dir()
+  const more = storeAt(enough)
+  for (let i = 0; i < 104; i++) await verifiedIntent(more, i, i % 8 === 3 ? 'question' : 'task')
+  const climbed = controller({ domain: 'intent', policy: intentPolicy(), store: more, root: enough })
+  assert.equal(await climbTo(climbed, 'GUARDED_LOCAL'), 'GUARDED_LOCAL')
+  // LOCAL_ONLY, the rung above, waits on the same counts: the evaluation that climbed lists its gates.
+  assert.equal(climbed.state().progress.next, 'LOCAL_ONLY')
+  assert.ok(climbed.state().progress.gates.some((g) => g.name === 'verified samples of question' && g.required === 10 && g.actual === 13), 'the rung above holds the class to the same count')
 })
 
 test('a conservation state file, classifier and samples left by an older version are ignored at start-up', async () => {

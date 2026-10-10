@@ -12,9 +12,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn as nodeSpawn } from 'node:child_process'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { delimiter, dirname, join } from 'node:path'
+import { basename, delimiter, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { TypeSafeClient } from '@typesafe-ai/sdk'
@@ -22,12 +23,13 @@ import { TypeSafeClient } from '@typesafe-ai/sdk'
 // test fails by its own assertion there rather than all of them at link time (9.1).
 import * as jevRouter from '../index.js'
 import { renderOptions, startFakeLaya } from './fixtures/fake-laya-serve.mjs'
+import { optionCount, startFakeColibri } from './fixtures/fake-colibri-laya.mjs'
 import { waitFor } from './wait-for.js'
 
 const REPO = fileURLToPath(new URL('../../../', import.meta.url))
 // Every folder this file makes, the engine home above first, removed once more when the file is
-// done: a plugin can still be finishing a write (Laya's standing, a task record) after its test
-// closed it, and that write makes its data folder again.
+// done: the engine home has no test of its own to remove it, and a run of a closed plugin still at
+// work when its test ended (one a test left held) still appends to its data folder as it ends.
 const made = [process.env.DSH_HOME]
 process.on('exit', () => { for (const dir of made) rmSync(dir, { recursive: true, force: true }) })
 const COMMIT = '1a2b3c4d5e6f7a8b9c0d'.padEnd(40, '0')
@@ -69,12 +71,14 @@ const typesafe = (url) => { try { return /typesafe/i.test(new URL(url).host) } c
 
 // Jev, as the TypeSafe SDK answers for every client that is not Laya's on this PC: each call kept
 // as it would leave the machine, each question answered from `jev.said` (a value or a function of
-// the call's state), else by its type.
+// the call's state), else by its type. A call for which `jev.refuses` (a function of the call's
+// questions) returns true fails, as a call to a Jev that is down does.
 const realSystemOne = TypeSafeClient.prototype.systemOne
-const jev = { calls: [], said: {} }
+const jev = { calls: [], said: {}, refuses: null }
 TypeSafeClient.prototype.systemOne = function systemOne(request, options) {
   if (/^http:\/\/127\.0\.0\.1:\d+$/.test(this.baseURL)) return realSystemOne.call(this, request, options)
   jev.calls.push({ baseURL: this.baseURL, body: JSON.stringify(request) })
+  if (jev.refuses?.(request.questions)) return Promise.reject(Object.assign(new Error('503 Service Unavailable'), { status: 503 }))
   const answers = {}
   for (const [name, q] of Object.entries(request.questions)) {
     const s = typeof jev.said[name] === 'function' ? jev.said[name](request.state) : jev.said[name]
@@ -144,9 +148,9 @@ async function installLaya(harnessDir, dataDir) {
 
 /**
  * What a test leaves in the temp folder goes when it ends: each plugin it made is closed first,
- * since one that is closing still writes to its data folder, and then each folder it made is
- * removed. One hook per test, so a plugin made later on another's folders is closed before either
- * goes. `dirs` are that test's folders to remove.
+ * which waits for what it still has to write to its data folder (index.js closeWithin), and then
+ * each folder it made is removed. One hook per test, so a plugin made later on another's folders
+ * is closed before either goes. `dirs` are that test's folders to remove.
  */
 const cleanups = new WeakMap()
 function cleanUp(t, ...dirs) {
@@ -177,22 +181,35 @@ const AGENTS = [
  * supervisor's interpreter is a child that only stays alive, and the fake laya.serve answers on
  * the port and key it was handed, from this process, as `world.said` says; with `world.failStart`
  * the next start exits before it is ready, and `world.loadMs` is how long the model takes to load.
+ * `replies` goes to apply() as its seam of that name (how soon a start reply that never said what it
+ * named is taken to have named nothing). A message the plugin appends to the chat for which
+ * `world.refuseAppend` returns true is refused, as a chat that cannot take it at that moment does.
+ * `world.attachments`, when a test sets it, is the engine's store of attached pictures, which reads
+ * a picture's bytes (`readImageRequest`) for a task that must hand it to an agent.
+ * `reload` names the plugin closed just before, which the engine applies again as a setting changes:
+ * the engine's parts are that one's (the data folder, the workspace, the chat's agent, the agents it
+ * starts, the world they report to and its job service), and so is the registry its work still going
+ * is handed over through (handover.js), where a plugin on a data folder shared otherwise starts as
+ * after a restart of the app, with nothing handed over.
  */
-async function plugin(t, { installed = true, pins = true, laya = {}, settings, config = {}, jobs = false, supervisor = {}, local, localModels = {}, dataDir: sharedData, harnessDir: sharedHarness, accounts, onSpawn } = {}) {
+async function plugin(t, { installed = true, pins = true, laya = {}, settings, config = {}, jobs = false, supervisor = {}, local, localModels = {}, dataDir: sharedData, harnessDir: sharedHarness, accounts, onSpawn, replies, reload = null } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'kz-laya-integration-'))
   const cleanup = cleanUp(t, root)
-  const dataDir = sharedData ?? join(root, 'data')
-  const harnessDir = sharedHarness ?? join(root, 'harness')
+  // Imported here, so this file still loads where there is no handover.js.
+  const { createHandover } = await import('../handover.js').catch(() => ({}))
+  const handover = reload?.engine.handover ?? createHandover?.()
+  const dataDir = reload?.dataDir ?? sharedData ?? join(root, 'data')
+  const harnessDir = reload?.harnessDir ?? sharedHarness ?? join(root, 'harness')
   mkdirSync(dataDir, { recursive: true })
-  if (installed && !sharedHarness) await installLaya(harnessDir, dataDir)
+  if (installed && !sharedHarness && !reload) await installLaya(harnessDir, dataDir)
   const pinsFile = join(harnessDir, 'config', 'laya.json')
   if (pins && !existsSync(pinsFile)) { mkdirSync(dirname(pinsFile), { recursive: true }); copyFileSync(join(REPO, 'config', 'laya.json'), pinsFile) }
   if (settings) { mkdirSync(join(dataDir), { recursive: true }); writeFileSync(join(dataDir, 'laya.json'), JSON.stringify(settings)) }
   if (accounts) writeFileSync(join(dataDir, 'accounts.json'), JSON.stringify(accounts))
-  const workspace = repo()
-  cleanUp(t, workspace)
+  const workspace = reload?.workspace ?? repo()
+  if (!reload) cleanUp(t, workspace)
   const children = []
-  const world = { said: {}, fakes: [], spawned: [], children, loadMs: 0, failStart: false, work: null, reply: null, outcome: null, beforeDispose: null, delivered: [], chat: [], emitted: [], disposed: [], providers: {}, readTools: ['read', 'glob', 'grep'], toolMode: 'native', childSees: null }
+  const world = reload?.world ?? { said: {}, fakes: [], spawned: [], children, loadMs: 0, failStart: false, work: null, reply: null, outcome: null, beforeDispose: null, delivered: [], notices: [], refuseAppend: null, chat: [], emitted: [], disposed: [], providers: {}, readTools: ['read', 'glob', 'grep'], toolMode: 'native', childSees: null, attachments: null }
 
   const spawn = (cmd, args, opts) => {
     world.spawned.push({ cmd, args, env: opts.env })
@@ -213,8 +230,8 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
     return child
   }
 
-  const ran = []
-  const subagents = {
+  const ran = reload?.ran ?? []
+  const subagents = reload?.engine.subagents ?? {
     // The providers as the engine names them: spawn takes a per-start tool filter, and any other
     // (the plan-mode Claude Code row) is what a test puts in `world.providers`.
     getProvider: (name) => world.providers[name] ?? (name === 'spawn' ? { capabilities: { toolFilter: true } } : undefined),
@@ -226,6 +243,7 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
       // really got is read after that.
       await world.beforeStart?.(n)
       entry.effortEnv = process.env.CLAUDE_CODE_EFFORT_LEVEL ?? null
+      entry.fastEnv = process.env.KZ_CLAUDE_FAST_MODE ?? null
       const result = (async () => {
         await world.work?.(opts, n)
         // A stopped agent's run rejects, as the engine's subagents do.
@@ -244,14 +262,21 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
     },
   }
   let jobCount = 0
-  const jobService = {
+  const jobService = reload?.engine.jobService ?? {
     start: (spec) => { const id = `jev-${++jobCount}`; spec.run(); return id },
     wait: () => new Promise(() => {}),
     read: (id) => ({ text: '', snapshot: { id } }),
     kill: () => 'requested',
   }
 
-  const agent = { id: SESSION, session: { id: SESSION, header: { cwd: workspace }, append: (_kind, msg) => world.delivered.push(msg) }, whenIdle: async () => {} }
+  // A result's summary names its task between `·`s (delivery.js); a milestone notice's never holds
+  // one (reply-words.js), and is kept apart, so `delivered` counts results as it always has.
+  const isResult = (msg) => String(msg?.source?.summary ?? '').includes('·')
+  const append = (_kind, msg) => {
+    if (world.refuseAppend?.(msg)) throw new Error('the chat could not take it')
+    ;(isResult(msg) ? world.delivered : world.notices).push(msg)
+  }
+  const agent = reload?.agent ?? { id: SESSION, session: { id: SESSION, header: { cwd: workspace }, append }, whenIdle: async () => {} }
   const effects = []
   const effect = (f) => { const d = f(); if (typeof d === 'function') effects.push(d) }
   const commands = new Map()
@@ -260,9 +285,9 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
   let adapter = null
   const llm = {
     registerAdapter: (ids, a) => { if (ids.includes('jev')) adapter = a; return () => {} },
-    // A chat model that answers every question the same way.
+    // A chat model that answers every question the same way, and keeps what it was sent.
     stream: (opts) => (async function* () {
-      world.chat.push({ provider: opts.provider, model: opts.model, purpose: opts.purpose ?? null })
+      world.chat.push({ provider: opts.provider, model: opts.model, purpose: opts.purpose ?? null, messages: opts.messages ?? [] })
       const text = 'A monad chains computations that carry a context.'
       yield { type: 'block-start', index: 0, blockType: 'text' }
       yield { type: 'text-delta', index: 0, text }
@@ -283,7 +308,7 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
   const ctx = {
     credentials: { resolve: async (ref) => (ref === 'TYPESAFE_API_KEY' ? { value: 'tsk_integration_test' } : undefined) },
     effect, subagents,
-    get: (name) => (name === 'jobs' && jobs ? jobService : null),
+    get: (name) => (name === 'jobs' && jobs ? jobService : name === 'attachments' ? world.attachments : null),
     commands: { register: (cmd) => { commands.set(cmd.name, cmd) } },
     // The registry as a scope sees it: the read tools mounted (`world.readTools`), presented natively
     // (`world.toolMode`), and a child seeing its allow list, or what `world.childSees` says it sees.
@@ -310,11 +335,13 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
       ...seams,
     },
     local,
+    handover,
     // No model of this machine's reaches these tests. Without this the manifest and the models
     // folder of the real installation are read, so whatever the owner happens to have installed
     // becomes an extra routing candidate and the answer depends on the PC the suite runs on. A
     // model this harness wants is given through `config.agents`, as the local agent already is.
     localModels: { modules: [], modelsDir: join(harnessDir, 'no-models'), ...localModels },
+    ...(replies ? { replies } : {}),
   })
 
   let closed = false
@@ -328,14 +355,20 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
   cleanup.closes.push(close)
 
   const messages = []
-  /** One message typed into the row `model` (Laya Auto by default), as the engine streams it through the adapter. */
-  async function say(text, { model = 'laya-auto', purpose, signal, effort } = {}) {
-    if (!purpose) messages.push({ role: 'user', content: [{ type: 'text', text }] })
+  /**
+   * One message typed into the row `model` (Laya Auto by default), as the engine streams it through
+   * the adapter, with `images`, the content parts of the pictures attached to it. `hold`, when a test
+   * gives it, is awaited with each event and the reply so far before the next event is read, as a
+   * chat slow to take a reply holds it.
+   */
+  async function say(text, { model = 'laya-auto', purpose, signal, effort, images = [], hold } = {}) {
+    if (!purpose) messages.push({ role: 'user', content: [{ type: 'text', text }, ...images] })
     const out = { text: '', reasoning: '' }
     const options = purpose ? { model, purpose, messages: [{ role: 'user', content: [{ type: 'text', text }] }], sessionId: SESSION } : { model, messages: [...messages], sessionId: SESSION, signal, ...(effort ? { reasoningEffort: effort } : {}) }
     for await (const e of adapter.stream(options)) {
       if (e.type === 'text-delta') out.text += e.text
       if (e.type === 'reasoning-delta') out.reasoning += e.text
+      await hold?.(e, out)
     }
     if (!purpose) messages.push({ role: 'assistant', content: [{ type: 'text', text: out.text }] })
     return out
@@ -359,17 +392,25 @@ async function plugin(t, { installed = true, pins = true, laya = {}, settings, c
 
   const read = (name) => (existsSync(join(dataDir, name)) ? readFileSync(join(dataDir, name), 'utf8') : '')
   const rows = (name) => read(name).split('\n').filter(Boolean).map((l) => JSON.parse(l))
-  return { dataDir, harnessDir, workspace, world, ran, commands, tools, agent, say, http, slash, read, rows, close, adapter: () => adapter }
+  return { dataDir, harnessDir, workspace, world, ran, commands, tools, agent, say, http, slash, read, rows, close, adapter: () => adapter, engine: { subagents, jobService, handover } }
 }
 
 /** Every file under `dir`, with its size and time, so a test can wait until nothing more is written. */
 function filesUnder(dir, out = []) {
-  if (!existsSync(dir)) return out
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
+  // A file or folder can go between the listing and its read: a store writes `<file>.tmp` and renames
+  // it over the file. It is left out, and the listing after this one shows the change all the same.
+  const gone = (err) => { if (err.code !== 'ENOENT') throw err }
+  let entries
+  try { entries = readdirSync(dir, { withFileTypes: true }) } catch (err) { gone(err); return out }
+  for (const e of entries) {
     const p = join(dir, e.name)
     if (e.isDirectory()) filesUnder(p, out)
-    // A tab, not a colon: `C:\path` splits on a colon and every reader would open `...\C`.
-    else { const s = statSync(p); out.push(`${p}\t${s.size}\t${s.mtimeMs}`) }
+    else {
+      let s
+      try { s = statSync(p) } catch (err) { gone(err); continue }
+      // A tab, not a colon: `C:\path` splits on a colon and every reader would open `...\C`.
+      out.push(`${p}\t${s.size}\t${s.mtimeMs}`)
+    }
   }
   return out
 }
@@ -390,8 +431,9 @@ async function until(label, read, ok, { timeoutMs = 10_000, everyMs = 25 } = {})
   const deadline = Date.now() + timeoutMs
   for (;;) {
     let value
-    try { value = await read() } catch (err) { value = `not readable yet: ${err.message}` }
-    if (ok(value)) return value
+    let readable = true
+    try { value = await read() } catch (err) { value = `not readable yet: ${err.message}`; readable = false }
+    if (readable && ok(value)) return value
     if (Date.now() > deadline) throw new Error(`${label}: still not true after ${timeoutMs} ms, last: ${JSON.stringify(value)?.slice(0, 800)}`)
     await tick(everyMs)
   }
@@ -560,6 +602,32 @@ test('offline, Laya Auto keeps deciding: Laya routes the task to a local model, 
   assert.equal(record.routing.decision.domains.task_classification.authority, 'laya', 'Laya decided the task')
 })
 
+test('Laya Auto · Online and · Local run as Laya Auto does over their own pool: Laya decides and reviews, its store learns, nothing is shadowed and Jev is never asked', async (t) => {
+  const local = { readiness: async () => ({ installed: true, loggedIn: true, detail: 'ready' }), chatModel: async () => 'qwen3-8b' }
+  const agents = [...AGENTS, { id: 'qwen-local', name: 'Local agent', provider: 'spawn', description: 'The native harness agent on the local model on this PC.', enabled: true, llm: { provider: 'local', model: 'qwen3-8b' } }]
+  const p = await plugin(t, { local, config: { agents } })
+  await started(p)
+  assert.deepEqual((await p.adapter().listModels('jev')).map((m) => m.id).slice(0, 4), ['jev-auto', 'laya-auto', 'laya-online', 'laya-local'], 'right after Laya Auto')
+  const jevBefore = jev.calls.length
+  const online = await p.say('Fix the failing test in the parser', { model: 'laya-online' })
+  assert.match(online.text.split('\n')[0], /^\*\*Laya router\*\* · AUTO \(.*\), CLOUD AND SUBSCRIPTION AGENTS ONLY$/, online.text)
+  assert.match(online.reasoning, /Routed to (?!qwen-local)[\w-]+ \(laya, online\)/, 'a cloud or subscription agent, never the local model')
+  const local1 = await p.say('Fix the failing test in the lexer', { model: 'laya-local' })
+  assert.match(local1.text.split('\n')[0], /^\*\*Laya router\*\* · AUTO \(.*\), LOCAL MODELS ONLY$/, local1.text)
+  assert.match(local1.reasoning, /Routed to qwen-local \(laya, local\)/)
+  assert.doesNotMatch(`${online.reasoning}\n${online.text}\n${local1.reasoning}\n${local1.text}`, /\bJev\b/, 'no line of either run mentions Jev')
+  assert.equal(jev.calls.length, jevBefore, 'and Jev was never asked')
+  await quiet(p.dataDir)
+  const records = p.rows('history.jsonl')
+  assert.deepEqual(records.map((r) => [r.routing.decider, r.routing.mode, r.routing.online ?? false]), [['laya', 'jev', true], ['laya', 'local', false]])
+  assert.ok(records.every((r) => r.assessments.length && r.assessments.every((x) => x.mode === 'laya')), 'Laya reviewed every attempt')
+  const samples = p.rows('laya-samples.jsonl').filter((r) => r.domain)
+  for (const r of records) assert.ok(samples.some((x) => x.runId === r.runId && x.authority === 'laya'), 'each run\'s samples are in Laya\'s store')
+  assert.equal(p.read('routing-samples.jsonl'), '', 'none in Jev\'s')
+  assert.equal(p.read('laya-shadow.jsonl'), '', 'and nothing is shadowed')
+  assert.equal(p.rows('usage.jsonl').filter((u) => u.agent === 'jev').length, 0)
+})
+
 test('invariant 5: a Laya Auto session never builds a TypeSafe client without 127.0.0.1 and never reaches a TypeSafe host: a question, a task and a title', async (t) => {
   // A local chat model, so a title has somewhere else to go and asks whether the cloud can be
   // reached: with none, offline and online pick the same model and the title path asks nothing.
@@ -723,10 +791,10 @@ test('a Laya that cannot start refuses the run with its reason, through /laya, a
   const blocked = new Promise((r) => { release = r })
   q.world.work = async (_opts, n) => { if (n === 1) await blocked }
   const one = await q.say('Fix the failing test in the parser')
-  assert.match(one.text, /^Queued → Laya picks as \*\*jev-1\*\*/, one.text)
+  assert.match(one.text, /^OK, I'll run \*\*[^*]+\*\* with [^\n]* as \*\*jev-1\*\* in [^\n]*\n\n> Picked by Laya on this PC in /, one.text)
   await waitFor('the first task is running', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
   const two = await q.say('Now fix the failing lint in the parser')
-  assert.match(two.text, /^Queued → Laya picks as \*\*jev-2\*\* \(2nd in line/, two.text)
+  assert.match(two.text, /^OK, \*\*jev-2\*\* is queued: 2nd in line for [^ ]+ \(another task is running there[^)]*\)\. Laya picks the agent when it starts;/, two.text)
   // Laya goes down under the open run, and cannot come back.
   q.world.failStart = true
   q.world.children.at(-1).kill('SIGKILL')
@@ -753,10 +821,10 @@ test('a task waiting behind another in its workspace says why and, from past run
   const blocked = new Promise((r) => { release = r })
   q.world.work = async (_opts, n) => { if (n === 1) await blocked }
   const one = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
-  assert.match(one.text, /^Queued → Jev picks as \*\*jev-1\*\*/, one.text)
+  assert.match(one.text, /^OK, I'll run \*\*[^*]+\*\* with [^\n]* as \*\*jev-1\*\* in [^\n]*\n\n> Picked by Jev in /, one.text)
   await waitFor('the first task is running', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
   const two = await q.say('Now fix the failing lint in the parser', { model: 'jev-auto' })
-  assert.match(two.text, /^Queued → Jev picks as \*\*jev-2\*\* \(2nd in line for [^:]+: another task is running there\)/, two.text)
+  assert.match(two.text, /^OK, \*\*jev-2\*\* is queued: 2nd in line for [^ ]+ \(another task is running there[^)]*\)\. Jev picks the agent when it starts;/, two.text)
   const waiting = await until('the second task says how long', async () => (await q.http('GET', '/jev-router/tasks')).body.tasks.find((x) => x.jobId === 'jev-2')?.waiting, (w) => w?.estimate).catch(() => null)
   assert.ok(waiting, 'the second task says what it waits for and how long')
   assert.equal(waiting.why, 'workspace')
@@ -800,6 +868,9 @@ test('a foreground /auto beside a background task in its workspace waits its tur
   assert.equal(r.kind, 'success', JSON.stringify(r).slice(0, 300))
   assert.match(r.text, /Final status: ACCEPTED/)
   assert.equal(q.ran.length, 2, 'it ran once the folder was free')
+  // The task's run can still be ending as the foreground one returns: a run still going when its
+  // plugin closes appends to the data folder as the clean-up removes it.
+  await until('the task has ended', () => taskRow(q, 'jev-1'), (x) => x?.state === 'completed', { timeoutMs: 20_000 })
 })
 
 
@@ -811,7 +882,7 @@ test('a task queued behind a run from the chat says a run from the chat holds it
   const fg = q.slash('auto', 'Fix the failing lint in the parser')
   await waitFor('the run from the chat is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
   const queued = await q.say('Now fix the failing test in the parser', { model: 'jev-auto' })
-  assert.match(queued.text, /\(2nd in line for [^:]+: a run started from the chat is using it\)/, queued.text)
+  assert.match(queued.text, /2nd in line for [^ ]+ \(a run started from the chat is using it\)/, queued.text)
   const row = (await q.http('GET', '/jev-router/tasks')).body.tasks.find((x) => x.jobId === 'jev-1')
   assert.equal(row?.waiting?.text, 'Waiting: a run started from the chat is using this workspace.')
   release()
@@ -867,6 +938,31 @@ function claudeSignedIn(t, { loggedIn = true } = {}) {
   const saved = Object.fromEntries(['PATH', 'HOME', 'USERPROFILE', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_EFFORT_LEVEL'].map((k) => [k, process.env[k]]))
   Object.assign(process.env, { PATH: `${home}${delimiter}${process.env.PATH}`, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, '.claude') })
   t.after(() => { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v } })
+  return home
+}
+
+/**
+ * claudeSignedIn's tool, which answers each `claude auth status` only once `answer()` lets it, as a
+ * tool on Windows can take seconds to, until `hold()` holds it again; `asked()` counts the checks
+ * begun. It answers by the test's own Node.js, so the same script serves a shell and cmd.exe.
+ */
+function claudeHeld(t) {
+  const home = claudeSignedIn(t)
+  writeFileSync(join(home, 'claude.cjs'), [
+    "const { appendFileSync, existsSync } = require('node:fs')",
+    "const { join } = require('node:path')",
+    "appendFileSync(join(__dirname, 'asked'), 'x')",
+    // Held, it gives up once the test's home is gone, so no check outlives the test.
+    "const answer = () => (existsSync(join(__dirname, 'answer')) ? console.log('{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}') : existsSync(__dirname) ? setTimeout(answer, 20) : process.exit(1))",
+    'answer()',
+  ].join('\n'))
+  writeFileSync(join(home, 'claude'), `#!/bin/sh\nexec "${process.execPath}" "$(dirname "$0")/claude.cjs"\n`)
+  writeFileSync(join(home, 'claude.cmd'), `@"${process.execPath}" "%~dp0claude.cjs"\r\n`)
+  return {
+    answer: () => writeFileSync(join(home, 'answer'), ''),
+    hold: () => rmSync(join(home, 'answer'), { force: true }),
+    asked: () => (existsSync(join(home, 'asked')) ? readFileSync(join(home, 'asked'), 'utf8').length : 0),
+  }
 }
 
 test('a task Jev reads as only reading runs locked beside the task writing in its workspace, and the writer keeps its own diff', async (t) => {
@@ -878,7 +974,7 @@ test('a task Jev reads as only reading runs locked beside the task writing in it
   await waitFor('the writer is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
   jevReads(t)
   const said = await q.say('How does the parser read its tokens', { model: 'jev-auto' })
-  assert.match(said.text, new RegExp(`^Queued → Jev picks as \\*\\*jev-2\\*\\* \\(starting now in ${folderOf(q)}\\)\\..* Read only: Jev judged it only reads the project \\(93%, its bar is 80%\\), so it runs on an agent locked against writing, beside any task changing ${folderOf(q)}\\.$`), said.text)
+  assert.match(said.text, new RegExp(`^OK, I'll run \\*\\*[^*]+\\*\\* with \\*\\*[^*]+\\*\\*( \\(effort [^)]+\\))? in the background as \\*\\*jev-2\\*\\* in ${folderOf(q)}\\. Read only: Jev judged it only reads the project \\(93%, its bar is 80%\\), so it runs on an agent locked against writing, beside any task changing ${folderOf(q)}\\. I'll report back here when it's done\\. Keep chatting\\.\\n`), said.text)
   await waitFor('the reader\'s result is posted while the writer still works', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
   assert.equal(q.ran.length, 2)
   assert.deepEqual(q.ran[1].toolFilter, { allow: ['read', 'glob', 'grep'] }, 'the reader was started with the read tools only')
@@ -942,6 +1038,24 @@ test('two Claude starts at once, a writer and a read pass beside it, each start 
   release()
   await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
   assert.deepEqual(q.ran.map((r) => [r.provider, r.effortEnv]), [['claude-code', 'high'], ['claude-code-readonly', 'low']])
+})
+
+test('Claude Code speed Fast: a Claude Code start reads KZ_CLAUDE_FAST_MODE 1 and its attempt says fast mode, and Normal clears it for the next start', async (t) => {
+  claudeSignedIn(t)
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: true }
+  const q = await plugin(t, { jobs: true, config: { agents: [claude] } })
+  const was = process.env.KZ_CLAUDE_FAST_MODE
+  t.after(() => { if (was === undefined) delete process.env.KZ_CLAUDE_FAST_MODE; else process.env.KZ_CLAUDE_FAST_MODE = was })
+  const settings = (body) => q.http('POST', '/jev-router/effort', { default: 'auto', perAgent: {}, codexSpeed: 'normal', ...body })
+  assert.equal((await settings({ claudeSpeed: 'fast' })).status, 200)
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto', effort: 'high' })
+  await waitFor('the first result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal((await settings({ claudeSpeed: 'normal' })).status, 200)
+  await q.say('Fix the failing test in the lexer', { model: 'jev-auto', effort: 'high' })
+  await waitFor('the second result is posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  assert.deepEqual(q.ran.map((r) => [r.provider, r.effortEnv, r.fastEnv]), [['claude-code', 'high', '1'], ['claude-code', 'high', null]])
+  const efforts = q.rows('history.jsonl').map((r) => r.attempts?.find((a) => a.role === 'primary')?.effort)
+  assert.deepEqual(efforts, ['high, fast mode', 'high'])
 })
 
 test('a read task whose routing says it changes files waits for the writer, then runs once as a writer at the effort it was queued with', async (t) => {
@@ -1028,7 +1142,7 @@ test('with no agent that can be locked, a task read as only reading is queued fo
   q.world.providers.spawn = { capabilities: { toolFilter: false } }
   jevReads(t)
   const said = await q.say('How does the parser read its tokens', { model: 'jev-auto' })
-  assert.match(said.text, new RegExp(`Read only: Jev judged it only reads the project \\(93%, its bar is 80%\\), but no agent here can be locked against writing \\(deepseek: its provider takes no per-start tool filter; kimi: its provider takes no per-start tool filter\\), so it runs as work that writes, and a task changing ${folderOf(q)} waits for it\\.$`), said.text)
+  assert.match(said.text, new RegExp(`Read only: Jev judged it only reads the project \\(93%, its bar is 80%\\), but no agent here can be locked against writing \\(deepseek: its provider takes no per-start tool filter; kimi: its provider takes no per-start tool filter\\), so it runs as work that writes, and a task changing ${folderOf(q)} waits for it\\. I'll report back here when it's done\\. Keep chatting\\.\\n`), said.text)
   await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
   const row = await taskRow(q, 'jev-1')
   assert.deepEqual([row.access, row.readVerdict?.reads], ['write', true])
@@ -1481,6 +1595,34 @@ test('one run id: usage.jsonl, history.jsonl, the shadow\'s rows, the inspector\
   assert.ok(p.rows('laya-shadow.jsonl').every((row) => row.runId === id))
 })
 
+test('a background task is known by its key: acknowledged while it runs it stays unread, its result posts once and is read under its name in its own chat, and its history row and the inspector\'s entry name it', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  const row = async () => (await q.http('GET', '/jev-router/tasks')).body.tasks.find((x) => x.jobId === 'jev-1')
+  const running = await until('the task is running', row, (r) => r?.state === 'running' && q.ran.length === 1, { timeoutMs: 20_000 })
+  assert.match(String(running.key), /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+  // What a page showing the chat `sessionId` posts for a row naming jev-1 and this task.
+  const seen = async (sessionId) => (await q.http('POST', '/jev-router/tasks/seen', { sessionId, results: [{ jobId: 'jev-1', name: running.taskName }] })).body
+  // A page acknowledging jev-1 while it runs, as an older task's notice under a reused id would.
+  assert.deepEqual(await seen(SESSION), { acknowledged: [] })
+  assert.equal((await row()).deliveryState, 'pending', 'nothing is marked read before it has a result')
+  const { body: log } = await q.http('GET', `/jev-router/log?session=${SESSION}`)
+  assert.deepEqual(log.filter((e) => e.jobId === 'jev-1').map((e) => e.taskKey), [running.key], 'the inspector names the task its pass is of')
+  release()
+  const [msg] = await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.equal(msg.source.summary, `jev-1 · ${running.taskName} · Completed`)
+  // Posted in the chat it was sent from: a page showing another chat marks nothing read, and one showing this chat does.
+  assert.deepEqual(await seen('session-2'), { acknowledged: [] })
+  assert.deepEqual(await seen(SESSION), { acknowledged: ['jev-1'] })
+  const [record] = await until('the run is in the history', () => q.rows('history.jsonl'), (r) => r.length === 1)
+  assert.equal(record.taskKey, running.key, 'the history row is the task\'s by its key')
+  await quiet(q.dataDir)
+  assert.equal(q.world.delivered.length, 1, 'and the result posted once')
+})
+
 // ---------------------------------------------------------------- holding Laya, and learning integrity
 
 test('an open Laya Auto run holds Laya: with idleMinutes 1 and an agent that works for 2 minutes, the review is Laya\'s, not the fallback\'s', async (t) => {
@@ -1812,4 +1954,1715 @@ test('the routes of 8.4: Laya\'s status, its settings, log, Test Laya, Stop whil
   assert.equal(compare.days, 7)
   assert.equal(compare.jevHost, 'api.typesafe.ai')
   assert.equal((await p.http('GET', '/jev-router/laya/compare?days=all&identity=all')).body.identity, 'all')
+})
+
+// ---------------------------------------------------------------- colibri's Laya, side by side (13)
+
+test('colibri\'s Laya side by side (13): with its address set, each request laya.serve answers in a Laya Auto run and in the shadow is asked of colibri too, the routes and the card\'s status carry the figures, and nothing colibri answers reaches any store but colibri-laya.jsonl', async (t) => {
+  // colibri answers every question unlike laya.serve: its last option at 0.876543, the rest sharing
+  // 0.123457, figures that laya.serve's sure answers here (layaAnswers) come to at no rounding, under
+  // a model name of its own.
+  const MARK = 'colibri-marker-model'
+  const colibri = await startFakeColibri({ model: MARK, answer: (name, q) => { const k = optionCount(q); return Array.from({ length: k }, (_, i) => (i === k - 1 ? 0.876543 : 0.123457 / (k - 1))) } })
+  t.after(() => colibri.close())
+  const p = await plugin(t, { settings: { colibriUrl: colibri.url, shadow: true } })
+  const first = await p.http('GET', '/jev-router/laya/colibri')
+  assert.equal(first.status, 200, JSON.stringify(first.body))
+  assert.deepEqual([first.body.address, first.body.on, first.body.used, first.body.provider.decides], [colibri.url, true, false, false])
+  // An address off this PC is refused with why, and the one set stays.
+  const refused = await p.http('POST', '/jev-router/laya/settings', { colibriUrl: 'http://192.168.1.20:8000' })
+  assert.deepEqual([refused.status, refused.body.error], [400, 'colibri Laya address: this PC only (127.0.0.1, localhost or [::1]), not 192.168.1.20'])
+  assert.equal((await laya(p)).settings.colibriUrl, colibri.url)
+  await until('colibri answered its test question', async () => (await p.http('GET', '/jev-router/laya/colibri')).body.reachable, (r) => r.ok === true)
+
+  const auto = await p.say('Fix the failing test in the parser')
+  assert.match(auto.text, /^\*\*Laya router\*\* · AUTO/, auto.text)
+  assert.doesNotMatch(`${auto.reasoning}\n${auto.text}`, /colibri/i, 'a run says nothing of the comparison')
+  const shadowed = await p.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  assert.match(shadowed.text, /^\*\*Jev router\*\* · AUTO/, shadowed.text)
+  await quiet(p.dataDir)
+  const [lauto, jauto] = p.rows('history.jsonl')
+  const compared = p.rows('colibri-laya.jsonl').filter((r) => r.kind === 'compare')
+  assert.ok(compared.every((r) => r.provider === 'colibri' && r.used === false))
+  assert.ok(compared.some((r) => r.role === 'act' && r.runId === lauto.runId && r.status === 'answered'), 'a request of the Laya Auto run')
+  assert.ok(compared.some((r) => r.role === 'shadow' && r.runId === jauto.runId && r.status === 'answered'), 'a shadow chunk of the Jev Auto run')
+  assert.ok(compared.some((r) => Object.values(r.questions ?? {}).some((q) => q.type === 'noul' && q.colibriSaw === 'raw' && q.confidenceUnknown === true)), 'its nouls read raw, their confidence unknown')
+  const figures = (await p.http('GET', '/jev-router/laya/colibri')).body
+  assert.equal(figures.compared.requests, compared.filter((r) => r.status !== 'failed').length)
+  assert.deepEqual((await laya(p)).colibri, figures, 'the card reads the same figures with Laya\'s status')
+
+  // Nothing colibri answered reached any other file: no store, sample, standing, shadow row or usage row.
+  // Its figures are looked for as it gave them and as KzH's stores round figures, to 4 decimals
+  // (laya-questions.js) and to 3 (shadow.js), which none of laya.serve's answers here comes to.
+  const FIGURES = [0.876543, 0.123457, 0.8765, 0.1235, 0.877, 0.123]
+  for (const [path, text] of Object.entries(bytesUnder(p.dataDir))) {
+    if (path.endsWith('colibri-laya.jsonl')) continue
+    assert.ok(!text.includes(MARK), `${path} holds nothing colibri answered`)
+    // laya.json's measured speeds are timings, which can come to any figure.
+    const read = basename(path) === 'laya.json' ? JSON.stringify({ ...JSON.parse(text), measured: null }) : text
+    const figures = (read.match(/(?<![\w.])\d+\.\d+(?![\w.])/g) ?? []).filter((x) => FIGURES.includes(Number(x)))
+    assert.deepEqual(figures, [], `${path} holds none of colibri's figures, as it gave them or as KzH rounds them`)
+    assert.ok(!text.includes('"provider":"colibri"'), `${path} has no row of colibri's`)
+  }
+  assert.ok(p.rows('laya-samples.jsonl').length, 'the Laya Auto run learned into Laya\'s store as ever')
+  assert.ok(p.rows('laya-shadow.jsonl').length, 'and the shadow compared Jev with Laya as ever')
+  const { body: log } = await p.http('GET', `/jev-router/log?session=${SESSION}`)
+  assert.ok(!JSON.stringify(log).includes(MARK), 'and the inspector holds none of it')
+})
+
+test('a colibri Laya address saved on the card is asked its test question at once (13.1): with no Laya Auto run and no shadow request in between, the section says within 5 s that colibri is reachable', async (t) => {
+  const colibri = await startFakeColibri()
+  t.after(() => colibri.close())
+  const p = await plugin(t)
+  const first = await p.http('GET', '/jev-router/laya/colibri')
+  assert.equal(first.status, 200, JSON.stringify(first.body))
+  assert.deepEqual([first.body.address, first.body.on, first.body.reachable.ok], ['', false, null], 'no address yet, and nothing asked')
+  const saved = await p.http('POST', '/jev-router/laya/settings', { colibriUrl: colibri.url })
+  assert.equal(saved.status, 200, JSON.stringify(saved.body))
+  const reachable = await until('colibri answered its test question', async () => (await p.http('GET', '/jev-router/laya/colibri')).body.reachable, (r) => r.ok === true, { timeoutMs: 5000 })
+  assert.equal(reachable.model, 'laya')
+  assert.deepEqual(colibri.requests.map((r) => [r.method, r.path, Object.keys(r.body?.questions ?? {})]), [['POST', '/v1/systemone', ['ready']]], 'the test question, and nothing else')
+})
+
+test('colibri\'s Laya never holds up a run, and closing leaves nothing of it writing: with colibri answering no comparison, a Laya Auto run replies as ever, its later requests are dropped rather than queued, and closing abandons the request on its way', async (t) => {
+  const colibri = await startFakeColibri()
+  t.after(() => colibri.close())
+  const p = await plugin(t, { settings: { colibriUrl: colibri.url } })
+  const first = await p.http('GET', '/jev-router/laya/colibri')
+  assert.equal(first.status, 200, JSON.stringify(first.body))
+  await until('colibri answered its test question', async () => (await p.http('GET', '/jev-router/laya/colibri')).body.reachable, (r) => r.ok === true)
+  // From here colibri takes each comparison and never answers it.
+  for (let i = 0; i < 100; i++) colibri.hangNext()
+  const out = await p.say('Fix the failing test in the parser')
+  assert.match(out.text, /^\*\*Laya router\*\* · AUTO/, 'the run replied with colibri still at its first comparison')
+  const hung = colibri.requests.filter((r) => r.path === '/v1/systemone' && r.status == null)
+  assert.equal(hung.length, 1, 'one comparison on its way, and no other')
+  const { body } = await p.http('GET', '/jev-router/laya/colibri')
+  assert.ok(body.dropped.busy >= 1, `the run's later requests were dropped, never queued behind it: ${JSON.stringify(body.dropped)}`)
+  await quiet(p.dataDir)
+  const before = p.read('colibri-laya.jsonl')
+  await p.close()
+  await until('the abandoned request\'s socket was closed by KzH', () => hung[0].closedEarly, Boolean)
+  await tick(300)
+  assert.equal(p.read('colibri-laya.jsonl'), before, 'nothing of the abandoned comparison was written, at closing or after')
+})
+
+// ---------------------------------------------------------------- the start reply and its notices
+
+test('a read task handed back before its pick is told it waits for its folder like work that writes, naming the run of its read pass, which a verdict on the reply is credited to nothing for, and gets one notice when it starts again as work that writes', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the writer is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  jevReads(t, { capability: 'project_change' })
+  const said = await q.say('Look at the parser and tidy it', { model: 'jev-auto', effort: 'low' })
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const where = folderOf(q)
+  assert.match(said.text, new RegExp(`^OK, \\*\\*jev-2\\*\\* is queued: 2nd in line for ${where} \\(another task is running there\\)\\. Read only: Jev judged it only reads the project \\(93%, its bar is 80%\\), but Jev's routing named project_change \\(\\d+%\\), which may change files, so it waits for ${where} like work that writes\\. Jev picks the agent when it starts; I'll say which here, and report back when it's done\\. Keep chatting\\.\\n\\n\\[jev-job\\]: kzh-job-1-[0-9a-f-]{36}\\n\\n\\[jev-run\\]: kzh-run-1-[\\w-]+$`), said.text)
+  // The run it names is its read pass's, which ended before its pick and so has no history row.
+  const run = /^\[jev-run\]: kzh-run-1-([\w-]+)$/m.exec(said.text)?.[1]
+  assert.equal(run, (await taskRow(q, 'jev-2'))?.runIds?.[0], 'the read pass, the run its task had begun as the reply was written')
+  await quiet(q.dataDir)
+  assert.equal(q.rows('history.jsonl').filter((r) => r.runId === run).length, 0, 'a run with no history row')
+  const notices = q.world.notices.filter((m) => m.source.summary.startsWith('jev-2'))
+  assert.deepEqual(notices.map((m) => m.source.summary), ['jev-2 started again as work that writes'], 'one notice, for the pass that writes, and none for the read pass it replaced')
+  assert.equal(notices[0].content[0].text, '**jev-2** needed to change files, so it started again as work that writes: **DeepSeek agent** (deepseek-flash, effort low).')
+  assert.deepEqual(q.world.notices.filter((m) => m.source.summary.startsWith('jev-1')), [], 'the first task\'s reply named its plan: no notice')
+  // A verdict on the reply goes with the run it names (client.js messageRunId), so it relabels no
+  // run's routing, where one with no run named would land on whichever run of this chat ended last.
+  const verdict = await q.http('POST', '/jev-router/feedback', { sessionId: SESSION, messageId: 'start-reply-2', verdict: 'dislike', tag: 'misread my question', runId: run })
+  assert.equal(verdict.status, 200, JSON.stringify(verdict.body))
+  await quiet(q.dataDir)
+  assert.deepEqual(q.rows('routing-samples.jsonl').filter((r) => r.outcome?.labelSource === 'human').map((r) => r.id), [], 'no sample of any run was relabelled by it')
+})
+
+test('a read task handed back before its pick in a free folder is told it starts again as work that writes, naming the run of its pass that writes, which a verdict on the reply is credited to', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // The first task is done, so the folder is free when the second one's read pass hands it back.
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  jevReads(t, { capability: 'project_change' })
+  const said = await q.say('Look at the parser and tidy it', { model: 'jev-auto' })
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const where = folderOf(q)
+  assert.match(said.text, new RegExp(`^OK, \\*\\*jev-2\\*\\* is starting in ${where}, and Jev is choosing the agent\\. Read only: Jev judged it only reads the project \\(93%, its bar is 80%\\), but Jev's routing named project_change \\(\\d+%\\), which may change files, so it runs as work that writes, and a task changing ${where} waits for it\\. I'll say here which one it picks, and report back when it's done\\. Keep chatting\\.\\n\\n\\[jev-job\\]: kzh-job-1-[0-9a-f-]{36}\\n\\n\\[jev-run\\]: kzh-run-1-[\\w-]+$`), said.text)
+  const run = /^\[jev-run\]: kzh-run-1-([\w-]+)$/m.exec(said.text)?.[1]
+  const runIds = (await taskRow(q, 'jev-2'))?.runIds ?? []
+  assert.equal(runIds.length, 2, 'a read pass, then a pass that writes')
+  assert.equal(run, runIds[1], 'the pass that writes, which had begun as the reply was written')
+  await quiet(q.dataDir)
+  assert.equal(q.rows('history.jsonl').filter((r) => r.runId === run && r.sessionId === SESSION).length, 1, 'a run of this chat with its history row, which a verdict on the reply is credited to')
+})
+
+test('a forced agent that waits is named at once with the effort it would start at, and a notice says so when it starts at another', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first task is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  const said = await q.say('Now fix the failing lint in the parser', { model: 'agent-deepseek' })
+  const where = folderOf(q)
+  assert.equal(said.text.split('\n\n[jev-job]')[0], `OK, I'll run **DeepSeek agent** with **deepseek-flash** (effort high) in the background as **jev-2** in ${where}. It waits 2nd in line (another task is running there). I'll report back here when it's done. Keep chatting.\n\n> You picked DeepSeek agent; effort high (Auto in Settings).`)
+  // DeepSeek's own effort is set in Settings while the task waits, so it starts at that one.
+  assert.equal((await q.http('POST', '/jev-router/effort', { default: 'auto', perAgent: { deepseek: 'max' }, codexSpeed: 'normal' })).status, 200)
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const notices = q.world.notices.filter((m) => m.source.summary.startsWith('jev-2'))
+  assert.deepEqual(notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-2: effort max instead of high', 'It started on DeepSeek agent (deepseek-flash, effort max).']])
+  const result = q.world.delivered.find((m) => m.source.summary.startsWith('jev-2')).content[0].text
+  assert.match(result, /^Agent: DeepSeek agent · deepseek-flash · effort max · took \d+ s$/m, 'and the result names what it ran')
+})
+
+test('a forced task whose agent list cannot be read as it is queued still gets its start reply, not an error, and runs once', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first task is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  // The agent list cannot be read the moment the second task is queued (a save or a scan holding it,
+  // say), and can again by the time that task starts.
+  const setup = join(q.dataDir, 'agents.json')
+  writeFileSync(setup, '{ damaged')
+  const said = await q.say('Now fix the failing lint in the parser', { model: 'agent-deepseek' })
+  rmSync(setup)
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  const row = await taskRow(q, 'jev-2')
+  assert.match(said.text, new RegExp(`^OK, \\*\\*jev-2\\*\\* is queued: 2nd in line for ${folderOf(q)} \\(another task is running there\\)\\. `), 'the reply says it is queued, since it is: an error would say nothing was, and sent again it would run twice')
+  assert.match(said.text, new RegExp(`\\n\\n\\[jev-job\\]: kzh-job-1-${row.key}$`))
+  assert.deepEqual(q.world.notices.filter((m) => m.source.summary.startsWith('jev-2')).map((m) => m.source.summary), ['jev-2 started: DeepSeek agent, deepseek-flash, effort high'], 'its reply named no plan, so the started notice names it')
+  const results = q.world.delivered.filter((m) => m.source.summary.startsWith('jev-2 '))
+  assert.equal(results.length, 1, 'it ran once')
+  assert.match(results[0].content[0].text, /^Agent: DeepSeek agent · deepseek-flash · effort high · took \d+ s$/m)
+  assert.equal(row.state, 'completed')
+})
+
+test('reply A for a forced agent names the effort it starts at and where it came from: a pick in the model menu, the default in Settings, or one set for the agent in Settings, and no effort notice follows', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  const where = folderOf(q)
+  let done = 0
+  /** Reply A's words to one task sent to DeepSeek agent's own row at `effort`, once its result is in, so the next starts in an idle folder. */
+  const replyOf = async (effort) => {
+    const said = await q.say('Fix the failing test in the parser', { model: 'agent-deepseek', effort })
+    done += 1
+    await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === done, { timeoutMs: 30_000 }).catch(() => [])
+    return said.text.split('\n\n[jev-job]')[0]
+  }
+  const reply = (jobId, effort, from) => `OK, I'll run **DeepSeek agent** with **deepseek-flash** (effort ${effort}) in the background as **${jobId}** in ${where}. I'll report back here when it's done. Keep chatting.\n\n> You picked DeepSeek agent; effort ${effort} (${from}).`
+  const settings = (body) => q.http('POST', '/jev-router/effort', { default: 'auto', perAgent: {}, codexSpeed: 'normal', ...body })
+  assert.equal(await replyOf('max'), reply('jev-1', 'max', 'your pick in the model menu'))
+  assert.equal((await settings({ default: 'xhigh' })).status, 200)
+  assert.equal(await replyOf(), reply('jev-2', 'max', 'the default in Settings'), 'xhigh is DeepSeek\'s max')
+  assert.equal((await settings({ perAgent: { deepseek: 'low' } })).status, 200)
+  assert.equal(await replyOf('high'), reply('jev-3', 'low', 'set for this agent in Settings'), 'the agent\'s own setting wins over the menu')
+  await quiet(q.dataDir)
+  assert.deepEqual(q.world.notices.map((m) => m.source.summary), [], 'each started at the effort its reply named, so no notice says otherwise')
+  const heads = ['jev-1', 'jev-2', 'jev-3'].map((jobId) => /^Agent: .*$/m.exec(q.world.delivered.find((m) => m.source.summary.startsWith(`${jobId} `))?.content[0].text ?? '')?.[0])
+  assert.deepEqual(heads.map((h) => h?.replace(/ · took \d+ s$/, '')), ['max', 'max', 'low'].map((e) => `Agent: DeepSeek agent · deepseek-flash · effort ${e}`), 'and each result names the effort it ran at')
+})
+
+test('a retry on another agent gets one moved notice, with the router\'s own lines for why', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // DeepSeek's first attempt finds its key out of balance, so the work goes to Kimi.
+  q.world.outcome = (n) => (n === 1 ? { stopReason: 'error', diagnostic: 'HTTP 402: insufficient balance', output: [], usage: {} } : null)
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  await quiet(q.dataDir)
+  assert.deepEqual(q.rows('history.jsonl')[0]?.attempts.map((a) => [a.agent, a.role]), [['deepseek', 'primary'], ['kimi', 'retry']])
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-1 moved to Kimi agent', 'deepseek hit its usage limit: handing the task to another agent\nRunning kimi (retry)…']], 'why, then the retry: once, and no other notice, since the reply named DeepSeek')
+})
+
+test('a retry on the agent the work is already on gets no moved notice', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // Jev's review sends DeepSeek's first answer back to DeepSeek (RETRY_SAME_TIER), and takes its second.
+  q.world.reply = (n) => (n === 1 ? 'FIRST-TRY: changed nothing useful' : 'SECOND-TRY: fixed the parser')
+  const second = (state) => JSON.stringify(state).includes('SECOND-TRY')
+  jev.said.disposition = (state) => (second(state) ? 'PASS' : 'RETRY_SAME_TIER')
+  jev.said.addressed = (state) => (second(state) ? 0.95 : 0.05)
+  t.after(() => { delete jev.said.disposition; delete jev.said.addressed })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  await quiet(q.dataDir)
+  assert.deepEqual(q.rows('history.jsonl')[0]?.attempts.map((a) => [a.agent, a.role]), [['deepseek', 'primary'], ['deepseek', 'retry']], 'retried on DeepSeek')
+  assert.deepEqual(q.world.notices, [], 'the work never moved, and the reply named DeepSeek: no notice')
+})
+
+test('a retry Jev\'s review sends to another agent gets one moved notice whose body says why: the review\'s line, then the retry\'s', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // Jev's review finds DeepSeek's first answer wrong in a way a different resource should try
+  // (RETRY_DIFFERENT_RESOURCE), and takes the second, Kimi's.
+  q.world.reply = (n) => (n === 1 ? 'FIRST-TRY: changed nothing useful' : 'SECOND-TRY: fixed the parser')
+  const second = (state) => JSON.stringify(state).includes('SECOND-TRY')
+  jev.said.disposition = (state) => (second(state) ? 'PASS' : 'RETRY_DIFFERENT_RESOURCE')
+  jev.said.addressed = (state) => (second(state) ? 0.95 : 0.05)
+  t.after(() => { delete jev.said.disposition; delete jev.said.addressed })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  await quiet(q.dataDir)
+  assert.deepEqual(q.rows('history.jsonl')[0]?.attempts.map((a) => [a.agent, a.role]), [['deepseek', 'primary'], ['kimi', 'retry']], 'retried on Kimi')
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-1 moved to Kimi agent', 'Review: retry. quality 0.05 ≤ 0.3\nRunning kimi (retry)…']], 'why, then the retry: once, and no other notice, since the reply named DeepSeek')
+})
+
+test('a retry on another agent after DeepSeek\'s credit falls under its floor gets one moved notice whose body says why: the balance\'s line, the limit\'s, then the retry\'s', async (t) => {
+  // DeepSeek on its one key, which holds 50 until the first attempt spends it to 19, under DeepSeek's
+  // floor of 20, before it has fixed anything; Kimi takes the task over and fixes it.
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__deepseek__k1=sk-one\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before); net.deepseekBalance = null })
+  let credit = 50
+  net.deepseekBalance = (key) => (key === 'sk-one' ? credit : 50)
+  const q = await plugin(t, { jobs: true, accounts: { keys: { deepseek: [{ name: 'k1', active: true }] }, limits: { deepseek: { minBalance: 20, handoffAtBalance: 22 } } } })
+  q.world.work = async (_opts, n) => { if (n === 1) credit = 19 }
+  q.world.outcome = (n) => (n === 1 ? { stopReason: 'completed', output: [{ type: 'text', text: 'Read the parser; out of credit before the fix.' }], usage: {} } : null)
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  await quiet(q.dataDir)
+  assert.deepEqual(q.rows('history.jsonl')[0]?.attempts.map((a) => [a.agent, a.role]), [['deepseek', 'primary'], ['kimi', 'retry']], 'handed to Kimi')
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-1 moved to Kimi agent', 'deepseek credit 19 USD: below the floor, handing the task over\ndeepseek hit its usage limit: handing the task to another agent\nRunning kimi (retry)…']], 'why, then the retry: once, and no other notice, since the reply named DeepSeek')
+})
+
+test('a retry Jev\'s review sends to another agent after DeepSeek\'s credit only ran low gets a moved notice whose body is the review\'s line, then the retry\'s: a credit over its floor keeps the work where it is, so it is no reason', async (t) => {
+  // DeepSeek on its one key, which holds 50 until the first attempt spends it to 21: under the 22 at
+  // which DeepSeek works in small steps, still over its floor of 20, so the work stays on it. Jev's
+  // review then finds the answer wrong in a way a different resource should try, and Kimi takes it.
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__deepseek__k1=sk-one\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before); net.deepseekBalance = null })
+  let credit = 50
+  net.deepseekBalance = (key) => (key === 'sk-one' ? credit : 50)
+  const q = await plugin(t, { jobs: true, accounts: { keys: { deepseek: [{ name: 'k1', active: true }] }, limits: { deepseek: { minBalance: 20, handoffAtBalance: 22 } } } })
+  q.world.work = async (_opts, n) => { if (n === 1) credit = 21 }
+  q.world.reply = (n) => (n === 1 ? 'FIRST-TRY: changed nothing useful' : 'SECOND-TRY: fixed the parser')
+  const second = (state) => JSON.stringify(state).includes('SECOND-TRY')
+  jev.said.disposition = (state) => (second(state) ? 'PASS' : 'RETRY_DIFFERENT_RESOURCE')
+  jev.said.addressed = (state) => (second(state) ? 0.95 : 0.05)
+  t.after(() => { delete jev.said.disposition; delete jev.said.addressed })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  await quiet(q.dataDir)
+  const row = q.rows('history.jsonl')[0]
+  assert.deepEqual(row?.attempts.map((a) => [a.agent, a.role]), [['deepseek', 'primary'], ['kimi', 'retry']], 'retried on Kimi')
+  assert.deepEqual(row?.availability, { out: [], near: ['deepseek'] }, 'the run heard DeepSeek\'s credit run low, and never run out')
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-1 moved to Kimi agent', 'Review: retry. quality 0.05 ≤ 0.3\nRunning kimi (retry)…']], 'the review moved the work, and the credit that ran low did not')
+})
+
+test('a retry Jev\'s review sends to another agent after Jev switched its own key in the review gets a moved notice whose body is the review\'s line, then the retry\'s: Jev\'s limit moves no work, so it is no reason', async (t) => {
+  // Jev on two keys: the review's first call on j1 meets a 429, so Jev goes on with j2 and finds
+  // DeepSeek's answer wrong in a way a different resource should try, and Kimi takes it.
+  const env = join(process.env.DSH_HOME, '.env')
+  const before = existsSync(env) ? readFileSync(env, 'utf8') : null
+  writeFileSync(env, `${before ?? ''}KZ_KEY__jev__j1=tsk-one\nKZ_KEY__jev__j2=tsk-two\n`)
+  t.after(() => { if (before === null) rmSync(env, { force: true }); else writeFileSync(env, before) })
+  const q = await plugin(t, { jobs: true, accounts: { keys: { jev: [{ name: 'j1', active: true }, { name: 'j2', active: false }] } } })
+  q.world.reply = (n) => (n === 1 ? 'FIRST-TRY: changed nothing useful' : 'SECOND-TRY: fixed the parser')
+  const second = (state) => JSON.stringify(state).includes('SECOND-TRY')
+  jev.said.disposition = (state) => (second(state) ? 'PASS' : 'RETRY_DIFFERENT_RESOURCE')
+  jev.said.addressed = (state) => (second(state) ? 0.95 : 0.05)
+  t.after(() => { delete jev.said.disposition; delete jev.said.addressed })
+  const answer = TypeSafeClient.prototype.systemOne
+  let reviews = 0
+  TypeSafeClient.prototype.systemOne = function limitedJev(request, options) {
+    if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(this.baseURL) && request.questions.disposition && reviews++ === 0) return Promise.reject(Object.assign(new Error('429 Too Many Requests'), { status: 429 }))
+    return answer.call(this, request, options)
+  }
+  t.after(() => { TypeSafeClient.prototype.systemOne = answer })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  await quiet(q.dataDir)
+  assert.deepEqual(q.rows('history.jsonl')[0]?.attempts.map((a) => [a.agent, a.role]), [['deepseek', 'primary'], ['kimi', 'retry']], 'retried on Kimi')
+  const accounts = JSON.parse(readFileSync(join(q.dataDir, 'accounts.json'), 'utf8'))
+  assert.deepEqual([accounts.keys.jev.map((k) => [k.name, k.active]), Object.keys(accounts.exhausted)], [[['j1', false], ['j2', true]], ['jev:j1']], 'Jev switched to j2 in the review')
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-1 moved to Kimi agent', 'Review: retry. quality 0.05 ≤ 0.3\nRunning kimi (retry)…']], 'the review moved the work, and Jev\'s own limit did not')
+})
+
+test('a retry Jev\'s review keeps on DeepSeek and then sends to another agent gets one moved notice whose body holds only the review since the attempt before it, then the retry\'s line', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // Jev's review sends DeepSeek's first answer back to DeepSeek (RETRY_SAME_TIER), finds its second
+  // wrong in a way a different resource should try (RETRY_DIFFERENT_RESOURCE), and takes Kimi's. The
+  // two reviews score the answers apart, so their lines differ.
+  q.world.reply = (n) => (n === 1 ? 'FIRST-TRY: changed nothing useful' : n === 2 ? 'SECOND-TRY: still nothing useful' : 'THIRD-TRY: fixed the parser')
+  const has = (state, s) => JSON.stringify(state).includes(s)
+  jev.said.disposition = (state) => (has(state, 'THIRD-TRY') ? 'PASS' : has(state, 'SECOND-TRY') ? 'RETRY_DIFFERENT_RESOURCE' : 'RETRY_SAME_TIER')
+  jev.said.addressed = (state) => (has(state, 'THIRD-TRY') ? 0.95 : has(state, 'SECOND-TRY') ? 0.1 : 0.05)
+  t.after(() => { delete jev.said.disposition; delete jev.said.addressed })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  await quiet(q.dataDir)
+  assert.deepEqual(q.rows('history.jsonl')[0]?.attempts.map((a) => [a.agent, a.role]), [['deepseek', 'primary'], ['deepseek', 'retry'], ['kimi', 'retry']], 'retried on DeepSeek, then on Kimi')
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-1 moved to Kimi agent', 'Review: retry. quality 0.10 ≤ 0.3\nRunning kimi (retry)…']], 'the review that moved the work, never the one that kept it on DeepSeek')
+})
+
+test('a task whose work moves twice in one routing gets one moved notice, for its first move: Jev\'s review sends DeepSeek\'s answer to Kimi and Kimi\'s back to DeepSeek', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  q.world.reply = (n) => (n === 1 ? 'FIRST-TRY: changed nothing useful' : n === 2 ? 'SECOND-TRY: still nothing useful' : 'THIRD-TRY: fixed the parser')
+  const third = (state) => JSON.stringify(state).includes('THIRD-TRY')
+  jev.said.disposition = (state) => (third(state) ? 'PASS' : 'RETRY_DIFFERENT_RESOURCE')
+  jev.said.addressed = (state) => (third(state) ? 0.95 : 0.05)
+  t.after(() => { delete jev.said.disposition; delete jev.said.addressed })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  await quiet(q.dataDir)
+  assert.deepEqual(q.rows('history.jsonl')[0]?.attempts.map((a) => [a.agent, a.role]), [['deepseek', 'primary'], ['kimi', 'retry'], ['deepseek', 'retry']], 'moved to Kimi, then back to DeepSeek')
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-1 moved to Kimi agent', 'Review: retry. quality 0.05 ≤ 0.3\nRunning kimi (retry)…']], 'one moved notice per routing: the first move\'s')
+  assert.deepEqual((await taskRow(q, 'jev-1'))?.progressPosted, { moved: 1 }, 'claimed once, for the routing it was posted in')
+})
+
+test('a pick that lands after the guard\'s grace but within the reply\'s wait gets reply A and no started notice: the guard waits out the reply\'s own wait before its grace', async (t) => {
+  // A reply that never says what it named is taken to have named nothing 100 ms after its wait, which
+  // is 15 s as shipped. Jev answers each call 400 ms late, so its pick lands a second or so after the
+  // task is queued: long after the grace alone, and well within the wait.
+  const q = await plugin(t, { jobs: true, replies: { graceMs: 100 } })
+  const answer = TypeSafeClient.prototype.systemOne
+  TypeSafeClient.prototype.systemOne = async function slowJev(request, options) {
+    if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(this.baseURL)) await tick(400)
+    return answer.call(this, request, options)
+  }
+  t.after(() => { TypeSafeClient.prototype.systemOne = answer })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  const took = Number(/^> Picked by Jev in ([\d.]+) s/m.exec(said.text)?.[1])
+  assert.ok(took * 1000 > 100, `the pick took ${took} s, past the grace: ${said.text}`)
+  assert.deepEqual(q.world.notices.map((m) => m.source.summary), [], 'the reply named the plan, so no started notice goes beside it')
+})
+
+test('a reply stopped in its wait whose work moves to another agent gets its started notice before the moved notice, naming the agent the work started on, and none after it', async (t) => {
+  // The reply waits up to 3 s for the pick, and one that said nothing is taken to have named nothing
+  // 100 ms after that: its guard fires while Kimi still works.
+  const q = await plugin(t, { jobs: true, replies: { graceMs: 100 } })
+  assert.equal((await q.http('POST', '/jev-router/chat-replies/settings', { waitMs: 3000 })).status, 200)
+  // Stopped while Jev routes the task, so the reply ends in its wait and never says what it named.
+  const stop = new AbortController()
+  jev.said.capability = () => { stop.abort(); return undefined }
+  t.after(() => { delete jev.said.capability })
+  // DeepSeek's first attempt finds its key out of balance, so the work goes to Kimi, held at work.
+  q.world.outcome = (n) => (n === 1 ? { stopReason: 'error', diagnostic: 'HTTP 402: insufficient balance', output: [], usage: {} } : null)
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 2) await blocked }
+  const queued = Date.now()
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto', signal: stop.signal }).catch((err) => err)
+  await waitFor('Kimi is at work', () => q.ran.length, (n) => n === 2, { timeoutMs: 20_000 }).catch(() => 0)
+  // Past the reply's wait and its guard, with Kimi still at work.
+  await tick(Math.max(0, queued + 3000 + 100 + 700 - Date.now()))
+  const notices = q.world.notices.map((m) => [m.source.summary, m.content[0].text])
+  release()
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => [])
+  assert.equal(said?.name, 'AbortError', 'the reply was stopped in its wait')
+  const row = await taskRow(q, 'jev-1')
+  assert.equal(row?.plan?.agent, 'deepseek', 'the work started on DeepSeek')
+  assert.deepEqual(notices, [
+    [`jev-1 started: DeepSeek agent, deepseek-flash${row.plan.effort ? `, effort ${row.plan.effort}` : ''}`, `**jev-1** started: **DeepSeek agent** (deepseek-flash${row.plan.effort ? `, effort ${row.plan.effort}` : ''}) is working on it in ${folderOf(q)}. Watch it in the Live tab; the result posts here when it's done.`],
+    ['jev-1 moved to Kimi agent', 'deepseek hit its usage limit: handing the task to another agent\nRunning kimi (retry)…'],
+  ], 'where the work started, then where it went: never a started notice after the moved one')
+  assert.equal(q.world.notices.length, 2, 'and nothing more once the guard had fired')
+})
+
+test('a task\'s notices go out in the order they were claimed: a started notice slow to post still comes before the moved notice claimed after it', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // Stopped while Jev routes the task, so the reply ends in its wait and never says what it named:
+  // when the work moves, the started notice is claimed, then the moved notice.
+  const stop = new AbortController()
+  jev.said.capability = () => { stop.abort(); return undefined }
+  t.after(() => { delete jev.said.capability })
+  // DeepSeek's first attempt finds its key out of balance, so the work goes to Kimi, held at work.
+  q.world.outcome = (n) => (n === 1 ? { stopReason: 'error', diagnostic: 'HTTP 402: insufficient balance', output: [], usage: {} } : null)
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 2) await blocked }
+  // The chat cannot take the started notice the first time, so it goes out a second later, on its retry.
+  let offered = 0
+  q.world.refuseAppend = (msg) => /^jev-1 started: /.test(msg.source?.summary ?? '') && offered++ === 0
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto', signal: stop.signal }).catch((err) => err)
+  const summaries = () => q.world.notices.map((m) => m.source.summary)
+  const notices = await until('both notices are posted', summaries, (n) => n.length === 2).catch(() => summaries())
+  release()
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => [])
+  assert.equal(said?.name, 'AbortError', 'the reply was stopped in its wait')
+  assert.equal(offered, 2, 'the started notice was refused once, and taken on its retry')
+  assert.deepEqual(notices.map((n) => n.split(':')[0]), ['jev-1 started', 'jev-1 moved to Kimi agent'], 'the order they were claimed in, not the order they were ready')
+  assert.match(notices[0], /^jev-1 started: DeepSeek agent, deepseek-flash/)
+})
+
+test('reply A\'s credit says where its effort came from: a pick in the model menu, the default in Settings, or one set for the agent in Settings', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let done = 0
+  /** The credit under the reply to one task sent at `effort`, once its result is in, so the next starts in an idle folder. */
+  const creditOf = async (effort) => {
+    const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto', effort })
+    done += 1
+    await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === done, { timeoutMs: 30_000 }).catch(() => [])
+    return said.text.split('\n\n')[1] ?? said.text
+  }
+  const settings = (body) => q.http('POST', '/jev-router/effort', { default: 'auto', perAgent: {}, codexSpeed: 'normal', ...body })
+  assert.match(await creditOf('max'), /^> Picked by Jev in (under 0\.1|[\d.]+) s: a design question, low risk; effort max \(your pick in the model menu\)\.$/)
+  assert.equal((await settings({ default: 'max' })).status, 200)
+  assert.match(await creditOf(), /^> Picked by Jev in (under 0\.1|[\d.]+) s: a design question, low risk; effort max \(the default in Settings\)\.$/)
+  assert.equal((await settings({ perAgent: { deepseek: 'max' } })).status, 200)
+  assert.match(await creditOf('high'), /^> Picked by Jev in (under 0\.1|[\d.]+) s: a design question, low risk; effort max \(set for this agent in Settings\)\.$/, 'the agent\'s own setting wins over the menu')
+})
+
+test('reply A\'s credit says your ratings moved its Auto effort a step, and only when that changed what the agent is sent', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let done = 0
+  /** The credit under the reply to one task sent at Auto, once its result is in, so the next starts in an idle folder. */
+  const creditOf = async () => {
+    const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+    done += 1
+    await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === done, { timeoutMs: 30_000 }).catch(() => [])
+    return said.text.split('\n\n')[1] ?? said.text
+  }
+  // Three `wrong effort` ratings of DeepSeek on design questions that agree, as acceptVerdict stamps them.
+  const rows = []
+  const rate = (planLevel, suggestedEffort) => {
+    for (let i = 0; i < 3; i++) {
+      const n = rows.length + 1
+      rows.push(JSON.stringify({ ts: `2026-10-01T10:${String(n).padStart(2, '0')}:00.000Z`, sessionId: 's-rated', messageId: `m-${n}`, verdict: 'dislike', reason: '', tag: 'wrong effort', about: 'plan', suggestedEffort, planFamily: 'deepseek', planLevel, taskType: 'architecture' }))
+    }
+    writeFileSync(join(q.dataDir, 'feedback.jsonl'), `${rows.join('\n')}\n`)
+  }
+  // Low risk reads medium on Jev's bands, which DeepSeek runs as high (effort.js); a step lower runs it at low.
+  rate('medium', 'low')
+  assert.match(await creditOf(), /^> Picked by Jev in (under 0\.1|[\d.]+) s: a design question, low risk; effort low \(Auto, lowered one step by your ratings\)\.$/)
+  // A step higher is high, which DeepSeek runs as it runs medium, so the profile gave that effort.
+  rate('medium', 'high')
+  assert.match(await creditOf(), /^> Picked by Jev in (under 0\.1|[\d.]+) s: a design question, low risk, so effort high\.$/)
+})
+
+test('reply A\'s credit says the routing rules picked when Jev could not, and why', async (t) => {
+  // Routing that asks Jev itself (no adaptive routing), and a Jev that is down for the routing call.
+  const q = await plugin(t, { jobs: true, config: { routing: { enabled: false } } })
+  jev.refuses = (questions) => 'capability' in questions || 'agent' in questions
+  t.after(() => { jev.refuses = null })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  jev.refuses = null
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => [])
+  const [reply, credit] = said.text.split('\n\n')
+  assert.match(reply ?? '', /^OK, I'll run \*\*DeepSeek agent\*\* with \*\*deepseek-flash\*\* \(effort high\) /, said.text)
+  assert.match(credit ?? '', /^> Picked by the routing rules in (under 0\.1|[\d.]+) s, since Jev could not pick \(Error: 503 Service Unavailable\); effort high \(Auto in Settings\)\.$/, said.text)
+})
+
+test('a plugin closed as soon as its task\'s result is posted has written all it will: the claim of that result is on disk, and nothing in its data folder changes after its close', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await q.close()
+  const closed = filesUnder(q.dataDir)
+  assert.equal(q.rows('tasks.jsonl').find((r) => r.jobId === 'jev-1')?.deliveryState, 'delivering', 'the result was claimed before it was posted, and the claim is saved')
+  // What it had under way as it closed (that claim, what the run taught, Laya's standing) would land within this.
+  await tick(1500)
+  assert.deepEqual(filesUnder(q.dataDir), closed, 'nothing written after the plugin closed')
+})
+
+test('closing waits for the writes under way, and for one that never ends only so long, saying so', async () => {
+  const { closeWithin } = jevRouter
+  assert.equal(typeof closeWithin, 'function', 'index.js bounds what closing waits for')
+  const logs = []
+  let landed = false
+  await closeWithin([tick(50).then(() => { landed = true }), null], { ms: 5000, log: (m) => logs.push(m) })
+  assert.equal(landed, true, 'a write under way has landed once closing resolves')
+  const started = Date.now()
+  await closeWithin([new Promise(() => {}), tick(10)], { ms: 200, log: (m) => logs.push(m) })
+  assert.ok(Date.now() - started < 2000, 'a write that never ends holds closing for the bound only')
+  assert.deepEqual(logs, ['1 of 2 still under way after 0.2 s; closing without waiting for it'])
+})
+
+test('a plugin applied again takes over the task the plugin closed before it still had at work: it reads it as running, a task sent meanwhile to its folder waits for it, and it records, saves and posts the result of each once, the closed plugin none', async (t) => {
+  const before = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  t.after(() => release())
+  before.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await before.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the task is at work', () => before.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  await before.close()
+  // The engine applies the plugin again on the same data, a setting changed: its job service, the
+  // chat and the agents are the engine's, and go on.
+  const after = await plugin(t, { jobs: true, reload: before })
+  const row = await until('the plugin applied again lists the task', () => taskRow(after, 'jev-1'), Boolean)
+  assert.equal(row.state, 'running', 'at work, not stopped by a restart')
+  // A task sent now to the same folder waits for the one at work there, as it would have before.
+  await after.say('Fix the failing lint in the parser', { model: 'jev-auto' })
+  const second = await until('the second task is listed', () => taskRow(after, 'jev-2'), Boolean)
+  assert.equal(second.state, 'queued', 'it waits for its folder')
+  assert.equal(after.ran.length, 1, 'no second agent works in the folder meanwhile')
+  release()
+  const posted = await waitFor('both results are posted', () => after.world.delivered, (d) => d.length >= 2, { timeoutMs: 30_000 }).catch(() => after.world.delivered)
+  assert.deepEqual(posted.map((m) => m.source.summary.split(' · ')[0]), ['jev-1', 'jev-2'], 'each result once, in the order the tasks ended')
+  await quiet(after.dataDir)
+  assert.deepEqual(after.rows('tasks.jsonl').map((r) => [r.jobId, r.state, r.deliveryState]), [['jev-1', 'completed', 'delivering'], ['jev-2', 'completed', 'delivering']], 'saved by the plugin applied again, each claimed for posting')
+  assert.equal(after.world.delivered.length, 2, 'nothing posted twice')
+})
+
+test('a task waiting in line as the plugin closes keeps its place there, and once its folder is free it is run by the plugin applied again, which says it started and posts its result, each once', async (t) => {
+  const before = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  t.after(() => release())
+  before.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await before.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first task is at work', () => before.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  await before.say('Fix the failing lint in the parser', { model: 'jev-auto' })
+  await until('the second task waits in line', () => taskRow(before, 'jev-2'), (r) => r?.state === 'queued')
+  await before.close()
+  const after = await plugin(t, { jobs: true, reload: before })
+  const waiting = await until('the plugin applied again lists the waiting task', () => taskRow(after, 'jev-2'), Boolean)
+  assert.deepEqual([waiting.state, waiting.position], ['queued', 2], 'still second in its folder\'s line')
+  release()
+  const posted = await waitFor('both results are posted', () => after.world.delivered, (d) => d.length >= 2, { timeoutMs: 30_000 }).catch(() => after.world.delivered)
+  assert.deepEqual(posted.map((m) => m.source.summary.split(' · ')[0]), ['jev-1', 'jev-2'])
+  // The plugin that closed started nothing after: the waiting task's run is the one applied again's.
+  const { body: log } = await after.http('GET', `/jev-router/log?session=${SESSION}`)
+  assert.deepEqual(log.map((e) => e.jobId), ['jev-2'], 'its run is in the log of the plugin applied again')
+  assert.deepEqual(after.world.notices.map((m) => m.source.summary), ['jev-2 started: DeepSeek agent, deepseek-flash, effort high'], 'its reply named no plan, so its start is said, once, by the plugin that follows it from then on')
+  await quiet(after.dataDir)
+  assert.deepEqual(after.rows('tasks.jsonl').map((r) => [r.jobId, r.state, r.deliveryState]), [['jev-1', 'completed', 'delivering'], ['jev-2', 'completed', 'delivering']])
+})
+
+test('a task waiting in line whose folder frees after the plugin closed, before the engine has applied it again, waits for the plugin applied again, which runs it, says it started and posts its result, each once', async (t) => {
+  const before = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  t.after(() => release())
+  before.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await before.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first task is at work', () => before.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  await before.say('Fix the failing lint in the parser', { model: 'jev-auto' })
+  await until('the second task waits in line', () => taskRow(before, 'jev-2'), (r) => r?.state === 'queued')
+  await before.close()
+  // The first task's agent answers while no plugin is applied, so its folder frees in between.
+  release()
+  await until('the first task has ended in the plugin that closed', () => taskRow(before, 'jev-1'), (r) => r?.state === 'completed', { timeoutMs: 30_000 })
+  await tick(300)
+  assert.equal(before.ran.length, 1, 'the waiting task starts no agent while no plugin is applied')
+  const after = await plugin(t, { jobs: true, reload: before })
+  const posted = await waitFor('both results are posted', () => after.world.delivered, (d) => d.length >= 2, { timeoutMs: 30_000 }).catch(() => after.world.delivered)
+  assert.deepEqual(posted.map((m) => m.source.summary.split(' · ')[0]), ['jev-1', 'jev-2'])
+  const { body: log } = await after.http('GET', `/jev-router/log?session=${SESSION}`)
+  assert.deepEqual(log.map((e) => e.jobId), ['jev-2'], 'its run is in the log of the plugin applied again')
+  assert.deepEqual(after.world.notices.map((m) => m.source.summary), ['jev-2 started: DeepSeek agent, deepseek-flash, effort high'], 'and its start is said from there, once')
+  await quiet(after.dataDir)
+  assert.deepEqual(after.rows('tasks.jsonl').map((r) => [r.jobId, r.state, r.deliveryState]), [['jev-1', 'completed', 'delivering'], ['jev-2', 'completed', 'delivering']])
+})
+
+test('a retry on another agent that starts after the plugin closed, before the engine has applied it again, gets its moved notice from the plugin applied again, once', async (t) => {
+  const before = await plugin(t, { jobs: true })
+  let releaseFirst, releaseRetry
+  const first = new Promise((r) => { releaseFirst = r })
+  const retry = new Promise((r) => { releaseRetry = r })
+  t.after(() => { releaseFirst(); releaseRetry() })
+  before.world.work = async (_opts, n) => { await (n === 1 ? first : retry) }
+  // DeepSeek's first attempt finds its key out of balance, so the work goes to Kimi.
+  before.world.outcome = (n) => (n === 1 ? { stopReason: 'error', diagnostic: 'HTTP 402: insufficient balance', output: [], usage: {} } : null)
+  await before.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('its first attempt is at work', () => before.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  await before.close()
+  // DeepSeek gives up while no plugin is applied: the retry on Kimi starts in the plugin that closed.
+  releaseFirst()
+  await waitFor('the retry is at work', () => before.ran.length, (n) => n === 2, { timeoutMs: 30_000 })
+  assert.deepEqual(before.world.notices, [], 'the plugin that closed posts no notice')
+  const after = await plugin(t, { jobs: true, reload: before })
+  const notices = await waitFor('the moved notice is posted', () => after.world.notices, (n) => n.length >= 1, { timeoutMs: 15_000 }).catch(() => after.world.notices)
+  assert.deepEqual(notices.map((m) => [m.source.summary, m.content[0].text]), [['jev-1 moved to Kimi agent', 'deepseek hit its usage limit: handing the task to another agent\nRunning kimi (retry)…']], 'the plugin applied again says it as it takes the task over')
+  releaseRetry()
+  const posted = await waitFor('the result is posted', () => after.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => after.world.delivered)
+  assert.equal(posted.length, 1)
+  await quiet(after.dataDir)
+  assert.equal(after.world.notices.length, 1, 'and only once')
+})
+
+test('a pass that waited for the plugin applied again starts there only once that plugin has read its task list, however slow the list is to read: its result is posted after the one that ended first, its start is said from there, and that plugin\'s reply ledger notes what ran', async (t) => {
+  const before = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  t.after(() => release())
+  before.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await before.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first task is at work', () => before.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  await before.say('Fix the failing lint in the parser', { model: 'jev-auto' })
+  const { key } = await until('the second task waits in line', () => taskRow(before, 'jev-2'), (r) => r?.state === 'queued')
+  await before.close()
+  release()
+  await until('the first task has ended in the plugin that closed', () => taskRow(before, 'jev-1'), (r) => r?.state === 'completed', { timeoutMs: 30_000 })
+  // The plugin applied again reads its task list slowly, as a busy disk does.
+  const fsp = createRequire(import.meta.url)('node:fs/promises')
+  const real = fsp.readFile
+  const list = join(before.dataDir, 'tasks.jsonl')
+  fsp.readFile = async function readFile(path, ...rest) {
+    if (String(path) === list) await tick(800)
+    return real.call(this, path, ...rest)
+  }
+  syncBuiltinESMExports()
+  t.after(() => { fsp.readFile = real; syncBuiltinESMExports() })
+  const after = await plugin(t, { jobs: true, reload: before })
+  const posted = await waitFor('both results are posted', () => after.world.delivered, (d) => d.length >= 2, { timeoutMs: 30_000 }).catch(() => after.world.delivered)
+  fsp.readFile = real
+  syncBuiltinESMExports()
+  assert.deepEqual(posted.map((m) => m.source.summary.split(' · ')[0]), ['jev-1', 'jev-2'])
+  const { body: reply } = await after.http('GET', `/jev-router/replies?key=${key}`)
+  assert.deepEqual(after.world.notices.map((m) => m.source.summary), ['jev-2 started: DeepSeek agent, deepseek-flash, effort high'])
+  assert.equal(reply?.ran?.agent, 'deepseek', `the reply ledger there notes what ran: ${JSON.stringify(reply)}`)
+})
+
+test('a start reply still waiting for the pick as the plugin closes keeps the wait it had in the plugin applied again: the pick lands within it, the reply names the plan, and no started notice goes beside it', async (t) => {
+  // A reply that never says what it named is taken to have named nothing 100 ms after its wait, here
+  // 6 s. Jev answers each call 1.5 s late, so the pick lands once the plugin applied again has taken
+  // the task over, well within the wait the reply still has.
+  const before = await plugin(t, { jobs: true, replies: { graceMs: 100 } })
+  assert.equal((await before.http('POST', '/jev-router/chat-replies/settings', { waitMs: 6000 })).status, 200)
+  const answer = TypeSafeClient.prototype.systemOne
+  TypeSafeClient.prototype.systemOne = async function slowJev(request, options) {
+    if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(this.baseURL)) await tick(1500)
+    return answer.call(this, request, options)
+  }
+  t.after(() => { TypeSafeClient.prototype.systemOne = answer })
+  const saying = before.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await until('the task is listed', () => taskRow(before, 'jev-1'), Boolean)
+  await before.close()
+  const after = await plugin(t, { jobs: true, reload: before, replies: { graceMs: 100 } })
+  const said = await saying
+  const posted = await waitFor('the result is posted', () => after.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => after.world.delivered)
+  assert.equal(posted.length, 1, 'the plugin applied again posts the result of the task it took over')
+  await quiet(after.dataDir)
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* /, said.text)
+  assert.deepEqual(after.world.notices.map((m) => m.source.summary), [], 'the reply named the plan, so no started notice goes beside it')
+})
+
+test('what a run taken over taught as it ends is learned by the plugin applied again, which then holds what a restart reads from the data folder', async (t) => {
+  const before = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  t.after(() => release())
+  before.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await before.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the task is at work', () => before.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  await before.close()
+  const after = await plugin(t, { jobs: true, reload: before })
+  const row = await until('the plugin applied again lists the task', () => taskRow(after, 'jev-1'), Boolean)
+  assert.equal(row.state, 'running', 'taken over')
+  // What a plugin holds of what runs taught: the labels its routing decisions earned, and the evidence
+  // of what each agent proved, both read from memory (GET /jev-router/routing).
+  const learned = async (q) => {
+    const { body } = await q.http('GET', '/jev-router/routing')
+    return { learning: body.learning, verified: body.training?.verified ?? null, evidence: body.profiles.reduce((n, p) => n + (p.samples ?? 0), 0) }
+  }
+  const was = await learned(after)
+  release()
+  await waitFor('its result is posted', () => after.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(after.dataDir)
+  const now = await learned(after)
+  assert.equal(now.learning, true)
+  assert.ok(now.verified > was.verified, `the labels its routing decisions earned are learned there: ${JSON.stringify([was, now])}`)
+  assert.ok(now.evidence > was.evidence, `and what it proved of the agent that ran: ${JSON.stringify([was, now])}`)
+  await after.close()
+  const restart = await plugin(t, { jobs: true, dataDir: after.dataDir, harnessDir: after.harnessDir })
+  assert.deepEqual(await learned(restart), now, 'what the plugin applied again holds is what a restart reads')
+})
+
+test('a lock breach that a read pass taken over finds after the plugin closed is kept by the plugin applied again: that agent takes no read-only work there either', async (t) => {
+  const before = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  t.after(() => release())
+  // The locked run's files change although nothing writes the folder, once the plugin has closed.
+  before.world.work = async (opts) => { if (opts.toolFilter?.allow) { await blocked; writeFileSync(join(before.workspace, 'breach.txt'), 'x') } }
+  jevReads(t)
+  await before.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the read pass is at work', () => before.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  await before.close()
+  const after = await plugin(t, { jobs: true, reload: before })
+  const row = await until('the plugin applied again lists the task', () => taskRow(after, 'jev-1'), Boolean)
+  assert.equal(row.state, 'running', 'taken over')
+  release()
+  await waitFor('the result is posted', () => after.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  const [record] = after.rows('history.jsonl')
+  const who = record.attempts[0].agent
+  assert.deepEqual(record.access?.lockCheck, { measured: true, changed: ['breach.txt'] }, 'the read pass ran locked, and its files changed')
+  const agent = (await after.http('GET', '/jev-router/setup')).body.agents.find((a) => a.id === who)
+  assert.match(agent.readOnly.why ?? '', /^files changed while it ran locked at \d\d:\d\d UTC \(breach\.txt\), so its lock is not trusted until the harness restarts$/, 'the plugin applied again does not trust its lock')
+})
+
+test('reply A\'s credit says the routing rules picked when Jev\'s routing calls failed and the routing domains filled in without them, as the strip under it does, never Jev and never that no Jev call was made', async (t) => {
+  // Adaptive routing, as shipped, and a Jev that is down for the routing calls but sorts the message:
+  // each routing call fails, and the routing domains fill in by their rules, which is no fallback.
+  const q = await plugin(t, { jobs: true })
+  jev.refuses = (questions) => ['taskType', 'strategy', 'secondOpinion', 'agent'].some((k) => k in questions)
+  t.after(() => { jev.refuses = null })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  jev.refuses = null
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => [])
+  // What the run's own log holds before its pick: Jev calls that failed, and none that answered.
+  const { body: log } = await q.http('GET', `/jev-router/log?session=${SESSION}`)
+  const events = log.find((e) => e.jobId === 'jev-1')?.events ?? []
+  const routed = events.findIndex((e) => e.type === 'routed')
+  const before = events.slice(0, Math.max(0, routed)).map((e) => e.type)
+  assert.ok(routed > 0 && before.includes('decider-error') && !before.includes('jev'), JSON.stringify(before))
+  assert.equal(events[routed]?.routing?.mode, 'jev', 'the routing domains picked, not the fallback')
+  const credit = said.text.split('\n\n')[1] ?? said.text
+  assert.match(credit, /^> Picked by the routing rules in (under 0\.1|[\d.]+) s, since Jev could not pick \(Error: 503 Service Unavailable\); effort high \(Auto in Settings\)\.$/, said.text)
+  assert.doesNotMatch(credit, /no Jev call/, 'Jev was called, and failed')
+  // The strip under the reply names the same picker: the routing rules, then the worker.
+  const strip = JSON.parse(Buffer.from(/^\[jev-agents\]: kzh-agents-1-(\S+)$/m.exec(said.text)?.[1] ?? '', 'base64url').toString() || 'null')
+  assert.deepEqual(strip?.[0], { agent: 'Routing rules', model: '', roles: [] }, said.text)
+})
+
+test('reply A\'s credit says when your feedback moved the pick off another agent', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // A dislike in this chat that says DeepSeek was the wrong agent and Kimi the right one.
+  const verdict = await q.http('POST', '/jev-router/feedback', { sessionId: SESSION, messageId: 'answer-1', verdict: 'dislike', tag: 'wrong agent', provider: 'deepseek', suggestedAgent: 'kimi' })
+  assert.equal(verdict.status, 200, JSON.stringify(verdict.body))
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => [])
+  const [reply, credit] = said.text.split('\n\n')
+  assert.match(reply ?? '', /^OK, I'll run \*\*Kimi agent\*\* with \*\*kimi-k2\*\* /, said.text)
+  assert.match(credit ?? '', /^> Picked by Jev in (under 0\.1|[\d.]+) s: a design question, low risk\. Your feedback moved it off DeepSeek agent\.$/, said.text)
+})
+
+test('reply A carries the agent strip of the pick it names: who picked, with the model its answers came from, then the worker by its id with its model and effort, for a Jev pick and a Laya pick', async (t) => {
+  const stripOf = (text) => JSON.parse(Buffer.from(/^\[jev-agents\]: kzh-agents-1-(\S+)$/m.exec(text)?.[1] ?? '', 'base64url').toString() || 'null')
+  const q = await plugin(t, { jobs: true })
+  const byJev = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => [])
+  assert.match(byJev.text, /^OK, I'll run \*\*DeepSeek agent\*\* with \*\*deepseek-flash\*\* \(effort high\) /, byJev.text)
+  assert.deepEqual(stripOf(byJev.text), [{ agent: 'Jev', model: 'jev-1.13.0', roles: [] }, { agent: 'deepseek', model: 'deepseek-flash, high', roles: ['work'] }], 'Jev, with the model its answers came from, then the worker')
+  const p = await plugin(t, { jobs: true })
+  await started(p)
+  const byLaya = await p.say('Fix the failing test in the parser', { model: 'laya-auto' })
+  await waitFor('its result is posted', () => p.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => [])
+  assert.match(byLaya.text, /^OK, I'll run \*\*DeepSeek agent\*\* with \*\*deepseek-flash\*\* \(effort low\) /, byLaya.text)
+  assert.deepEqual(stripOf(byLaya.text), [{ agent: 'Laya', model: LABEL, roles: [] }, { agent: 'deepseek', model: 'deepseek-flash, low', roles: ['work'] }], 'Laya, with its model\'s label, then the worker')
+})
+
+test('a message Laya could not sort says why it runs as a task in every start reply: A once Laya picks, B while it waits its turn, and C when the reply does not wait for the pick', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  await started(q)
+  // Laya fails the call that sorts each message, and answers every routing call.
+  q.world.said.kind = () => { throw new Error('model error') }
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  const one = await q.say('Fix the failing test in the parser')
+  await waitFor('the first task is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  const two = await q.say('Now fix the failing lint in the parser')
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 }).catch(() => [])
+  // A reply that does not wait for the pick is C, as the task is queued.
+  assert.equal((await q.http('POST', '/jev-router/chat-replies/settings', { waitMs: 0 })).status, 200)
+  const three = await q.say('And tidy the parser')
+  await waitFor('every result is posted', () => q.world.delivered, (d) => d.length === 3, { timeoutMs: 30_000 }).catch(() => [])
+  const why = /Laya could not sort this message \(.+\); treating it as a task\./.exec(one.text)?.[0] ?? 'none'
+  const where = folderOf(q)
+  const said = (text) => text.split('\n\n[jev-job]')[0]
+  assert.match(said(one.text), new RegExp(`^OK, I'll run \\*\\*DeepSeek agent\\*\\* with \\*\\*deepseek-flash\\*\\* \\(effort \\w+\\) in the background as \\*\\*jev-1\\*\\* in ${where}\\. Laya could not sort this message \\(.+\\); treating it as a task\\. I'll report back here when it's done\\. Keep chatting\\.\\n\\n> Picked by Laya on this PC `), one.text)
+  assert.equal(said(two.text), `OK, **jev-2** is queued: 2nd in line for ${where} (another task is running there). ${why} Laya picks the agent when it starts; I'll say which here, and report back when it's done. Keep chatting.`)
+  assert.equal(said(three.text), `OK, **jev-3** is starting in ${where}, and Laya is choosing the agent. ${why} I'll say here which one it picks, and report back when it's done. Keep chatting.`)
+})
+
+test('a question asked while a task works is told what that task is doing now, and of no task in another chat or one that has ended', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  jev.said.kind = (state) => (String(state?.message).includes('?') ? 'question' : 'task')
+  t.after(() => { delete jev.said.kind })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the task is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  // Another chat queues a task in the same folder, where it waits.
+  for await (const _ of q.adapter().stream({ model: 'jev-auto', messages: [{ role: 'user', content: [{ type: 'text', text: 'Now fix the failing lint in the parser' }] }], sessionId: 'session-2', signal: new AbortController().signal })) { /* the reply */ }
+  assert.equal((await taskRow(q, 'jev-2'))?.state, 'queued')
+  const about = () => q.world.chat.at(-1)?.messages.at(-1)?.content[0]?.text ?? ''
+  const question = await q.say('How is it going?', { model: 'jev-auto' })
+  assert.match(question.text, /^A monad/, 'the chat model answered it')
+  assert.match(about(), /^You are talking with the person who runs this app: .* Right now in this chat: jev-1 is running on DeepSeek agent \(\d+ s, last: .+\)\.$/, about())
+  assert.doesNotMatch(about(), /jev-2/, 'the task another chat queued is not this chat\'s')
+  release()
+  await waitFor('both results are posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  await q.say('And now?', { model: 'jev-auto' })
+  assert.doesNotMatch(about(), /Right now/, 'nothing runs in this chat now')
+})
+
+test('a task Jev reads as needing a person names no agent: its reply says it ended, one that waited gets no started notice, and each result reads Needs input', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // Jev reads the next message as needing a person, at 85%, over its bar of 60%. It is sent at a
+  // level picked in the model menu, which no attempt of its run starts at.
+  jev.said.capability = 'human_required'
+  t.after(() => { delete jev.said.capability })
+  const one = await q.say('Deploy this to production with my AWS keys', { model: 'jev-auto', effort: 'xhigh' })
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  // A task at work in the folder, so the next one waits its turn.
+  delete jev.said.capability
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the task between them is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  jev.said.capability = 'human_required'
+  const three = await q.say('Now deploy it to production with my AWS keys', { model: 'jev-auto' })
+  release()
+  await waitFor('every result is posted', () => q.world.delivered, (d) => d.length === 3, { timeoutMs: 30_000 })
+  assert.equal(one.text.split('\n\n')[0], '**jev-1** ended before Jev picked its agent (Needs input). Its result is posted here as its own message.', 'no agent is named for a run that starts none')
+  assert.match(one.text, new RegExp(`\\n\\n\\[jev-job\\]: kzh-job-1-${(await taskRow(q, 'jev-1')).key}(\\n|$)`))
+  assert.doesNotMatch(one.text, /\[jev-agents\]/, 'and no agent strip names one')
+  assert.match(three.text, /^OK, \*\*jev-3\*\* is queued: 2nd in line for [^ ]+ \(another task is running there[^)]*\)\. Jev picks the agent when it starts;/, three.text)
+  assert.deepEqual(q.world.notices.filter((m) => !m.source.summary.startsWith('jev-2')).map((m) => m.source.summary), [], 'no notice says an agent started for either')
+  for (const jobId of ['jev-1', 'jev-3']) {
+    const result = q.world.delivered.find((m) => m.source.summary.startsWith(`${jobId} `))
+    assert.match(result?.source.summary ?? '', / · Needs input$/, jobId)
+    assert.match(result.content[0].text, /^Agent: Jev picks$/m, 'its head names no agent and no effort, as its reply named none')
+    assert.match(result.content[0].text, /^Status: Needs input$/m)
+    assert.match(result.content[0].text, /Jev read this as needing a person/)
+  }
+  assert.equal(q.ran.length, 1, 'only the task between them ran an agent')
+})
+
+test('a read task whose agent could not be started locked is told, as it starts again as work that writes, the lock it could not have, not that it needed to change files', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  jevReads(t)
+  // The routing found deepseek lockable; by its last call the spawn provider takes no tool filter any
+  // more, so its locked start is refused and the task goes to its folder's line.
+  jev.said.strategy = () => { q.world.providers.spawn = { capabilities: { toolFilter: false } }; return undefined }
+  t.after(() => { delete jev.said.strategy })
+  await q.say('How does the parser read its tokens', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  const notices = await until('its notice is posted', () => q.world.notices.filter((m) => m.source.summary.startsWith('jev-1')), (n) => n.length > 0).catch(() => [])
+  assert.deepEqual(notices.map((m) => m.source.summary), ['jev-1 started again as work that writes'])
+  assert.match(notices[0].content[0].text, /^\*\*jev-1\*\* could not run locked against writing \(deepseek could not be started locked: its provider takes no per-start tool filter\), so it started again as work that writes: \*\*[^*]+\*\* \([^)]+\)\.$/, notices[0].content[0].text)
+})
+
+test('while a start reply waits for a pick that takes a moment, its block shows the router\'s own lines after its choosing line, before the reply names the agent', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  await started(q)
+  // Laya, loaded and ready, now takes 100 ms a question, so its routing calls take over a second.
+  q.world.fakes.at(-1).setMsPerRow(100)
+  const chunks = []
+  for await (const c of q.adapter().stream({ model: 'laya-auto', messages: [{ role: 'user', content: [{ type: 'text', text: 'Fix the failing test in the parser' }] }], sessionId: SESSION, signal: new AbortController().signal })) chunks.push(c)
+  const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join('')
+  const text = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  // A message that took a moment to sort says so first, in a block of its own.
+  const wait = reasoning.slice(Math.max(0, reasoning.indexOf('Queued as jev-1.')))
+  assert.match(wait, /^Queued as jev-1\. Choosing the agent \(I reply once it's picked, at most 15 s\)\. Stop here ends this reply only; the task keeps going \(stop it on the work board\)\.\n/, reasoning)
+  const lines = wait.split('\n').slice(1)
+  const route = lines.findIndex((l) => /^Laya route: \d+\/\d+ questions in \d+ ms/.test(l))
+  const routed = lines.findIndex((l) => /^Routed to \w+ \(laya\)/.test(l))
+  assert.ok(route >= 0 && routed > route, `the router's own lines, as they came: ${JSON.stringify(lines)}`)
+  assert.ok(chunks.findLastIndex((c) => c.type === 'reasoning-delta') < chunks.findIndex((c) => c.type === 'text-delta'), 'all of them before the reply')
+  assert.match(text, /^OK, I'll run \*\*[^*]+\*\* with [^\n]* as \*\*jev-1\*\* in [^\n]*\n\n> Picked by Laya on this PC in /, text)
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+})
+
+test('a task read as needing a person whose routing takes a moment names no agent in its reply\'s block either: the router\'s line says no agent runs', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  await started(q)
+  // Laya reads the message as needing a person, over its bar, and its routing calls take over a second.
+  q.world.said.capability = 'human_required'
+  q.world.fakes.at(-1).setMsPerRow(100)
+  const chunks = []
+  for await (const c of q.adapter().stream({ model: 'laya-auto', messages: [{ role: 'user', content: [{ type: 'text', text: 'Deploy this to production with my AWS keys' }] }], sessionId: SESSION, signal: new AbortController().signal })) chunks.push(c)
+  const reasoning = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join('')
+  const text = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 }).catch(() => [])
+  assert.equal(text.split('\n\n')[0], '**jev-1** ended before Laya picked its agent (Needs input). Its result is posted here as its own message.')
+  const wait = reasoning.slice(Math.max(0, reasoning.indexOf('Queued as jev-1.')))
+  assert.match(wait, /^Queued as jev-1\. Choosing the agent /, 'the reply waited in a block of its own')
+  assert.match(wait, /^Laya read this as needing a person: no agent runs$/m, 'the router\'s line for the routing that stopped for a person')
+  assert.doesNotMatch(reasoning, /Routed to|deepseek|kimi/i, 'and nothing in the block names an agent that would have run')
+  assert.equal(q.ran.length, 0)
+})
+
+// ---------------------------------------------------------------- task or question, and the reply ledger, in shadow
+
+/** The intent samples in a plugin's store `file`, each with its newest outcome. */
+const intentSamples = (p, file = 'routing-samples.jsonl') => {
+  const all = p.rows(file)
+  return all.filter((r) => r.domain === 'intent').map((s) => ({ ...s, outcome: all.filter((r) => r.id === s.id && r.outcome).at(-1)?.outcome ?? null }))
+}
+/** How many intent calls Jev has been sent: the call whose questions hold `alsoWork`. */
+const jevIntentCalls = () => jev.calls.filter((c) => 'alsoWork' in (JSON.parse(c.body).questions ?? {})).length
+
+test('under Jev Auto each message is one intent sample with Jev\'s answer as the teacher\'s, still one Jev call a message: a direct answer ends with its mark, and a task carries its sample to its run, which labels it', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  jev.said.kind = (state) => (String(state?.message).includes('?') ? 'question' : 'task')
+  t.after(() => { delete jev.said.kind })
+  const calls = jevIntentCalls()
+  const answer = await q.say('What is a monad?', { model: 'jev-auto' })
+  assert.match(answer.text, /^A monad chains computations/, 'the question was answered directly')
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  assert.equal(jevIntentCalls() - calls, 2, 'Jev was asked once a message, as before')
+  assert.equal(q.rows('usage.jsonl').filter((u) => u.agent === 'jev' && u.phase === 'intent').length, 2, 'and paid once a message')
+  const samples = intentSamples(q)
+  assert.deepEqual(samples.map((s) => [s.teacher?.label, s.authority]), [['question', 'jev'], ['task', 'jev']], 'one sample a message, Jev deciding and teaching while the domain learns')
+  const [question, task] = samples
+  assert.ok(answer.text.endsWith(`no agents or project work\n\n[jev-intent]: kzh-intent-1-${question.id}`), answer.text)
+  assert.equal(question.outcome, null, 'only a person\'s word labels a direct answer')
+  const [record] = q.rows('history.jsonl')
+  assert.equal(record.intentSample, task.id, 'the run\'s record carries the sample of the message that asked for it')
+  assert.equal(q.rows('tasks.jsonl').find((r) => r.jobId === 'jev-1')?.intentSample, task.id, 'and so does its task')
+  assert.deepEqual([task.outcome?.label, task.outcome?.labelSource, task.outcome?.verified], ['task', 'verified_outcome', true], 'an accepted run that changed files says it was a task')
+  assert.doesNotMatch(JSON.stringify(samples), /monad|parser|failing/i, 'a sample keeps features, never the words')
+})
+
+/** A picture attached to a message, as the engine gives it, and the store that reads its bytes. */
+const PICTURE = { type: 'image', image: 'data:image/png;base64,iVBORw0KGgo=', mediaType: 'image/png', attachment: { attachmentId: 'shot-1' } }
+const PICTURES = { readImageRequest: async () => ({ mediaType: 'image/png', data: Buffer.from('a picture') }) }
+
+test('a message\'s intent sample says whether a picture came with it, as classify hands the intent domain the message\'s modalities', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  q.world.attachments = PICTURES
+  jev.said.kind = (state) => (String(state?.message).includes('?') ? 'question' : 'task')
+  t.after(() => { delete jev.said.kind })
+  await q.say('What is this?', { model: 'jev-auto', images: [PICTURE] })
+  await q.say('What is a monad?', { model: 'jev-auto' })
+  await quiet(q.dataDir)
+  const features = intentSamples(q).map((s) => s.input?.features)
+  assert.deepEqual(features.map((f) => [f?.numeric?.has_image, f?.categorical?.modality]), [[1, 'text+image'], [0, 'text']], 'the screenshot sent with its question, and the question sent alone')
+})
+
+test('the reply ledger keeps what a Jev Auto start reply named and what the router then ran, with no words of the task, and GET /jev-router/replies/summary shows it', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  assert.match(said.text, /^OK, I'll run \*\*[^*]+\*\* with /, said.text)
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  const [record] = q.rows('history.jsonl')
+  const picked = record.routing.primaryAgent
+  const rows = q.rows('reply-ledger.jsonl')
+  assert.equal(new Set(rows.map((r) => r.key)).size, 1, 'one task, one row')
+  const row = rows.at(-1)
+  assert.deepEqual([row.jobId, row.decider, row.mode, row.forced, row.predicted, row.match], ['jev-1', 'jev', 'auto', false, null, null], 'no predictor is trained yet: no guess, and nothing scored')
+  assert.deepEqual([row.said.how, row.said.agent], ['routed', picked], 'the reply waited for the pick and named it')
+  assert.ok(Number.isFinite(row.said.ms) && row.said.ms >= 0, JSON.stringify(row.said))
+  assert.deepEqual([row.ran.agent, row.ran.runId], [picked, record.runId], 'what the router ran, from its first routing')
+  const plan = q.rows('tasks.jsonl').find((r) => r.jobId === 'jev-1')?.plan
+  assert.ok(plan?.effort && plan?.model, `the setting: the router planned an effort and a model: ${JSON.stringify(plan)}`)
+  assert.equal(row.ran.level, plan.level, 'at the level of the effort the router planned, which a guess is scored on')
+  assert.deepEqual([row.said.effort, row.said.model], [plan.effort, plan.model], 'the reply named the effort and the model of the pick')
+  assert.deepEqual([row.ran.effort, row.ran.model], [plan.effort, plan.model], 'and the router ran them')
+  assert.deepEqual(AGENTS.map((a) => row.features.numeric[`avail:${a.id}`]), [1, 1], 'with the pool it was picked from')
+  assert.doesNotMatch(q.read('reply-ledger.jsonl'), /parser|failing/i, 'and no words of the task')
+  // The intent domain's evaluation after the run, which counts the label the run gave the message.
+  const evaluated = await until('the intent domain is evaluated with the run\'s label', () => JSON.parse(q.read(join('domains', 'intent.state.json')) || 'null')?.lastEvaluation ?? null, (ev) => ev?.samples?.verified >= 1).catch(() => null)
+  const { status, body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.equal(status, 200, JSON.stringify(body))
+  assert.equal(body.learning, true)
+  assert.deepEqual([body.startReplies.n, body.startReplies.days], [1, 7], 'one reply waited for routing this week')
+  assert.equal(body.startReplies.medianMs, row.said.ms)
+  assert.deepEqual(body.recent.map((r) => [r.jobId, r.said.how, r.ran.agent, r.match]), [['jev-1', 'routed', picked, null]])
+  assert.deepEqual(body.recent.map((r) => [r.said.effort, r.said.model, r.ran.effort, r.ran.model]), [[plan.effort, plan.model, plan.effort, plan.model]], 'with the effort and the model of each, for the card to name')
+  assert.deepEqual([body.prediction.labelled, body.prediction.minRows, body.prediction.trained], [1, 60, null])
+  assert.deepEqual(body.prediction.gates, { quick: { right: 45, of: 50 }, likely: { right: 16, of: 20 } })
+  assert.deepEqual(body.prediction.records.jev.quick, { decider: 'jev', of: 50, n: 0, right: 0 })
+  assert.equal(body.intent.maturity, 'JEV_PRIMARY')
+  assert.deepEqual(body.intent.needs, { samples: 750, perClass: 100, recentAccuracy: 0.94 })
+  assert.deepEqual([body.intent.verified, body.intent.classes, body.intent.recent], [evaluated?.samples?.verified, evaluated?.classes?.counts, null], 'the checked examples and those of each class, as the domain\'s last evaluation counted them, with no classifier yet to score')
+  assert.deepEqual([body.intent.verified, body.intent.classes], [1, { task: 1 }], 'the one message, checked as a task by its run')
+  assert.equal(body.names[picked], AGENTS.find((a) => a.id === picked).name)
+  assert.doesNotMatch(JSON.stringify(body), /parser|failing/i)
+})
+
+test('the summary gives the How Jev replies card the message intent\'s figures as the domain\'s last evaluation counted them: its checked examples, those of each class, and how often its classifier was right of the newest it was not trained on', async (t) => {
+  const { intentFeatures } = await import('../features.js')
+  assert.equal(typeof intentFeatures, 'function', 'features.js reads a message for its intent')
+  const { calibrate, saveArtifact, trainMulticlass } = await import('../classifier.js')
+  const { createTrainingStore } = await import('../training.js')
+  const TASKS = ['Fix the failing test in the parser', 'Add a dark mode switch to the settings page', 'Rename the config loader to settings loader']
+  const QUESTIONS = ['What is a monad?', 'Why does the build fail on Windows?']
+  // Forty messages in Jev's store, each checked by what its run did: every fourth a question, and the
+  // rest tasks, but for three worded as tasks that ran as answers and changed no file, so checked as
+  // questions. The classifier was trained through the tenth, and is right of the thirty after it but
+  // for those three.
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-intent-figures-'))
+  cleanUp(t, dataDir)
+  const store = createTrainingStore({ file: join(dataDir, 'routing-samples.jsonl') })
+  const ids = []
+  for (let i = 0; i < 40; i++) {
+    const worded = i % 4 === 3 ? 'question' : 'task'
+    const label = [16, 26, 36].includes(i) ? 'question' : worded
+    const row = await store.append({ domain: 'intent', input: { features: intentFeatures(worded === 'task' ? TASKS[i % 3] : QUESTIONS[i % 2]) }, teacher: { label: worded, probabilities: { [worded]: 0.9 }, confidence: 0.9, model: 'jev-test' }, local: null, authority: 'jev' })
+    await store.resolveOutcome(row.id, { label, labelSource: 'verified_outcome', verified: true, details: { finalStatus: 'accepted', attempts: 1, escalated: false } })
+    ids.push(row.id)
+  }
+  const samples = [...TASKS.flatMap((m) => Array.from({ length: 6 }, () => ({ features: intentFeatures(m), label: 'task' }))), ...QUESTIONS.flatMap((m) => Array.from({ length: 6 }, () => ({ features: intentFeatures(m), label: 'question' })))]
+  saveArtifact(join(dataDir, 'classifiers', 'intent.json'), calibrate(trainMulticlass({ samples, domain: 'intent', options: { epochs: 300, learningRate: 0.3 }, extras: { verifiedSamples: 10, trainedThrough: ids[9], calibratedThrough: ids[9] } }), samples))
+  const q = await plugin(t, { dataDir })
+  // The evaluation pass a run starts on its own, asked for at once.
+  const { status, body: evaluatedNow } = await q.http('POST', '/jev-router/routing/evaluate', {})
+  assert.equal(status, 200, JSON.stringify(evaluatedNow))
+  const ev = JSON.parse(q.read(join('domains', 'intent.state.json')) || 'null')?.lastEvaluation
+  assert.deepEqual([ev?.samples?.verified, ev?.classes?.counts, ev?.recent?.n, ev?.recent?.accuracy], [40, { task: 27, question: 13 }, 30, 0.9], 'the setting: forty checked, thirty of them scored, twenty-seven right')
+  const { body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual([body?.intent?.verified, body?.intent?.classes, body?.intent?.recent], [40, { task: 27, question: 13 }, { accuracy: 0.9, n: 30 }], 'the figures the card reads, as the evaluation counted them')
+})
+
+test('the summary gives the How Jev replies card the bars task or question is held to by the routing policy in force, not the ones that ship: checked examples, those of each class, and a recent accuracy set between two whole percents', async (t) => {
+  // The message intent is a LOW domain, so the LOW gates are its own.
+  const q = await plugin(t, { config: { routing: { gates: { LOW: { guardedSamples: 600, perClassSamples: 50, guarded: { recentAccuracy: 0.945 } } } } } })
+  const { status, body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.equal(status, 200, JSON.stringify(body))
+  assert.deepEqual(body?.intent?.needs, { samples: 600, perClass: 50, recentAccuracy: 0.945 }, 'the bars the policy sets')
+  const held = (await q.http('GET', '/jev-router/routing')).body?.policy?.gates?.LOW
+  assert.deepEqual([held?.guardedSamples, held?.perClassSamples, held?.guarded?.recentAccuracy], [600, 50, 0.945], 'which are those the Router tab says the domains are held to')
+})
+
+test('the reply ledger keeps how each start reply came to name what it named: the pick it waited for as routed, none for a reply that waits its turn, and an agent picked in the model menu as forced, which teaches the predictor nothing and is not timed with the replies that waited for routing', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  const first = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first task is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  const second = await q.say('Now fix the failing lint in the parser', { model: 'jev-auto' })
+  const third = await q.say('Then tidy the parser', { model: 'agent-deepseek' })
+  release()
+  await waitFor('every result is posted', () => q.world.delivered, (d) => d.length === 3, { timeoutMs: 60_000 })
+  await quiet(q.dataDir)
+  assert.match(first.text, /^OK, I'll run \*\*[^*]+\*\* with /, 'the first waited for its pick and named it')
+  assert.match(second.text, /^OK, \*\*jev-2\*\* is queued: /, 'the second waits its turn, so its reply named no plan')
+  assert.match(third.text, /^OK, I'll run \*\*DeepSeek agent\*\* with \*\*deepseek-flash\*\* /, 'the third named the agent picked in the model menu')
+  // Each task's newest line, which holds its whole row, by job.
+  const rows = Object.fromEntries([...new Map(q.rows('reply-ledger.jsonl').map((r) => [r.key, r])).values()].map((r) => [r.jobId, r]))
+  assert.deepEqual(Object.keys(rows).sort(), ['jev-1', 'jev-2', 'jev-3'], 'a row a task')
+  const picked = q.rows('history.jsonl').find((h) => h.taskKey === rows['jev-1'].key)?.routing?.primaryAgent
+  assert.deepEqual(['jev-1', 'jev-2', 'jev-3'].map((j) => [j, rows[j].forced, rows[j].said?.how, rows[j].said?.agent ?? null]), [
+    ['jev-1', false, 'routed', picked],
+    ['jev-2', false, 'waited', null],
+    ['jev-3', true, 'forced', 'deepseek'],
+  ])
+  assert.deepEqual([rows['jev-2'].said.effort, rows['jev-2'].said.model], [null, null], 'a reply that named no plan named no effort or model either')
+  assert.deepEqual([rows['jev-3'].said.model, rows['jev-3'].predicted], ['deepseek-flash', null], 'the forced reply named its model, and nothing was guessed for a task nobody routes')
+  assert.deepEqual(['jev-1', 'jev-2', 'jev-3'].map((j) => !!rows[j].ran?.agent), [true, true, true], 'each was routed once it started')
+  const { body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual([body.startReplies.n, body.startReplies.medianMs], [1, rows['jev-1'].said.ms], 'only the reply that waited for routing is timed')
+  assert.equal(body.prediction.labelled, 2, 'and the predictor learns from the two tasks routing picked for, not from your pick')
+  assert.deepEqual(body.recent.map((r) => [r.jobId, r.said.how]), [['jev-3', 'forced'], ['jev-2', 'waited'], ['jev-1', 'routed']])
+})
+
+test('the reply ledger keeps a pick that gives the work to a tool as the tool its start reply named, as what ran names it, never the agent that takes over only if the tool fails', async (t) => {
+  const tools = [{ id: 'fixer', description: 'Writes fixed into state.txt and nothing else', command: "node -e \"require('fs').writeFileSync('state.txt','fixed')\"", params: {}, enabled: true }]
+  const q = await plugin(t, { jobs: true, config: { tools } })
+  // Jev's routing hands the work to the fixer tool; the router names an agent behind it all the same.
+  Object.assign(jev.said, { handler: 'fixer', 'fixer.fits': 0.95, capability: 'other' })
+  t.after(() => { for (const k of ['handler', 'fixer.fits', 'capability']) delete jev.said[k] })
+  const said = await q.say('Write fixed into state.txt', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  assert.match(said.text, /^OK, I'll run the \*\*fixer\*\* tool on this in the background as \*\*jev-1\*\* /, said.text)
+  const rows = q.rows('reply-ledger.jsonl')
+  assert.equal(new Set(rows.map((r) => r.key)).size, 1, 'one task, one row')
+  const row = rows.at(-1)
+  assert.deepEqual([row.ran?.agent, row.ran?.effort, row.ran?.model], ['tool:fixer', null, null], 'the tool ran')
+  assert.ok(q.rows('history.jsonl')[0]?.routing?.primaryAgent, 'with an agent behind it, should it fail')
+  assert.deepEqual([row.said?.agent, row.said?.effort, row.said?.model, row.said?.how], ['tool:fixer', null, null, 'routed'], 'and the reply is kept as naming the tool, as what ran names it')
+  const { body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual(body.recent.map((r) => [r.said.agent, r.ran.agent]), [['tool:fixer', 'tool:fixer']])
+})
+
+test('a start reply whose wait for the pick runs out is kept as such and timed with the replies that named the pick, and the card is told when replies wait for no pick at all', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  assert.equal((await q.http('POST', '/jev-router/chat-replies/settings', { waitMs: 300 })).status, 200)
+  // Jev's routing and review calls take a second, longer than the reply waits; sorting the message does not.
+  const answer = TypeSafeClient.prototype.systemOne
+  TypeSafeClient.prototype.systemOne = async function systemOne(request, options) {
+    if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(this.baseURL) && !('alsoWork' in (request.questions ?? {}))) await tick(1000)
+    return answer.call(this, request, options)
+  }
+  t.after(() => { TypeSafeClient.prototype.systemOne = answer })
+  const said = await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  assert.match(said.text, /^OK, \*\*jev-1\*\* is starting in .+, and Jev is still choosing the agent \(0\.3 s so far\)\./, said.text)
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  const row = q.rows('reply-ledger.jsonl').at(-1)
+  assert.deepEqual([row?.said?.how, row?.said?.agent], ['bound', null], 'kept as a reply whose wait ran out before the pick')
+  assert.ok(row.said.ms >= 300, JSON.stringify(row.said))
+  let { body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual([body.startReplies?.n, body.startReplies?.atBound, body.startReplies?.medianMs, body.startReplies?.waitMs], [1, 1, row.said.ms, 300], 'timed, counted as one whose wait ran out, beside the wait replies are given now')
+  // With the wait set to none, a reply waits for no pick, and the card is told so.
+  TypeSafeClient.prototype.systemOne = answer
+  assert.equal((await q.http('POST', '/jev-router/chat-replies/settings', { waitMs: 0 })).status, 200)
+  await q.say('Now fix the failing lint in the parser', { model: 'jev-auto' })
+  await waitFor('the second result is posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  const second = [...new Map(q.rows('reply-ledger.jsonl').map((r) => [r.key, r])).values()].find((r) => r.jobId === 'jev-2')
+  assert.equal(second?.said?.how, 'now', 'a reply that waited for no pick went out at once, and is not one whose wait ran out')
+  ;({ body } = await q.http('GET', '/jev-router/replies/summary'))
+  assert.deepEqual([body.startReplies.n, body.startReplies.atBound, body.startReplies.waitMs], [1, 1, 0], 'and is not timed')
+})
+
+test('a start reply that goes out at once beside a task that starts at once is kept as going out at once, never as one that waited: the sentence of work asked for beside a question answered directly, whatever the wait for the pick, and C with that wait set to none; a reply whose task waits its turn waited', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  // A question that also asks for work, in an idle folder, with the wait for the pick as it ships.
+  jev.said.kind = (state) => (String(state?.message).includes('?') ? 'question' : 'task')
+  jev.said.alsoWork = 0.95
+  t.after(() => { delete jev.said.kind; delete jev.said.alsoWork })
+  const answered = await q.say('What does the parser do, and can you also fix its failing test?', { model: 'jev-auto' })
+  assert.match(answered.text, /^A monad chains computations[\s\S]*\n\nOK, \*\*jev-1\*\* is starting in /, answered.text)
+  delete jev.said.alsoWork
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  // With the wait for the pick set to none, a task in the idle folder, and one that waits its turn behind it.
+  assert.equal((await q.http('POST', '/jev-router/chat-replies/settings', { waitMs: 0 })).status, 200)
+  // The second task is held at work by its own words, however many agents started before it.
+  let release
+  const blocked = new Promise((r) => { release = r })
+  let held = false
+  q.world.work = async (opts) => { if (String(opts.prompt?.[0]?.text ?? '').includes('Fix the failing lint in the parser')) { held = true; await blocked } }
+  const atOnce = await q.say('Fix the failing lint in the parser', { model: 'jev-auto' })
+  assert.match(atOnce.text, /^OK, \*\*jev-2\*\* is starting in /, atOnce.text)
+  await waitFor('the second task is at work', () => held, Boolean, { timeoutMs: 20_000 })
+  const queued = await q.say('Then tidy the parser', { model: 'jev-auto' })
+  assert.match(queued.text, /^OK, \*\*jev-3\*\* is queued: /, queued.text)
+  release()
+  await waitFor('every result is posted', () => q.world.delivered, (d) => d.length === 3, { timeoutMs: 60_000 })
+  await quiet(q.dataDir)
+  // Each task's newest line, which holds its whole row, by job.
+  const rows = Object.fromEntries([...new Map(q.rows('reply-ledger.jsonl').map((r) => [r.key, r])).values()].map((r) => [r.jobId, r]))
+  assert.deepEqual(['jev-1', 'jev-2', 'jev-3'].map((j) => [j, rows[j]?.said?.how ?? null, rows[j]?.said?.agent ?? null]), [['jev-1', 'now', null], ['jev-2', 'now', null], ['jev-3', 'waited', null]], `the work beside the answer and C each went out at once, and B waited its turn; none named an agent: ${JSON.stringify(Object.values(rows).map((r) => [r.jobId, r.said]))}`)
+  const { body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual([body?.startReplies?.n, body?.recent?.map((r) => [r.jobId, r.said?.how])], [0, [['jev-3', 'waited'], ['jev-2', 'now'], ['jev-1', 'now']]], 'none of them waited for a pick, so none is timed')
+})
+
+test('the summary tells a reply whose task ended before routing picked anything from one whose task is still to be routed: a task stopped as it waited its turn, and one Jev read as needing a person once its reply\'s wait ran out', async (t) => {
+  const q = await plugin(t, { jobs: true })
+  const recentOf = async (jobId) => ((await q.http('GET', '/jev-router/replies/summary')).body?.recent ?? []).find((r) => r.jobId === jobId)
+  // A task at work in the folder, so the next one waits its turn.
+  let release
+  const blocked = new Promise((r) => { release = r })
+  q.world.work = async (_opts, n) => { if (n === 1) await blocked }
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the first task is working', () => q.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+  const second = await q.say('Now fix the failing lint in the parser', { model: 'jev-auto' })
+  assert.match(second.text, /^OK, \*\*jev-2\*\* is queued: /, 'the second waits its turn, so its reply named no plan')
+  const waiting = await until('the waiting task\'s reply is kept', () => recentOf('jev-2'), (r) => r?.said?.how === 'waited', { timeoutMs: 5000 }).catch(() => null)
+  assert.deepEqual([waiting?.said?.how, waiting?.ran, waiting?.ended ?? null], ['waited', null, null], 'its task is still to be routed')
+  assert.deepEqual((await q.http('POST', '/jev-router/tasks/stop', { jobId: 'jev-2', onlyIfWaiting: true })).body, { result: 'requested' })
+  const stopped = await until('the stopped task\'s reply says it ended', () => recentOf('jev-2'), (r) => !!r?.ended, { timeoutMs: 5000 }).catch(() => null)
+  assert.deepEqual([stopped?.ran, stopped?.ended], [null, 'stopped'], 'stopped as it waited: nothing ran, and nothing will')
+  // Cleared from the task list, which only a finished task leaves, it is still one that ended.
+  assert.deepEqual((await q.http('POST', '/jev-router/tasks/clear', { jobIds: ['jev-2'] })).body, { cleared: ['jev-2'] })
+  assert.equal((await recentOf('jev-2'))?.ended, true, 'gone from the task list, and ended')
+  release()
+  await waitFor('the first result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  // Jev's routing takes a second, longer than the reply waits, and reads the next task as needing a person.
+  assert.equal((await q.http('POST', '/jev-router/chat-replies/settings', { waitMs: 300 })).status, 200)
+  const answer = TypeSafeClient.prototype.systemOne
+  TypeSafeClient.prototype.systemOne = async function systemOne(request, options) {
+    if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(this.baseURL) && !('alsoWork' in (request.questions ?? {}))) await tick(1000)
+    return answer.call(this, request, options)
+  }
+  t.after(() => { TypeSafeClient.prototype.systemOne = answer })
+  jev.said.capability = 'human_required'
+  t.after(() => { delete jev.said.capability })
+  const third = await q.say('Now deploy it to production with my AWS keys', { model: 'jev-auto' })
+  assert.match(third.text, /^OK, \*\*jev-3\*\* is starting in .+, and Jev is still choosing the agent/, third.text)
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  const person = await recentOf('jev-3')
+  assert.deepEqual([person?.said?.how, person?.ran, person?.ended], ['bound', null, 'needs_human'], 'routed as needing a person after its wait ran out: nothing ran, and nothing will')
+  const first = await recentOf('jev-1')
+  assert.deepEqual([!!first?.ran?.agent, first?.ended], [true, 'completed'], 'and the task that ran is said to have run what it ran')
+  assert.equal(q.ran.length, 1, 'only the first task started an agent')
+})
+
+test('a start reply that goes out once its task has ended is kept all the same: one whose wait for the pick, as it ships, ended as Jev read the task as needing a person, and reply A for an agent picked in the model menu that refused the task at once, kept as your pick and not as one that waited for routing', async (t) => {
+  // Claude is switched on but signed out, so a task sent to it from the model menu ends as it starts.
+  claudeSignedIn(t, { loggedIn: false })
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: true }
+  const q = await plugin(t, { jobs: true, config: { agents: [...AGENTS, claude] } })
+  const recentOf = async (jobId) => ((await q.http('GET', '/jev-router/replies/summary')).body?.recent ?? []).find((r) => r.jobId === jobId)
+  // Jev reads the message as needing a person well within the wait for the pick as it ships (15 s),
+  // so the reply's wait ends with its task, and the reply goes out once the task has ended.
+  jev.said.capability = 'human_required'
+  t.after(() => { delete jev.said.capability })
+  const person = await q.say('Deploy this to production with my AWS keys', { model: 'jev-auto' })
+  assert.match(person.text, /^\*\*jev-1\*\* ended before Jev picked its agent \(Needs input\)\. /, person.text)
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  delete jev.said.capability
+  // Reply A for Claude, held once its text is out until its task has ended, as a chat slow to take
+  // it holds it, so it says what it named only after that.
+  const forced = await q.say('Fix the failing test in the parser', {
+    model: 'agent-claude',
+    hold: async (e) => { if (e.type === 'block-end' && e.block?.type === 'text') await until('the task Claude refused has ended', () => taskRow(q, 'jev-2'), (r) => r?.state === 'failed', { timeoutMs: 20_000 }) },
+  })
+  assert.match(forced.text, /^OK, I'll run \*\*Claude Code\*\* /, forced.text)
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  // Each task's newest line, which holds its whole row, by job.
+  const rows = Object.fromEntries([...new Map(q.rows('reply-ledger.jsonl').map((r) => [r.key, r])).values()].map((r) => [r.jobId, r]))
+  assert.deepEqual([rows['jev-1']?.said?.how, rows['jev-1']?.said?.agent, rows['jev-1']?.ran], ['waited', null, null], `the reply that waited for a pick that did not come, and named none, is kept: ${JSON.stringify(rows['jev-1'])}`)
+  assert.deepEqual([rows['jev-2']?.forced, rows['jev-2']?.said?.how, rows['jev-2']?.said?.agent, rows['jev-2']?.ran], [true, 'forced', 'claude', null], `and so is reply A, as naming your pick, not a pick it waited for: ${JSON.stringify(rows['jev-2'])}`)
+  const needsYou = await recentOf('jev-1')
+  assert.deepEqual([needsYou?.said?.how, needsYou?.ran, needsYou?.ended], ['waited', null, 'needs_human'], 'Recent replies holds the reply, whose task ran nothing as it needed a person')
+  const refused = await recentOf('jev-2')
+  assert.deepEqual([refused?.said?.how, refused?.ran, refused?.ended], ['forced', null, 'failed'], 'and reply A, whose task ran nothing as its agent refused it')
+  const { body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual([body?.startReplies?.n, body?.recent?.map((r) => r.jobId)], [0, ['jev-2', 'jev-1']], 'neither is timed with the replies that named the pick they waited for')
+  assert.equal(q.ran.length, 0, 'no agent started on either')
+})
+
+test('after a restart hands out a job id again, the summary reads each reply\'s task by its key: the reply of the task stopped before the restart still ended, and the new one under that job id is still to be routed', async (t) => {
+  /** A task at work in the plugin `p`'s folder, held until the returned function lets it go, and a second that waits its turn behind it. */
+  const twoTasks = async (p) => {
+    let release
+    const blocked = new Promise((r) => { release = r })
+    p.world.work = async (_opts, n) => { if (n === 1) await blocked }
+    await p.say('Fix the failing test in the parser', { model: 'jev-auto' })
+    await waitFor('the first task is working', () => p.ran.length, (n) => n === 1, { timeoutMs: 20_000 })
+    const second = await p.say('Now fix the failing lint in the parser', { model: 'jev-auto' })
+    assert.match(second.text, /^OK, \*\*jev-2\*\* is queued: /, 'the second waits its turn as jev-2')
+    return release
+  }
+  const repliesOf = async (p, jobId) => ((await p.http('GET', '/jev-router/replies/summary')).body?.recent ?? []).filter((r) => r.jobId === jobId)
+  const before = await plugin(t, { jobs: true })
+  const release = await twoTasks(before)
+  await until('the waiting task\'s reply is kept', () => repliesOf(before, 'jev-2'), (rows) => rows[0]?.said?.how === 'waited', { timeoutMs: 5000 }).catch(() => null)
+  assert.deepEqual((await before.http('POST', '/jev-router/tasks/stop', { jobId: 'jev-2', onlyIfWaiting: true })).body, { result: 'requested' })
+  const stopped = await until('the stopped task\'s reply says it ended', () => repliesOf(before, 'jev-2'), (rows) => !!rows[0]?.ended, { timeoutMs: 5000 }).catch(() => null)
+  assert.deepEqual(stopped?.map((r) => r.ended), ['stopped'], 'stopped as it waited its turn, before the restart')
+  release()
+  await waitFor('the first result is posted', () => before.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(before.dataDir)
+  await before.close()
+  // KzH started again on the same data: the job ids start again, so the next task waiting its turn is jev-2 too.
+  const after = await plugin(t, { jobs: true, dataDir: before.dataDir, harnessDir: before.harnessDir })
+  const releaseAfter = await twoTasks(after)
+  const both = await until('both replies under jev-2 are kept', () => repliesOf(after, 'jev-2'), (rows) => rows.length === 2 && rows.every((r) => r.said?.how), { timeoutMs: 5000 }).catch(() => null)
+  assert.deepEqual(both?.map((r) => [r.said?.how, r.ran, r.ended]), [['waited', null, null], ['waited', null, true]], 'newest first: the new task, still to be routed, and the one stopped before the restart, which has left the task list and still ended')
+  releaseAfter()
+  await waitFor('both results after the restart are posted', () => after.world.delivered, (d) => d.length === 2, { timeoutMs: 60_000 })
+  await quiet(after.dataDir)
+})
+
+test('a trained reply predictor guesses as a task is queued, from the agents routing could pick then, and the guess is scored once routing picks: right when the router runs the agent and level it named, and counted against the gates config.replies sets', async (t) => {
+  const { replyFeatures, trainPredictor } = await import('../reply-ledger.js').catch(() => ({}))
+  assert.equal(typeof trainPredictor, 'function', 'reply-ledger.js trains a predictor of the pick')
+  const { saveArtifact } = await import('../classifier.js')
+  // A predictor that learned what the router runs here for this task (DeepSeek at medium, as the
+  // test of what a start reply named above has it) and for other words something else, saved where
+  // the plugin keeps it before it starts.
+  const task = 'Fix the failing test in the parser'
+  const pool = { available: AGENTS.map((a) => a.id), mode: 'auto', level: 'auto', decider: 'jev' }
+  const rows = Array.from({ length: 60 }, (_, i) => (i % 3 === 2
+    ? { key: `seed-${i}`, features: replyFeatures({ text: 'Write the docs for the logger', ...pool }), ran: { agent: 'kimi', level: 'low' } }
+    : { key: `seed-${i}`, features: replyFeatures({ text: task, ...pool }), ran: { agent: 'deepseek', level: 'medium' } }))
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-predictor-'))
+  cleanUp(t, dataDir)
+  saveArtifact(join(dataDir, 'reply-model.json'), trainPredictor(rows))
+  const q = await plugin(t, { jobs: true, dataDir, config: { replies: { quick: { right: 3, of: 4 } } } })
+  await q.say(task, { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  const plan = q.rows('tasks.jsonl').find((r) => r.jobId === 'jev-1')?.plan
+  assert.deepEqual([plan?.agent, plan?.level], ['deepseek', 'medium'], 'the setting: the router runs what the predictor learned it runs')
+  const row = q.rows('reply-ledger.jsonl').at(-1)
+  assert.deepEqual([row.predicted?.agent, row.predicted?.level, row.predicted?.trusted], ['deepseek', 'medium', true], 'guessed as it was queued, every agent it could name being one routing could pick')
+  assert.equal(row.ran?.level, plan.level, 'what ran keeps the level of the effort the router planned')
+  assert.equal(row.match, true, 'and the guess is scored right')
+  const { body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual(body.prediction.gates, { quick: { right: 3, of: 4 }, likely: { right: 16, of: 20 } }, 'the gates config.replies sets')
+  assert.equal(body.prediction.trained?.rows, 60, 'the predictor in service is the one it found')
+  assert.deepEqual([body.prediction.records.jev.quick, body.prediction.records.jev.likely], [{ decider: 'jev', of: 4, n: 1, right: 1 }, { decider: 'jev', of: 20, n: 1, right: 1 }], 'its record, against each gate')
+  assert.deepEqual(body.recent.map((r) => [r.jobId, r.predicted?.agent, r.match]), [['jev-1', 'deepseek', true]])
+})
+
+test('a trained reply predictor guesses only among the agents routing could pick as the task is queued: one whose favourite is switched on but signed out names the best agent left, and is not trusted', async (t) => {
+  const { replyFeatures, trainPredictor } = await import('../reply-ledger.js').catch(() => ({}))
+  assert.equal(typeof trainPredictor, 'function', 'reply-ledger.js trains a predictor of the pick')
+  const { predict, saveArtifact } = await import('../classifier.js')
+  // Claude is switched on but signed out, so routing cannot pick it; the predictor learned that the
+  // router runs Claude at high for this task, and DeepSeek at medium for other words.
+  claudeSignedIn(t, { loggedIn: false })
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: true }
+  const task = 'Fix the failing test in the parser'
+  const pool = { available: AGENTS.map((a) => a.id), mode: 'auto', level: 'auto', decider: 'jev' }
+  const rows = Array.from({ length: 60 }, (_, i) => (i % 3 === 2
+    ? { key: `seed-${i}`, features: replyFeatures({ text: 'Write the docs for the logger', ...pool }), ran: { agent: 'deepseek', level: 'medium' } }
+    : { key: `seed-${i}`, features: replyFeatures({ text: task, ...pool }), ran: { agent: 'claude', level: 'high' } }))
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-masked-'))
+  cleanUp(t, dataDir)
+  const predictor = trainPredictor(rows)
+  saveArtifact(join(dataDir, 'reply-model.json'), predictor)
+  const q = await plugin(t, { jobs: true, dataDir, config: { agents: [...AGENTS, claude] } })
+  await q.say(task, { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  const row = q.rows('reply-ledger.jsonl').at(-1)
+  assert.deepEqual(Object.keys(row?.features?.numeric ?? {}).filter((k) => k.startsWith('avail:')).sort(), ['avail:deepseek', 'avail:kimi'], 'the setting: Claude is no agent routing could pick')
+  assert.equal(predict(predictor, row.features).label, 'claude|high', 'the setting: unmasked, the predictor names Claude')
+  assert.deepEqual([row.predicted?.agent, row.predicted?.level, row.predicted?.trusted], ['deepseek', 'medium', false], 'the best agent routing could pick, not trusted, since its favourite is out of reach')
+})
+
+/**
+ * A reply ledger and predictor of 60 earlier Jev Auto tasks worded as `task` that routing gave `agent`
+ * at high, but for four that went to the other agent: the guesses of the newest 50 scored, 47 right,
+ * so quick replies are earned for Jev and its guess for such a task is `agent`. Saved in `dataDir`
+ * with the wait for the pick set to Reply at once, so the reply names the guess whatever routing
+ * does meanwhile.
+ */
+async function earnedJevGuess(dataDir, task, agent) {
+  const { replyFeatures, trainPredictor } = await import('../reply-ledger.js')
+  const { saveArtifact } = await import('../classifier.js')
+  const other = AGENTS.find((a) => a.id !== agent).id
+  const misses = new Set([3, 13, 23, 33])
+  const features = replyFeatures({ text: task, available: AGENTS.map((a) => a.id), mode: 'auto', level: 'auto', decider: 'jev' })
+  const rows = Array.from({ length: 60 }, (_, i) => ({
+    ts: new Date(Date.now() - (60 - i) * 60_000).toISOString(), sessionId: 'earlier', key: `seed-${i}`, jobId: `jev-${i}`, decider: 'jev', mode: 'auto', forced: false, features,
+    predicted: { agent, level: 'high', confidence: 0.97, trusted: true }, said: { agent: null, effort: null, model: null, how: 'routed', ms: 900 },
+    ran: { agent: misses.has(i) ? other : agent, level: 'high', effort: 'high', model: null }, match: !misses.has(i), verdict: null, ask: null,
+  }))
+  writeFileSync(join(dataDir, 'reply-ledger.jsonl'), rows.map((r) => `${JSON.stringify(r)}\n`).join(''))
+  saveArtifact(join(dataDir, 'reply-model.json'), trainPredictor(rows))
+  writeFileSync(join(dataDir, 'chat-replies.json'), JSON.stringify({ waitMs: 0 }))
+}
+
+test('a quick reply that named an agent routing then found at its usage limit is followed by one change-of-plan notice that says so and when the limit resets, then who gave the work to which agent', async (t) => {
+  const task = 'Fix the failing test in the parser'
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-limit-reason-'))
+  cleanUp(t, dataDir)
+  await earnedJevGuess(dataDir, task, 'kimi')
+  // Kimi met its limit after the last usage reading, of which there is none yet: the guess reads it
+  // as ready, and routing, which reads usage afresh, finds it out until 20 past the hour after next.
+  const until = new Date(Date.now() + 2 * 3_600_000)
+  until.setMinutes(20, 0, 0)
+  const q = await plugin(t, { jobs: true, dataDir, accounts: { exhausted: { kimi: { until: until.toISOString(), reason: 'HTTP 429' } } } })
+  const said = await q.say(task, { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  assert.match(said.text, /^OK, I'll run \*\*Kimi agent\*\* with \*\*kimi-k2\*\* /, said.text)
+  const plan = q.rows('tasks.jsonl').find((r) => r.jobId === 'jev-1')?.plan
+  assert.deepEqual([plan?.agent, plan?.model, plan?.effort], ['deepseek', 'deepseek-flash', 'high'], 'the setting: routing gave the work to the agent left')
+  const clock = `${String(until.getHours()).padStart(2, '0')}:20`
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [
+    ['jev-1: DeepSeek agent instead of Kimi agent', `Kimi agent is at its usage limit (resets ${clock}), so Jev gave the work to DeepSeek agent (deepseek-flash, effort high).`],
+  ], 'one notice, naming the agent the reply named, the reason routing could not pick it, and the agent that ran')
+})
+
+test('with Start and result only, a quick reply that named an agent routing then found at its usage limit still gets its change-of-plan notice, with the reason, as under Milestones, and no other notice', async (t) => {
+  const task = 'Fix the failing test in the parser'
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-off-reason-'))
+  cleanUp(t, dataDir)
+  await earnedJevGuess(dataDir, task, 'kimi')
+  // Progress in chat at Start and result only (decided by the owner, 9 Oct), the reply still at once.
+  writeFileSync(join(dataDir, 'chat-replies.json'), JSON.stringify({ waitMs: 0, progress: 'off' }))
+  const until = new Date(Date.now() + 2 * 3_600_000)
+  until.setMinutes(20, 0, 0)
+  const q = await plugin(t, { jobs: true, dataDir, accounts: { exhausted: { kimi: { until: until.toISOString(), reason: 'HTTP 429' } } } })
+  const said = await q.say(task, { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  assert.match(said.text, /^OK, I'll run \*\*Kimi agent\*\* with \*\*kimi-k2\*\* .* I'll report back here when it's done\. Keep chatting\./, said.text)
+  const clock = `${String(until.getHours()).padStart(2, '0')}:20`
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [
+    ['jev-1: DeepSeek agent instead of Kimi agent', `Kimi agent is at its usage limit (resets ${clock}), so Jev gave the work to DeepSeek agent (deepseek-flash, effort high).`],
+  ], 'the one notice Start and result only posts, worded as Milestones word it')
+})
+
+test('a quick reply that named the agent your feedback then moved the pick off is followed by one change-of-plan notice that says your feedback moved it, then who gave the work to which agent', async (t) => {
+  const task = 'Fix the failing test in the parser'
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-feedback-reason-'))
+  cleanUp(t, dataDir)
+  await earnedJevGuess(dataDir, task, 'deepseek')
+  const q = await plugin(t, { jobs: true, dataDir })
+  // A dislike in this chat that says DeepSeek was the wrong agent and Kimi the right one, which the
+  // guess, learned from what routing ran before, does not read.
+  const verdict = await q.http('POST', '/jev-router/feedback', { sessionId: SESSION, messageId: 'answer-1', verdict: 'dislike', tag: 'wrong agent', provider: 'deepseek', suggestedAgent: 'kimi' })
+  assert.equal(verdict.status, 200, JSON.stringify(verdict.body))
+  const said = await q.say(task, { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  assert.match(said.text, /^OK, I'll run \*\*DeepSeek agent\*\* with \*\*deepseek-flash\*\* /, said.text)
+  const plan = q.rows('tasks.jsonl').find((r) => r.jobId === 'jev-1')?.plan
+  assert.deepEqual([plan?.agent, plan?.model, plan?.effort], ['kimi', 'kimi-k2', null], 'the setting: your feedback moved the pick to Kimi, which takes no effort')
+  assert.deepEqual(q.world.notices.map((m) => [m.source.summary, m.content[0].text]), [
+    ['jev-1: Kimi agent instead of DeepSeek agent', 'Your feedback moved the pick off DeepSeek agent, so Jev gave the work to Kimi agent (kimi-k2).'],
+  ], 'one notice, naming the agent the reply named, why the pick moved off it, and the agent that ran')
+})
+
+test('a quick reply names the effort its first attempt starts at: the default effort set in Settings when that is a level, not the level the guess learned before it was set, so no effort notice follows', async (t) => {
+  const task = 'Fix the failing test in the parser'
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-quick-effort-'))
+  cleanUp(t, dataDir)
+  // The guess learned DeepSeek at high, the level Auto gave such a task; Settings now say xhigh.
+  await earnedJevGuess(dataDir, task, 'deepseek')
+  const q = await plugin(t, { jobs: true, dataDir })
+  assert.equal((await q.http('POST', '/jev-router/effort', { default: 'xhigh', perAgent: {}, codexSpeed: 'normal' })).status, 200)
+  const said = await q.say(task, { model: 'jev-auto' })
+  await waitFor('its result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  assert.equal(said.text.split('\n\n')[0], `OK, I'll run **DeepSeek agent** with **deepseek-flash** (effort max) in the background as **jev-1** in ${folderOf(q)}. I'll report back here when it's done. Keep chatting.`, 'xhigh is DeepSeek\'s max')
+  assert.equal(q.rows('tasks.jsonl').find((r) => r.jobId === 'jev-1')?.plan?.effort, 'max', 'the setting: the first attempt started at the effort Settings set')
+  assert.deepEqual(q.world.notices.map((m) => m.source.summary), [], 'it started at the effort its reply named, so no notice says otherwise')
+})
+
+test('a quick reply names its guess by the last reading of which agents are ready, never waiting for a new one, which begins in the background once that reading is older than routing keeps one', async (t) => {
+  const task = 'Fix the failing test in the parser'
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-reading-at-hand-'))
+  cleanUp(t, dataDir)
+  await earnedJevGuess(dataDir, task, 'deepseek')
+  // Claude Code is switched off, so routing cannot pick it, but each reading of which agents are
+  // ready asks its tool, which answers only when this test lets it.
+  const tool = claudeHeld(t)
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: false }
+  const q = await plugin(t, { jobs: true, dataDir, config: { agents: [...AGENTS, claude] } })
+  tool.answer()
+  await q.say(task, { model: 'jev-auto' })
+  await waitFor('the first result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  // Six minutes on, the reading routing keeps for five is old, and the tool is slow to answer again.
+  tool.hold()
+  const asked = tool.asked()
+  const realNow = Date.now
+  Date.now = () => realNow() + 6 * 60_000
+  t.after(() => { Date.now = realNow })
+  const said = await Promise.race([q.say(task, { model: 'jev-auto' }), tick(5000).then(() => null)])
+  const reply = said ? said.text.split('\n\n')[0] : 'no reply while the tool had not answered'
+  assert.equal(reply, `OK, I'll run **DeepSeek agent** with **deepseek-flash** (effort high) in the background as **jev-2** in ${folderOf(q)}. I'll report back here when it's done. Keep chatting.`, 'the guess, by the reading at hand')
+  await waitFor('a new reading has begun', () => tool.asked(), (n) => n > asked, { timeoutMs: 10_000 })
+  tool.answer()
+  await waitFor('the second result is posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+})
+
+test('a replies gate whose right is above its of stops the plugin at start-up with the key\'s name, rather than starting it on the gates that ship', async (t) => {
+  await assert.rejects(plugin(t, { config: { replies: { likely: { right: 21, of: 20 } } } }), /^Error: replies\.likely: right and of are whole numbers from 1, right no more than of$/)
+})
+
+test('the configuration editor\'s replies group says a reply names the predictor\'s guess while the predictor keeps the record set there, not that replies use it only from a later version', () => {
+  const said = jevRouter.Config.dict?.replies?.meta?.description ?? ''
+  assert.doesNotMatch(said, /later version/, said)
+  assert.match(said, /a reply names its guess only while the predictor keeps the record set here/, said)
+})
+
+test('the reply ledger keeps the pool each task was picked from: the effort picked in the model menu, the row\'s mode and who decides, a picture, each tool switched on, and only the agents routing could pick then, never one signed out', async (t) => {
+  // Claude is switched on but signed out; the fixer tool is switched on, the linter is not.
+  claudeSignedIn(t, { loggedIn: false })
+  const claude = { id: 'claude', name: 'Claude Code', provider: 'claude-code', description: 'Claude Code.', enabled: true }
+  const tools = [
+    { id: 'fixer', description: 'Writes fixed into state.txt and nothing else', command: "node -e \"require('fs').writeFileSync('state.txt','fixed')\"", params: {}, enabled: true },
+    { id: 'linter', description: 'Lints the project', command: 'node -e "0"', params: {}, enabled: false },
+  ]
+  const q = await plugin(t, { jobs: true, config: { agents: [...AGENTS, claude], tools } })
+  q.world.attachments = PICTURES
+  await q.say('Fix what this screenshot shows in the parser', { model: 'jev-auto', effort: 'xhigh', images: [PICTURE] })
+  await waitFor('the first result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await q.say('Now fix the failing lint in the parser', { model: 'jev-online' })
+  await waitFor('the second result is posted', () => q.world.delivered, (d) => d.length === 2, { timeoutMs: 30_000 })
+  await started(q)
+  await q.say('Then tidy the parser', { model: 'laya-auto' })
+  await waitFor('the third result is posted', () => q.world.delivered, (d) => d.length === 3, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  // Each task's newest line, which holds its whole row, by job; and the pool's own features of it.
+  const rows = Object.fromEntries([...new Map(q.rows('reply-ledger.jsonl').map((r) => [r.key, r])).values()].map((r) => [r.jobId, r]))
+  const pool = (jobId) => Object.keys(rows[jobId]?.features?.numeric ?? {}).filter((k) => /^(avail|mode|level|decider|modal):/.test(k)).sort()
+  assert.deepEqual(pool('jev-1'), ['avail:deepseek', 'avail:kimi', 'avail:tool:fixer', 'decider:jev', 'level:xhigh', 'modal:image', 'mode:auto'], 'Jev Auto at Extra High, with a screenshot')
+  assert.equal(rows['jev-1'].features.numeric.has_image, 1, 'which the words\' own features say too')
+  assert.deepEqual(pool('jev-2'), ['avail:deepseek', 'avail:kimi', 'avail:tool:fixer', 'decider:jev', 'level:auto', 'mode:online'], 'Jev Auto Online, at the effort routing picks')
+  assert.deepEqual(pool('jev-3'), ['avail:deepseek', 'avail:kimi', 'avail:tool:fixer', 'decider:laya', 'level:auto', 'mode:auto'], 'Laya Auto')
+  assert.deepEqual(['jev-1', 'jev-2', 'jev-3'].map((j) => rows[j]?.decider), ['jev', 'jev', 'laya'], 'and each row is its decider\'s, so a guess under Laya Auto is scored in Laya\'s record, apart from Jev\'s')
+})
+
+test('the reply ledger reads a task sent with a picture by the person\'s own words, as its intent sample does, never by the line that hands the agent the picture, which names folders of this PC and the attachment', async (t) => {
+  const { intentFeatures } = await import('../features.js')
+  assert.equal(typeof intentFeatures, 'function', 'features.js reads a message for its intent')
+  const q = await plugin(t, { jobs: true })
+  q.world.attachments = PICTURES
+  const message = 'Fix what this screenshot shows in the parser'
+  await q.say(message, { model: 'jev-auto', images: [PICTURE] })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+  assert.match(q.rows('tasks.jsonl').find((r) => r.jobId === 'jev-1')?.taskText ?? '', /^The person attached an image\. Open `[^`]*shot-1\.png` /, 'the setting: the task is sent with the line that hands the agent the picture by its path in this folder')
+  const row = q.rows('reply-ledger.jsonl').at(-1)
+  // The row's features but for the pool's: what the predictor reads of the words.
+  const pool = /^(avail|mode|level|decider|modal):/
+  const words = { numeric: Object.fromEntries(Object.entries(row?.features?.numeric ?? {}).filter(([k]) => !pool.test(k))), categorical: row?.features?.categorical ?? {} }
+  assert.deepEqual(words, intentFeatures(message, { modalities: ['text', 'image'] }), 'the message as the person wrote it, with the picture as has_image')
+  assert.deepEqual(words, intentSamples(q).at(-1)?.input?.features, 'as its intent sample reads it')
+  assert.equal(row?.features?.numeric?.['modal:image'], 1, 'and the pool says a picture came with it')
+})
+
+test('the plugin\'s reply ledger retrains in a worker thread, and closing the plugin ends a retrain under way: its worker is ended, and nothing it trained is saved for the next start', async (t) => {
+  const { replyFeatures } = await import('../reply-ledger.js').catch(() => ({}))
+  assert.equal(typeof replyFeatures, 'function', 'reply-ledger.js keeps the features a predictor of the pick learns from')
+  // Fifty-nine tasks routing picked for are on record, so the next one routed starts the first retrain.
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-retrain-'))
+  cleanUp(t, dataDir)
+  const pool = { available: AGENTS.map((a) => a.id), mode: 'auto', level: 'auto', decider: 'jev' }
+  const seeded = Array.from({ length: 59 }, (_, i) => ({ key: `seed-${i}`, jobId: `seed-${i}`, decider: 'jev', mode: 'auto', forced: false, ts: new Date().toISOString(), features: replyFeatures({ text: 'Fix the failing test in the parser', ...pool }), ran: { agent: 'deepseek', level: 'medium' } }))
+  writeFileSync(join(dataDir, 'reply-ledger.jsonl'), seeded.map((r) => `${JSON.stringify(r)}\n`).join(''))
+  // Every worker thread of reply-ledger.js started (shadow.js has workers of its own), with what it says
+  // when it ends held until the test lets it go, so the retrain is under way for as long as the test
+  // needs it to be, and each one ended by terminate().
+  const wt = createRequire(import.meta.url)('node:worker_threads')
+  const Real = wt.Worker
+  const started = []
+  const ended = []
+  const held = []
+  let holding = true
+  wt.Worker = class extends Real {
+    constructor(...a) {
+      super(...a)
+      this.retrains = String(a[0]).endsWith('/reply-ledger.js')
+      if (this.retrains) started.push(this)
+    }
+    once(event, fn) { return super.once(event, this.retrains && ['message', 'error', 'exit'].includes(event) ? (...v) => (holding ? held.push(() => fn(...v)) : fn(...v)) : fn) }
+    terminate() { if (this.retrains) ended.push(this); return super.terminate() }
+  }
+  syncBuiltinESMExports()
+  t.after(() => { wt.Worker = Real; syncBuiltinESMExports() })
+  const q = await plugin(t, { jobs: true, dataDir })
+  await q.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  const worker = await until('the sixtieth task routing picked for starts a retrain', () => started.length, (n) => n >= 1, { timeoutMs: 5000 }).then(() => started[0], () => null)
+  assert.ok(worker, 'in a worker thread')
+  await q.close()
+  assert.deepEqual([ended.length, ended[0] === worker], [1, true], 'closing the plugin ended it')
+  holding = false
+  for (const go of held.splice(0)) go()
+  if (worker.threadId !== -1) await new Promise((r) => worker.on('exit', r))
+  await quiet(dataDir)
+  assert.equal(existsSync(join(dataDir, 'reply-model.json')), false, 'and nothing it trained was saved')
+  assert.equal(started.length, 1, 'one retrain, and no other')
+})
+
+test('with learning off the plugin trains no predictor of the pick from the ledger the card still reads, however many tasks routing picked for are on record and none trained through them', async (t) => {
+  const { replyFeatures } = await import('../reply-ledger.js').catch(() => ({}))
+  assert.equal(typeof replyFeatures, 'function', 'reply-ledger.js keeps the features a predictor of the pick learns from')
+  // Seventy tasks routing picked for, from before learning was switched off, and no predictor saved.
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-learning-off-'))
+  cleanUp(t, dataDir)
+  const pool = { available: AGENTS.map((a) => a.id), mode: 'auto', level: 'auto', decider: 'jev' }
+  const seeded = Array.from({ length: 70 }, (_, i) => ({ key: `seed-${i}`, jobId: `seed-${i}`, decider: 'jev', mode: 'auto', forced: false, ts: new Date().toISOString(), features: replyFeatures({ text: 'Fix the failing test in the parser', ...pool }), ran: { agent: 'deepseek', level: 'medium' } }))
+  writeFileSync(join(dataDir, 'reply-ledger.jsonl'), seeded.map((r) => `${JSON.stringify(r)}\n`).join(''))
+  const q = await plugin(t, { dataDir, config: { routing: { learn: false } } })
+  const { body } = await q.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual([body?.learning, body?.prediction?.labelled, body?.prediction?.training, body?.prediction?.trained], [false, 70, false, null], 'the card reads the ledger, and nothing trains')
+  await quiet(dataDir)
+  assert.equal(existsSync(join(dataDir, 'reply-model.json')), false, 'and nothing is saved')
+})
+
+test('no intent sample is recorded where Jev teaches nothing: Jev Auto offline or with no network, Laya Auto, and learning or adaptive routing off; there an answer carries no mark, and with learning off no reply is kept either', async (t) => {
+  jev.said.kind = (state) => (String(state?.message).includes('?') ? 'question' : 'task')
+  t.after(() => { delete jev.said.kind })
+  const local = { chatModel: async () => 'qwen-local' }
+  /**
+   * A question on the row `model`: answered, with no mark, no intent sample in either store, and
+   * `jevCalls` intent calls to Jev. The plugin is closed after, unless it is to be `kept`.
+   */
+  const nothingKept = async (p, label, { model = 'jev-auto', jevCalls = 0, kept = false } = {}) => {
+    const calls = jevIntentCalls()
+    const out = await p.say('What is a monad?', { model })
+    assert.match(out.text, /A monad chains computations/, `${label}: answered`)
+    assert.doesNotMatch(out.text, /jev-intent/, `${label}: no mark`)
+    await quiet(p.dataDir)
+    assert.deepEqual(intentSamples(p), [], `${label}: no sample in Jev's store`)
+    assert.deepEqual(intentSamples(p, 'laya-samples.jsonl'), [], `${label}: nor in Laya's`)
+    assert.equal(jevIntentCalls() - calls, jevCalls, `${label}: Jev's intent calls`)
+    if (!kept) await p.close()
+  }
+  await nothingKept(await plugin(t, { local }), 'Jev Auto offline', { model: 'jev-offline' })
+  const dead = await plugin(t, { local })
+  net.online = false
+  t.after(() => { net.online = true })
+  await nothingKept(dead, 'a dead network')
+  net.online = true
+  await nothingKept(await plugin(t), 'Laya Auto', { model: 'laya-auto' })
+  const routingOff = await plugin(t, { config: { routing: { enabled: false } } })
+  await nothingKept(routingOff, 'adaptive routing off', { jevCalls: 1, kept: true })
+  const { body: routingOffSummary } = await routingOff.http('GET', '/jev-router/replies/summary')
+  assert.deepEqual([routingOffSummary.learning, routingOffSummary.intent], [true, null], 'adaptive routing off: the card is told start replies are still learned from, and task or question is not')
+  await routingOff.close()
+  const off = await plugin(t, { jobs: true, config: { routing: { learn: false } } })
+  await nothingKept(off, 'learning off', { jevCalls: 1, kept: true })
+  await off.say('Fix the failing test in the parser', { model: 'jev-auto' })
+  await waitFor('the result is posted', () => off.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(off.dataDir)
+  assert.equal(off.rows('history.jsonl')[0]?.intentSample, undefined, 'learning off: the run carries no sample')
+  assert.equal(off.read('reply-ledger.jsonl'), '', 'learning off: no reply is kept')
+  assert.equal((await off.http('GET', '/jev-router/replies/summary')).body.learning, false, 'and the card is told so')
+})
+
+test('where no task can run, in No project and the scratch workspace, Jev reads every message on a Jev row, so a question the local classifier is sure is a task is answered there, not refused; in a project folder that classifier decides', async (t) => {
+  const { intentFeatures } = await import('../features.js')
+  assert.equal(typeof intentFeatures, 'function', 'features.js reads a message for its intent')
+  const { calibrate, saveArtifact, trainMulticlass } = await import('../classifier.js')
+  const { STATE_VERSION } = await import('../domains.js')
+  // The intent domain at LOCAL_ONLY, as one that earned the rung leaves it, with a classifier sure
+  // that this question is a task, as one that learned it wrong would be.
+  const taken = 'How do I center a div?'
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-intent-'))
+  cleanUp(t, dataDir)
+  const samples = [
+    ...Array.from({ length: 20 }, () => ({ features: intentFeatures(taken), label: 'task' })),
+    ...['What is a monad?', 'Why does the build fail?', 'Can you explain closures?', 'How does the cache work?'].flatMap((m) => Array.from({ length: 5 }, () => ({ features: intentFeatures(m), label: 'question' }))),
+  ]
+  saveArtifact(join(dataDir, 'classifiers', 'intent.json'), calibrate(trainMulticlass({ samples, domain: 'intent', options: { epochs: 300, learningRate: 0.3 } }), samples))
+  mkdirSync(join(dataDir, 'domains'), { recursive: true })
+  writeFileSync(join(dataDir, 'domains', 'intent.state.json'), JSON.stringify({ stateVersion: STATE_VERSION, domain: 'intent', riskClass: 'LOW', kind: 'multiclass', maturity: 'LOCAL_ONLY', since: new Date().toISOString() }))
+  const q = await plugin(t, { jobs: true, dataDir })
+  jev.said.kind = (state) => (String(state?.message).includes('?') ? 'question' : 'task')
+  t.after(() => { delete jev.said.kind })
+  const project = q.agent.session.header.cwd
+  for (const [where, cwd] of [['No project', join(REPO, 'no-project')], ['the scratch workspace', join(REPO, '..', 'kzh-scratch')]]) {
+    q.agent.session.header.cwd = cwd
+    const calls = jevIntentCalls()
+    const out = await q.say(taken, { model: 'jev-auto' })
+    assert.match(out.text, /^A monad chains computations/, `${where}: the question is answered, not refused: ${out.text}`)
+    assert.equal(jevIntentCalls() - calls, 1, `${where}: Jev read it`)
+    const sample = intentSamples(q).at(-1)
+    assert.deepEqual([sample?.authority, sample?.teacher?.label, sample?.local?.label], ['jev', 'question', 'task'], `${where}: the classifier's answer is recorded beside Jev's, and decides nothing`)
+  }
+  // In the project folder the same classifier decides, with no Jev call, and the message runs as a task.
+  q.agent.session.header.cwd = project
+  const calls = jevIntentCalls()
+  const out = await q.say(taken, { model: 'jev-auto' })
+  assert.match(out.text, /^OK, I'll run \*\*[^*]+\*\* with /, out.text)
+  assert.equal(jevIntentCalls() - calls, 0, 'the project folder: no Jev call for it')
+  assert.deepEqual([intentSamples(q).at(-1)?.authority, intentSamples(q).length], ['local', 3], 'the project folder: decided on this PC, one sample a message')
+  await waitFor('the result is posted', () => q.world.delivered, (d) => d.length === 1, { timeoutMs: 30_000 })
+  await quiet(q.dataDir)
+})
+
+test('Jev\'s routing samples are read as the plugin starts, in the background, so the first message on a Jev row, which records its intent sample there before it is answered, does not wait for the whole file to be read', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'kz-laya-samples-'))
+  cleanUp(t, dataDir)
+  writeFileSync(join(dataDir, 'routing-samples.jsonl'), '')
+  // Every read of the store's file, as training.js makes it.
+  const fsp = createRequire(import.meta.url)('node:fs/promises')
+  const real = fsp.readFile
+  const reads = []
+  fsp.readFile = function readFile(path, ...rest) {
+    if (String(path).startsWith(dataDir) && String(path).endsWith('routing-samples.jsonl')) reads.push(String(path))
+    return real.call(this, path, ...rest)
+  }
+  syncBuiltinESMExports()
+  try {
+    const q = await plugin(t, { dataDir })
+    const atStart = await until('the store is read', () => reads.length, (n) => n >= 1, { timeoutMs: 5000 }).catch(() => reads.length)
+    assert.equal(atStart, 1, 'read once as the plugin starts, with no message sent')
+    jev.said.kind = (state) => (String(state?.message).includes('?') ? 'question' : 'task')
+    t.after(() => { delete jev.said.kind })
+    const out = await q.say('What is a monad?', { model: 'jev-auto' })
+    assert.match(out.text, /^A monad chains computations/)
+    await quiet(q.dataDir)
+    assert.equal(intentSamples(q).length, 1, 'the question\'s intent sample is in the store')
+    assert.equal(reads.length, 1, 'which it found read: the question did not wait for another read')
+  } finally {
+    fsp.readFile = real
+    syncBuiltinESMExports()
+  }
 })

@@ -14,6 +14,11 @@
 #   dsh-subagent-codex/lib/index.js (turn/start reads KZ_CODEX_EFFORT /
 #   KZ_CODEX_SERVICE_TIER; original kept as index.js.orig). A reinstall drops it.
 #   Do not set `env: CLAUDE_CODE_EFFORT_LEVEL` here: it would override per-run effort.
+# Live agent view (README, Live agent view): scripts/patch-agent-live.mjs adds the
+#   live view and steering hooks to both connectors' lib/index.js (the original kept
+#   as index.js.kzh-backup). A connector reinstall drops them, and live detail for
+#   Claude Code and Codex is off until Start-KzH runs the patch again, or, for a new
+#   engine version, until KzH is updated for it; their runs work as before meanwhile.
 #   claude-code-readonly (below) is Claude Code once more, in plan mode, for
 #     read-only work.
 - id: subagent-claude-code
@@ -60,7 +65,20 @@
     thresholdRatio: 0.97
     modelPolicies:
       - { provider: local, model: qwen3-8b, maxTokens: 1024 }
+      - { provider: local, model: qwen3-30b-a3b, maxTokens: 1024 }
       - { provider: local, model: gemma4-e4b, maxTokens: 1024 }
+
+# Background jobs (the engine's jobs registry, @deepseek-ai/dsh-jobs-local): how
+# many one chat may hold at once. Every jev-router task holds one from the moment
+# it is queued until it ends, so tasks waiting their turn count as much as running
+# ones, and the engine's default of 10 refused the eleventh task typed into a busy
+# chat. How many run at once is still Tasks at once (Settings, Resource budget).
+# Add it to a live profile while no task runs: taking the new limit can restart
+# the job service, which stops every task it holds.
+# plugins/jev-router/test/jobs-config.test.js checks the figure.
+- id: jobs
+  config:
+    maxConcurrentJobsPerOwner: 32
 
 # Router plugin. Agents, limits and thresholds are configurable here; omitted
 # fields use the defaults in the plugin's Config schema.

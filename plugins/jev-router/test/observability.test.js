@@ -552,14 +552,15 @@ async function decisionsPage(runs) {
  * tab is mounted instead and handed `tasks` directly, as the inspector hands it the ones it polls.
  */
 async function workBoardPage(tasks, { tab = false } = {}) {
-  const page = { posts: [] }
+  // `answers` holds what a POST to a path answers, Stop's `stopResult` otherwise.
+  const page = { posts: [], answers: {} }
   let busy = 0
   page.stopResult = 'requested'
   const fetch = async (path, init) => {
     busy++
     try {
       if (init?.method === 'POST') page.posts.push([path, JSON.parse(init.body)])
-      const body = path === '/jev-router/tasks' ? { tasks } : { result: page.stopResult }
+      const body = path === '/jev-router/tasks' ? { tasks } : page.answers[path] ?? { result: page.stopResult }
       return { ok: true, status: 200, json: async () => body }
     } finally { busy-- }
   }
@@ -689,6 +690,149 @@ test('the work board: a waiting row shows why and how long, its time in line, an
     const dialog = nodes(page.tree()).find((n) => n.props?.role === 'dialog')
     assert.equal(dialog?.props['aria-describedby'], 'jevi-confirm-b')
     assert.ok(nodes(dialog).some((n) => n.props?.id === 'jevi-confirm-b' && /has not started/.test(textOf(n))), 'the body it names is the words about what goes')
+  })
+}
+
+// Send now and Steer for waiting work (docs/live-agent-view.md Feature 5): the buttons each row offers,
+// and their dialogs, which never do what nobody read.
+{
+  const now = Date.now()
+  const SLOT = { sendNow: 'slot', holder: null, heldBy: null, ahead: [], chatAhead: 0, held: 1, max: 1, local: null, forcedLocal: false }
+  const running = (over = {}) => ({ jobId: 'jev-1', key: 'k1', sessionId: 's1', workspace: 'C:\\work\\kz-harness', state: 'running', taskName: 'fix the parser', startedAt: now - 60_000, agent: 'claude', position: 0, controls: { sendNow: null }, ...over })
+  const queued = (over = {}) => ({ jobId: 'jev-2', key: 'k2', sessionId: 's1', workspace: 'C:\\work\\elsewhere', state: 'queued', taskName: 'tidy the docs', startedAt: null, queuedAt: now - 30_000, position: 1,
+    waiting: { why: 'cap', place: 1, ahead: 0, since: now - 30_000, placeText: 'next for a free slot', text: 'Waiting for a free slot: the resource budget caps how many tasks run at once.' }, controls: SLOT, ...over })
+
+  test('the work board: a waiting row offers Send now, Steer and Remove, a running row Steer and Stop, each named by its task', async () => {
+    const page = await workBoardPage([running(), queued()])
+    assert.ok(page.button('Send jev-2 now'), 'a waiting row is sent now from its row')
+    assert.equal(textOf(page.button('Send jev-2 now')), 'Send now')
+    assert.equal(textOf(page.button('Steer jev-2')), 'Steer…')
+    assert.ok(page.button('Remove tidy the docs'))
+    assert.ok(page.button('Steer jev-1'), 'a running row is steered too')
+    assert.equal(page.button('Send jev-1 now'), undefined, 'but there is nothing to send now')
+    assert.ok(page.button('Stop fix the parser'))
+    const tab = await workBoardPage([running(), queued()], { tab: true })
+    assert.deepEqual(['Send jev-2 now', 'Steer jev-2', 'Steer jev-1'].map((l) => !!tab.button(l)), [true, true, true], 'and the Tasks tab offers the same')
+  })
+
+  test('Send now on a task waiting for a slot asks first in the words of the line, then starts it; a race the server refuses says why, and the task stays in line', async () => {
+    const tasks = [running(), queued()]
+    const page = await workBoardPage(tasks)
+    assert.ok(page.button('Send jev-2 now'), 'a waiting row is sent now from its row')
+    await page.click('Send jev-2 now')
+    assert.match(page.text(), /Start jev-2 now\?It runs beside 1 other task, over your limit of 1 task at once \(Settings, Resource budget\), so the next task to end frees no slot\./)
+    assert.deepEqual(page.posts, [], 'nothing is sent before it is confirmed')
+    page.answers['/jev-router/tasks/start-now'] = { result: 'started', holder: null, words: 'jev-2 started, over your limit of 1 task at once: the next task to end frees no slot.' }
+    await page.click('Start now')
+    assert.deepEqual(page.posts, [['/jev-router/tasks/start-now', { key: 'k2' }]])
+    assert.doesNotMatch(page.text(), /Start jev-2 now\?/, 'the dialog closed')
+    // Refused after a race: a writer took the folder first.
+    page.answers['/jev-router/tasks/start-now'] = { result: 'workspace-busy', holder: 'jev-3', words: 'jev-2 could not start now: jev-3 is changing elsewhere, and two tasks never write one folder at once. It stays in line; Run next puts it first.' }
+    await page.click('Send jev-2 now')
+    await page.click('Start now')
+    assert.match(page.text(), /jev-2 could not start now: jev-3 is changing elsewhere, and two tasks never write one folder at once\. It stays in line; Run next puts it first\./)
+  })
+
+  test('a Send now dialog closes with \'jev-2 has already started.\' when its task starts while it is open', async () => {
+    const tasks = [running(), queued()]
+    const page = await workBoardPage(tasks)
+    assert.ok(page.button('Send jev-2 now'), 'a waiting row is sent now from its row')
+    await page.click('Send jev-2 now')
+    assert.match(page.text(), /Start jev-2 now\?/)
+    Object.assign(tasks[1], { state: 'routing', startedAt: now, waiting: null, controls: { sendNow: null } })
+    await page.poll()
+    assert.doesNotMatch(page.text(), /Start jev-2 now\?/)
+    assert.equal(page.button('Start now'), undefined)
+    assert.match(page.text(), /jev-2 has already started\./)
+    assert.deepEqual(page.posts, [])
+  })
+
+  test('Send now behind a writer offers Put first in line, or Stop it and start this, which asks again and then stops the writer for it', async () => {
+    const behind = queued({ jobId: 'jev-3', key: 'k3', workspace: 'C:\\work\\kz-harness', position: 3, waiting: { why: 'workspace', place: 3, ahead: 1, text: 'Waiting: another task is running in this workspace.' }, controls: { ...SLOT, sendNow: 'workspace', holder: 'jev-1', heldBy: 'task', ahead: ['jev-2'] } })
+    const page = await workBoardPage([running(), behind])
+    assert.ok(page.button('Send jev-3 now'), 'a waiting row is sent now from its row')
+    await page.click('Send jev-3 now')
+    assert.match(page.text(), /jev-1 is changing kz-harnessOnly one task changes a folder at a time\. You can put jev-3 first in line, or stop jev-1 now \(what it changed so far stays in the folder\) and start jev-3\./)
+    assert.equal(page.button('Start now'), undefined, 'it cannot start now, so it is not offered')
+    await page.click('Put first in line')
+    assert.deepEqual(page.posts, [['/jev-router/tasks/reorder', { workspace: 'C:\\work\\kz-harness', order: ['jev-3'] }]])
+    await page.click('Send jev-3 now')
+    await page.click('Stop jev-1 and start this')
+    assert.match(page.text(), /Stop jev-1\?Work it already did stays in kz-harness\. jev-3 starts as soon as it has stopped\./)
+    assert.equal(page.posts.length, 1, 'asked twice before anything stops')
+    page.answers['/jev-router/tasks/start-now'] = { result: 'stopping', holder: 'jev-1', words: 'Stopping jev-1; jev-3 starts as soon as it has stopped.' }
+    await page.click('Stop jev-1')
+    assert.deepEqual(page.posts[1], ['/jev-router/tasks/start-now', { key: 'k3', stop: 'jev-1' }])
+    // Behind a run from the chat, only Put first in line.
+    const chat = queued({ jobId: 'jev-4', key: 'k4', controls: { ...SLOT, sendNow: 'chat', heldBy: 'chat' } })
+    const other = await workBoardPage([chat])
+    await other.click('Send jev-4 now')
+    assert.match(other.text(), /A run started from the chat is using elsewhere; jev-4 can go first in line after it\./)
+    const dialog = nodes(other.tree()).find((n) => n.props?.role === 'dialog')
+    assert.deepEqual(nodes(dialog).filter((n) => n.type === 'button').map(textOf), ['Cancel', 'Put first in line'], 'a run from the chat is not stopped from here')
+  })
+
+  test('Steer on a waiting task adds the words; one that started meanwhile keeps them and offers a follow-up, or a fresh start that asks first', async () => {
+    const tasks = [running(), queued()]
+    const page = await workBoardPage(tasks)
+    assert.ok(page.button('Steer jev-2'), 'a waiting row is steered from its row')
+    await page.click('Steer jev-2')
+    assert.match(page.text(), /Steer jev-2Your words are added to the task before it starts\. It keeps its place in line\./)
+    const box = () => nodes(page.tree()).find((n) => n.type === 'textarea')
+    assert.equal(box().props.placeholder, 'What should it do differently?')
+    assert.equal(page.button('Add to task').props.disabled, true, 'nothing to add yet')
+    box().props.onChange({ target: { value: 'also update the README' } })
+    await page.settle()
+    page.answers['/jev-router/tasks/steer'] = { result: 'added', state: 'added', words: 'Added to jev-2 before it starts. Jev chooses the agent with it.' }
+    await page.click('Add to task')
+    assert.deepEqual(page.posts, [['/jev-router/tasks/steer', { key: 'k2', text: 'also update the README', how: 'amend' }]])
+    assert.equal(box(), undefined, 'the dialog closed')
+    // It starts while the person types: the words stay, and the dialog offers what can be done now.
+    await page.click('Steer jev-2')
+    box().props.onChange({ target: { value: 'and the changelog' } })
+    Object.assign(tasks[1], { state: 'running', startedAt: now, waiting: null, controls: { sendNow: null } })
+    await page.poll()
+    assert.equal(box().props.value, 'and the changelog')
+    // Since slice 8 a task at work takes words mid-run, so they now go to the running agent.
+    assert.match(page.text(), /jev-2 started while you were typing, so your words were not added\. Steer it again: they now go to the running agent\./)
+    assert.equal(page.button('Add to task'), undefined)
+    await page.click('Stop and start again')
+    assert.match(page.text(), /Stop jev-2 and start again\?Stop jev-2 and start again with your message\? What it changed so far stays in elsewhere\./)
+    page.answers['/jev-router/tasks/steer'] = { result: 'restarting', state: null, jobId: 'jev-5', words: 'Stopping jev-2. jev-5 starts again with your message, first in line in elsewhere.' }
+    await page.click('Stop and start again')
+    assert.deepEqual(page.posts.at(-1), ['/jev-router/tasks/steer', { key: 'k2', text: 'and the changelog', how: 'restart' }])
+    await page.click('Steer jev-2')
+    box().props.onChange({ target: { value: 'add a test' } })
+    await page.settle()
+    page.answers['/jev-router/tasks/steer'] = { result: 'queued', state: null, jobId: 'jev-6', words: 'Queued jev-6 as a follow-up to jev-2, first in line in elsewhere.' }
+    await page.click('Follow-up after it')
+    assert.deepEqual(page.posts.at(-1), ['/jev-router/tasks/steer', { key: 'k2', text: 'add a test', how: 'follow-up' }])
+  })
+
+  test('TaskQueue Send now renders only while a turn runs, for a prompt not already steering, and calls updateQueue(id, { kind: \'steer\' })', async () => {
+    const document = { getElementById: () => ({}), createElement: () => ({}), head: { appendChild() {} }, addEventListener() {}, removeEventListener() {} }
+    const { React, mount } = statefulReact()
+    let registration
+    const window = { __ModuleLoader__: { load: (r) => { registration = r } }, addEventListener() {}, removeEventListener() {} }
+    const hold = () => 0
+    new Function('window', 'setTimeout', 'clearTimeout', 'document', client)(window, hold, hold, document)
+    const { TaskQueue } = registration.factory((x) => { if (x === 'react') return React; throw new Error(`unexpected require: ${x}`) }).__test
+    assert.equal(typeof TaskQueue, 'function', 'the task queue can be rendered')
+    const updates = []
+    let snap = { running: false, queue: [{ id: 'q1', placement: 'queue', message: { content: [{ type: 'text', text: 'then run the tests' }] } }, { id: 'q2', placement: 'steering', message: { content: [{ type: 'text', text: 'use pnpm' }] } }] }
+    const face = { getSnapshot: () => snap, subscribe: () => () => {}, updateQueue: async (id, action) => { updates.push([id, action]); return { accepted: true } } }
+    const view = mount(TaskQueue, { face })
+    const buttons = () => nodes(view.tree).filter((n) => n.type === 'button')
+    assert.equal(buttons().filter((b) => textOf(b) === 'Send now').length, 0, 'no turn runs, so nothing can be given to one')
+    snap = { ...snap, running: true }
+    view.render()
+    const send = buttons().filter((b) => textOf(b) === 'Send now')
+    assert.deepEqual(send.map((b) => b.props['aria-label']), ['Send task 1 now'], 'only the prompt waiting for the next turn, not one already steering')
+    assert.equal(send[0].props.title, 'Give this to the current turn at its next step instead of waiting for the turn to end')
+    send[0].props.onClick()
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r))
+    assert.deepEqual(updates, [['q1', { kind: 'steer' }]])
+    view.unmount()
   })
 }
 

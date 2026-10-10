@@ -83,7 +83,7 @@ test('a speed run measures every installed chat model through local.js, stores e
   assert.equal(w.server.to('/completion').filter((r) => r.body.n_predict === 128).length, 6)
   assert.ok(w.server.started.every((x) => x.child.exitCode !== null), 'no llama-server is left running')
   // The logs: the run's summary in the history, as Speed-Run.bat's, and its detail log with the engine's lines.
-  assert.match(history(w.data), /^\d{4}-\d\d-\d\d \d\d:\d\d UTC, Speed-Run\.bat: 2 of 2 measured\n  PC: RTX 3080 10 GB, 32 GB RAM, Core i7-8700K 6 cores, 200 GB free; engine: cuda12 build [0-9a-f]{12}; budget: GPU layers auto; no Laya held\n  Big    64\.0 tokens\/s generating, 2048 tokens\/s reading, 16k context, 37\/37 layers on the GPU, 6\.0 GB VRAM \+ 0\.5 GB RAM, loaded in \d+\.\d s, 4 threads\n  Small  64\.0 tokens\/s generating/)
+  assert.match(history(w.data), /^\d{4}-\d\d-\d\d \d\d:\d\d UTC, Speed-Run\.bat: 2 of 2 measured\n  PC: RTX 3080 10 GB, 32 GB RAM, Core i7-8700K 6 cores, 200 GB free; engine: cuda12 build [0-9a-f]{12}; budget: GPU layers auto; no Laya held\n  Big    64\.0 tokens\/s generating, 2048 tokens\/s reading, 16k context, 37\/37 layers on the GPU, 6\.0 GB VRAM \+ 0\.5 GB RAM, loaded in \d+\.\d s, 4 threads, peak RAM not read\n {9}output kept as the first baseline for this engine build and GPU split\n  Small  64\.0 tokens\/s generating/)
   const [detail] = details(w.data)
   assert.match(detail, /^KzH speed run, started .* UTC from Speed-Run\.bat\n/)
   assert.match(detail, /\d\d:\d\d:\d\d\.\d{3} {2}engine ready: big, 37\/37 layers on GPU\n/)
@@ -312,7 +312,7 @@ test('Ctrl+C cancels as the card\'s Cancel does: the engine is put back, reading
   assert.match(text, /Stopped\. Readings already taken are kept; the engine is stopped again, as it was before\./)
   const s = JSON.parse(readFileSync(join(w.data, 'local.json'), 'utf8'))
   assert.deepEqual(Object.keys(s.speed), ['big@16384'])
-  assert.match(history(w.data), /: 1 of 2 measured, stopped\n.*\n  Big    [\d.]+ tokens\/s generating.*\n  Small  not measured: cancelled\n  Stopped\. Readings already taken are kept; the engine is stopped again, as it was before\.\n/)
+  assert.match(history(w.data), /: 1 of 2 measured, stopped\n.*\n  Big    [\d.]+ tokens\/s generating.*\n {9}output kept as the first baseline for this engine build and GPU split\n  Small  not measured: cancelled\n  Stopped\. Readings already taken are kept; the engine is stopped again, as it was before\.\n/)
   assert.ok(server.started.every((x) => x.child.exitCode !== null), 'no llama-server is left running')
 })
 
@@ -415,16 +415,16 @@ test('a speed run log that cannot be written is said, and its paths are not give
   assert.doesNotMatch(text, /Every speed run on this PC|This run in detail/)
 })
 
-test('the table lines its columns up in plain ASCII', () => {
+test('the table lines its columns up in plain ASCII, with the engine\'s peak working set beside its memory', () => {
   const t = table([
-    { name: 'Qwen3 8B', ok: true, ctx: 16384, reading: { tokensPerSec: 71.26, promptTokensPerSec: 2210.4, layersOnGpu: { gpu: 37, total: 37 }, loadMs: 4200, threads: 4 }, memory: { vramGB: 6.1, ramGB: 0.4 } },
+    { name: 'Qwen3 8B', ok: true, ctx: 16384, reading: { tokensPerSec: 71.26, promptTokensPerSec: 2210.4, layersOnGpu: { gpu: 37, total: 37 }, loadMs: 4200, threads: 4, peakRamGB: 7.94 }, memory: { vramGB: 6.1, ramGB: 0.4 } },
     { name: 'Gemma 4 E4B', ok: false, ctx: null, reading: null, memory: null },
   ])
   assert.equal(t, [
-    'Model        Generate tok/s  Read tok/s  Context  GPU layers  VRAM GB  RAM GB  Load s  Threads',
-    '-----------  --------------  ----------  -------  ----------  -------  ------  ------  -------',
-    'Qwen3 8B     71.3            2210        16k      37/37       6.1      0.4     4.2     4',
-    'Gemma 4 E4B  not measured    -           -        -           -        -       -       -',
+    'Model        Generate tok/s  Read tok/s  Context  GPU layers  VRAM GB  RAM GB  Peak RAM GB  Load s  Threads',
+    '-----------  --------------  ----------  -------  ----------  -------  ------  -----------  ------  -------',
+    'Qwen3 8B     71.3            2210        16k      37/37       6.1      0.4     7.9          4.2     4',
+    'Gemma 4 E4B  not measured    -           -        -           -        -       -            -       -',
   ].join('\n'))
   assert.ok(/^[\x20-\x7e\n]*$/.test(t))
 })
@@ -442,4 +442,60 @@ test('Speed-Run.bat runs the script from the harness it sits in, in plain ASCII 
   assert.match(bat, /^for %%a in \(%\*\) do if \/i "%%~a"=="--no-pause" set pause=0\r$/m)
   assert.match(bat, /^if "%pause%"=="1" pause\r$/m)
   assert.match(bat, /exit \/b %code%/i)
+})
+
+test('Speed-Run.bat\'s header, what a person setting up a scheduled run reads, names every exit code the script ends with and its --accept-output', () => {
+  const header = readFileSync(BAT, 'latin1').split('\r\n').filter((l) => l.startsWith('rem ')).map((l) => l.slice(4).trim()).join(' ')
+  const codes = header.slice(header.indexOf('Exit codes:'))
+  for (const [name, code] of Object.entries(EXIT)) assert.match(codes, new RegExp(`[:,] ${code} `), `${name} (${code}) in: ${codes}`)
+  assert.match(header, /Speed-Run\.bat --accept-output +accept the new output a run kept aside/)
+})
+
+test('a run whose output differs from its baseline exits 4 and keeps the figure aside; --accept-output takes it without measuring anything, and the profile\'s local.outputCheckShare is the share held to', async () => {
+  assert.equal(EXIT.outputDiffers, 4, 'its own exit code')
+  assert.equal(parseArgs(['--accept-output']).acceptOutput, true)
+  const MONTH = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const today = `${new Date().getDate()} ${MONTH[new Date().getMonth()]}`
+  // 64 words, those from `from` on spelt differently: the greedy answer of the output check.
+  const answer = (from = 64) => Array.from({ length: 64 }, (_, i) => `${i < from ? 'w' : 'x'}${i}`).join(' ')
+  let text = answer()
+  const w = world({ server: fakeLlamaServer({ report: () => SPLIT, speed: () => ({ generate: 64, read: 2048 }), greedy: () => text }) })
+  // The profile asks for three quarters: an answer agreeing for 40 of 64 tokens differs.
+  mkdirSync(join(w.root, 'home'), { recursive: true })
+  writeFileSync(join(w.root, 'home', 'cordis.patch.yml'), '- id: jev-router\n  config:\n    local:\n      outputCheckShare: 0.75\n')
+  assert.equal(await w.run(), EXIT.measured, w.err.join('\n'))
+  assert.ok(w.out.includes(`Output check: 0.75 of each baseline must agree, jev-router's local.outputCheckShare in ${join(w.root, 'home', 'cordis.patch.yml')}.`), w.out.join('\n'))
+  text = answer(40)
+  w.out.length = 0
+  assert.equal(await w.run(), EXIT.outputDiffers, w.err.join('\n'))
+  const said = w.out.join('\n')
+  assert.match(said, new RegExp(`OK  Big: 64\\.0 tokens/s generating .* Its output differs from the ${today} baseline after 40 tokens \\(48 needed\\), so this figure is not taken as its speed until the new output is accepted\\.`))
+  assert.match(said, /\nNo speed reading was saved\.\nKept aside, since the output differs from its baseline: Big\. Read both outputs in Settings, Local models, and accept the new one there, or run this again with --accept-output --models big\.\n/)
+  const local = () => JSON.parse(readFileSync(join(w.data, 'local.json'), 'utf8'))
+  const before = local().speed['big@16384']
+  assert.deepEqual(Object.keys(local().speedHeld), ['big@16384'])
+
+  // Accepted from the shell: nothing is loaded or measured, and the figure is the model's speed.
+  const requests = w.server.requests.length
+  w.out.length = 0
+  assert.equal(await w.run(['--accept-output']), EXIT.measured, w.err.join('\n'))
+  assert.equal(w.server.requests.length, requests, 'no request reaches an engine')
+  assert.equal(w.server.started.length, 2, 'no engine is started')
+  assert.ok(w.out.includes(`Accepted the new output of Big: its figure of ${today}, 64.0 tokens/s generating, is its speed now, and that output the baseline its later runs are held to (it differed from the ${today} baseline after 40 tokens).`), w.out.join('\n'))
+  assert.ok(w.out.includes('KzH takes these as the models\' speeds at its next start.'))
+  const after = local()
+  assert.deepEqual(after.speedHeld, {})
+  assert.notEqual(after.speed['big@16384'].at, before.at)
+  assert.equal(after.speed['big@16384'].output.state, 'accepted')
+  assert.match(history(w.data), /UTC, Speed-Run\.bat: accepted the new output of Big: /)
+  // Nothing left to accept: a model named is refused, and none named is told so.
+  w.out.length = 0
+  assert.equal(await w.run(['--accept-output', '--models', 'big']), EXIT.couldNotRun)
+  assert.ok(w.out.includes('Big has no new output waiting to be accepted.'), w.out.join('\n'))
+  w.out.length = 0
+  assert.equal(await w.run(['--accept-output']), EXIT.measured)
+  assert.ok(w.out.includes('No model has a new output waiting to be accepted.'), w.out.join('\n'))
+  // The accepted output is the baseline now: the next run is the same, and exits 0.
+  w.out.length = 0
+  assert.equal(await w.run(), EXIT.measured, w.out.join('\n'))
 })

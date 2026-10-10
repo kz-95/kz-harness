@@ -246,6 +246,38 @@ test('the domains a rule in code decides are the ones decision.js asks Jev nothi
   assert.equal(resolvePolicy().domains.frontier_escalation.teacher, 'code')
 })
 
+test('DOMAINS.intent is LOW with localLabels [\'task\'] and requiredClasses [\'task\',\'question\']; every other domain is unchanged', async () => {
+  const { DOMAINS, gatesFor, resolvePolicy } = await import('../routing-policy.js')
+  // The message intent: its local classifier may say "task", never "question", and no rung that
+  // decides is reached on a store short of either.
+  assert.deepEqual(DOMAINS.intent, { risk: 'LOW', kind: 'multiclass', label: 'message intent', localLabels: ['task'], requiredClasses: ['task', 'question'] })
+  const { intent, ...rest } = DOMAINS
+  assert.deepEqual(rest, {
+    task_classification: { risk: 'LOW', kind: 'multiclass', label: 'task classification' },
+    skill_selection: { risk: 'LOW', kind: 'multiclass', label: 'skill selection' },
+    resource_selection: { risk: 'MEDIUM', kind: 'ranking', label: 'resource selection', localDecides: false, teacher: 'code' },
+    execution_strategy: { risk: 'MEDIUM', kind: 'multiclass', label: 'execution strategy' },
+    second_opinion: { risk: 'MEDIUM', kind: 'multiclass', label: 'second opinion' },
+    frontier_escalation: { risk: 'HIGH', kind: 'multiclass', label: 'frontier escalation', teacher: 'code' },
+    outcome_disposition: { risk: 'HIGH', kind: 'multiclass', label: 'outcome disposition' },
+  })
+  const policy = resolvePolicy()
+  assert.deepEqual(policy.domains.intent, intent, 'the policy in force carries it as shipped')
+  assert.equal(gatesFor(policy, 'intent'), policy.gates.LOW, 'at the LOW gates: 750 verified samples and 100 of each class to decide anything')
+  assert.deepEqual([policy.gates.LOW.guardedSamples, policy.gates.LOW.perClassSamples], [750, 100])
+})
+
+test('no policy lets the intent classifier decide a question, or drop task or question from the classes its local rungs wait for', async () => {
+  const { resolvePolicy } = await import('../routing-policy.js')
+  assert.throws(() => resolvePolicy({ domains: { intent: { localLabels: ['task', 'question'] } } }), /^Error: routing policy: domain intent: localLabels can only narrow what its local classifier may decide \(task\)$/)
+  assert.throws(() => resolvePolicy({ domains: { intent: { localLabels: null } } }), /^Error: routing policy: domain intent: localLabels must be a list of labels$/)
+  assert.throws(() => resolvePolicy({ domains: { intent: { requiredClasses: ['task'] } } }), /^Error: routing policy: domain intent: requiredClasses cannot drop a class it ships with \(task, question\)$/)
+  assert.throws(() => resolvePolicy({ domains: { task_classification: { requiredClasses: 'implementation' } } }), /^Error: routing policy: domain task_classification: requiredClasses must be a list of labels$/)
+  // Narrowing what a classifier may decide, and adding a class a rung waits on, are the policy's to choose.
+  assert.deepEqual(resolvePolicy({ domains: { task_classification: { localLabels: ['implementation'] } } }).domains.task_classification.localLabels, ['implementation'])
+  assert.deepEqual(resolvePolicy({ domains: { intent: { requiredClasses: ['task', 'question', 'chat'] } } }).domains.intent.requiredClasses, ['task', 'question', 'chat'])
+})
+
 test('the subscription-to-metered crossover falls where the policy comment says', async () => {
   const { resolvePolicy } = await import('../routing-policy.js')
   const { CURVE_KNEES, conservationCurve, expectedJobCost } = await import('../governor.js')

@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -601,6 +601,24 @@ test('the upgrade seed counts every agent a decision record saw, even one that n
   const upgraded = createResourceTracker({ file: join(root, 'known-resources.json'), store, records, domains })
   assert.deepEqual(await upgraded.note([{ id: 'claude' }, { id: 'deepseek' }]), [], 'deepseek was already seen')
   assert.deepEqual(changes, [])
+})
+
+test('a tracker disposed of, as the plugin closing or applied again leaves it, has saved the set it was saving once its dispose resolves, and saves it no more, so the one the plugin that replaces it saved stays', async () => {
+  const { createResourceTracker } = await import('../index.js')
+  const file = join(mkdtempSync(join(tmpdir(), 'kz-known-')), 'known-resources.json')
+  const domains = { noteEnvironmentChange: () => {} }
+  const closed = createResourceTracker({ file, store: null, domains })
+  // A run starts as the plugin closes: the set it notes is still being saved.
+  const noting = closed.note([{ id: 'claude' }])
+  await closed.dispose?.()
+  assert.equal(existsSync(file) ? readFileSync(file, 'utf8') : null, '["claude"]', 'the save under way has landed')
+  await noting
+  // The plugin that replaces it saves the set it knows, with an agent added to config since.
+  await createResourceTracker({ file, store: null, domains }).note([{ id: 'claude' }, { id: 'codex' }])
+  const theirs = readFileSync(file, 'utf8')
+  // A run of the closed plugin still going starts with an agent of its own.
+  await closed.note([{ id: 'claude' }, { id: 'qwen-local' }])
+  assert.equal(readFileSync(file, 'utf8'), theirs, 'known-resources.json is still the set the plugin that replaced it saved')
 })
 
 // ---------------------------------------------------------------- one answer governs the second opinion

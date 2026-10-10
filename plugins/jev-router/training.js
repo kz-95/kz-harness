@@ -26,7 +26,8 @@ import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, open, readFile, rename } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { FEATURE_SCHEMA_VERSION, validateFeatures } from './features.js'
-import { ROUTING_TAGS } from './feedback.js'
+import { PLAN_TAGS, ROUTING_TAGS } from './feedback.js'
+import { ANSWER_CAPABILITIES, INTENT_TAGS, QUESTION, TASK } from './intent.js'
 import { SILENT_STATUSES, isWorkAttempt, succeeded } from './outcome.js'
 import { TEACHER } from './providers.js'
 import { DISPOSITIONS, STRATEGIES, resolvePolicy, tierAtLeast } from './routing-policy.js'
@@ -65,6 +66,8 @@ const HUMAN = known('HUMAN', DISPOSITIONS)
 // the one that says the pick was right.
 const MISREAD_TAGS = new Set([known('misread my question', ROUTING_TAGS), known('wrong scope', ROUTING_TAGS)])
 const GOOD_PICK = known('good pick', ROUTING_TAGS)
+// The tag of a verdict about the pick that says another agent should have had the work.
+const WRONG_AGENT = known('wrong agent', PLAN_TAGS)
 // Strictly stronger, through routing-policy's own tier ordering rather than a second copy of it:
 // a peer of the same tier is no escalation, and an unknown tier is never stronger than anything.
 const strongerTier = (a, b) => tierAtLeast(a, b) && !tierAtLeast(b, a)
@@ -191,7 +194,7 @@ export function samplesCap(policy = resolvePolicy()) {
  * @param {object} [p.policy]      resolvePolicy() result, which the cap is derived from
  * @param {number} [p.cap]         samples kept per domain; samplesCap(policy) when not given
  * @param {number} [p.slack]       how many rows past what the cap keeps the file may grow before
- *   it is rewritten. One cap's worth by default. At the cap the file holds, for each of seven
+ *   it is rewritten. One cap's worth by default. At the cap the file holds, for each of eight
  *   domains, about a cap's worth of samples and as many outcome rows, so that is about a
  *   sixteenth of it, and with some sixteen rows to a routed run a rewrite comes every six hundred
  *   or so runs, never on every append.
@@ -214,6 +217,10 @@ export function createTrainingStore({ file, kind = 'jev', now = () => new Date()
   let checkedAt = 0 // `lines` when the file was last measured against the cap
   let unread = false // the file exists and could not be read
   let queue = Promise.resolve()
+  // Once the plugin closes or is applied again (dispose), the file is rewritten no more: the plugin
+  // that replaces this one appends its own rows there, which this store does not hold, so a row
+  // recorded after, as a run of the old plugin still going ends, is only appended.
+  let disposed = false
 
   // Every change to the file goes through here, one at a time. An append that ran while a
   // compaction was between writing its copy and renaming it over the file would land in the file
@@ -332,7 +339,7 @@ export function createTrainingStore({ file, kind = 'jev', now = () => new Date()
     for (const id of [...samples.keys()]) if (!keep.has(id)) samples.delete(id)
     for (const id of [...outcomes.keys()]) if (!samples.has(id)) outcomes.delete(id)
     dropped = count
-    if (unread || lines - list.length < slack) return
+    if (disposed || unread || lines - list.length < slack) return
     try {
       await rewrite(list)
       lines = checkedAt = list.length
@@ -392,6 +399,12 @@ export function createTrainingStore({ file, kind = 'jev', now = () => new Date()
       if (typeof id !== 'string' || !id) throw new Error('training outcome: a sample id is required')
       if (!outcome || typeof outcome !== 'object') throw new Error('training outcome: an outcome object is required')
       return write({ id, outcomeTs: now(), outcome })
+    },
+    /** Take a sample's label back: its newest outcome is none, as before it was labelled. */
+    async withdrawOutcome(id) {
+      await ready()
+      if (typeof id !== 'string' || !id) throw new Error('training outcome: a sample id is required')
+      return write({ id, outcomeTs: now(), outcome: null })
     },
     /** One sample joined with its newest outcome, or null when the id is unknown. */
     async get(id) {
@@ -464,6 +477,16 @@ export function createTrainingStore({ file, kind = 'jev', now = () => new Date()
       }
       return out
     },
+    /**
+     * The plugin is closing or applied again: the file is compacted no more, and a row recorded
+     * after is only appended. Resolves once every change asked for so far has landed or failed, one
+     * still waiting for the first read of the file included (it joins the queue as that read ends,
+     * before this looks at it).
+     */
+    dispose() {
+      disposed = true
+      return Promise.resolve(loading).catch(() => {}).then(() => queue)
+    },
   }
   return api
 }
@@ -531,7 +554,9 @@ const candidateLookup = (sample) => {
 const whenOf = (ts) => (typeof ts === 'string' ? Date.parse(ts) : NaN)
 
 /**
- * The feedback rows about this run. By runId when the verdict carries one. Otherwise by session,
+ * The feedback rows about this run. By runId when the verdict carries one, else by the task it is
+ * about (`taskKey`, which a verdict about a start reply's pick names: index.js runOfVerdict binds it to
+ * that task's run). Otherwise by session,
  * and only when the verdict was given after this run's answer existed (record.ts is written when
  * the run ends) and before `until`, the next run in the session when the caller knows it: a
  * verdict is about the last run of the session that ended at or before it. Without the time rule
@@ -539,11 +564,14 @@ const whenOf = (ts) => (typeof ts === 'string' ? Date.parse(ts) : NaN)
  * labelled many runs. The time rule is the one profiles.js verdictIsAbout applies to capability
  * evidence (not exported there, so restated here). One difference, kept on purpose: a session
  * verdict that names no agent still counts, because a routing label credits no agent, while one
- * that names an agent must name the one that answered last.
+ * that names an agent must name the one that answered last. A verdict about the pick that names
+ * neither a run nor a task is about no run: by time it could only be guessed at.
  */
 const feedbackFor = (record, feedback, lastAgent, until) => (Array.isArray(feedback) ? feedback : []).filter((f) => {
   if (!f || typeof f !== 'object') return false
   if (f.runId) return f.runId === record.runId
+  if (f.taskKey) return !!record.taskKey && f.taskKey === record.taskKey
+  if (f.about === 'plan') return false
   if (!record.sessionId || f.sessionId !== record.sessionId) return false
   if (f.provider && f.provider !== lastAgent) return false
   const given = whenOf(f.ts); const ended = whenOf(record.ts)
@@ -551,11 +579,34 @@ const feedbackFor = (record, feedback, lastAgent, until) => (Array.isArray(feedb
   return until === undefined || until === null || given < whenOf(until)
 })
 
-function labelResourceSelection(sample, record) {
+/**
+ * What a person said of the run's pick in a verdict about it (`about: 'plan'`), the newest that says
+ * anything: the agent it should have been (a `wrong agent` or untagged dislike naming one; a
+ * `wrong agent` naming none says only that the pick was wrong, and so does one naming an agent that
+ * was no candidate when the pick was made, one not ready or at its limit then, as a rescuer outside
+ * the table does), or that it was right (`good pick`). A person's word on the pick, whatever came of
+ * the run, so it is read before the run's own evidence.
+ */
+function personOnPick(sample, record, feedback, until, key, cands) {
+  const base = { verified: true, details: details(record) }
+  const rows = feedbackFor(record, feedback, workAttempts(record).at(-1)?.agent, until).filter((f) => f.about === 'plan')
+  for (const f of rows.reverse()) {
+    if (f.verdict === 'like' && f.tag === GOOD_PICK) return { chosenKey: key, labelSource: 'human', ...base }
+    if (f.verdict !== 'dislike' || (f.tag && f.tag !== WRONG_AGENT)) continue
+    const better = f.suggestedAgent ? cands.keyOf(f.suggestedAgent) : null
+    if (better && better !== key) return { chosenKey: better, negativeKey: key, labelSource: 'human', ...base }
+    if ((f.tag === WRONG_AGENT && !f.suggestedAgent) || (f.suggestedAgent && !better)) return { chosenKey: null, negativeKey: key, labelSource: 'human', ...base }
+  }
+  return null
+}
+
+function labelResourceSelection(sample, record, feedback, until) {
   const pick = pickOf(sample)
   const key = pick?.chosenKey
   const cands = candidateLookup(sample)
   if (!key || !cands.any) return null
+  const said = personOnPick(sample, record, feedback, until, key, cands)
+  if (said) return said
   const pickId = cands.idOf(key)
   const work = workAttempts(record)
   const last = work.at(-1)
@@ -581,6 +632,9 @@ function labelResourceSelection(sample, record) {
 }
 
 function labelClassification(sample, record, feedback, until) {
+  // The words a steered or amended run worked from are not the ones its task was sorted by, so what
+  // came of it says nothing of how the task was read (Steer, docs/live-agent-view.md Feature 5).
+  if (record.steered > 0 || record.amended) return null
   const pick = pickOf(sample)
   const label = pick?.label
   if (label == null) return null
@@ -655,6 +709,44 @@ function labelDisposition(sample, record) {
 }
 
 /**
+ * What a message turned out to be, a task or a question (intent.js), from what a person said of it
+ * and what its run did. A person's word comes first: `should have been a question` on its start reply
+ * (a verdict about the pick, bound to the task by its key), a Like on its direct answer, or `should
+ * have been a task` on a direct answer, each found by the message's intent sample. Then the run: a
+ * task when it was accepted with files changed, or when its routing named a capability that is no
+ * answer (an `other` or a `human_required` names none); a question when it was accepted as an answer
+ * and changed no file. Where the label is not what the message was treated as (a run means it was
+ * taken for a task, a direct answer for a question), that is its negative. Nothing for a run asked
+ * only for an answer, a run that proves nothing (stopped, paused, continued from a handoff), or a
+ * task whose words were changed after it was sent (steered or amended). `record` is `{}` for a
+ * message that ran nothing, a direct answer, which only a person's word labels.
+ */
+function labelIntent(sample, record, feedback) {
+  if (record.steered > 0 || record.amended) return null
+  const base = { verified: true, details: details(record) }
+  const ran = typeof record.runId === 'string' && !!record.runId
+  const treated = ran ? TASK : QUESTION
+  const labelled = (truth, labelSource) => ({ label: truth, ...(truth !== treated ? { negativeLabel: treated } : {}), labelSource, ...base })
+  const about = (f) => !!f && typeof f === 'object' && (f.intentSample === sample.id || (f.about === 'plan' && !!record.taskKey && f.taskKey === record.taskKey))
+  const rows = (Array.isArray(feedback) ? feedback : []).filter(about)
+  const onAnswer = (f) => (f.about ?? 'answer') === 'answer' && f.intentSample === sample.id
+  if (rows.some((f) => f.about === 'plan' && f.tag === INTENT_TAGS.question)) return labelled(QUESTION, 'human')
+  if (rows.some((f) => onAnswer(f) && f.tag === INTENT_TAGS.task)) return labelled(TASK, 'human')
+  if (rows.some((f) => onAnswer(f) && f.verdict === 'like')) return labelled(QUESTION, 'human')
+  if (!ran || record.answerOnly || noEvidence(record)) return null
+  const work = workAttempts(record)
+  const changed = work.some((a) => Array.isArray(a.changedFiles) && a.changedFiles.length > 0)
+  // Measured to be none: a folder git could not read says nothing either way.
+  const unchanged = work.length > 0 && work.every((a) => Array.isArray(a.changedFiles) && !a.changedFiles.length)
+  const capability = record.routing?.capability
+  const named = typeof capability === 'string' && capability !== 'other' && capability !== 'human_required'
+  if (accepted(record) && changed) return labelled(TASK, 'verified_outcome')
+  if (named && !ANSWER_CAPABILITIES.includes(capability)) return labelled(TASK, 'verified_outcome')
+  if (accepted(record) && unchanged && ANSWER_CAPABILITIES.includes(capability)) return labelled(QUESTION, 'verified_outcome')
+  return null
+}
+
+/**
  * The outcome a finished run justifies for one sample, or null when the run gives no evidence.
  * The rules are per domain (see the file header): a pick that did the accepted work is
  * confirmed, a rescue by another resource or strategy becomes the label with the pick as the
@@ -665,20 +757,22 @@ function labelDisposition(sample, record) {
  * the store gets: conservation is a hard limit now, with nothing for a run to confirm.
  * @param {string} domain   a routing domain id
  * @param {object} sample   the stored sample row
- * @param {object} record   the history.jsonl record of the run
+ * @param {object} record   the history.jsonl record of the run; for the message intent, `{}` for a
+ *   message that ran nothing (a direct answer), which only feedback labels (labelIntent)
  * @param {{ feedback?: object[], until?: string }} [deps] feedback rows (feedback.js shape), and
  *   the end of the next run in the same session when the caller knows it (see feedbackFor)
  */
 export function labelFromRun(domain, sample, record, { feedback = [], until } = {}) {
   if (!sample || !record || typeof record !== 'object') return null
   switch (domain) {
-    case 'resource_selection': return labelResourceSelection(sample, record)
+    case 'resource_selection': return labelResourceSelection(sample, record, feedback, until)
     case 'task_classification':
     case 'skill_selection': return labelClassification(sample, record, feedback, until)
     case 'execution_strategy':
     case 'second_opinion':
     case 'frontier_escalation': return labelStrategy(domain, sample, record)
     case 'outcome_disposition': return labelDisposition(sample, record)
+    case 'intent': return labelIntent(sample, record, feedback)
     default: return null
   }
 }

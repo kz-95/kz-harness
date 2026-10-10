@@ -1,4 +1,5 @@
-// Posting a finished background result into its conversation.
+// Posting a finished background result into its conversation, and the milestone notices that say
+// how its task is getting on before then (notify).
 //
 // This is pulled out of the plugin body because it is the one path that must not go wrong, and
 // inside a closure it could not be tested at all: it decides whether a person ever learns what
@@ -12,21 +13,30 @@
 //      agent to go idle, because that wait is exactly where a second attempt could start.
 import { randomUUID } from 'node:crypto'
 import { TASK_LABELS, resultSection } from './adapter.js'
+import { noDots } from './reply-words.js'
+import { guidanceLines } from './steer.js'
+import { TERMINAL_STATES } from './tasks.js'
 
 /** How many times a delivery that never landed is retried before the result is left unread. */
 const MAX_TRIES = 5
 const RETRY_CEILING_MS = 30_000
+/** How long a milestone notice whose append failed waits before its one retry. */
+const NOTICE_RETRY_MS = 1000
 
 /**
  * @param {object} p
- * @param {object} p.tasks  the task registry (delivering/undeliver are its delivery state machine)
+ * @param {object} p.tasks  the task registry (delivering/undeliver are its delivery state machine;
+ *   byKey is where a notice reads whether its task still runs)
  * @param {(m: string) => void} [p.log]
  * @param {(r: object, body: string) => Promise<string>} [p.format]  rewrites a result body before
  *   it is posted (message transfer). Injected lazily, because the local model it uses only exists
  *   once the plugin's llm block has run. Identity by default.
  * @param {() => void} [p.setTimer]  injectable so a test can drive retries without waiting
+ * @param {() => Promise<Record<string, string>>} [p.names]  each agent's name by its id, for the result's head
+ * @param {() => string} [p.progress]  the chat replies setting's `progress`: 'off' posts no milestone notice
+ *   but a guess's change of plan (notify's `missedGuess`)
  */
-export function createDelivery({ tasks, log = () => {}, format = async (_r, body) => body, setTimer = (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t } }) {
+export function createDelivery({ tasks, log = () => {}, format = async (_r, body) => body, setTimer = (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t }, names = async () => ({}), progress = () => 'milestones' }) {
   /**
    * Append one finished result to its own conversation. Returns false when no message was
    * created, so the caller can retry it later; true when it is in the conversation (which is
@@ -43,8 +53,10 @@ export function createDelivery({ tasks, log = () => {}, format = async (_r, body
     // message and nothing to retry. Only the report goes through it; the structured head stays
     // exactly as written, and so does the terminal reason that resultSection puts in front of the
     // report when a task did not complete, so the task, id, agent, status and reason are never
-    // touched. A formatter failure keeps the raw report.
-    const full = resultSection(r)
+    // touched. A formatter failure keeps the raw report. The head names the agent as the start reply
+    // did, a name that cannot be read leaving its id, and says what became of each piece of the
+    // person's guidance (Steer): read by the agent, carried to a later attempt, or not used.
+    const full = resultSection(r, { names: await Promise.resolve().then(names).catch(() => ({})), guidance: guidanceLines(r.steers) })
     const cut = full.indexOf('\n\n')
     let text = full
     if (cut >= 0) {
@@ -106,5 +118,39 @@ export function createDelivery({ tasks, log = () => {}, format = async (_r, body
     return false
   }
 
-  return { deliver, deliverWithRetry }
+  /**
+   * Append one milestone notice about a task still at work (index.js, the notice scheduler) as its
+   * own collapsed row: `summary` shows, `text` is its body. Like a result it never goes inside an
+   * answer, so it waits for the agent to go idle first, and it is checked again right before it is
+   * appended: a task that ended meanwhile posts none (its result says the rest), nor does one whose
+   * milestone notices were switched off meanwhile, but for the change of plan of a guess routing did
+   * not pick (`missedGuess`, tasks.js guessMissed), the one notice Start and result only posts. It never
+   * touches a result's delivery state, and its summary holds no `·`, so the browser never reads it as
+   * a result. An append that fails is tried once more. Resolves true once the notice is in the chat.
+   */
+  async function notify(owner, { key, summary, text, missedGuess = false }) {
+    const session = owner?.session
+    if (!session?.append) return false
+    const attempt = async () => {
+      try { await owner.whenIdle?.() } catch {}
+      const t = tasks.byKey?.(key)
+      if (!t || TERMINAL_STATES.includes(t.state) || (progress() === 'off' && !missedGuess)) return false
+      // A fresh id every time: the inbox rejects a duplicate id and the UI keys rows on it.
+      session.append('user/message', {
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin', plugin: 'jev-router', form: 'notice', summary: noDots(summary) },
+      }, { surfaceOp: 'append' })
+      return true
+    }
+    try { return await attempt() } catch (err) { log(`notice "${noDots(summary)}" not posted: ${err.message}; trying once more`) }
+    return new Promise((done) => {
+      setTimer(() => {
+        attempt().then(done, (err) => { log(`notice "${noDots(summary)}" not posted: ${err.message}`); done(false) })
+      }, NOTICE_RETRY_MS)
+    })
+  }
+
+  return { deliver, deliverWithRetry, notify }
 }

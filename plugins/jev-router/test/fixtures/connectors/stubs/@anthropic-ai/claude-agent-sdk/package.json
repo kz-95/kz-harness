@@ -1,0 +1,6 @@
+{
+  "name": "@anthropic-ai/claude-agent-sdk",
+  "private": true,
+  "type": "module",
+  "exports": "./index.js"
+}

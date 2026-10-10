@@ -54,6 +54,24 @@ test('the Router tab never says the local router decides a domain whose classifi
   assert.equal(maturityWords(states.task_classification), 'Jev decides; the local router is not trained yet')
 })
 
+test('the Router tab lists the message intent, whose local router decides only that a message is a task, at the rungs where it decides at all', () => {
+  const root = mkdtempSync(join(tmpdir(), 'kz-routerview-'))
+  const reg = createDomainRegistry({ policy: resolvePolicy(), store: createTrainingStore({ file: join(root, 'samples.jsonl') }), artifactsDir: join(root, 'classifiers'), stateDir: root })
+  const states = reg.states()
+  assert.ok(states.intent, 'the registry reports it, so the tab lists it with its rung')
+  assert.deepEqual(states.intent.localLabels, ['task'], 'and says what its local router may decide')
+  const only = ', and only when it answers task: Jev decides every other answer'
+  assert.equal(maturityWords({ ...states.intent, maturity: 'GUARDED_LOCAL' }), `the local router decides when it is confident and the case is familiar${only}`)
+  assert.equal(maturityWords({ ...states.intent, maturity: 'LOCAL_ONLY' }), `the local router decides normal cases with no Jev call${only}`)
+  // Below the rungs where it decides, and back down from them, Jev decides everything anyway.
+  assert.equal(maturityWords(states.intent), 'Jev decides; the local router is not trained yet')
+  assert.equal(maturityWords({ ...states.intent, maturity: 'SHADOW' }), 'Jev decides; the local router predicts alongside it and is being scored')
+  assert.equal(maturityWords({ ...states.intent, maturity: 'ROLLBACK' }), 'local authority suspended; Jev decides until it is earned back')
+  // A domain with no such limit keeps the words for its rung.
+  assert.equal(states.task_classification.localLabels, null)
+  assert.equal(maturityWords({ ...states.task_classification, maturity: 'GUARDED_LOCAL' }), 'the local router decides when it is confident and the case is familiar')
+})
+
 // ---------- Jev and Laya, side by side (docs/laya-auto.md 5.6, 8.4) ----------
 
 // The same client, with a React whose createElement records what it was asked for, so the card
@@ -130,6 +148,31 @@ test('the Router tab\'s side-by-side card reads the comparison by its own names,
   assert.ok(whys.includes('Skipped: 3 not running, 1 starting, 0 queue full, 0 waited too long, 2 gave way to a local model, 1 Jev call failed; 1 failed.'))
   assert.ok(whys.includes('Median answer time: Jev intent 110 ms, route 900 ms, review 800 ms; Laya intent 300 ms, route 950 ms, review not measured.'))
   assert.equal(LayaCompare({ data: null }), null, 'nothing to show before the comparison has been read')
+})
+
+test('the side-by-side card gives a share its 95% range beside it when the comparison gives one, so a share of a few rows reads as the range it is, and says what a range is (docs/live-agent-view.md 6, slice 9)', () => {
+  const { LayaCompare } = renderPlugin()
+  // As shadow-stats.js compare() gives them: each share's interval, null where nothing is counted.
+  const iv = (low, high) => ({ low, high })
+  const data = {
+    ...COMPARE,
+    questions: [{ ...COMPARE.questions[0], intervals: { all: iv(0.387, 0.679), informative: iv(0.455, 0.781) } }, { ...COMPARE.questions[1], intervals: { all: iv(0.468, 0.911), informative: null } }],
+    domains: [
+      { ...COMPARE.domains[0], intervals: { agree: iv(0.455, 0.781), jevRight: iv(0.301, 0.954), layaRight: iv(0.15, 0.85), contradicted: iv(0.061, 0.792), failed: null } },
+      { ...COMPARE.domains[1], intervals: { agree: iv(0.584, 0.919), jevRight: null, layaRight: null, contradicted: null, failed: iv(0.047, 0.448) } },
+      { ...COMPARE.domains[2], intervals: { agree: null, jevRight: null, layaRight: null, contradicted: null, failed: null } },
+    ],
+  }
+  const all = nodes(expand(LayaCompare({ data })))
+  const [domains, questions] = all.filter((n) => n.type === 'table')
+  const rows = (t) => nodes(t).filter((n) => n.type === 'tr' && n.children.some((c) => c?.props?.scope === 'row')).map((tr) => tr.children.map(textOf))
+  assert.deepEqual(rows(domains), [
+    ['task classification', '41', '19 of 30 (63%, range 46 to 78%)', '3 / 2 of 4 (range 30 to 95% / range 15 to 85%)', '1 of 3 (range 6 to 79%)', 'not measured (12 runs)'],
+    ['execution strategy', '40', '16 of 20 (80%, range 58 to 92%)', 'none yet', 'none yet', '2 of 12 (range 5 to 45%)'],
+    ['second opinion', '0', 'none yet', 'none yet', 'none yet', 'none yet'],
+  ])
+  assert.deepEqual(rows(questions).map((r) => r.slice(2, 4)), [['22 of 41 (54%, range 39 to 68%)', '19 of 30 (63%, range 46 to 78%)'], ['9 of 12 (75%, range 47 to 91%)', 'none yet']])
+  assert.ok(all.filter((n) => n.props.className === 'why').map(textOf).some((w) => w.endsWith('A range beside a share is its 95% interval: how far a longer record could still put it.')))
 })
 
 /**

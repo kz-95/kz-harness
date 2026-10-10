@@ -180,8 +180,9 @@ async function until(label, read, ok, { timeoutMs = 60_000 } = {}) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
     let value
-    try { value = await read() } catch (err) { value = `not readable yet: ${err.message}` }
-    if (ok(value)) return value
+    let readable = true
+    try { value = await read() } catch (err) { value = `not readable yet: ${err.message}`; readable = false }
+    if (readable && ok(value)) return value
     if (Date.now() > deadline) throw new Error(`${label}: still not true after ${timeoutMs} ms, last: ${JSON.stringify(value)?.slice(0, 1200)}`)
     await tick(50)
   }
@@ -260,7 +261,7 @@ async function plugin(t, { tasks = ['preflight', 'debugging-1', 'investigation-1
       world.counts[key] = (world.counts[key] ?? 0) + 1
       const what = world.behave(agent, task, world.counts[key])
       const signal = opts.signal
-      world.started.push({ provider, agent, task, folder, text, parent: opts.parent, what, codexEffort: process.env.KZ_CODEX_EFFORT ?? null, codexTier: process.env.KZ_CODEX_SERVICE_TIER ?? null, reasoningEffort: opts.agentOptions?.reasoningEffort ?? null })
+      world.started.push({ provider, agent, task, folder, text, parent: opts.parent, what, codexEffort: process.env.KZ_CODEX_EFFORT ?? null, codexTier: process.env.KZ_CODEX_SERVICE_TIER ?? null, reasoningEffort: opts.agentOptions?.reasoningEffort ?? null, kzhTap: opts.kzhTap ?? null, kzhControl: opts.kzhControl ?? null })
       const result = (async () => {
         if (what === 'hold') {
           await Promise.race([new Promise((open) => world.gates.push(open)), abortOf(signal)])
@@ -633,6 +634,18 @@ test('the task\'s own checks run the agent\'s code with no key of KzH\'s in its 
   assert.ok(seen.some((x) => x.script === 'test'), `the checks ran the agent's code: ${JSON.stringify(seen)}`)
   assert.deepEqual(seen.filter((x) => x.key !== null), [], 'with no key of KzH\'s, in the checks as in the grade')
   assert.deepEqual(rows(p.file('benchmark.jsonl')).filter((r) => r.type === 'task').map((r) => [r.task, r.outcome]), [['preflight', 'passed'], ['debugging-1', 'passed']])
+})
+
+test('a benchmark run is none the live view follows: its Codex is handed neither the engine patch\'s tap nor its control, though the patch is in its connector', async (t) => {
+  const file = join(process.env.DSH_HOME, 'profiles', 'web', 'node_modules', '@deepseek-ai', 'dsh-subagent-codex', 'lib', 'index.js')
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, 'var a = 1;\n/* KZH_AGENT_LIVE 2: patched by Kz-harness scripts/patch-agent-live.mjs */\n')
+  t.after(() => rmSync(join(process.env.DSH_HOME, 'profiles'), { recursive: true, force: true }))
+  const p = await plugin(t, { tasks: ['preflight'] })
+  assert.deepEqual((await p.http('GET', '/jev-router/engine-patches')).body.codex, { on: true, why: null }, 'the patch is in its connector')
+  const runId = await p.begin(['codex'])
+  await p.ended(runId)
+  assert.deepEqual(p.world.started.map((x) => [x.agent, x.kzhTap, x.kzhControl]), [['codex', null, null]])
 })
 
 test('a forced agent whose task\'s own checks still fail is started once for it: no retry, no review and no other agent, and the failing check is recorded', async (t) => {

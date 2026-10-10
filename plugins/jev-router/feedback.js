@@ -22,9 +22,15 @@
 // A tag is only ever one of the fixed TAGS below: an unknown value is rejected before it is
 // stored, because the reader decides what may move routing from the tag alone, and a typo must
 // not fall through as a category nobody chose.
+//
+// A verdict is about an answer, or, on a start reply, about the pick (`about: 'plan'`): the agent
+// and effort the reply named for a task (docs/live-agent-view.md Feature 4). A verdict about the pick
+// names its task by its key, takes PLAN_TAGS only, and is applied to the task's run when that run has
+// ended (index.js bindRun); one about an answer takes TAGS, and `should have been a task` beside them.
 import { appendFile, mkdir, readFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { SESSION_ID } from './export.js'
+import { INTENT_TAGS } from './intent.js'
 
 export const VERDICTS = Object.freeze(['like', 'dislike'])
 // The wire value that stores "no verdict". Not a verdict: a marker that the pair is cleared.
@@ -40,6 +46,19 @@ export const TAGS = Object.freeze([...ROUTING_TAGS, ...ANSWER_TAGS])
 const ANSWER_ONLY = new Set(ANSWER_TAGS)
 /** True for a tag that must not demote or promote a pick. Untagged is routing affecting. */
 export const tagIsAnswerOnly = (tag) => ANSWER_ONLY.has(tag)
+/** What a verdict can be about: an answer (the default), or the pick a start reply named. */
+export const ABOUT = Object.freeze(['answer', 'plan'])
+/** The tags of a verdict about the pick, in the order the start reply offers them. */
+export const PLAN_TAGS = Object.freeze(['good pick', 'wrong agent', 'wrong effort', 'misread my question', 'wrong scope', INTENT_TAGS.question])
+// The tags each kind of verdict accepts: an answer's also says its message was a task after all.
+const TAGS_OF = Object.freeze({ answer: Object.freeze([...TAGS, INTENT_TAGS.task]), plan: PLAN_TAGS })
+// The tags that say something of the pick other than which agent: the effort, or whether the message
+// was a task at all. With the answer-only tags they count for no agent, as a vote or a suggestion.
+const NOT_ABOUT_AGENT = new Set([...ANSWER_TAGS, 'wrong effort', INTENT_TAGS.question, INTENT_TAGS.task])
+/** True for a tag that may vote on the agent it judges (router.js feedbackPrior); untagged votes too. */
+export const tagVotesOnAgent = (tag) => !NOT_ABOUT_AGENT.has(tag)
+/** The efforts a verdict about the pick may say it should have run at (the unified levels, effort.js). */
+export const SUGGESTED_EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max'])
 // A row's own key, from the browser: the assistant message id the control sits under.
 const MESSAGE_ID = /^[\w.:-]{1,200}$/
 const AGENT_ID = /^[a-z][a-z0-9_-]{0,40}$/
@@ -47,6 +66,9 @@ const PROVIDER = /^[\w.-]{1,64}$/
 const MODEL = /^[\w.:/+-]{1,128}$/
 // The run the answer came from, as the answer message carries it (index.js withRunMark).
 const RUN_ID = /^[\w-]{1,80}$/
+// The task a start reply is about (tasks.js key), and the intent sample a direct answer was recorded as.
+const TASK_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const SAMPLE_ID = /^[\w-]{1,80}$/
 export const MAX_REASON = 2000
 
 /**
@@ -58,6 +80,10 @@ export const MAX_REASON = 2000
  * model, which is how router.js attributes the verdict. `runId` is the run the answer came from,
  * when the message says (index.js withRunMark): the one exact link from a message to its run,
  * which index.js runOfVerdict credits the verdict to instead of guessing by time.
+ * `about` is what the verdict judges: `answer` (the default, left off the row) or `plan`, the pick a
+ * start reply named, which names its task by `taskKey` and may say the effort it should have run at
+ * (`suggestedEffort`). `intentSample` is the example a direct answer's message was recorded as
+ * (reply-words.js INTENT_MARK), which the verdict labels.
  * A `verdict` of `clear` is the tombstone: it needs only the two ids, and any reason, tag or
  * attribution in the body is ignored rather than stored on a row that has no verdict.
  */
@@ -74,10 +100,21 @@ export function validFeedback(body, { now = () => new Date().toISOString() } = {
   // would otherwise ride the routing prompt intact. Empty stays empty, and is not an error.
   const reason = body.reason == null ? '' : String(body.reason).replace(/\s+/g, ' ').trim()
   if (reason.length > MAX_REASON) throw new Error(`reason: one line, at most ${MAX_REASON} characters`)
+  const about = body.about == null ? 'answer' : body.about
+  if (!ABOUT.includes(about)) throw new Error(`about: ${ABOUT.join(' or ')}`)
   // Optional category. Rejected rather than stored when unknown: router.js reads routing rights
-  // off this value, so a typo must not be silently treated as a category nobody picked.
+  // off this value, so a typo must not be silently treated as a category nobody picked. A verdict
+  // about the pick takes its own tags, and one about an answer never takes those.
   const tag = body.tag == null ? '' : String(body.tag).trim()
-  if (tag && !TAGS.includes(tag)) throw new Error(`tag: one of ${TAGS.join(', ')}`)
+  if (tag && !TAGS_OF[about].includes(tag)) throw new Error(`tag: one of ${TAGS_OF[about].join(', ')}`)
+  const taskKey = typeof body.taskKey === 'string' ? body.taskKey.trim() : ''
+  if (taskKey && !TASK_KEY.test(taskKey)) throw new Error('taskKey: the key of the task the reply is about')
+  if (about === 'plan' && !taskKey) throw new Error('taskKey: a verdict about the pick names its task')
+  const suggestedEffort = typeof body.suggestedEffort === 'string' ? body.suggestedEffort.trim() : ''
+  if (suggestedEffort && !SUGGESTED_EFFORTS.includes(suggestedEffort)) throw new Error(`suggestedEffort: one of ${SUGGESTED_EFFORTS.join(', ')}`)
+  if (suggestedEffort && about !== 'plan') throw new Error('suggestedEffort: only a verdict about the pick says what effort it should have run at')
+  const intentSample = typeof body.intentSample === 'string' ? body.intentSample.trim() : ''
+  if (intentSample && !SAMPLE_ID.test(intentSample)) throw new Error('intentSample: the example the message was recorded as')
   const suggestedAgent = typeof body.suggestedAgent === 'string' ? body.suggestedAgent.trim() : ''
   if (suggestedAgent && (!AGENT_ID.test(suggestedAgent) || suggestedAgent === 'auto')) throw new Error('suggestedAgent: a specific agent id')
   const provider = typeof body.provider === 'string' ? body.provider.trim() : ''
@@ -97,6 +134,10 @@ export function validFeedback(body, { now = () => new Date().toISOString() } = {
     ...(provider ? { provider } : {}),
     ...(model ? { model } : {}),
     ...(runId ? { runId } : {}),
+    ...(about === 'plan' ? { about } : {}),
+    ...(taskKey ? { taskKey } : {}),
+    ...(suggestedEffort ? { suggestedEffort } : {}),
+    ...(intentSample ? { intentSample } : {}),
   }
 }
 

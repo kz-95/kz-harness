@@ -70,8 +70,21 @@ function interpreter({ env = () => ({}), before } = {}) {
   return { spawn, spawned }
 }
 
-/** A port the OS says is free, as the first one this sidecar tries, so files running at once never meet. */
-const basePort = () => new Promise((r) => { const s = createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => r(port)) }) })
+/**
+ * The first port this sidecar tries: a free one picked at random below the ports the OS hands out by
+ * itself (32768 and up on Linux, 49152 and up on Windows and macOS), so files running at once seldom
+ * meet. Never one listen(0) gave: the port after it, where a restart on a fresh port or a taken port
+ * moves, is then one the OS gives outgoing connections, and a connection anywhere on the machine that
+ * takes it between the sidecar's check and laya.serve's bind, open or in TIME_WAIT for a minute after
+ * it closed, fails that bind: one laya.serve more than the test counts, or a start that fails.
+ */
+const isFree = (port) => new Promise((r) => { const s = createServer(); s.once('error', () => r(false)); s.listen(port, '127.0.0.1', () => s.close(() => r(true))) })
+async function basePort() {
+  for (;;) {
+    const port = 20_000 + Math.floor(Math.random() * 12_000)
+    if (await isFree(port)) return port
+  }
+}
 
 /** nvidia-smi as the sidecar reads it: free, used and total MiB, and the name. */
 function gpu({ free = 3500, used = 596, total = 4096 } = {}) {
@@ -177,6 +190,8 @@ test('laya.serve is started as the official entry point, from an empty folder, w
 test('ready means English loaded and a warm-up answered with this start\'s key: another server on the port is not ready, and a taken port is retried once on the next, uncounted', async (t) => {
   const h = await harness()
   let foreign = null
+  // Closed however the test ends: a server left listening would keep this file's process alive for good.
+  t.after(async () => (await foreign?.catch(() => null))?.close())
   const seen = []
   const fake = interpreter({
     env: () => ({ FAKE_LAYA_LOAD_MS: '1500' }),
@@ -187,7 +202,6 @@ test('ready means English loaded and a warm-up answered with this start\'s key: 
   const { sidecar, logs } = await sidecarFor(t, h, { spawn: fake.spawn, onChange: ({ state }) => seen.push([state, fake.spawned.length]) })
   const conn = await sidecar.ensureReady()
   const other = await foreign
-  t.after(() => other.close())
   assert.equal(fake.spawned.length, 2)
   assert.ok(other.requests.length > 0, 'the other server was asked')
   assert.ok(other.requests.every((r) => r.authorization === `Bearer ${fake.spawned[0].opts.env.LAYA_API_KEY}` && r.status === 401), 'with this start\'s key, and refused')
@@ -764,19 +778,14 @@ test('Keep Laya loaded holds it; Start Laya when KzH starts warms it at start-up
 
 test('reservePort never hands out one port twice, skips a port in use, and gives a port back once freed', async (t) => {
   const h = await harness()
-  // The port in use is one the OS hands this test, held from the start, and the first port tried is
-  // the one below it once that is seen free: binding a chosen port instead could meet another test
-  // file running at the same time.
+  // The port in use is the one after the first port tried, held from the start, and closed however
+  // the test ends. Both are below the ports the OS hands out by itself (basePort), so no connection
+  // takes the first one meanwhile; a port another test file holds is passed over for the next pick.
   const listen = (port) => new Promise((r) => { const s = createServer(); s.once('error', () => r(null)); s.listen(port, '127.0.0.1', () => r(s)) })
-  let taken
+  let taken = null
   let base
-  for (let tries = 0; !base; tries++) {
-    taken = await listen(0)
-    const below = await listen(taken.address().port - 1)
-    if (below) { base = taken.address().port - 1; await new Promise((r) => below.close(r)) } else if (tries < 20) await new Promise((r) => taken.close(r))
-    else throw new Error('no two free ports in a row')
-  }
-  t.after(() => taken.close())
+  t.after(() => taken?.close())
+  while (!taken) { base = await basePort(); taken = await listen(base + 1) }
   const { sidecar } = await sidecarFor(t, h, { config: { port: base } })
   const ports = await Promise.all(Array.from({ length: 6 }, () => sidecar.reservePort()))
   assert.equal(new Set(ports).size, 6, `no port twice: ${ports}`)
@@ -943,13 +952,41 @@ test('the settings: each field checked with its own message, a refused patch sav
     [{ idleMinutes: 20, device: 'fast' }, "Device: 'auto', 'gpu' or 'cpu'"],
   ]) await assert.rejects(sidecar.setSettings(patch), { message }, JSON.stringify(patch))
   assert.equal(sidecar.readSettings().idleMinutes, 30, 'the valid half of a refused patch was not saved')
-  assert.deepEqual(await sidecar.setSettings({ idleMinutes: 240, device: 'cpu', shadow: false }), { startWithKzh: false, keepLoaded: false, idleMinutes: 240, device: 'cpu', shadow: false })
-  assert.deepEqual(sidecar.status().settings, { startWithKzh: false, keepLoaded: false, idleMinutes: 240, device: 'cpu', shadow: false })
+  assert.deepEqual(await sidecar.setSettings({ idleMinutes: 240, device: 'cpu', shadow: false }), { startWithKzh: false, keepLoaded: false, idleMinutes: 240, device: 'cpu', shadow: false, colibriUrl: '' })
+  assert.deepEqual(sidecar.status().settings, { startWithKzh: false, keepLoaded: false, idleMinutes: 240, device: 'cpu', shadow: false, colibriUrl: '' })
   await sidecar.noteSelfTest({ protocol: { ok: true }, identity: 'x' })
   const file = JSON.parse(readFileSync(h.paths.settings, 'utf8'))
   assert.deepEqual([file.idleMinutes, file.device, file.shadow, file.lastSelfTest], [240, 'cpu', false, { protocol: { ok: true }, identity: 'x' }])
   assert.deepEqual(Object.keys(file.measured), ['cpu', 'cuda'])
   assert.deepEqual(sidecar.status().selfTest, { protocol: { ok: true }, identity: 'x' })
+})
+
+test('the colibri Laya address (13): empty, so off, by default; kept when it is plain http on this PC with its port, refused with why otherwise, and one laya.json holds that would be refused is not read back', async (t) => {
+  const h = await harness()
+  const { sidecar } = await sidecarFor(t, h, {})
+  assert.equal(sidecar.readSettings().colibriUrl, '', 'off until the owner sets it')
+  for (const [value, why] of [
+    ['https://127.0.0.1:8000', /^colibri Laya address: plain http/],
+    ['http://10.0.0.5:8000', /^colibri Laya address: this PC only \(127\.0\.0\.1, localhost or \[::1\]\), not 10\.0\.0\.5$/],
+    ['http://colibri.example:8000', /this PC only/],
+    ['http://127.0.0.1', /with its port/],
+    ['http://127.0.0.1:8000/v1/systemone', /no path/],
+    ['http://me:pw@127.0.0.1:8000', /no user name or password/],
+    [8000, /text such as http:\/\/127\.0\.0\.1:8000, or empty for off/],
+  ]) await assert.rejects(sidecar.setSettings({ colibriUrl: value }), { message: why }, String(value))
+  assert.equal(sidecar.readSettings().colibriUrl, '', 'nothing refused was saved')
+  for (const ok of ['http://localhost:8000/', 'http://[::1]:8000', 'http://127.0.0.1:8000']) await assert.doesNotReject(sidecar.setSettings({ colibriUrl: ok }), ok)
+  assert.equal(sidecar.status().settings.colibriUrl, 'http://127.0.0.1:8000', 'the card reads it from the status')
+  await waitFor('laya.json keeps it', () => JSON.parse(readFileSync(h.paths.settings, 'utf8')).colibriUrl, (x) => x === 'http://127.0.0.1:8000')
+  await sidecar.setSettings({ colibriUrl: '' })
+  assert.equal(sidecar.readSettings().colibriUrl, '', 'emptied, it is off again')
+
+  // laya.json edited by hand to an address off this PC: read back as off, never sent anything.
+  const other = await harness()
+  mkdirSync(other.dataDir, { recursive: true })
+  writeFileSync(other.paths.settings, JSON.stringify({ colibriUrl: 'http://192.168.1.20:8000', idleMinutes: 45 }))
+  const { sidecar: again } = await sidecarFor(t, other, {})
+  assert.deepEqual([again.readSettings().colibriUrl, again.readSettings().idleMinutes], ['', 45])
 })
 
 test('route() holds by its run id, as 2.4 writes it: listed as run:<id>, and Stop and Restart are refused until it is released', async (t) => {
@@ -1245,6 +1282,20 @@ test('dispose kills an install check under way', async (t) => {
   await sidecar.dispose()
   assert.ok(await settle(() => exited(fake.spawned[0].child), (x) => x), 'the plugin going takes the check with it')
   assert.equal((await checking).ok, false)
+})
+
+test('a supervisor disposed of, as the plugin closing or applied again leaves it, saves laya.json no more, so the settings the plugin that replaces it saved there stay', async (t) => {
+  const h = await harness()
+  const { sidecar: closed } = await sidecarFor(t, h)
+  await closed.dispose()
+  // The plugin that replaces it reads laya.json and saves a setting of its own.
+  const { sidecar: next } = await sidecarFor(t, h)
+  await next.setSettings({ idleMinutes: 5 })
+  const theirs = readFileSync(h.paths.settings, 'utf8')
+  // What the closed plugin's routes still had under way as it closed: a setting, and Test Laya's result.
+  await closed.setSettings({ keepLoaded: true })
+  await closed.noteSelfTest({ ok: true, at: 'then' })
+  assert.equal(readFileSync(h.paths.settings, 'utf8'), theirs, 'laya.json is still what the plugin that replaced it saved')
 })
 
 test('an install check from a supervisor that never swept (the command line\'s) stops a Laya an earlier session left before it writes over that record', async (t) => {

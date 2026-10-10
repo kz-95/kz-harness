@@ -3,6 +3,7 @@
 // Benchmark all measures them, with KzH not running.
 //
 //   node scripts/speed-run.mjs [--models <id>[,<id> ...]] [--context <tokens>] [--harness <dir>] [--data <dir>] [--verbose] [--no-pause]
+//   node scripts/speed-run.mjs --accept-output [--models <id>[,<id> ...]] [--harness <dir>] [--data <dir>]
 //
 // It runs local.js's own speed run (createLocalModels().benchmark()), so each reading is taken,
 // checked and stored the same way: in <data>/local.json under `speed`, keyed <model>@<context>,
@@ -17,6 +18,12 @@
 // speed-runs.log with why, a bad argument included. Ctrl+C cancels as the card's Cancel does, at
 // any point; closing the console window ends it too; the engine is stopped on the way out.
 //
+// Each model's output check (docs/benchmark.md 2.15) holds its greedy output to the baseline its
+// first run kept in <data>/speed-baselines.json, by jev-router's local.outputCheckShare from the
+// profile as KzH does. A figure whose output differs is kept aside, not taken as the model's speed,
+// until it is accepted: --accept-output accepts the new output of each model named with --models,
+// or of every model that has one waiting, as the card's Accept new output does, and measures nothing.
+//
 // The context: KzH starts a local model at the plugin config's local.contextSize when the profile
 // sets one, and a reading stands only for a load at the context it was taken at. This reads
 // jev-router's local.contextSize from the profile's patch files (<DSH_HOME>/profiles/web and
@@ -27,8 +34,11 @@
 //
 // Exit codes, for a scheduled run: 0 every model was measured; 1 a model was not measured (its
 // line says why); 2 it could not run (no engine, no model, an unknown model, a bad argument, a
-// context it cannot tell); 3 KzH, a llama-server, a Laya or another Speed-Run is running; 130
+// context it cannot tell); 3 KzH, a llama-server, a Laya or another Speed-Run is running; 4 every
+// model was measured, and a model's output differs from its baseline (its line says so); 130
 // cancelled with Ctrl+C; 128 and the signal's number when its console was closed or it was ended.
+// --accept-output answers 0 once it has accepted every output asked for (or there was none
+// waiting), 2 when a model named has none, and 3 as a run does.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -43,7 +53,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(here, '..', 'plugins', 'jev-router')
 const plugin = (file) => import(pathToFileURL(join(PLUGIN, file)).href)
 
-export const EXIT = { measured: 0, notMeasured: 1, couldNotRun: 2, kzhRunning: 3, cancelled: 130 }
+export const EXIT = { measured: 0, notMeasured: 1, couldNotRun: 2, kzhRunning: 3, outputDiffers: 4, cancelled: 130 }
 /** Who started a run, as the speed run history says it. */
 const BY = 'Speed-Run.bat'
 
@@ -55,7 +65,7 @@ class Stop extends Error {
   constructor(code, message, { logged = false } = {}) { super(message); this.code = code; this.logged = logged }
 }
 
-const USAGE = 'usage: node scripts/speed-run.mjs [--models <id>[,<id> ...]] [--context <tokens>] [--harness <dir>] [--data <dir>] [--verbose] [--no-pause]'
+const USAGE = 'usage: node scripts/speed-run.mjs [--models <id>[,<id> ...]] [--context <tokens>] [--harness <dir>] [--data <dir>] [--verbose] [--no-pause]\n       node scripts/speed-run.mjs --accept-output [--models <id>[,<id> ...]] [--harness <dir>] [--data <dir>]'
 
 export function parseArgs(argv) {
   const out = { models: undefined, context: undefined, harness: undefined, data: undefined, verbose: false, help: false }
@@ -63,6 +73,7 @@ export function parseArgs(argv) {
     const a = argv[i]
     if (a === '--help' || a === '-h') { out.help = true; continue }
     if (a === '--verbose') { out.verbose = true; continue }
+    if (a === '--accept-output') { out.acceptOutput = true; continue }
     if (a === '--no-pause') continue
     if (!['--models', '--context', '--harness', '--data'].includes(a)) throw new Stop(EXIT.couldNotRun, `unknown argument ${a}\n${USAGE}`)
     const v = argv[++i]
@@ -145,16 +156,20 @@ export async function machineCheck({ harness, data, port = KZH_PORT, answers = p
 }
 
 /**
- * jev-router's config.local.contextSize in one patch file's text: `{ value }`, `{ unreadable: true }`
- * when the file gives it (or gives config.local) in a form this cannot read, or null when it gives
- * none. The patch files are YAML lists of `- id: <plugin>` entries (config/cordis.patch.yml); this
- * reads the block form and the one-line forms of the keys under a jev-router entry, comments aside.
- * Any other contextSize (another plugin's, an agent's llm.contextSize) is not this one.
+ * One key of jev-router's config.local in one patch file's text: `{ value }` when `valid` takes it,
+ * `{ unreadable: true }` when the file gives it (or gives config.local) in a form this cannot read,
+ * or null when it gives none. The patch files are YAML lists of `- id: <plugin>` entries
+ * (config/cordis.patch.yml); this reads the block form and the one-line forms of the keys under a
+ * jev-router entry, comments aside. The same key elsewhere (another plugin's, an agent's
+ * llm.contextSize) is not this one.
  */
-export function jevContextSize(text) {
+export function jevLocalSetting(text, key, valid) {
   const lines = String(text).split(/\r?\n/).map((l) => l.replace(/(^|\s)#.*$/, '').trimEnd())
   const indent = (l) => l.length - l.trimStart().length
   const flow = /^\{[^{}]*\}$/
+  const inLocal = new RegExp(`\\b${key}:\\s*([^,}\\s]+)`)
+  const inConfig = new RegExp(`\\blocal:\\s*\\{[^{}]*\\b${key}:\\s*([^,}\\s]+)[^{}]*\\}`)
+  const read = (v) => (valid.test(v) ? { value: Number(v) } : { unreadable: true })
   let found = null
   for (let i = 0; i < lines.length; i++) {
     const entry = /^(\s*)- id:\s*['"]?jev-router['"]?$/.exec(lines[i])
@@ -171,16 +186,16 @@ export function jevContextSize(text) {
       while (path.length && path.at(-1).indent >= ind) path.pop()
       const keys = [...path.map((p) => p.key), kv[1]].join('.')
       const v = kv[2].trim()
-      if (keys === 'config.local.contextSize') found = /^\d+$/.test(v) ? { value: Number(v) } : { unreadable: true }
+      if (keys === `config.local.${key}`) found = read(v)
       else if (keys === 'config.local' && v) {
-        // `local: { ... }` read for its contextSize; anything else (an !include, say) cannot be read here.
-        const inline = flow.test(v) ? /\bcontextSize:\s*([^,}\s]+)/.exec(v) : null
+        // `local: { ... }` read for the key; anything else (an !include, say) cannot be read here.
+        const inline = flow.test(v) ? inLocal.exec(v) : null
         if (!flow.test(v)) found = { unreadable: true }
-        else if (inline) found = /^\d+$/.test(inline[1]) ? { value: Number(inline[1]) } : { unreadable: true }
+        else if (inline) found = read(inline[1])
       } else if (keys === 'config' && v && /\blocal\b/.test(v)) {
-        const inline = /\blocal:\s*\{[^{}]*\bcontextSize:\s*(\d+)[^{}]*\}/.exec(v)
-        if (inline) found = { value: Number(inline[1]) }
-        else if (/\bcontextSize\b/.test(v)) found = { unreadable: true }
+        const inline = inConfig.exec(v)
+        if (inline) found = read(inline[1])
+        else if (new RegExp(`\\b${key}\\b`).test(v)) found = { unreadable: true }
       }
       if (!v) path.push({ indent: ind, key: kv[1] })
     }
@@ -188,38 +203,45 @@ export function jevContextSize(text) {
   return found
 }
 
+/** jev-router's config.local.contextSize in one patch file's text, as jevLocalSetting reads it: a whole number of tokens. */
+export const jevContextSize = (text) => jevLocalSetting(text, 'contextSize', /^\d+$/)
+/** jev-router's config.local.outputCheckShare in one patch file's text: a number from 0 to 1. */
+export const jevOutputShare = (text) => jevLocalSetting(text, 'outputCheckShare', /^(0(\.\d+)?|1(\.0+)?|\.\d+)$/)
+
 /**
- * The context KzH starts local models with, from the profile: `{ value, file }` for jev-router's
- * local.contextSize (the home patch, read last, winning), `{ unreadable: file }` for a patch file
+ * One of jev-router's local settings from the profile, as `read` takes it from a patch file's text:
+ * `{ value, file }` (the home patch, read last, winning), `{ unreadable: file }` for a patch file
  * that gives it in a form this cannot read, or null when the profile sets none.
  */
-export function profileContext(dshHome) {
+export function profileSetting(dshHome, read) {
   let found = null
   for (const file of [join(dshHome, 'profiles', 'web', 'cordis.patch.yml'), join(dshHome, 'cordis.patch.yml')]) {
     let text
     try { text = readFileSync(file, 'utf8') } catch { continue }
-    const got = jevContextSize(text)
+    const got = read(text)
     if (got?.unreadable) return { unreadable: file }
     if (got) found = { value: got.value, file }
   }
   return found
 }
+/** The context KzH starts local models with, from the profile (profileSetting). */
+export const profileContext = (dshHome) => profileSetting(dshHome, jevContextSize)
 
-const PHASES = { loading: 'loading', warming: 'warming up', reading: 'reading the prompt', measuring: 'timed request', restoring: 'putting the engine back as it was' }
+const PHASES = { loading: 'loading', warming: 'warming up', reading: 'reading the prompt', measuring: 'timed request', checking: 'checking its output', restoring: 'putting the engine back as it was' }
 const fixed = (n, d = 1) => (typeof n === 'number' && Number.isFinite(n) ? n.toFixed(d) : '-')
 const ctxText = (ctx) => (ctx % 1024 === 0 ? `${ctx / 1024}k` : String(ctx))
 const utcMinute = (d) => `${d.toISOString().replace('T', ' ').slice(0, 16)} UTC`
 
-/** The table of what was measured, in plain ASCII columns. */
+/** The table of what was measured, in plain ASCII columns; Peak RAM GB is the engine's highest working set while it was measured. */
 export function table(rows) {
-  const head = ['Model', 'Generate tok/s', 'Read tok/s', 'Context', 'GPU layers', 'VRAM GB', 'RAM GB', 'Load s', 'Threads']
+  const head = ['Model', 'Generate tok/s', 'Read tok/s', 'Context', 'GPU layers', 'VRAM GB', 'RAM GB', 'Peak RAM GB', 'Load s', 'Threads']
   const body = rows.map((r) => [
     r.name,
     r.ok ? fixed(r.reading.tokensPerSec) : 'not measured',
     r.ok ? (r.reading.promptTokensPerSec == null ? 'cached' : fixed(r.reading.promptTokensPerSec, 0)) : '-',
     r.ctx ? ctxText(r.ctx) : '-',
     r.reading?.layersOnGpu ? `${r.reading.layersOnGpu.gpu}/${r.reading.layersOnGpu.total}` : '-',
-    fixed(r.memory?.vramGB), fixed(r.memory?.ramGB),
+    fixed(r.memory?.vramGB), fixed(r.memory?.ramGB), fixed(r.reading?.peakRamGB),
     r.reading?.loadMs != null ? fixed(r.reading.loadMs / 1000) : '-',
     r.reading?.threads != null ? String(r.reading.threads) : '-',
   ])
@@ -242,8 +264,10 @@ async function logRefusal(data, at, why) {
  * Ctrl+C and 'ended' with the signal's name when the console is closed or the process is ended.
  * `seams` reach what the tests replace: `machineCheck`, `specs` (detectSpecs), `localModels`
  * (createLocalModels options: spawn, fetch, port) and `holds` (whether a pid holds the lock).
+ * `acceptOutput` accepts the new output waiting for each of `models`, or for every model with one,
+ * under the same lock and the same refusals as a run, since both write local.json, and measures nothing.
  */
-export async function speedRun({ harness = defaultHarness(), data = defaultDataDir(), models, context, verbose = false, print = (s) => process.stdout.write(`${s}\n`), interrupts = null, pollMs = 200, stopWaitMs = 10_000, seams = {} } = {}) {
+export async function speedRun({ harness = defaultHarness(), data = defaultDataDir(), models, context, verbose = false, acceptOutput = false, print = (s) => process.stdout.write(`${s}\n`), interrupts = null, pollMs = 200, stopWaitMs = 10_000, seams = {} } = {}) {
   const { SPEED_HISTORY, SPEED_LOCK, createLocalModels, detectSpecs, readManifest, specsText } = await plugin('local.js')
   const { isAlive, layaPaths } = await plugin('laya-install.js')
   const { processInfo } = await plugin('laya-sidecar.js')
@@ -319,6 +343,10 @@ export async function speedRun({ harness = defaultHarness(), data = defaultDataD
     let modules
     try { modules = readManifest(join(harness, 'config', 'local-models.json')) } catch (err) { throw refuse(EXIT.couldNotRun, `The local models manifest did not load: ${err.message}`) }
     const modelsDir = join(harness, 'models')
+    if (acceptOutput) {
+      local = createLocalModels({ modules, engineDir: join(harness, 'engine', 'llama'), modelsDir, settingsFile: join(data, 'local.json'), speedLogDir: logDir, ...seams.localModels })
+      return await acceptWaiting(local, { models, modules, print })
+    }
     const specs = await (seams.specs ?? (() => detectSpecs({ dir: modelsDir })))().catch(() => null)
     print(`PC: ${specs ? specsText(specs) : 'not detected'}`)
     cancelledNow()
@@ -327,6 +355,10 @@ export async function speedRun({ harness = defaultHarness(), data = defaultDataD
       if (fromProfile?.unreadable) throw refuse(EXIT.couldNotRun, `${fromProfile.unreadable} gives jev-router's local.contextSize in a form this cannot read. Run this again with --context <the number KzH starts local models with>: a reading stands only for a load at the context it was taken at.`)
       if (fromProfile) { context = fromProfile.value; print(`Context: ${context} tokens, jev-router's local.contextSize in ${fromProfile.file}.`) }
     }
+    // The output check is held to the share KzH holds it to (docs/benchmark.md 2.15).
+    const share = profileSetting(dirname(data), jevOutputShare)
+    if (share?.unreadable) throw refuse(EXIT.couldNotRun, `${share.unreadable} gives jev-router's local.outputCheckShare in a form this cannot read: it takes a number from 0 to 1, such as 0.5.`)
+    if (share) print(`Output check: ${share.value} of each baseline must agree, jev-router's local.outputCheckShare in ${share.file}.`)
     print('Do not start KzH until this ends: it would load models beside the ones measured.')
 
     local = createLocalModels({
@@ -336,6 +368,7 @@ export async function speedRun({ harness = defaultHarness(), data = defaultDataD
       settingsFile: join(data, 'local.json'),
       speedLogDir: logDir,
       contextSize: context,
+      outputShare: share?.value,
       specs: async () => specs,
       log: (t) => { if (verbose) print(`  [engine] ${t}`) },
       ...seams.localModels,
@@ -399,7 +432,7 @@ export async function speedRun({ harness = defaultHarness(), data = defaultDataD
     const { done } = local.speedResults()
     const results = order.map((id) => {
       const line = done.find((d) => d.id === id)
-      return { id, name: nameOf(id), ok: !!line?.ok, ctx: line?.ctx ?? null, reading: line?.ok ? line.reading : null, memory: line?.memory ?? null }
+      return { id, name: nameOf(id), ok: !!line?.ok, held: !!line?.held, ctx: line?.ctx ?? null, reading: line?.ok ? line.reading : null, memory: line?.memory ?? null }
     })
     print('')
     print(table(results))
@@ -410,21 +443,49 @@ export async function speedRun({ harness = defaultHarness(), data = defaultDataD
     print('')
     // A load writes its memory reading to local.json whatever became of the speed, so only the
     // speed readings are counted here.
-    const saved = results.filter((r) => r.ok).length
+    const saved = results.filter((r) => r.ok && !r.held).length
     print(saved ? `${saved === 1 ? '1 speed reading' : `${saved} speed readings`} saved in local.json, where KzH reads them.` : 'No speed reading was saved.')
+    // A figure whose output differs from its baseline is kept aside until it is accepted (2.15).
+    const held = results.filter((r) => r.held)
+    if (held.length) print(`Kept aside, since the output differs from its baseline: ${held.map((r) => r.name).join(', ')}. Read both outputs in Settings, Local models, and accept the new one there, or run this again with --accept-output --models ${held.map((r) => r.id).join(',')}.`)
     // The logs' paths only when they hold this run; else what could not be written.
     if (run.logError) print(`The speed run log could not be written: ${run.logError}. This run is not in it, or not all of it.`)
     else if (run.log) {
       print(`Every speed run on this PC: ${run.log.history}`)
       print(`This run in detail: ${run.log.detail}`)
     }
-    return forced || cancelled ? EXIT.cancelled : results.every((r) => r.ok) ? EXIT.measured : EXIT.notMeasured
+    return forced || cancelled ? EXIT.cancelled : !results.every((r) => r.ok) ? EXIT.notMeasured : held.length ? EXIT.outputDiffers : EXIT.measured
   } finally {
     interrupts?.off('interrupt', onInterrupt)
     interrupts?.off('ended', onEnded)
     await local?.dispose({ why: 'the speed run was stopped at once' })
     release()
   }
+}
+
+/**
+ * --accept-output: the new output waiting for each of `models`, or for every model with one, made
+ * its baseline and its figure its speed, as the card's Accept new output does (local.js
+ * acceptOutput), each said as it is done. Returns 0, or 2 when a model asked for had none.
+ */
+async function acceptWaiting(local, { models, modules, print }) {
+  const nameOf = (id) => modules.find((m) => m.id === id)?.name ?? id
+  const waitingNow = async () => [...new Set(Object.keys((await local.readSettings()).speedHeld ?? {}).map((k) => k.slice(0, k.lastIndexOf('@'))))]
+  const ids = models ?? (await waitingNow())
+  if (!ids.length) { print('No model has a new output waiting to be accepted.'); return EXIT.measured }
+  let code = EXIT.measured
+  for (const id of ids) {
+    try {
+      const { line } = await local.acceptOutput(id, { by: BY })
+      print(`${line[0].toUpperCase()}${line.slice(1)}.`)
+    } catch (err) { print(err.message); code = EXIT.couldNotRun }
+  }
+  if (code === EXIT.measured) print('KzH takes these as the models\' speeds at its next start.')
+  else {
+    const waiting = await waitingNow()
+    print(`Waiting to be accepted: ${waiting.length ? waiting.map(nameOf).join(', ') : 'none'}.`)
+  }
+  return code
 }
 
 /** The value of `--data` in raw arguments, for a refusal that comes before they are read. */
@@ -435,7 +496,7 @@ export async function main(argv = process.argv.slice(2), { print = (s) => proces
   try {
     const a = parseArgs(argv)
     if (a.help) { print(USAGE); return EXIT.measured }
-    return await speedRun({ harness: a.harness, data: a.data, models: a.models, context: a.context, verbose: a.verbose, print, interrupts, seams })
+    return await speedRun({ harness: a.harness, data: a.data, models: a.models, context: a.context, verbose: a.verbose, acceptOutput: a.acceptOutput, print, interrupts, seams })
   } catch (err) {
     // A bad argument, or something nobody foresaw, is written in the history too: a scheduled run
     // shows nobody its console. The history gets the first line; the console the whole of it.

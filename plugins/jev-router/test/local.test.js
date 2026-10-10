@@ -1,13 +1,15 @@
 // Local models and offline mode, with no network and no real llama-server:
 // offline routing rule, local agent eligibility, the connectivity cache,
 // llama-server arguments, verified resumable downloads, the wire format,
-// and the resource budget the engine is started and watched under.
+// the resource budget the engine is started and watched under, what a start
+// takes for its own llama-server on its port, and llama-server's log on disk.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, mkdirSync, statSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { badgesOf, buildCatalog, contextSteps, defaultThreads, estimateMemory, parsePsRss, parseTasklistMemory, workingSetOf, kvGbPerToken, readMemoryUsage, createConnectivity, createLocalModels, defaultsFor, detectSpecs, downloadVerified, installLlmCommand, llamaArgs, localAdapter, looksLikeQuestion, offlinePick, parseLlmArgs, pickEngineVariant, rateModule, readManifest, removeLlmCommand, specsLine, suggest, toWire, translate } from '../local.js'
@@ -16,7 +18,7 @@ import { fileURLToPath } from 'node:url'
 // then still loads where local.js lacks it, and each of those tests fails by its own assertion.
 import * as localJs from '../local.js'
 import { waitFor } from './wait-for.js'
-import { answerOf, fakeLlamaServer } from './fixtures/fake-llama-server.mjs'
+import { answerOf, fakeDownload, fakeLlamaServer } from './fixtures/fake-llama-server.mjs'
 import { formatReport, runRouted } from '../router.js'
 import { kindOf, keyProviderOf } from '../accounts.js'
 import { jevAdapter } from '../adapter.js'
@@ -436,7 +438,9 @@ const fakeFetch = (data, { honorRange = true } = {}) => {
     seen.push(headers.range ?? null)
     const from = honorRange && headers.range ? Number(/bytes=(\d+)-/.exec(headers.range)[1]) : 0
     const slice = data.subarray(from)
-    return { ok: true, status: from ? 206 : 200, body: (async function* () { yield slice.subarray(0, 1000); yield slice.subarray(1000) })() }
+    // A resumed answer says where its bytes start, as Hugging Face and GitHub do (Content-Range).
+    const range = from ? `bytes ${from}-${data.length - 1}/${data.length}` : null
+    return { ok: true, status: from ? 206 : 200, headers: new Headers(range ? { 'content-range': range } : {}), body: (async function* () { yield slice.subarray(0, 1000); yield slice.subarray(1000) })() }
   }
   f.seen = seen
   return f
@@ -464,7 +468,10 @@ test('download: SHA256 mismatch deletes the file and fails; server ignoring Rang
   writeFileSync(`${dest}.part`, body.subarray(0, 700))
   await downloadVerified({ url: 'u', dest, size: body.length, sha256: bodySha, fetch: fakeFetch(body, { honorRange: false }) })
   assert.ok(readFileSync(dest).equals(body))
-  await assert.rejects(downloadVerified({ url: 'u', dest: join(dir, 'x.gguf'), size: body.length + 5, sha256: bodySha, fetch: fakeFetch(body) }), /incomplete/)
+  // A file that ends short is tried again, from where it ended, before it is given up as incomplete.
+  const short = fakeFetch(body)
+  await assert.rejects(downloadVerified({ url: 'u', dest: join(dir, 'x.gguf'), size: body.length + 5, sha256: bodySha, fetch: short, retryMs: [0, 0] }), /incomplete: 4000 of 4005 bytes after 3 tries/)
+  assert.deepEqual(short.seen, [null, 'bytes=4000-', 'bytes=4000-'])
 })
 
 // ---------- wire format ----------
@@ -483,6 +490,31 @@ test('toWire: system, tool calls and tool results in OpenAI shape', () => {
   assert.equal(w.messages[2].tool_calls[0].function.name, 'read')
   assert.equal(w.messages[3].tool_call_id, 'c1')
   assert.equal(w.tools[0].type, 'function')
+})
+
+test('toWire: a step\'s tool results come before the person\'s words it took in, and a system message after the conversation has begun is sent as the user\'s, while the ones it begins with stay system', () => {
+  const w = toWire({
+    model: 'qwen3-8b',
+    system: 'harness',
+    messages: [
+      { role: 'system', content: [{ type: 'text', text: 'the agent\'s own prompt' }] },
+      { role: 'user', content: [{ type: 'text', text: 'fix the parser' }] },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }, { type: 'tool-call', id: 'c2', name: 'grep', arguments: '{}' }] },
+      // A Steer the agent took in at its next step, in the same message as the results of the step before.
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'file' }] }, { type: 'tool-result', toolCallId: 'c2', content: [{ type: 'text', text: 'hits' }] }, { type: 'text', text: '(Added by the person while you work on this task.) use tabs' }] },
+      { role: 'system', content: [{ type: 'text', text: 'context the loop added later' }] },
+    ],
+  })
+  assert.deepEqual(w.messages.map((m) => [m.role, m.tool_call_id ?? m.content]), [
+    ['system', 'harness'],
+    ['system', 'the agent\'s own prompt'],
+    ['user', 'fix the parser'],
+    ['assistant', ''],
+    ['tool', 'c1'],
+    ['tool', 'c2'],
+    ['user', '(Added by the person while you work on this task.) use tabs'],
+    ['user', 'context the loop added later'],
+  ])
 })
 
 test('translate: text and a streamed tool call become DSH chunks, usage before finish', async () => {
@@ -665,7 +697,8 @@ test('a saved settings change is handed on, so whatever follows the budget sees 
 })
 
 /**
- * A stand-in for llama-server: it records what it was started with and answers /health at once.
+ * A stand-in for llama-server: it records what it was started with and answers /health at once,
+ * and /v1/models, with the start's key only, naming its --alias, as llama-server b10964 does.
  * Its pid, 2147483647, is one no process can have (a Windows process id is a multiple of 4, and
  * Linux ids stop far below it), because the Windows stop path calls taskkill on the pid and must
  * never reach a real process from a test. `report` gives the load report each start prints, as
@@ -673,16 +706,19 @@ test('a saved settings change is handed on, so whatever follows the budget sees 
  */
 function fakeEngine({ report = () => [] } = {}) {
   const started = []
-  const spawn = (cmd, args) => {
+  const spawn = (cmd, args, opts = {}) => {
     const child = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, pid: 2147483647 })
     child.kill = () => { child.exitCode = 0; child.emit('exit', 0) }
-    started.push({ cmd, args, child, reported: false })
+    started.push({ cmd, args, child, reported: false, key: opts.env?.LLAMA_API_KEY ?? null })
     return child
   }
-  const fetch = async () => {
+  const fetch = async (url = '', init = {}) => {
     const run = started.at(-1)
     if (run && !run.reported) { run.reported = true; for (const l of report()) run.child.stderr.emit('data', `${l}\n`) }
-    return { ok: true }
+    if (String(url).endsWith('/v1/models')) {
+      return init.headers?.authorization === `Bearer ${run?.key}` ? Response.json({ object: 'list', data: [{ id: argOf(run.args, '--alias') }] }) : Response.json({ error: { code: 401, message: 'Invalid API Key' } }, { status: 401 })
+    }
+    return String(url).endsWith('/health') ? Response.json({ status: 'ok' }) : { ok: true }
   }
   return { started, spawn, fetch }
 }
@@ -1378,7 +1414,7 @@ test('isBusy() says a request holds the engine: true while a stream is open, fal
   let finish
   const body = new ReadableStream({ start(c) { finish = () => { c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')); c.close() } } })
   const eng = fakeEngine()
-  const fetch = async (url) => (String(url).endsWith('/health') ? eng.fetch() : new Response(body))
+  const fetch = async (url, init) => (/\/(health|v1\/models)$/.test(String(url)) ? eng.fetch(url, init) : new Response(body))
   const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch })
   assert.equal(typeof local.isBusy, 'function', 'the local models say whether a request is in flight')
   assert.equal(local.isBusy(), false, 'nothing asked yet')
@@ -1392,6 +1428,85 @@ test('isBusy() says a request holds the engine: true while a stream is open, fal
   assert.equal(local.isBusy(), false, 'the stream has ended')
   assert.ok(chunks.some((c) => c.type === 'text-delta'), JSON.stringify(chunks))
   await local.dispose()
+})
+
+test('a local model\'s answer cut off before it finished ends early, as an error, where a whole one finishes and an aborted one still throws (docs/live-agent-view.md 6)', async () => {
+  // The fake llama-server stops the first answer after five events (two of thinking, three words),
+  // with no finish_reason and no [DONE], closing the stream as if the answer were whole.
+  let said = { reasoning: 'Look first.', content: 'The fix is in parse.js and', cut: { after: 5 } }
+  const server = fakeLlamaServer({ chat: () => said })
+  const { local } = await installedIn(tmp(), { spawn: server.spawn, fetch: server.fetch })
+  const answer = async (signal) => {
+    const chunks = []
+    for await (const c of local.stream({ model: 'big', messages: [{ role: 'user', content: [{ type: 'text', text: 'where is the bug?' }] }], signal })) chunks.push(c)
+    return chunks
+  }
+  const cut = await answer()
+  assert.deepEqual(cut.at(-1), { type: 'finish', reason: { kind: 'error', failure: { code: 'ENDED_EARLY', message: 'llama-server closed the stream before the answer was finished' } } })
+  assert.equal(cut.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), 'The fix is ', 'what came was streamed as it came')
+  assert.equal(cut.some((c) => c.type === 'block-end'), false, 'and none of it is passed on as a finished block')
+  // The whole answer finishes as before.
+  said = { reasoning: 'Look first.', content: 'The fix is in parse.js and lexer.js.' }
+  const whole = await answer()
+  assert.deepEqual(whole.filter((c) => c.type === 'block-end').map((c) => c.block), [{ type: 'reasoning', text: 'Look first.' }, { type: 'text', text: 'The fix is in parse.js and lexer.js.' }])
+  assert.deepEqual(whole.at(-2), { type: 'usage', usage: { inputTokens: 100, outputTokens: 20 } })
+  assert.deepEqual(whole.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+  // An answer stopped by its caller is the caller's own: it throws, and is not said to have ended early.
+  said = { content: 'one two three four five six', paceMs: 40 }
+  const ac = new AbortController()
+  const stopped = answer(ac.signal)
+  await waitFor('the answer has begun', () => server.to('/v1/chat/completions').length, (n) => n === 3, { timeoutMs: 10_000 })
+  setTimeout(() => ac.abort(), 60)
+  await assert.rejects(stopped, (err) => err.name === 'AbortError')
+  assert.deepEqual(server.aborts.map((a) => a.path), ['/v1/chat/completions'])
+  assert.equal(local.isBusy(), false, 'and the engine is let go')
+  await local.dispose()
+})
+
+test('a local model\'s answer whose connection breaks off mid-answer, as a killed llama-server\'s does, ends early too and says why, where an aborted one still throws (docs/live-agent-view.md 6)', async () => {
+  // A real server that streams the start of an answer and then lets its socket go, as the connection
+  // of a llama-server killed mid-answer goes: fetch's body then fails (`terminated`), never ending cleanly.
+  const event = (delta) => `data: ${JSON.stringify({ id: 'chatcmpl-fake', object: 'chat.completion.chunk', model: 'fake', choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`
+  let hangUp = true
+  let asked = 0
+  const real = createServer((req, res) => {
+    asked++
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write(event({ reasoning_content: 'Look first.' }))
+    res.write(event({ content: 'The fix is ' }))
+    if (hangUp) setTimeout(() => req.socket.destroy(), 20)
+  })
+  await new Promise((r) => real.listen(0, '127.0.0.1', r))
+  const server = fakeLlamaServer()
+  const chat = `http://127.0.0.1:${real.address().port}/v1/chat/completions`
+  const fetch = (url, init) => (new URL(String(url)).pathname === '/v1/chat/completions' ? globalThis.fetch(chat, init) : server.fetch(url, init))
+  const { local } = await installedIn(tmp(), { spawn: server.spawn, fetch })
+  /** The chunks of one answer, and how it threw where it did. */
+  const answer = async (signal) => {
+    const chunks = []
+    try {
+      for await (const c of local.stream({ model: 'big', messages: [{ role: 'user', content: [{ type: 'text', text: 'where is the bug?' }] }], signal })) chunks.push(c)
+    } catch (err) { chunks.push({ threw: err.name }) }
+    return chunks
+  }
+  try {
+    const broke = await answer()
+    assert.deepEqual(broke.at(-1), { type: 'finish', reason: { kind: 'error', failure: { code: 'ENDED_EARLY', message: 'llama-server closed the stream before the answer was finished (terminated: other side closed)' } } })
+    assert.equal(broke.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), 'The fix is ', 'what came was streamed as it came')
+    assert.equal(broke.some((c) => c.type === 'block-end'), false, 'and none of it is passed on as a finished block')
+    // Stopped by its caller mid-answer, it is the caller's own: it throws, and is not said to have ended early.
+    hangUp = false
+    const ac = new AbortController()
+    const stopped = answer(ac.signal)
+    await waitFor('the answer has begun', () => asked, (n) => n === 2, { timeoutMs: 10_000 })
+    setTimeout(() => ac.abort(), 50)
+    assert.deepEqual((await stopped).at(-1), { threw: 'AbortError' })
+    assert.equal(local.isBusy(), false, 'and the engine is let go')
+  } finally {
+    real.closeAllConnections()
+    real.close()
+    await local.dispose()
+  }
 })
 
 test('the loaded engine registers in the shared residency as llama, held, and leaves it when it stops', async () => {
@@ -1415,7 +1530,7 @@ test('an engine that exits on its own leaves the shared residency, and a late ex
   const res = residencyStub()
   const eng = fakeEngine()
   let healthy = true
-  const fetch = async () => (healthy ? eng.fetch() : { ok: false })
+  const fetch = async (url, init) => (healthy ? eng.fetch(url, init) : Response.json({ error: { code: 503, message: 'Loading model' } }, { status: 503 }))
   const { local } = await installedIn(tmp(), { spawn: eng.spawn, fetch, residency: res })
   await local.start('big')
   assert.ok(res.get('llama'), 'the setting: resident once ready')
@@ -1503,6 +1618,268 @@ test('a local model start first unloads a Laya nothing holds; the plan counts on
   const refusal = 'Wide needs about 0.3 GB of RAM even at the 12k context floor (estimated: 4 GB VRAM + 0.3 GB RAM), over the resource budget of 3.5 GB RAM, less the 3.3 GB Laya holds. Raise the RAM budget or use a smaller model.'
   assert.equal((await wideOf(local)).overBudget, refusal)
   await assert.rejects(local.start('wide'), { message: refusal })
+  await local.dispose()
+})
+
+test('a request stopped while it waits for another model\'s requests to end loads nothing in its place, and a stream stopped so throws its stop rather than an engine failure', async () => {
+  const eng = fakeEngine()
+  const { local, modelsDir } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch })
+  writeFileSync(join(modelsDir, 'small.gguf'), 'small')
+  await local.installed()
+  await local.start('big')
+  const conn = await local.acquire('big') // a request in flight on Big
+  const ac = new AbortController()
+  const waiting = local.acquire('small', { signal: ac.signal })
+  await new Promise((r) => setTimeout(r, 50))
+  ac.abort(new Error('the run was stopped'))
+  conn.release()
+  const outcome = await waiting.then((c) => { c.release(); return 'Small was loaded' }, (err) => err.message)
+  assert.equal(outcome, 'the run was stopped')
+  assert.equal(eng.started.length, 1, 'Small was never loaded in Big\'s place')
+  assert.equal((await local.status()).engine.model, 'big')
+  // The same through a chat call: its stream throws the stop, and still nothing is loaded.
+  const held = await local.acquire('big')
+  const stopped = new AbortController()
+  const it = local.stream({ model: 'small', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], signal: stopped.signal })
+  const first = it.next()
+  await new Promise((r) => setTimeout(r, 50))
+  stopped.abort(new Error('stopped by the user'))
+  held.release()
+  await assert.rejects(first, { message: 'stopped by the user' })
+  assert.equal(eng.started.length, 1)
+  // A request whose run is already over when its turn comes loads nothing either.
+  await local.stop()
+  await assert.rejects(local.acquire('small', { signal: AbortSignal.abort(new Error('over')) }), { message: 'over' })
+  assert.equal((await local.status()).engine.running, false)
+  await local.dispose()
+})
+
+test('a request stopped while it waits its turn behind another\'s wait for the engine is let go at once, and the requests behind it keep their order and load nothing more', async (t) => {
+  const eng = fakeEngine()
+  const { local, modelsDir } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch })
+  writeFileSync(join(modelsDir, 'small.gguf'), 'small')
+  await local.installed()
+  await local.start('big')
+  const inFlight = await local.acquire('big') // a request in flight on Big
+  const small = local.acquire('small') // waits for it to end
+  const ac = new AbortController()
+  const behind = local.acquire('big', { signal: ac.signal }) // waits its turn behind Small's request
+  const after = local.acquire('small') // and one more behind that
+  // Whatever happens, each hold is let go and the engine closed, so no wait outlives the test.
+  t.after(async () => { inFlight.release(); for (const w of [small, behind, after]) w.then((c) => c.release(), () => {}); await local.dispose() })
+  await new Promise((r) => setTimeout(r, 50))
+  ac.abort(new Error('the run was stopped'))
+  const outcome = await Promise.race([behind.then(() => 'it took the engine', (err) => err.message), new Promise((r) => setTimeout(() => r('still waiting'), 100))])
+  assert.equal(outcome, 'the run was stopped', 'let go while Big\'s request still runs, not once its turn comes')
+  inFlight.release()
+  const first = await small
+  assert.equal((await local.status()).engine.model, 'small', 'the request ahead of it went first')
+  first.release()
+  ;(await after).release()
+  assert.equal(eng.started.length, 2, 'Big, then Small once: nothing was loaded for the stopped request, and Small only once')
+})
+
+/**
+ * A clock for the capped wait for a model: `now` and `setTimer` for createLocalModels, which stand
+ * still until `advance(ms)` moves the clock on and runs every timer due by then.
+ */
+function fakeClock() {
+  let at = 0
+  let timers = []
+  return {
+    now: () => at,
+    setTimer: (fn, ms) => { const t = { due: at + ms, fn }; timers.push(t); return () => { timers = timers.filter((x) => x !== t) } },
+    advance(ms) {
+      at += ms
+      const due = timers.filter((t) => t.due <= at)
+      timers = timers.filter((t) => t.due > at)
+      for (const t of due) t.fn()
+    },
+    /** The timers set and neither run nor cancelled. */
+    pending: () => timers.length,
+  }
+}
+
+test('a local agent\'s attempt holds its model until it ends: another agent\'s attempt on another model waits before it starts, saying whose model it waits for, and starts once that one has ended; one on the same model starts at once until the one waiting has waited 2 minutes, and a stop while it waits names what it waited for', async () => {
+  const eng = fakeEngine()
+  // The clock stands still until the test moves it on, so no attempt waits the cap by chance.
+  const clock = fakeClock()
+  const { local, modelsDir } = await installedIn(tmp(), { spawn: eng.spawn, fetch: eng.fetch, now: clock.now, setTimer: clock.setTimer })
+  writeFileSync(join(modelsDir, 'small.gguf'), 'small')
+  await local.installed()
+  const later = () => new Promise((r) => setTimeout(r, 30))
+  let finishFirst
+  const first = local.localAgentAttempt(() => new Promise((r) => { finishFirst = r }), { model: 'big', who: 'jev-3' })
+  await later()
+  const said = []
+  let started = false
+  const second = local.localAgentAttempt(async () => { started = true; return 'small worked' }, { model: 'small', who: 'jev-4', onWait: (t) => said.push(t) })
+  clock.advance(119_999)
+  assert.equal(await local.localAgentAttempt(async () => 'big again', { model: 'big', who: 'jev-5' }), 'big again', 'an attempt on the model held starts at once while the one waiting has waited less than 2 minutes')
+  await later()
+  assert.equal(started, false, 'the attempt on another model has not started its subagent')
+  assert.deepEqual(said, ['Waiting for jev-3 to finish with Big: one local model works at a time.'])
+  finishFirst('big worked')
+  assert.equal(await first, 'big worked')
+  assert.equal(await second, 'small worked', 'and it starts once the model is let go')
+  assert.equal(said.length, 1)
+  // Stopped while it waits: it ends with an error that names what it waited for.
+  let finishThird
+  const third = local.localAgentAttempt(() => new Promise((r) => { finishThird = r }), { model: 'big', who: 'jev-6' })
+  await later()
+  const stop = new AbortController()
+  const waiting = local.localAgentAttempt(async () => 'never', { model: 'small', who: 'jev-7', signal: stop.signal })
+  stop.abort(new Error('stopped by the user'))
+  await assert.rejects(waiting, { message: 'stopped while it waited for jev-6 to finish with Big (stopped by the user)' })
+  finishThird('done')
+  await third
+  // An attempt that names no model holds none, and waits for none.
+  let finishFourth
+  const fourth = local.localAgentAttempt(() => new Promise((r) => { finishFourth = r }), { who: 'jev-8' })
+  assert.equal(await local.localAgentAttempt(async () => 'free', { model: 'small', who: 'jev-9' }), 'free')
+  finishFourth()
+  await fourth
+  // Once the one waiting has waited 2 minutes, an attempt on the model held no longer starts at once.
+  let finishLast
+  const last = local.localAgentAttempt(() => new Promise((r) => { finishLast = r }), { model: 'big', who: 'jev-10' })
+  await later()
+  const behind = local.localAgentAttempt(async () => 'small after', { model: 'small', who: 'jev-11' })
+  clock.advance(120_000)
+  let joined = false
+  const late = local.localAgentAttempt(async () => { joined = true; return 'big late' }, { model: 'big', who: 'jev-12' })
+  await later()
+  assert.equal(joined, false, 'it waits behind the attempt that has waited 2 minutes')
+  finishLast()
+  await last
+  assert.equal(await behind, 'small after')
+  assert.equal(await late, 'big late')
+  assert.equal(clock.pending(), 0, 'no timer is left once nothing waits')
+  await local.dispose()
+})
+
+test('once a local agent\'s attempt has waited 2 minutes for its model, no attempt joins the model held ahead of it: its line says it is next, the model is let go once the attempts already on it end and its own goes next, and one held back behind it says whom it waits for', async () => {
+  const clock = fakeClock()
+  const { local } = await installedIn(tmp(), { now: clock.now, setTimer: clock.setTimer })
+  const later = () => new Promise((r) => setTimeout(r, 30))
+  const started = []
+  const finish = {}
+  const attempt = (who, model, said) => local.localAgentAttempt(() => { started.push(who); return new Promise((r) => { finish[who] = r }) }, { model, who, onWait: said && ((t) => said.push(t)) })
+  const first = attempt('jev-3', 'big')
+  await later()
+  const said = []
+  const small = attempt('jev-4', 'small', said)
+  // Before the cap an attempt on the model held starts at once beside the first.
+  clock.advance(60_000)
+  const beside = attempt('jev-5', 'big')
+  await later()
+  assert.deepEqual(started, ['jev-3', 'jev-5'])
+  clock.advance(59_999)
+  await later()
+  assert.deepEqual(said, ['Waiting for jev-3 to finish with Big: one local model works at a time.'], 'nothing changes before 2 minutes')
+  // At 2 minutes its line says it is next, and an attempt on the model held waits behind it.
+  clock.advance(1)
+  await later()
+  assert.deepEqual(said, ['Waiting for jev-3 to finish with Big: one local model works at a time.', 'Waiting for jev-3 to finish with Big; it is next once that ends.'])
+  const lateSaid = []
+  const late = attempt('jev-6', 'big', lateSaid)
+  await later()
+  assert.deepEqual(started, ['jev-3', 'jev-5'], 'no attempt joins Big ahead of the one that has waited 2 minutes')
+  assert.deepEqual(lateSaid, ['Waiting for jev-4, which has waited longer, to finish with Small: one local model works at a time.'])
+  // Big is let go once the attempts already on it have ended; meanwhile the line names who holds it.
+  finish['jev-3']()
+  await first
+  await later()
+  assert.equal(said.at(-1), 'Waiting for jev-5 to finish with Big; it is next once that ends.')
+  assert.deepEqual(started, ['jev-3', 'jev-5'])
+  finish['jev-5']()
+  await beside
+  await later()
+  assert.deepEqual(started, ['jev-3', 'jev-5', 'jev-4'], 'Small goes next')
+  assert.equal(lateSaid.at(-1), 'Waiting for jev-4 to finish with Small: one local model works at a time.')
+  finish['jev-4']()
+  await small
+  await later()
+  assert.deepEqual(started, ['jev-3', 'jev-5', 'jev-4', 'jev-6'])
+  finish['jev-6']()
+  await late
+  assert.equal(clock.pending(), 0, 'no timer is left once nothing waits')
+  await local.dispose()
+})
+
+test('local agents\' attempts that have waited the cap for their models go in order of arrival, the cap being the one the local models are given, and one stopped while it waits lets those behind it go', async () => {
+  const clock = fakeClock()
+  const { local } = await installedIn(tmp(), { now: clock.now, setTimer: clock.setTimer, modelWaitCapMinutes: 5 })
+  const later = () => new Promise((r) => setTimeout(r, 30))
+  const started = []
+  const finish = {}
+  const said = { 'jev-2': [], 'jev-3': [], 'jev-4': [] }
+  const attempt = (who, model, signal) => local.localAgentAttempt(() => { started.push(who); return new Promise((r) => { finish[who] = r }) }, { model, who, signal, onWait: (t) => said[who]?.push(t) })
+  const first = attempt('jev-1', 'big')
+  await later()
+  // Three attempts wait for Big to be let go: on Small from 0:00, on Exp from 1:00, on Small again from 2:00.
+  const onSmall = attempt('jev-2', 'small')
+  clock.advance(60_000)
+  const stop = new AbortController()
+  const onExp = attempt('jev-3', 'exp', stop.signal)
+  clock.advance(60_000)
+  const smallToo = attempt('jev-4', 'small')
+  // At 4:59.999 none has waited the cap of 5 minutes, so an attempt on Big still joins it at once.
+  clock.advance(179_999)
+  const bigToo = attempt('jev-5', 'big')
+  await later()
+  assert.deepEqual(started, ['jev-1', 'jev-5'])
+  // At 6:00 the attempts on Small (6 minutes) and Exp (5 minutes) have waited the cap: only the first in line is next.
+  clock.advance(60_001)
+  await later()
+  assert.equal(said['jev-2'].at(-1), 'Waiting for jev-1 to finish with Big; it is next once that ends.')
+  assert.deepEqual(said['jev-3'], ['Waiting for jev-1 to finish with Big: one local model works at a time.'])
+  // Big's attempts end: Small goes, and the attempt on Small that has not waited the cap waits behind the one on Exp that has.
+  finish['jev-1']()
+  finish['jev-5']()
+  await Promise.all([first, bigToo])
+  await later()
+  assert.deepEqual(started, ['jev-1', 'jev-5', 'jev-2'])
+  assert.equal(said['jev-3'].at(-1), 'Waiting for jev-2 to finish with Small; it is next once that ends.')
+  assert.equal(said['jev-4'].at(-1), 'Waiting for jev-3, which has waited longer, to finish with Exp: one local model works at a time.')
+  // The one on Exp is stopped while it waits: the one on Small behind it joins Small at once.
+  stop.abort(new Error('stopped by the user'))
+  await assert.rejects(onExp, { message: 'stopped while it waited for jev-2 to finish with Small (stopped by the user)' })
+  await later()
+  assert.deepEqual(started, ['jev-1', 'jev-5', 'jev-2', 'jev-4'])
+  finish['jev-2']()
+  finish['jev-4']()
+  await Promise.all([onSmall, smallToo])
+  assert.equal(clock.pending(), 0, 'no timer is left once nothing waits')
+  await local.dispose()
+})
+
+test('a timer for the capped wait that fires before the clock has reached the cap, as one on the wall clock can, is set again for what is left, so the line changes at the cap and not before', async () => {
+  let at = 0
+  const timers = []
+  const setTimer = (fn, ms) => { const x = { fn, ms, cancelled: false }; timers.push(x); return () => { x.cancelled = true } }
+  const { local } = await installedIn(tmp(), { now: () => at, setTimer })
+  const later = () => new Promise((r) => setTimeout(r, 30))
+  let finishFirst
+  const first = local.localAgentAttempt(() => new Promise((r) => { finishFirst = r }), { model: 'big', who: 'jev-3' })
+  await later()
+  const said = []
+  const small = local.localAgentAttempt(async () => 'small worked', { model: 'small', who: 'jev-4', onWait: (t) => said.push(t) })
+  await later()
+  assert.deepEqual(timers.map((x) => x.ms), [120_000], 'one timer, for the cap')
+  // It fires a millisecond early by the clock: the line stays, and a timer is set for that millisecond.
+  at = 119_999
+  timers[0].fn()
+  await later()
+  assert.deepEqual(said, ['Waiting for jev-3 to finish with Big: one local model works at a time.'])
+  assert.deepEqual(timers.map((x) => x.ms), [120_000, 1])
+  at = 120_000
+  timers[1].fn()
+  await later()
+  assert.deepEqual(said, ['Waiting for jev-3 to finish with Big: one local model works at a time.', 'Waiting for jev-3 to finish with Big; it is next once that ends.'])
+  finishFirst()
+  await first
+  assert.equal(await small, 'small worked')
+  assert.deepEqual(timers.map((x) => x.cancelled), [false, true], 'starting cancels the timer set last')
   await local.dispose()
 })
 
@@ -1663,14 +2040,17 @@ test('a speed run sends a warm-up, a fill of exactly the first 8,192 tokens of t
   assert.deepEqual(await local.benchmark(), ['big'], 'Benchmark all: every installed chat model')
   const run = await speedEnded(local)
   const [started] = server.started
-  // In order: the warm-up, the speed text in the model's own tokens, the fill, three generations.
-  assert.deepEqual(server.requests.map((r) => [r.path, r.body.n_predict ?? null]), [['/completion', 16], ['/tokenize', null], ['/completion', 1], ['/completion', 128], ['/completion', 128], ['/completion', 128]])
+  // In order: the warm-up, the speed text in the model's own tokens, the fill, three generations, and the output check (2.15).
+  assert.deepEqual(server.requests.map((r) => [r.path, r.body.n_predict ?? null]), [['/completion', 16], ['/tokenize', null], ['/completion', 1], ['/completion', 128], ['/completion', 128], ['/completion', 128], ['/completion', 64]])
   for (const r of server.requests) assert.equal(r.headers.authorization, `Bearer ${started.key}`, `${r.path} carries the engine's own key`)
   assert.deepEqual(server.to('/tokenize')[0].body, { content: localJs.SPEED_TEXT })
   const [, fill, ...timed] = server.to('/completion')
+  const check = timed.pop()
   const first = Array.from({ length: 8192 }, (_, n) => 1000 + n)
   assert.deepEqual(fill.body, { prompt: first, n_predict: 1, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: true })
   for (const t of timed) assert.deepEqual(t.body, { prompt: first, n_predict: 128, ignore_eos: true, cache_prompt: true, temperature: 0, seed: 1, stream: true })
+  // The output check: the fixed prompt as text, decoded greedily, with no prompt cache.
+  assert.deepEqual(check.body, { prompt: localJs.CHECK_PROMPT, n_predict: 64, ignore_eos: true, cache_prompt: false, temperature: 0, top_k: 1, seed: 1, stream: true })
   // The speed text is synthetic, fixed and long: far more than 8,192 tokens in any tokenizer.
   assert.ok(localJs.SPEED_TEXT.length > 60_000 && localJs.SPEED_TEXT.length < 70_000, String(localJs.SPEED_TEXT.length))
   assert.match(localJs.SPEED_TEXT, /^\/\/ Step 1 of the pipeline\.\nfunction step1\(value\) \{/)
@@ -1684,6 +2064,10 @@ test('a speed run sends a warm-up, a fill of exactly the first 8,192 tokens of t
     runs: [{ tokensPerSec: 19.5 }, { tokensPerSec: 21 }, { tokensPerSec: 20 }],
     loadMs: null, roomGB: 4, gpuLayers: 'auto', threads: 4,
     engine: { variant: 'cuda12', sha256: sha('e') }, weights: { file: 'big.gguf', sha256: sha('big') }, layersOnGpu: { gpu: 29, total: 37 }, vision: false, laya: null,
+    // The engine's peak working set: none could be read from the stand-in's pid, which no process has.
+    peakRamGB: null,
+    // The output check of its first run: its output is the baseline of its weights, build and split.
+    output: { state: 'baseline' },
   })
   assert.ok(Number.isFinite(r.loadMs) && r.loadMs >= 0, 'the load time from spawn to a healthy /health')
   assert.ok(Math.abs(Date.parse(r.at) - Date.now()) < 60_000)
@@ -1715,11 +2099,13 @@ test('every speed run is logged: its summary appended to speed-runs.log, and eve
   const lines = history.split('\n')
   assert.match(lines[0], /^\d{4}-\d\d-\d\d \d\d:\d\d UTC, Speed-Run\.bat: 1 of 2 measured$/)
   assert.equal(lines[1], '  PC: RTX 3050 Laptop 4 GB, 24 GB RAM, Core i5-11400H 6 cores, 52 GB free; engine: cuda12 build ' + sha('e').slice(0, 12) + '; budget: GPU layers auto; no Laya held')
-  assert.equal(lines[2], '  Big    20.0 tokens/s generating, 400 tokens/s reading, 12k context, 29/37 layers on the GPU, 3.5 GB VRAM + 1.0 GB RAM, loaded in ' + (results.done[0].reading.loadMs / 1000).toFixed(1) + ' s, 4 threads')
-  assert.equal(lines[3], '  Small  not measured: llama-server generated 100 tokens, not 128')
-  assert.equal(lines[4], '  The engine is stopped again, as it was before.')
-  assert.equal(lines[5], `  Details: ${detail[0]}`)
-  assert.deepEqual(lines.slice(6), ['', ''], 'a blank line after each entry')
+  assert.equal(lines[2], '  Big    20.0 tokens/s generating, 400 tokens/s reading, 12k context, 29/37 layers on the GPU, 3.5 GB VRAM + 1.0 GB RAM, loaded in ' + (results.done[0].reading.loadMs / 1000).toFixed(1) + ' s, 4 threads, peak RAM not read')
+  // The output check's verdict under the figures (2.15).
+  assert.equal(lines[3], '         output kept as the first baseline for this engine build and GPU split')
+  assert.equal(lines[4], '  Small  not measured: llama-server generated 100 tokens, not 128')
+  assert.equal(lines[5], '  The engine is stopped again, as it was before.')
+  assert.equal(lines[6], `  Details: ${detail[0]}`)
+  assert.deepEqual(lines.slice(7), ['', ''], 'a blank line after each entry')
   assert.ok(/^[\x20-\x7e\n]*$/.test(history), 'plain ASCII, for any editor on Windows')
 
   // The detail log: the head, then every step with its time, in order.
@@ -1846,10 +2232,10 @@ test('a speed run cut off before its end (KzH killed for a restart or an update)
 test('a model\'s row in the speed run history says a figure its reading lacks is missing, never a zero', () => {
   assert.equal(typeof localJs.speedFigures, 'function', 'local.js words a model\'s row in the speed run history')
   const { speedFigures } = localJs
-  const line = { ctx: 16384, memory: { vramGB: 6, ramGB: 0.5 }, reading: { tokensPerSec: 64, promptTokensPerSec: 2048, layersOnGpu: { gpu: 37, total: 37 }, loadMs: 4200, threads: 1 } }
-  assert.equal(speedFigures(line), '64.0 tokens/s generating, 2048 tokens/s reading, 16k context, 37/37 layers on the GPU, 6.0 GB VRAM + 0.5 GB RAM, loaded in 4.2 s, 1 thread')
-  const bare = { ctx: 12500, memory: null, reading: { tokensPerSec: 3.25, promptTokensPerSec: null, layersOnGpu: null, loadMs: null, threads: undefined } }
-  assert.equal(speedFigures(bare), '3.3 tokens/s generating, reading speed not measured (prompt cache), 12500-token context, layers on the GPU not reported, memory not reported, load time not reported, threads not reported')
+  const line = { ctx: 16384, memory: { vramGB: 6, ramGB: 0.5 }, reading: { tokensPerSec: 64, promptTokensPerSec: 2048, layersOnGpu: { gpu: 37, total: 37 }, loadMs: 4200, threads: 1, peakRamGB: 7.94 } }
+  assert.equal(speedFigures(line), '64.0 tokens/s generating, 2048 tokens/s reading, 16k context, 37/37 layers on the GPU, 6.0 GB VRAM + 0.5 GB RAM, loaded in 4.2 s, 1 thread, peak RAM 7.9 GB')
+  const bare = { ctx: 12500, memory: null, reading: { tokensPerSec: 3.25, promptTokensPerSec: null, layersOnGpu: null, loadMs: null, threads: undefined, peakRamGB: null } }
+  assert.equal(speedFigures(bare), '3.3 tokens/s generating, reading speed not measured (prompt cache), 12500-token context, layers on the GPU not reported, memory not reported, load time not reported, threads not reported, peak RAM not read')
 })
 
 test('a speed run log that cannot be written never stops the run: the readings are kept, and the status says what failed', async () => {
@@ -2568,4 +2954,277 @@ test('a speed reading stands only for the weights it was measured on: once a man
   assert.equal((await modelIn(again, 'big')).speed.stands, true)
   assert.deepEqual((await again.readSettings()).speed['big@12288'].weights, { file: 'big-q5.gguf', sha256: sha('big-q5') })
   await again.dispose()
+})
+
+// ---------- what a start takes for its own llama-server, downloads that survive a drop, llama-server's log ----------
+
+/** The local models on `server`, with the first free port from 8081 always the one asked for, so the ports a start tries are known. */
+const onPorts = (server, extra = {}) => installedIn(tmp(), { spawn: server.spawn, fetch: server.fetch, port: 8081, findPort: async (from) => from, ...extra })
+
+test('what answers on llama-server\'s port: nothing yet and a model still loading are waited for, and it is ready only once /health says {"status":"ok"} and /v1/models, asked with the start\'s key, names the model', async () => {
+  assert.equal(typeof localJs.probeLlama, 'function', 'local.js says what answers on the port')
+  const asked = []
+  const answering = (health, models) => async (url, init = {}) => { asked.push([new URL(url).pathname, init.headers?.authorization ?? null]); return String(url).endsWith('/health') ? health() : models() }
+  const probe = (fetch) => localJs.probeLlama({ port: 8081, key: 'start-key', alias: 'big', fetch })
+  const ok = () => Response.json({ status: 'ok' })
+  assert.deepEqual(await probe(async () => { throw new TypeError('fetch failed') }), {}, 'nothing listens yet')
+  assert.deepEqual(await probe(answering(() => Response.json({ error: { code: 503, message: 'Loading model' } }, { status: 503 }))), {}, 'the model still loads')
+  assert.deepEqual(await probe(answering(ok, () => Response.json({ object: 'list', data: [{ id: 'big' }] }))), { ready: true })
+  assert.deepEqual(asked.slice(-2), [['/health', null], ['/v1/models', 'Bearer start-key']], '/health asked as it is, /v1/models with the key')
+  assert.deepEqual(await probe(answering(ok, () => Response.json({ data: [{ id: 'big-q5', aliases: ['big'] }] }))), { ready: true }, 'an alias names it too')
+  assert.deepEqual(await probe(answering(ok, () => Response.json({}, { status: 503 }))), {}, 'a server error is waited out')
+  assert.deepEqual(await probe(answering(() => new Response('OK'))), { other: 'its /health does not answer as llama-server does' })
+  assert.deepEqual(await probe(answering(() => new Response('Not Found', { status: 404 }))), { other: 'its /health answered HTTP 404' })
+  assert.deepEqual(await probe(answering(() => new Response('<h1>Service Unavailable</h1>', { status: 503 }))), { other: 'its /health answered HTTP 503' }, 'only llama-server\'s own 503 is a model loading')
+  assert.deepEqual(await probe(answering(ok, () => Response.json({ error: { code: 401 } }, { status: 401 }))), { other: 'it refused this start\'s key' })
+  assert.deepEqual(await probe(answering(ok, () => Response.json({ error: 'not found' }, { status: 404 }))), { other: 'it answered /v1/models with HTTP 404' })
+  assert.deepEqual(await probe(answering(ok, () => Response.json({ data: [{ id: 'small' }] }))), { other: 'its /v1/models does not name big' })
+})
+
+test('a program on llama-server\'s port never passes for the model: a /health that is not llama-server\'s, a key refused or another model named moves the start to the next port, once, after its own llama-server there has gone', async () => {
+  const strangers = {
+    // A web page, say: any 2xx on /health was taken for the model before.
+    page: () => new Response('<html>It works</html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+    // A llama-server left over from an earlier session: its /health is llama-server's, its key another start's.
+    leftover: (path) => (path === '/health' ? Response.json({ status: 'ok' }) : Response.json({ error: { code: 401, message: 'Invalid API Key' } }, { status: 401 })),
+    // A server that lists its models to anyone, none of them this one.
+    other: (path) => (path === '/health' ? Response.json({ status: 'ok' }) : Response.json({ object: 'list', data: [{ id: 'someone-else' }] })),
+  }
+  const why = { page: 'its /health does not answer as llama-server does', leftover: 'it refused this start\'s key', other: 'its /v1/models does not name big' }
+  for (const [name, answer] of Object.entries(strangers)) {
+    const server = fakeLlamaServer({ stranger: (port) => (port === 8081 ? answer : null) })
+    const logs = []
+    const { local } = await onPorts(server, { log: (t) => logs.push(t) })
+    const failed = await local.start('big').then(() => null, (err) => err)
+    assert.equal(failed, null, `${name}: the model loads on the next port`)
+    assert.deepEqual(server.started.map((s) => s.port), [8081, 8082], `${name}: started once more, on the next port`)
+    assert.notEqual(server.started[0].child.exitCode, null, `${name}: the llama-server started on the taken port was stopped`)
+    assert.equal((await local.status()).engine.port, 8082, name)
+    assert.ok(logs.includes(`local: port 8081 is answered by another program (${why[name]}); trying port 8082`), logs.join('\n'))
+    assert.equal(server.probes.at(-1).authorization, `Bearer ${server.started[1].key}`, `${name}: the second start is asked with its own key`)
+    assert.notEqual(server.started[0].key, server.started[1].key, `${name}: each start has a key of its own`)
+    await local.dispose()
+  }
+})
+
+test('a port taken before llama-server could bind it: llama-server says so and exits, and the start is made once more, on the next port; a second port taken too fails the start, naming both, with no third', async () => {
+  const server = fakeLlamaServer({ refuses: (port) => port === 8081 })
+  const logs = []
+  const { local } = await onPorts(server, { log: (t) => logs.push(t) })
+  const failed = await local.start('big').then(() => null, (err) => err)
+  assert.equal(failed, null, 'the model loads on the next port')
+  assert.deepEqual(server.started.map((s) => s.port), [8081, 8082])
+  assert.equal((await local.status()).engine.port, 8082)
+  assert.ok(logs.includes('local: port 8081 was taken before llama-server could bind it; trying port 8082'), logs.join('\n'))
+  await local.dispose()
+
+  const busy = fakeLlamaServer({ refuses: (port) => port === 8081 || port === 8082 })
+  const { local: twice } = await onPorts(busy)
+  const err = await twice.start('big').then(() => null, (e) => e)
+  assert.match(String(err?.message), /^llama-server found no port of its own: 8081 was taken before llama-server could bind it, and 8082 was taken before llama-server could bind it$/)
+  assert.equal(busy.started.length, 2, 'once more, and no more')
+  assert.equal((await twice.status()).engine.running, false)
+  await twice.dispose()
+})
+
+test('a download whose connection drops is tried again from where it stopped, saying each new try; a try that brings bytes starts the waits again, tries in a row that bring none are bounded, and the .part stays to resume from', async () => {
+  const dir = tmp()
+  const dest = join(dir, 'm.gguf')
+  const host = fakeDownload(body, [{ cutAfter: 1500 }, { cutAfter: 1000 }])
+  const notes = []
+  const failed = await downloadVerified({ url: 'u', dest, size: body.length, sha256: bodySha, fetch: host.fetch, onNote: (t) => notes.push(t), retryMs: [0, 0, 0] }).then(() => null, (err) => err)
+  assert.equal(failed, null, 'a dropped connection does not fail the download')
+  assert.deepEqual(host.ranges, [null, 'bytes=1500-', 'bytes=2500-'])
+  assert.ok(readFileSync(dest).equals(body))
+  assert.ok(!existsSync(`${dest}.part`))
+  assert.deepEqual(notes, ['terminated (other side closed); trying again in 0 s', 'terminated (other side closed); trying again in 0 s'])
+
+  // A try that brings new bytes starts the waits again, so a link that keeps dropping still finishes.
+  const dropping = fakeDownload(body, [{ cutAfter: 100 }, { cutAfter: 100 }, { cutAfter: 100 }, { cutAfter: 100 }])
+  const waited = []
+  await downloadVerified({ url: 'u', dest: join(dir, 'd.gguf'), size: body.length, sha256: bodySha, fetch: dropping.fetch, onNote: (t) => waited.push(t), retryMs: [0] })
+  assert.deepEqual(dropping.ranges, [null, 'bytes=100-', 'bytes=200-', 'bytes=300-', 'bytes=400-'])
+  assert.equal(waited.length, 4)
+  assert.ok(readFileSync(join(dir, 'd.gguf')).equals(body))
+
+  // Tries in a row that bring nothing use the waits up, and the .part stays to resume from.
+  const flaky = fakeDownload(body, [{ cutAfter: 100 }, { status: 503 }, { status: 503 }])
+  const gaveUp = await downloadVerified({ url: 'u', dest: join(dir, 'f.gguf'), size: body.length, sha256: bodySha, fetch: flaky.fetch, retryMs: [0, 0] }).then(() => null, (err) => err)
+  assert.equal(gaveUp?.message, 'download incomplete: 100 of 4000 bytes after 3 tries (HTTP 503; press Download again to resume)')
+  assert.deepEqual(flaky.ranges, [null, 'bytes=100-', 'bytes=100-'])
+  assert.equal(readFileSync(join(dir, 'f.gguf.part')).length, 100)
+  // Resumed later, the bytes already there are read once into the hash: a .part whose bytes are wrong fails it.
+  writeFileSync(join(dir, 'f.gguf.part'), Buffer.alloc(100, 'x'))
+  await assert.rejects(downloadVerified({ url: 'u', dest: join(dir, 'f.gguf'), size: body.length, sha256: bodySha, fetch: fakeDownload(body).fetch }), /SHA256 mismatch/)
+  assert.ok(!existsSync(join(dir, 'f.gguf.part')) && !existsSync(join(dir, 'f.gguf')))
+})
+
+test('a resume the server does not honour starts over from the first byte: a 206 from another byte, a 200 with the whole file or a 416 is never added to the .part', async () => {
+  for (const [why, step, ranges] of [
+    ['a 206 from another byte', { from: 1000 }, ['bytes=1500-', null]],
+    // From the first byte, it is the whole file, as a 200 is, and is kept from there.
+    ['a 206 from the first byte', { from: 0 }, ['bytes=1500-']],
+    ['a 200 with the whole file', { ignoreRange: true }, ['bytes=1500-']],
+    ['a 416', { status: 416 }, ['bytes=1500-', null]],
+  ]) {
+    const dest = join(tmp(), 'm.gguf')
+    writeFileSync(`${dest}.part`, body.subarray(0, 1500))
+    const host = fakeDownload(body, [step])
+    const notes = []
+    const failed = await downloadVerified({ url: 'u', dest, size: body.length, sha256: bodySha, fetch: host.fetch, onNote: (t) => notes.push(t), retryMs: [0] }).then(() => null, (err) => err)
+    assert.equal(failed, null, `${why}: the download starts over and is verified`)
+    assert.ok(readFileSync(dest).equals(body), why)
+    assert.deepEqual(host.ranges, ranges, why)
+    assert.match(notes[0] ?? '', /resume at byte 1500; downloading it again from the first byte$/, why)
+  }
+  // Asked for the whole file, a part of it is of no use and would come again: the download fails at once.
+  const part = fakeDownload(body, [{ from: 5 }])
+  await assert.rejects(downloadVerified({ url: 'u', dest: join(tmp(), 'p.gguf'), size: body.length, sha256: bodySha, fetch: part.fetch, retryMs: [0] }), { message: 'download failed: the server sent part of the file when asked for all of it' })
+  assert.deepEqual(part.ranges, [null])
+})
+
+test('a server that sends less than the file ends its download in a few tries rather than starting it over for good: a start over that stops where the server would not resume ends it at once, keeping no .part to resume onto, and one that gets no further than an earlier try uses a wait', async () => {
+  // A server holding `data`, less than the manifest's size: a Range it can serve gets a 206 and one past its end a 416,
+  // unless it ignores the Range, as a Wi-Fi sign-in page does, and sends all it has with a 200.
+  const short = (data, { ignoreRange = false } = {}) => {
+    const ranges = []
+    // A download that keeps starting over is stopped at the 31st request, so the test fails on its assertions rather than hanging.
+    const stop = new AbortController()
+    const fetch = async (url, init = {}) => {
+      const range = init.headers?.range ?? null
+      if (ranges.push(range) > 30) stop.abort(new Error('still downloading after 30 requests'))
+      init.signal?.throwIfAborted()
+      const from = range && !ignoreRange ? Number(/bytes=(\d+)-/.exec(range)[1]) : 0
+      if (from && from >= data.length) return new Response(null, { status: 416, headers: { 'content-range': `bytes */${data.length}` } })
+      return new Response(new Uint8Array(data.subarray(from)), { status: from ? 206 : 200, headers: from ? { 'content-range': `bytes ${from}-${data.length - 1}/${data.length}` } : {} })
+    }
+    return { fetch, ranges, signal: stop.signal }
+  }
+  const download = async (server, dest) => {
+    const notes = []
+    const failed = await downloadVerified({ url: 'u', dest, size: body.length, sha256: bodySha, fetch: server.fetch, onNote: (t) => notes.push(t), retryMs: [0, 0, 0, 0, 0], signal: server.signal }).then(() => null, (err) => err)
+    return { message: failed?.message, notes }
+  }
+  const gone = (n) => `the server sends only the first ${n} bytes and would not resume after them; press Download again to start over`
+
+  // The server's file is shorter than the manifest says: it comes twice, rather than again and again.
+  const shorter = short(body.subarray(0, 2000))
+  const dest = join(tmp(), 'm.gguf')
+  assert.deepEqual(await download(shorter, dest), {
+    message: `download incomplete: 2000 of 4000 bytes after 3 tries (${gone(2000)})`,
+    notes: ['the connection closed at byte 2000 of 4000; trying again in 0 s', 'the server would not resume at byte 2000; downloading it again from the first byte'],
+  })
+  assert.deepEqual(shorter.ranges, [null, 'bytes=2000-', null])
+  assert.ok(!existsSync(`${dest}.part`) && !existsSync(dest), 'what the server sent is not kept to resume onto')
+
+  // A sign-in page in place of the file, whatever Range is asked for.
+  const page = Buffer.from('<html><body>Sign in to use this Wi-Fi</body></html>')
+  const signIn = short(page, { ignoreRange: true })
+  const pageDest = join(tmp(), 'm.gguf')
+  const n = page.length
+  assert.deepEqual(await download(signIn, pageDest), {
+    message: `download incomplete: ${n} of 4000 bytes after 2 tries (${gone(n)})`,
+    notes: [`the connection closed at byte ${n} of 4000; trying again in 0 s`, `the server did not resume at byte ${n}; downloading it again from the first byte`],
+  })
+  assert.deepEqual(signIn.ranges, [null, `bytes=${n}-`])
+  // Signed in, Download again gets the file from its first byte, rather than resuming it onto the page and failing its SHA256.
+  const file = fakeDownload(body)
+  assert.equal((await download(file, pageDest)).message, undefined)
+  assert.deepEqual(file.ranges, [null])
+  assert.ok(readFileSync(pageDest).equals(body))
+
+  // A server that ignores the Range over a link that keeps dropping: a start over that gets no further than the first try
+  // uses a wait, though it brought bytes, so the waits run out.
+  const dropping = fakeDownload(body, [{ cutAfter: 3000 }, { ignoreRange: true, cutAfter: 1000 }, { ignoreRange: true, cutAfter: 2000 }])
+  const gaveUp = await downloadVerified({ url: 'u', dest: join(tmp(), 'm.gguf'), size: body.length, sha256: bodySha, fetch: dropping.fetch, retryMs: [0, 0] }).then(() => null, (err) => err)
+  assert.equal(gaveUp?.message, 'download incomplete: 2000 of 4000 bytes after 3 tries (terminated (other side closed); press Download again to resume)')
+  assert.deepEqual(dropping.ranges, [null, 'bytes=3000-', 'bytes=1000-'])
+})
+
+test('a download that goes quiet is given up after stallMs and tried again, rather than waited on for good', async () => {
+  const host = fakeDownload(body, [{ stall: true }])
+  const notes = []
+  const stop = new AbortController()
+  let timer
+  const got = await Promise.race([
+    downloadVerified({ url: 'u', dest: join(tmp(), 'm.gguf'), size: body.length, sha256: bodySha, fetch: host.fetch, onNote: (t) => notes.push(t), retryMs: [0], stallMs: 50, signal: stop.signal }).then(() => 'done', (err) => err),
+    new Promise((r) => { timer = setTimeout(() => r('still waiting'), 3000) }),
+  ])
+  clearTimeout(timer)
+  stop.abort()
+  assert.equal(got, 'done')
+  assert.deepEqual(host.ranges, [null, null])
+  assert.deepEqual(notes, ['no data for 0.05 s; trying again in 0 s'])
+})
+
+test('the free-disk check counts what a download stopped part way left in its .part: the picker and the install take it as there, and the install resumes it rather than fetching it again', async () => {
+  const data = Buffer.from('tiny model '.repeat(1000))
+  const tiny = { id: 'tiny', kind: 'model', name: 'Tiny', source: 'https://huggingface.co/Org/Tiny-GGUF/resolve/main/tiny.gguf', file: 'tiny.gguf', size: data.length, sha256: sha(data), reliability: 'official-stable', verified: true, rank: 1, recommendedVramGB: 1, contextSize: 8192 }
+  const cpuEngine = MANIFEST_MODULES[1]
+  const host = fakeDownload(data)
+  // 6,000 of its 11,000 bytes are there: the rest and the 10% to spare (6,100 bytes) fit in 8,000 free, the whole (12,100) would not.
+  const specs = { ...PC, gpus: [], cuda: null, diskFreeBytes: 8000 }
+  const { local, engineDir, modelsDir } = localIn(tmp(), { modules: [cpuEngine, tiny], specs: async () => specs, fetch: host.fetch })
+  writeFileSync(join(engineDir, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'), '')
+  mkdirSync(join(engineDir, '.installed'))
+  writeFileSync(join(engineDir, '.installed', `${cpuEngine.id}.json`), JSON.stringify({ sha256: cpuEngine.sha256 }))
+  writeFileSync(join(modelsDir, 'tiny.gguf.part'), data.subarray(0, 6000))
+  const row = async () => (await local.status()).modules.find((m) => m.id === 'tiny')
+  assert.equal((await row()).partBytes, 6000, 'the status says what the .part holds')
+  const rating = (await buildCatalog(local, specs)).modules.find((m) => m.id === 'tiny').rating
+  assert.notEqual(rating.fit, 'no', `the picker offers it: ${rating.reason}`)
+  const ids = await local.install(['tiny']).catch((err) => err.message)
+  assert.deepEqual(ids, ['tiny'], 'the install is not refused for the disk')
+  for (const deadline = Date.now() + 5000; (await row()).job?.state !== 'done' && Date.now() < deadline;) await new Promise((r) => setTimeout(r, 10))
+  assert.equal((await row()).state, 'installed')
+  assert.deepEqual(host.ranges, ['bytes=6000-'], 'resumed from the .part, not fetched again')
+  assert.ok(readFileSync(join(modelsDir, 'tiny.gguf')).equals(data))
+  await local.dispose()
+})
+
+test('llama-server\'s log on disk: every line it prints and KzH\'s own on each start, stamped with the time, with the start\'s key and any other secret taken out, and its tail served from the file', async () => {
+  const report = (run) => [
+    'load_tensors: offloaded 37/37 layers to GPU',
+    `srv  load_model: api_keys: ****${run.key.slice(-4)}`,
+    `main: echoing the key ${run.key} by mistake`,
+    'common_download: using token hf_abcdefghijklmnopqrstuvwxyz0123 for a gated file',
+  ]
+  const server = fakeLlamaServer({ report })
+  const root = tmp()
+  const file = join(root, 'logs', 'llama-server.log')
+  const { local } = await installedIn(root, { spawn: server.spawn, fetch: server.fetch, serverLog: file })
+  assert.equal(typeof local.logTail, 'function', 'the local models serve the tail of llama-server\'s log')
+  await local.start('big')
+  await local.stop()
+  const lines = await local.logTail(50)
+  assert.equal(local.logFile, file)
+  assert.deepEqual(lines, readFileSync(file, 'utf8').trim().split(/\r?\n/), 'the tail is the file\'s')
+  assert.ok(lines.every((l) => /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z /.test(l)), 'each line stamped with the time')
+  const text = lines.map((l) => l.slice(25))
+  assert.match(text[0], /^KzH: starting big on 127\.0\.0\.1:\d+: "?.*llama-server(\.exe)?"? -m "?.*big\.gguf"? --alias big /)
+  assert.deepEqual(text.slice(1, 5), [
+    'load_tensors: offloaded 37/37 layers to GPU',
+    'srv  load_model: api_keys: [key]',
+    'main: echoing the key [key] by mistake',
+    'common_download: using token hf_abc...REDACTED for a gated file',
+  ])
+  assert.match(text[5], /^KzH: ready: big on 127\.0\.0\.1:\d+ after \d+\.\d s, 37\/37 layers on GPU$/)
+  assert.deepEqual(text.slice(6), ['KzH: stopping big', 'KzH: llama-server exited with code 0'])
+  assert.ok(!readFileSync(file, 'utf8').includes(server.started[0].key), 'the key is nowhere in the file')
+  assert.deepEqual((await local.logTail(2)).map((l) => l.slice(25)), text.slice(-2), 'as many lines as asked for, the newest')
+  await local.dispose()
+})
+
+test('llama-server\'s log is kept to two files of bounded size: past its limit it moves to .1, replacing the older one, and the tail reads across both', async () => {
+  assert.equal(typeof localJs.createRotatingLog, 'function', 'local.js keeps rotating logs')
+  const dir = tmp()
+  const file = join(dir, 'llama-server.log')
+  const log = localJs.createRotatingLog(file, { maxBytes: 100, keep: 1 })
+  // 29 bytes a line: a file passes 100 bytes at its fourth line, and the fifth starts a new one.
+  for (let n = 1; n <= 30; n++) log.append(`line ${String(n).padStart(2, '0')} ${'x'.repeat(20)}\n`)
+  await log.flushed()
+  assert.deepEqual(readdirSync(dir).sort(), ['llama-server.log', 'llama-server.log.1'])
+  for (const f of readdirSync(dir)) assert.ok(statSync(join(dir, f)).size <= 100 + 29, f)
+  assert.deepEqual((await localJs.readLogTail(file, 6)).map((l) => l.slice(0, 7)), ['line 25', 'line 26', 'line 27', 'line 28', 'line 29', 'line 30'])
+  assert.deepEqual(await localJs.readLogTail(join(dir, 'none.log'), 5), [], 'no log yet, no lines')
 })

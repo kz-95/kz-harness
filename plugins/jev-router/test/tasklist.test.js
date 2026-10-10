@@ -260,3 +260,21 @@ test('Remove on a task whose read pass saw files change says so rather than that
   const m = taskRowModel(task({ state: 'queued', phase: 'queued', agent: null, startedAt: 1000, requeuedAt: 40_000, readBreach: { changed: ['src/a.ts'], agents: ['claude'] }, taskName: 'How does the parser work', waiting: { why: 'workspace', place: 2, ahead: 0, placeText: '2nd in line', text: 'Waiting.', since: 40_000 } }), 50_000)
   assert.equal(stopOneWords(m).body, '"How does the parser work" ran a read pass, and src/a.ts changed in this repository while it read, so its lock may not have held. It leaves the line, and nothing more of it runs.')
 })
+
+test('the Tasks tab offers Send now and Steer beside Run next and Remove on a waiting row, Steer beside Stop on a running one, and only Clear on a finished one', () => {
+  const p = loadPlugin().__test
+  assert.equal(typeof p.queueActions, 'function', 'the rows offer Send now and Steer')
+  const controls = { sendNow: 'slot', holder: null, heldBy: null, ahead: ['jev-3'], chatAhead: 0, held: 1, max: 1, local: null, forcedLocal: false }
+  const rows = [
+    task({ jobId: 'jev-4', key: 'k4', state: 'queued', startedAt: null, position: 3, waiting: { why: 'line', ahead: 1, text: 'Waiting: an earlier task in this workspace is waiting for a free slot first.' }, controls }),
+    task({ jobId: 'jev-2', key: 'k2', state: 'running' }),
+    task({ jobId: 'jev-1', key: 'k1', state: 'completed', finishedAt: 5000, deliveryState: 'delivered' }),
+  ]
+  const items = p.taskItems({ sessionId: 's1', runs: [], jobs: [], entries: [], tasks: rows, open: new Set(), now: 6000 })
+  const by = Object.fromEntries(items.map((it) => [it.kind, it]))
+  const offered = (it) => [...it.queue.map((q) => p.queueLabel(q.action, q.task)), ...(it.runNext ? ['Run next'] : []), ...(it.stop ? [it.stop.word] : []), ...(it.clear ? ['Clear'] : [])]
+  assert.deepEqual(offered(by['jev-4']), ['Send jev-4 now', 'Steer jev-4', 'Run next', 'Remove'])
+  assert.deepEqual(offered(by['jev-2']), ['Steer jev-2', 'Stop'])
+  assert.deepEqual(offered(by['jev-1']), ['Clear'])
+  assert.equal(by['jev-4'].queue[0].task.key, 'k4', 'each opens its dialog about its own task')
+})

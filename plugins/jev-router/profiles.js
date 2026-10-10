@@ -666,9 +666,11 @@ const verdictKeyOf = (f) => {
  * (record.ts is written when the run ends) and before `until`, the next run in the session when
  * the caller knows it. A session verdict given before this run ended is about an earlier answer,
  * so crediting it here would count one verdict again for every later run of the same agent.
+ * A verdict about the pick a start reply named (`about: 'plan'`) judges the choice, not an answer,
+ * so it is about no run's capability at all.
  */
 function verdictIsAbout(f, record, until) {
-  if (!f || VERDICT_SCORE[f.verdict] === undefined || f.tag === NOT_A_CAPABILITY_TAG) return false
+  if (!f || VERDICT_SCORE[f.verdict] === undefined || f.tag === NOT_A_CAPABILITY_TAG || f.about === 'plan') return false
   if (f.runId) return f.runId === record.runId
   if (!f.provider || !record.sessionId || f.sessionId !== record.sessionId) return false
   const given = at(f.ts); const ended = at(record.ts)
@@ -729,11 +731,18 @@ export function answererUnconfigured(verdict, record, { agents = [] } = {}) {
   return named.length ? gone(named.at(-1)) : scored.some(gone)
 }
 
+/**
+ * The dimensions a run the person steered as it ran gives no evidence on (Steer, docs/live-agent-view.md
+ * Feature 5): with guidance that reached its agents (router.js `steered`), how its first attempt did
+ * alone, and how well its agents followed the task as it was first given, are not what it shows.
+ */
+const STEERED_OUT = Object.freeze(['first_pass_quality', 'instruction_following'])
+
 // What evidenceFromRun and evidenceFromFeedback share: the work attempts worth scoring, each with
 // the subject it stands for, and the dimensions the task type exercises. A run the teacher did not
 // decide has no task type to give a row: it would be that provider's label, and it would set how
 // much the row weighs when Jev Auto reads a profile (evidenceWeight); a row with none is general
-// evidence, fully relevant.
+// evidence, fully relevant. A steered run leaves out the dimensions it says nothing of (STEERED_OUT).
 function runShape(record, { versionOf, agents, priors, now }) {
   if (!record || NO_EVIDENCE.has(record.finalStatus)) return null
   const attempts = Array.isArray(record.attempts) ? record.attempts : []
@@ -741,7 +750,8 @@ function runShape(record, { versionOf, agents, priors, now }) {
   if (!work.length) return null
   const taught = taughtRun(record)
   const taskType = taught ? str(record.routing?.taskType) ?? 'other' : null
-  const dims = TASK_DIMENSIONS[taskType] ?? TASK_DIMENSIONS.other
+  const steered = Number(record.steered) > 0
+  const dims = (TASK_DIMENSIONS[taskType] ?? TASK_DIMENSIONS.other).filter((d) => !(steered && STEERED_OUT.includes(d)))
   const first = work[0]; const last = work.at(-1)
   // The version reported now says what runs NOW. It is only the version that ran this record when
   // the run has just ended; for an older record (a backfill, a verdict given later) it may be one
@@ -761,7 +771,7 @@ function runShape(record, { versionOf, agents, priors, now }) {
   const push = (subject, dimension, source, score, confidence, extra = {}) => out.push({
     ...(record.ts ? { ts: record.ts } : {}), subject, dimension, score, source, confidence, n: 1, ...(taskType ? { taskType } : {}), ...(record.runId ? { runId: record.runId } : {}), ...extra,
   })
-  return { attempts, work, first, last, taught, taskType, dims, reviewDims: dims.filter((d) => d !== 'reliability'), scored, out, push }
+  return { attempts, work, first, last, taught, steered, taskType, dims, reviewDims: dims.filter((d) => d !== 'reliability'), scored, out, push }
 }
 
 /**
@@ -774,7 +784,8 @@ function runShape(record, { versionOf, agents, priors, now }) {
  * from a completed review by another agent; a `human_outcome` row from a like or dislike that is
  * about THIS run (verdictIsAbout), credited to one attempt and keyed by the verdict so the
  * registry counts it once however often it is derived. Nothing from the record's text reaches a
- * row: ids, numbers, categories and timestamps only.
+ * row: ids, numbers, categories and timestamps only. A run the person steered as it ran gives no
+ * `first_pass_quality` or `instruction_following` row (STEERED_OUT); its other rows stay.
  *
  * A run another provider decided (`routing.decider` is not Jev) gives only the `reliability` row
  * of each scored attempt, with no task type (runShape): the dimensions come from that provider's
@@ -790,7 +801,7 @@ function runShape(record, { versionOf, agents, priors, now }) {
 export function evidenceFromRun(record, { versionOf, agents = [], feedback = [], until, priors, now = Date.now } = {}) {
   const shape = runShape(record, { versionOf, agents, priors, now })
   if (!shape) return []
-  const { attempts, work, first, last, taught, dims, reviewDims, scored, out, push } = shape
+  const { attempts, work, first, last, taught, steered, dims, reviewDims, scored, out, push } = shape
   if (!taught) {
     for (const { attempt, subject } of scored) push(subject, 'reliability', 'objective_deterministic', attempt.stopReason === 'completed' ? 1 : 0, 0.9)
     return out
@@ -807,7 +818,7 @@ export function evidenceFromRun(record, { versionOf, agents = [], feedback = [],
     const failed = checksFailed(attempt)
     const objective = attempt === last && success && !failed ? 1 : followedByOther || failed ? 0 : null
     if (objective !== null) for (const dim of taskDims) push(subject, dim, 'objective_deterministic', objective, 0.9)
-    if (attempt === first) push(subject, 'first_pass_quality', 'objective_deterministic', success && work.length === 1 ? 1 : 0, 0.9)
+    if (attempt === first && !steered) push(subject, 'first_pass_quality', 'objective_deterministic', success && work.length === 1 ? 1 : 0, 0.9)
     push(subject, 'reliability', 'objective_deterministic', attempt.stopReason === 'completed' ? 1 : 0, 0.9)
     // The last word on this attempt: Jev's own assessment, or a completed review by another agent
     // before the next work attempt.

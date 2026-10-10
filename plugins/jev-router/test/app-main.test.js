@@ -347,6 +347,19 @@ test("Start-KzH.ps1 prints the engine line after the patches and right before ei
   assert.ok(lastPatch < said && said < cached && said < fetched, `the line comes after the patches (${lastPatch}) and before both starts (${cached}, ${fetched}), not at ${said}`)
 })
 
+test("Start-KzH.ps1 runs patch-agent-live.mjs after patch-codex-effort.mjs and before 'Starting the engine.'", () => {
+  const lines = LAUNCHER.split(/\r?\n/)
+  const at = (re) => lines.findIndex((l) => re.test(l))
+  const effort = at(/^node \(Join-Path \$PSScriptRoot 'scripts\\patch-codex-effort\.mjs'\)$/)
+  const live = at(/^node \(Join-Path \$PSScriptRoot 'scripts\\patch-agent-live\.mjs'\)$/)
+  const said = at(/^Write-Host 'Starting the engine\.'$/)
+  assert.ok(effort > 0, 'the launcher runs patch-codex-effort.mjs')
+  assert.ok(live > effort && live < said, `the live view patch runs after the effort patch (${effort}) and before the engine line (${said}), not at ${live}`)
+  assert.match(lines[live - 1], /^# What each Claude Code and Codex run is doing \(the Live tab\), and Steer \/ Send now into them\.$/, 'with a line that says what it is for')
+  // PowerShell 5.1 reads a file without a BOM as the system code page: what was added stays ASCII.
+  assert.equal(/[^\x00-\x7f]/.test(lines.slice(live - 1, live + 1).join('\n')), false)
+})
+
 test('the splash only moves forward: the patches after a fetch leave it on the fetch, and the launcher says when the engine boots', async (t) => {
   const w = await startApp(t)
   const child = w.children[0]
